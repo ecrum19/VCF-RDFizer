@@ -7,3 +7,6 @@ run_output/
 tsv_vcf_files/
 test_vcf_files/
 RMLStreamer-v2.5.0-standalone.jar
+out/
+tsv/
+run_metrics/

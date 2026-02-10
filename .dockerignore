@@ -1,0 +1,8 @@
+.git/
+run_output/
+run_metrics/
+tsv_vcf_files/
+test_vcf_files/
+out/
+tsv/
+*.jar

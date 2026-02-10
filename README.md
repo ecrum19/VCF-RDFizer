@@ -4,15 +4,76 @@ VCF-RDFizer generates [RDF](https://www.w3.org/2001/sw/wiki/RDF) serializations
 of [VCF files](https://samtools.github.io/hts-specs/VCFv4.2.pdf) as [N-Quads](https://www.w3.org/TR/n-quads/)
 using [RML](http://rml.io/) rules and the [RMLStreamer](https://github.com/RMLio/RMLStreamer) application. 
 
+## Overview
 
-## Quick Start (Docker)
+Pipeline steps:
+1. Convert VCF to TSV (`vcf_as_tsv.sh`)
+2. Convert TSV to RDF with RMLStreamer (`run_conversion.sh`)
+
+## Quick Start (Docker + Python)
+
+Prereqs:
+- Docker (running)
+- Python 3.9+
+
+Example:
+```
+python vcf_rdfizer.py --input vcf_files/ --rules rules.ttl
+```
+
+Outputs:
+- `./tsv` for TSV intermediates
+- `./out` for RDF output
+- `./run_metrics` for logs and metrics
+
+## How Dependencies Are Handled
+
+The Docker image bundles:
+- Java 11 runtime
+- HDT Java libraries
+- Brotli and Node.js
+- RMLStreamer standalone jar (downloaded at build time)
+- The conversion scripts from `src/`
+
+## Wrapper Checks
+
+The wrapper validates:
+- Docker is installed and running
+- Input path exists and contains `.vcf` or `.vcf.gz`
+- Rules file exists
+- Docker image exists or is built
+
+## Configuration
+
+CLI usage:
+```
+python vcf_rdfizer.py --input <file|dir> --rules <rules.ttl> [options]
+```
+
+Options:
+- `--input` (required): path to `.vcf` or `.vcf.gz`, or a directory containing them
+- `--rules` (required): path to RML mapping `.ttl`
+- `--out` (default `./out`): RDF output directory
+- `--tsv` (default `./tsv`): TSV output directory
+- `--image` (default `vcf-rdfizer:latest`): Docker image tag
+- `--build`: force docker build
+- `--no-build`: fail if image missing
+- `--out-name` (default `rdf`): output name for `run_test.sh`
+- `--metrics` (default `./run_metrics`): metrics/log directory
+- `--keep-tsv`: keep TSV intermediates (otherwise removed after RDF generation if created by the wrapper)
+
+## Notes On Mappings
+
+The wrapper runs RMLStreamer with working directory `/data/rules`.
+If your mapping refers to TSVs using relative paths, make them relative to the rules file.
+You can also use absolute container paths like `/data/tsv/<file>.tsv`.
 
 
-## Quick Start (Conda)
+## Manual Setup (Legacy)
 
+If you prefer to run the steps without Docker, the original manual commands are below.
 
-
-### VCF Commands to Execute
+### VCF Commands To Execute
 Download the RMLStreamer STANDALONE jar file:
 ```
 wget --content-disposition --trust-server-names \
@@ -43,7 +104,7 @@ mvn clean install -DskipTests
 
 Generate tsv representations of vcf files (for all VCFs to be converted):
 ```
-bash vcf_as_tsv.sh vcf_files/ 
+bash vcf_as_tsv.sh vcf_files/ tsv/
 ```
 
 Run VCF Conversion:
@@ -119,8 +180,6 @@ options:
 ### Moderately quick start (Docker - the recommended way)
 
 If you want to get RMLStreamer up and running within 5 minutes using Docker, check out [docker/README.md](docker/README.md)
-
-
 
 
 

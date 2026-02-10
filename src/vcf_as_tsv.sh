@@ -1,27 +1,37 @@
 #!/bin/bash
 set -euo pipefail
 
-# Usage check
 if [ "$#" -ne 2 ]; then
-  echo "Usage: $0 <input_dir> <output_dir>"
+  echo "Usage: $0 <input_path> <output_dir>"
   exit 1
 fi
 
-input_dir="$1"
+input_path="$1"
 output_dir="$2"
-
-if [ ! -d "$input_dir" ]; then
-  echo "Error: input directory '$input_dir' not found."
-  exit 1
-fi
 
 mkdir -p "$output_dir"
 
-mapfile -t files < <(find "$input_dir" -maxdepth 1 -type f \( -name '*.vcf' -o -name '*.vcf.gz' \) | sort)
+files=()
+if [ -f "$input_path" ]; then
+  case "$input_path" in
+    *.vcf|*.vcf.gz)
+      files+=("$input_path")
+      ;;
+    *)
+      echo "Error: input file must end with .vcf or .vcf.gz"
+      exit 1
+      ;;
+  esac
+elif [ -d "$input_path" ]; then
+  mapfile -t files < <(find "$input_path" -maxdepth 1 -type f \( -name '*.vcf' -o -name '*.vcf.gz' \) | sort)
+else
+  echo "Error: input path '$input_path' not found."
+  exit 1
+fi
 
 if [ "${#files[@]}" -eq 0 ]; then
-  echo "No .vcf or .vcf.gz files found in '$input_dir'."
-  exit 0
+  echo "No .vcf or .vcf.gz files found in '$input_path'."
+  exit 1
 fi
 
 for infile in "${files[@]}"; do
