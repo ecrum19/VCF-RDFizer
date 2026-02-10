@@ -1,0 +1,21 @@
+# Created by .ignore support plugin (hsz.mobi)
+.idea/
+*.iml
+target/
+kafka_2*/
+*.txt
+*.swp
+*.properties
+!src/test/resources/log4j.properties
+!kafka_test_example.properties
+!*_example.properties
+!docker/configuration.properties
+scripts/node_modules
+
+!time-*
+
+run_output/
+vcf_files/
+*.vcf
+*.tsv
+RMLStreamer-v2.5.0-standalone.jar
