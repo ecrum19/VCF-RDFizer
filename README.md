@@ -1,11 +1,15 @@
-## RMLStreamer
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.3887065.svg)](https://doi.org/10.5281/zenodo.3887065)
+## VCF-RDFizer
 
 VCF-RDFizer generates [RDF](https://www.w3.org/2001/sw/wiki/RDF) serializations 
-of [VCF files]() as nquads [NQUADS]()
-using [RML](http://rml.io/) rules and the [RMLStreamer]() application. 
+of [VCF files](https://samtools.github.io/hts-specs/VCFv4.2.pdf) as [N-Quads](https://www.w3.org/TR/n-quads/)
+using [RML](http://rml.io/) rules and the [RMLStreamer](https://github.com/RMLio/RMLStreamer) application. 
 
-Documentation regarding the use of (custom) functions can be found [here]().
+
+## Quick Start (Docker)
+
+
+## Quick Start (Conda)
+
 
 
 ### VCF Commands to Execute
