@@ -13,10 +13,6 @@ RUN mvn -q clean install -DskipTests
 WORKDIR /opt/hdt-java/hdt-java-cli
 RUN mvn -q clean install -DskipTests
 
-RUN mkdir -p /opt/hdt \
-  && cp /opt/hdt-java/hdt-java/target/hdt-java*.jar /opt/hdt/ \
-  && cp /opt/hdt-java/hdt-java-cli/target/hdt-java-cli*.jar /opt/hdt/
-
 
 FROM eclipse-temurin:11-jre
 
@@ -43,9 +39,10 @@ RUN mkdir -p /opt/rmlstreamer \
 ENV RMLSTREAMER_JAR=/opt/rmlstreamer/RMLStreamer-v${RMLSTREAMER_VERSION}-standalone.jar
 ENV JAR=/opt/rmlstreamer/RMLStreamer-v${RMLSTREAMER_VERSION}-standalone.jar
 
-COPY --from=build-hdt /opt/hdt /opt/hdt
+COPY --from=build-hdt /opt/hdt-java /opt/hdt-java
 COPY src/*.sh /opt/vcf-rdfizer/
 
-RUN chmod +x /opt/vcf-rdfizer/*.sh
+RUN chmod +x /opt/vcf-rdfizer/*.sh \
+  && chmod +x /opt/hdt-java/hdt-java-cli/rdf2hdt.sh
 
 WORKDIR /work

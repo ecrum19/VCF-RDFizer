@@ -25,6 +25,7 @@ Outputs:
 - `./tsv` for TSV intermediates
 - `./out` for RDF output
 - `./run_metrics` for logs and metrics
+  - `run_metrics/metrics.csv` includes both conversion and compression metrics per run
 
 ## How Dependencies Are Handled
 
@@ -41,7 +42,7 @@ The wrapper validates:
 - Docker is installed and running
 - Input path exists and contains `.vcf` or `.vcf.gz`
 - Rules file exists
-- Docker image exists or is built
+- Docker image exists or is built (if `--image-version` is set, it will attempt to pull that version and fail if missing)
 
 ## Configuration
 
@@ -55,11 +56,13 @@ Options:
 - `--rules` (required): path to RML mapping `.ttl`
 - `--out` (default `./out`): RDF output directory
 - `--tsv` (default `./tsv`): TSV output directory
-- `--image` (default `vcf-rdfizer:latest`): Docker image tag
+- `--image` (default `vcf-rdfizer`): Docker image repo (no tag) or full image reference
+- `--image-version` (default `latest`): image tag/version to use when `--image` has no tag
 - `--build`: force docker build
 - `--no-build`: fail if image missing
-- `--out-name` (default `rdf`): output name for `run_test.sh`
+- `--out-name` (default `rdf`): output name for `run_conversion.sh`
 - `--metrics` (default `./run_metrics`): metrics/log directory
+- `--compression` (default `gzip,brotli,hdt`): compression methods for `compression.sh` (gzip,brotli,hdt,none)
 - `--keep-tsv`: keep TSV intermediates (otherwise removed after RDF generation if created by the wrapper)
 
 ## Notes On Mappings
@@ -180,6 +183,3 @@ options:
 ### Moderately quick start (Docker - the recommended way)
 
 If you want to get RMLStreamer up and running within 5 minutes using Docker, check out [docker/README.md](docker/README.md)
-
-
-

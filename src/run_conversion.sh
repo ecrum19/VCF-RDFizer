@@ -13,11 +13,12 @@ OUT="$OUT_DIR/$OUT_NAME"
 LOGDIR=${LOGDIR:-run_metrics}
 mkdir -p "$LOGDIR" "$OUT_DIR"
 
-RUN_ID=$(date +%Y%m%dT%H%M%S)
-TIMESTAMP=$(date +"%Y-%m-%dT%H:%M:%S")
+RUN_ID=${RUN_ID:-$(date +%Y%m%dT%H%M%S)}
+TIMESTAMP=${TIMESTAMP:-$(date +"%Y-%m-%dT%H:%M:%S")}
 TIME_LOG="$LOGDIR/time-$RUN_ID.txt"
 METRICS_JSON="$LOGDIR/metrics-$RUN_ID.json"
 METRICS_CSV="$LOGDIR/metrics.csv"
+METRICS_HEADER="run_id,timestamp,output_name,output_dir,exit_code_java,wall_seconds_java,user_seconds_java,sys_seconds_java,max_rss_kb_java,input_mapping_size_bytes,input_vcf_size_bytes,output_dir_size_bytes,output_triples,jar,mapping_file,output_path,combined_nq_size_bytes,gzip_size_bytes,brotli_size_bytes,hdt_size_bytes,exit_code_gzip,exit_code_brotli,exit_code_hdt,wall_seconds_gzip,user_seconds_gzip,sys_seconds_gzip,max_rss_kb_gzip,wall_seconds_brotli,user_seconds_brotli,sys_seconds_brotli,max_rss_kb_brotli,wall_seconds_hdt,user_seconds_hdt,sys_seconds_hdt,max_rss_kb_hdt,compression_methods"
 
 
 stat_size() {
@@ -112,6 +113,13 @@ else
 fi
 
 # ---------- Post-run ----------
+# Normalize output files to .nq for downstream compression
+for NO_EXT_FILE in "$OUT_DIR/$OUT_NAME"/*; do
+  if [[ -f "$NO_EXT_FILE" && "$NO_EXT_FILE" != *.nq ]]; then
+    mv "$NO_EXT_FILE" "${NO_EXT_FILE}.nq"
+  fi
+done
+
 OUT_SIZE=$(stat_size "$OUT_DIR/$OUT_NAME")
 TRIPLES_JSON=$(count_triples_json "$OUT_DIR/$OUT_NAME")
 
@@ -163,12 +171,40 @@ cat > "$METRICS_JSON" <<EOF
 EOF
 
 # ---------- Save/append CSV ----------
-# Header if file doesn't exist
+# Header if file doesn't exist (or mismatch)
 TOTAL_TRIPLES=$(echo "$TRIPLES_JSON" | grep '"TOTAL"' | awk -F': ' '{print $2}' | tr -d '", ')
 if [[ ! -f "$METRICS_CSV" ]]; then
-  echo "run_id,timestamp,exit_code,wall_seconds,user_seconds,sys_seconds,max_rss_kb,input_size_bytes,output_size_bytes,output_triples,jar,input,output" > "$METRICS_CSV"
+  echo "$METRICS_HEADER" > "$METRICS_CSV"
+else
+  EXISTING_HEADER=$(head -n 1 "$METRICS_CSV")
+  if [[ "$EXISTING_HEADER" != "$METRICS_HEADER" ]]; then
+    BACKUP="$METRICS_CSV.bak-$RUN_ID"
+    cp "$METRICS_CSV" "$BACKUP"
+    echo "WARNING: metrics header mismatch; backed up to $BACKUP and creating new metrics file." >&2
+    echo "$METRICS_HEADER" > "$METRICS_CSV"
+  fi
 fi
-echo "$RUN_ID,$TIMESTAMP,$EXIT_CODE,${WALL_SEC:-},${USER_SEC:-},${SYS_SEC:-},${MAX_RSS_KB:-},$IN_SIZE,$OUT_SIZE,$TOTAL_TRIPLES,$JAR,$IN,$OUT" >> "$METRICS_CSV"
+
+csv_fields=(
+  "$RUN_ID"
+  "$TIMESTAMP"
+  "$OUT_NAME"
+  "$OUT"
+  "$EXIT_CODE"
+  "${WALL_SEC:-}"
+  "${USER_SEC:-}"
+  "${SYS_SEC:-}"
+  "${MAX_RSS_KB:-}"
+  "$IN_SIZE"
+  "$VCF_SIZE"
+  "$OUT_SIZE"
+  "$TOTAL_TRIPLES"
+  "$JAR"
+  "$IN"
+  "$OUT"
+  "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" ""
+)
+( IFS=,; echo "${csv_fields[*]}" ) >> "$METRICS_CSV"
 
 echo "Done."
 echo "JSON: $METRICS_JSON"

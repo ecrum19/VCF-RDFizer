@@ -1,0 +1,90 @@
+@prefix rr:    <http://www.w3.org/ns/r2rml#> .
+@prefix rml:   <http://semweb.mmlab.be/ns/rml#> .
+@prefix ql:    <http://semweb.mmlab.be/ns/ql#> .
+@prefix csvw:  <http://www.w3.org/ns/csvw#> .
+@prefix fnml:  <http://semweb.mmlab.be/ns/fnml#> .
+@prefix fno:   <http://w3id.org/function/ontology#> .
+@prefix grel:  <http://users.ugent.be/~bjdmeest/function/grel.ttl#> .
+@prefix xsd:   <http://www.w3.org/2001/XMLSchema#> .
+@prefix sio:   <http://semanticscience.org/resource/> .
+@prefix faldo: <http://biohackathon.org/resource/faldo#> .
+@prefix so:    <http://purl.obolibrary.org/obo/SO_> .
+@prefix geno:  <http://purl.obolibrary.org/obo/GENO_> .
+@prefix ho:    <https://w3id.org/hereditary/ontology/genomics/schema/> .
+@prefix ex:    <http://example.org/variant/> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+rr:TriplesMap a rr:TriplesMap ;
+  rml:logicalSource [
+    rml:source [
+      a csvw:Table;
+      csvw:url "PG0001202-BLD.Genotyping.tsv";
+      csvw:dialect [
+        a csvw:Dialect;
+        csvw:delimiter "\t";
+        csvw:headerRowCount 1
+      ]
+    ];
+    rml:referenceFormulation ql:CSV
+  ].
+
+# ---- Subject (a line in the vcf) ----
+rr:TriplesMap rr:subjectMap [
+  rr:template "http://example.org/variant/chrom{CHROM}-pos{POS}"
+].
+
+# ---- RDF Type predicate ----
+rr:TriplesMap rr:predicateObjectMap [
+  rr:predicate rdf:type ;
+  rr:objectMap [
+    rr:constant geno:0000660
+  ]
+].
+
+# ---- FALDO exact position predicate ----
+rr:TriplesMap rr:predicateObjectMap [
+  rr:predicate faldo:location ;
+  rr:objectMap [
+    rml:reference "POS"
+  ]
+].
+
+# ---- CHROM Predicate----
+rr:TriplesMap rr:predicateObjectMap [
+  rr:predicate ex:chromosome ;
+  rr:objectMap [
+    rml:reference "CHROM"
+  ]
+].
+
+# ---- rsID ----
+rr:TriplesMap rr:predicateObjectMap [
+  rr:predicate sio:000671 ;
+  rr:objectMap [
+    rml:reference "ID"
+  ]
+].
+
+# ---- REF allele ----
+rr:TriplesMap rr:predicateObjectMap [
+  rr:predicate geno:0000385 ;
+  rr:objectMap [
+    rml:reference "REF"
+  ]
+].
+
+# ---- ALT allele ----
+rr:TriplesMap rr:predicateObjectMap [
+  rr:predicate geno:0000382 ;
+  rr:objectMap [
+    rml:reference "ALT"
+  ]
+].
+
+# ---- QUAL Predicate----
+rr:TriplesMap rr:predicateObjectMap [
+  rr:predicate ho:vcfQual ;
+  rr:objectMap [
+    rml:reference "QUAL"
+  ]
+].

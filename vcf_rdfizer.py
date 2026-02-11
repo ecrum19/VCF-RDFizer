@@ -4,6 +4,7 @@ import argparse
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 
@@ -75,17 +76,45 @@ def docker_build_image(image: str, repo_root: Path):
     return run(["docker", "build", "-t", image, "."], cwd=str(repo_root))
 
 
+def docker_pull_image(image: str):
+    return run(["docker", "pull", image])
+
+
+def resolve_image_ref(image: str, image_version: str | None):
+    if ":" in image:
+        if image_version is not None:
+            raise ValueError("Do not include a tag in --image when using --image-version.")
+        return image, False
+    if image_version is None:
+        return f"{image}:latest", False
+    return f"{image}:{image_version}", True
+
+
 def main():
     parser = argparse.ArgumentParser(description="VCF-RDFizer Docker wrapper")
     parser.add_argument("--input", required=True, help="VCF file or directory")
     parser.add_argument("--rules", required=True, help="RML mapping rules .ttl")
     parser.add_argument("--out", default="./out", help="RDF output directory")
     parser.add_argument("--tsv", default="./tsv", help="TSV output directory")
-    parser.add_argument("--image", default="vcf-rdfizer:latest", help="Docker image tag")
+    parser.add_argument(
+        "--image",
+        default="vcf-rdfizer",
+        help="Docker image repo (no tag) or full image reference",
+    )
+    parser.add_argument(
+        "--image-version",
+        default=None,
+        help="Image tag/version to use (e.g. 1.2.3). Defaults to latest if omitted.",
+    )
     parser.add_argument("--build", action="store_true", help="Force docker build")
     parser.add_argument("--no-build", action="store_true", help="Fail if image missing")
     parser.add_argument("--out-name", default="rdf", help="Output name for run_conversion.sh")
     parser.add_argument("--metrics", default="./run_metrics", help="Metrics output directory")
+    parser.add_argument(
+        "--compression",
+        default="gzip,brotli,hdt",
+        help="Compression methods for compression.sh (gzip,brotli,hdt,none)",
+    )
     parser.add_argument("--keep-tsv", action="store_true", help="Keep TSV intermediates")
     args = parser.parse_args()
 
@@ -100,7 +129,7 @@ def main():
     tsv_dir = Path(args.tsv).expanduser().resolve()
     metrics_dir = Path(args.metrics).expanduser().resolve()
 
-    print("Step 1/4: Validating inputs")
+    print("Step 1/5: Validating inputs")
     try:
         input_dir, container_input = resolve_input(input_path)
     except ValueError as exc:
@@ -119,25 +148,39 @@ def main():
     rules_dir = rules_path.parent
     rules_name = rules_path.name
     container_rules = f"/data/rules/{rules_name}"
+    run_id = datetime.now().strftime("%Y%m%dT%H%M%S")
+    timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
     if not check_docker():
         return 2
 
-    print("Step 2/4: Ensuring Docker image is available")
+    try:
+        image_ref, version_requested = resolve_image_ref(args.image, args.image_version)
+    except ValueError as exc:
+        eprint(f"Error: {exc}")
+        return 2
+
+    print("Step 2/5: Ensuring Docker image is available")
     if args.build:
-        if docker_build_image(args.image, repo_root) != 0:
+        if docker_build_image(image_ref, repo_root) != 0:
             eprint("Error: docker build failed.")
             return 1
     else:
-        if not docker_image_exists(args.image):
-            if args.no_build:
-                eprint(f"Error: image '{args.image}' not found and --no-build set.")
-                return 2
-            if docker_build_image(args.image, repo_root) != 0:
-                eprint("Error: docker build failed.")
-                return 1
+        if not docker_image_exists(image_ref):
+            if version_requested:
+                print(f"Image {image_ref} not found locally. Attempting to pull...")
+                if docker_pull_image(image_ref) != 0:
+                    eprint(f"Error: image version '{image_ref}' not found.")
+                    return 2
+            else:
+                if args.no_build:
+                    eprint(f"Error: image '{image_ref}' not found and --no-build set.")
+                    return 2
+                if docker_build_image(image_ref, repo_root) != 0:
+                    eprint("Error: docker build failed.")
+                    return 1
 
-    print("Step 3/4: Converting VCF to TSV")
+    print("Step 3/5: Converting VCF to TSV")
     tsv_existed = tsv_dir.exists()
     ensure_dir(tsv_dir)
     tsv_cmd = [
@@ -148,7 +191,7 @@ def main():
         f"{str(input_dir)}:/data/in:ro",
         "-v",
         f"{str(tsv_dir)}:/data/tsv",
-        args.image,
+        image_ref,
         "/opt/vcf-rdfizer/vcf_as_tsv.sh",
         container_input,
         "/data/tsv",
@@ -157,7 +200,7 @@ def main():
         eprint("Error: TSV conversion failed.")
         return 1
 
-    print("Step 4/4: Running RMLStreamer")
+    print("Step 4/5: Running Conversion with RMLStreamer")
     ensure_dir(out_dir)
     ensure_dir(metrics_dir)
     run_cmd = [
@@ -183,14 +226,46 @@ def main():
         "-e",
         f"OUT_NAME={args.out_name}",
         "-e",
+        f"RUN_ID={run_id}",
+        "-e",
+        f"TIMESTAMP={timestamp}",
+        "-e",
         f"IN_VCF={container_input}",
         "-e",
         "LOGDIR=/data/metrics",
-        args.image,
+        image_ref,
         "/opt/vcf-rdfizer/run_conversion.sh",
     ]
     if run(run_cmd) != 0:
         eprint("Error: RMLStreamer step failed.")
+        return 1
+
+    print("Step 5/5: Compressing outputs")
+    compression_cmd = [
+        "docker",
+        "run",
+        "--rm",
+        "-v",
+        f"{str(out_dir)}:/data/out",
+        "-v",
+        f"{str(metrics_dir)}:/data/metrics",
+        "-e",
+        "OUT_ROOT_DIR=/data/out",
+        "-e",
+        f"OUT_NAME={args.out_name}",
+        "-e",
+        "LOGDIR=/data/metrics",
+        "-e",
+        f"RUN_ID={run_id}",
+        "-e",
+        f"TIMESTAMP={timestamp}",
+        image_ref,
+        "/opt/vcf-rdfizer/compression.sh",
+        "-m",
+        args.compression,
+    ]
+    if run(compression_cmd) != 0:
+        eprint("Error: compression step failed.")
         return 1
 
     if not args.keep_tsv:
@@ -199,7 +274,7 @@ def main():
         else:
             print("Note: TSV directory existed; skipping cleanup.")
 
-    print("Done.")
+    print("Done. See output and metrics directories for results and statistics about the conversion process.")
     return 0
 
 
