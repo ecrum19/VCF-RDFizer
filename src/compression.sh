@@ -47,6 +47,8 @@ while getopts ":m:h" opt; do
   esac
 done
 
+COMPRESSION_METHODS_CSV=${COMPRESSION_METHODS//,/|}
+
 DO_GZIP=0
 DO_BROTLI=0
 DO_HDT=0
@@ -285,9 +287,9 @@ for OUT in "${OUTPUT_DIRS[@]}"; do
       EXIT_CODE_BROTLI=0
 
       if have_gnu_time; then
-        /usr/bin/time -v -o "$TIME_LOG_BROTLI" -- brotli -q 7 "$BIG_NQ" || EXIT_CODE_BROTLI=$?
+        /usr/bin/time -v -o "$TIME_LOG_BROTLI" -- brotli -q 7 -k "$BIG_NQ" || EXIT_CODE_BROTLI=$?
       else
-        { time -p brotli -q 7 "$BIG_NQ"; } >"$TIME_LOG_BROTLI" 2>&1 || EXIT_CODE_BROTLI=$?
+        { time -p brotli -q 7 -k "$BIG_NQ"; } >"$TIME_LOG_BROTLI" 2>&1 || EXIT_CODE_BROTLI=$?
       fi
 
       BROTLI_SIZE=$(stat_size "$BROTLI_PATH")
@@ -436,7 +438,7 @@ EOF
     -v user_seconds_hdt="$USER_SEC_HDT" \
     -v sys_seconds_hdt="$SYS_SEC_HDT" \
     -v max_rss_kb_hdt="$MAX_RSS_KB_HDT" \
-    -v compression_methods="$COMPRESSION_METHODS" \
+    -v compression_methods="$COMPRESSION_METHODS_CSV" \
     -v conv_exit_code="" \
     -v conv_wall="" \
     -v conv_user="" \

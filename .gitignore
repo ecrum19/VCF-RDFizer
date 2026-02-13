@@ -10,3 +10,6 @@ RMLStreamer-v2.5.0-standalone.jar
 out/
 tsv/
 run_metrics/
+__pycache__/
+*.py[cod]
+.venv/

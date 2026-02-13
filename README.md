@@ -71,6 +71,18 @@ The wrapper runs RMLStreamer with working directory `/data/rules`.
 If your mapping refers to TSVs using relative paths, make them relative to the rules file.
 You can also use absolute container paths like `/data/tsv/<file>.tsv`.
 
+## Testing
+
+Run unit tests:
+```
+python -m unittest discover -s test -p "test_*_unit.py" -v
+```
+
+Test suite notes:
+- Tests live in `test/`.
+- External tools are mocked (Docker, Java/RMLStreamer, gzip, brotli, rdf2hdt).
+- GitHub Actions runs this suite on each push and pull request (`.github/workflows/tests.yml`).
+
 
 ## Manual Setup (Legacy)
 
