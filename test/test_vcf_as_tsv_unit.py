@@ -12,6 +12,40 @@ SCRIPT = REPO_ROOT / "src" / "vcf_as_tsv.sh"
 
 
 class VcfAsTsvUnitTests(VerboseTestCase):
+    def test_vcf_as_tsv_errors_with_wrong_argument_count(self):
+        """Wrong argument count: script exits non-zero and prints usage."""
+        result = subprocess.run(["bash", str(SCRIPT)], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Usage:", result.stdout)
+
+    def test_vcf_as_tsv_errors_when_input_path_missing(self):
+        """Missing input path: script exits non-zero with path-not-found error."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            output_dir = tmp_path / "tsv"
+            result = subprocess.run(
+                ["bash", str(SCRIPT), str(tmp_path / "nope"), str(output_dir)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("not found", result.stdout)
+
+    def test_vcf_as_tsv_errors_for_unsupported_input_file_extension(self):
+        """Unsupported single-file extension: script rejects non-VCF inputs."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_file = tmp_path / "sample.txt"
+            input_file.write_text("x")
+            output_dir = tmp_path / "tsv"
+            result = subprocess.run(
+                ["bash", str(SCRIPT), str(input_file), str(output_dir)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("must end with .vcf or .vcf.gz", result.stdout)
+
     def test_vcf_as_tsv_directory_mode(self):
         """Directory input: converts VCF and normalizes #CHROM header to CHROM."""
         with tempfile.TemporaryDirectory() as td:
@@ -72,6 +106,27 @@ class VcfAsTsvUnitTests(VerboseTestCase):
 
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("No .vcf or .vcf.gz files found", result.stdout)
+
+    def test_vcf_as_tsv_processes_multiple_files_in_sorted_order(self):
+        """Directory with multiple files: outputs one TSV per VCF in sorted filename order."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir = tmp_path / "in"
+            input_dir.mkdir()
+            output_dir = tmp_path / "tsv"
+            (input_dir / "b.vcf").write_text("##x\n#CHROM\tPOS\n1\t2\n")
+            (input_dir / "a.vcf").write_text("##x\n#CHROM\tPOS\n1\t1\n")
+
+            result = subprocess.run(
+                ["bash", str(SCRIPT), str(input_dir), str(output_dir)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertIn("a.tsv", result.stdout)
+            self.assertIn("b.tsv", result.stdout)
+            self.assertTrue((output_dir / "a.tsv").exists())
+            self.assertTrue((output_dir / "b.tsv").exists())
 
 
 if __name__ == "__main__":

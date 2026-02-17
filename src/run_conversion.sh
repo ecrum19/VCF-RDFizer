@@ -69,9 +69,7 @@ count_triples_json() {
   for f in "$path"/*; do
     if [[ -f "$f" ]]; then
       local count
-      count=$(
-        grep -E '^[[:space:]]*[^#].*\.[[:space:]]*$' "$f" | wc -l | tr -d ' '
-      )
+      count=$( (grep -E '^[[:space:]]*[^#].*\.[[:space:]]*$' "$f" || true) | wc -l | tr -d ' ' )
       total=$((total + count))
       printf "  \"%s\": %s,\n" "$f" "$count"
     fi
@@ -209,3 +207,8 @@ csv_fields=(
 echo "Done."
 echo "JSON: $METRICS_JSON"
 echo "CSV:  $METRICS_CSV"
+
+if [[ "$EXIT_CODE" -ne 0 ]]; then
+  echo "Error: conversion command failed with exit code $EXIT_CODE." >&2
+  exit "$EXIT_CODE"
+fi

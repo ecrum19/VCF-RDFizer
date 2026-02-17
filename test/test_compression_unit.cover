@@ -1,0 +1,158 @@
+    1: import csv
+    1: import subprocess
+    1: import tempfile
+    1: import unittest
+    1: from pathlib import Path
+       
+    1: from test.helpers import VerboseTestCase, env_with_path, make_executable, seed_conversion_metrics_row
+       
+       
+    1: REPO_ROOT = Path(__file__).resolve().parents[1]
+    1: SCRIPT = REPO_ROOT / "src" / "compression.sh"
+       
+       
+    1: def prepare_fake_tools(bin_dir: Path):
+    4:     make_executable(
+    2:         bin_dir / "gzip",
+    2:         """#!/usr/bin/env bash
+       set -euo pipefail
+       file="${@: -1}"
+       cp "$file" "$file.gz"
+       """,
+           )
+    4:     make_executable(
+    2:         bin_dir / "brotli",
+    2:         """#!/usr/bin/env bash
+       set -euo pipefail
+       file="${@: -1}"
+       cp "$file" "$file.br"
+       """,
+           )
+    2:     hdt = bin_dir / "rdf2hdt.sh"
+    4:     make_executable(
+    2:         hdt,
+    2:         """#!/usr/bin/env bash
+       set -euo pipefail
+       cp "$1" "$2"
+       """,
+           )
+    2:     return hdt
+       
+       
+    1: def read_metrics_row(metrics_csv: Path, run_id: str, output_name: str):
+    4:     with metrics_csv.open() as f:
+    2:         rows = list(csv.DictReader(f))
+    2:     for row in rows:
+    2:         if row["run_id"] == run_id and row["output_name"] == output_name:
+    2:             return row
+           raise AssertionError(f"Metrics row not found for run_id={run_id}, output_name={output_name}")
+       
+       
+    2: class CompressionUnitTests(VerboseTestCase):
+    1:     def test_compression_updates_existing_metrics_row_with_mocked_tools(self):
+               """Compression mode gzip|brotli|hdt updates existing metrics row and writes artifacts."""
+    2:         with tempfile.TemporaryDirectory() as td:
+    1:             tmp_path = Path(td)
+    1:             out_root = tmp_path / "out"
+    1:             output = out_root / "rdf"
+    1:             output.mkdir(parents=True)
+    1:             (output / "chunk-a.nq").write_text("<s> <p> <o> .\n")
+    1:             (output / "chunk-b.nq").write_text("<s2> <p2> <o2> .\n")
+       
+    1:             logdir = tmp_path / "metrics"
+    1:             run_id = "run-compress-1"
+    1:             timestamp = "2026-01-01T00:00:00"
+    1:             metrics_csv = logdir / "metrics.csv"
+    1:             seed_conversion_metrics_row(metrics_csv, run_id, timestamp, "rdf", output)
+       
+    1:             fake_bin = tmp_path / "bin"
+    1:             fake_bin.mkdir()
+    1:             hdt_path = prepare_fake_tools(fake_bin)
+       
+    1:             env = env_with_path(fake_bin)
+    2:             env.update(
+    1:                 {
+    1:                     "OUT_ROOT_DIR": str(out_root),
+    1:                     "OUT_NAME": "rdf",
+    1:                     "LOGDIR": str(logdir),
+    1:                     "RUN_ID": run_id,
+    1:                     "TIMESTAMP": timestamp,
+    1:                     "RDF2HDT": str(hdt_path),
+                       }
+                   )
+       
+    2:             result = subprocess.run(
+    1:                 ["bash", str(SCRIPT), "-m", "gzip,brotli,hdt"],
+    1:                 env=env,
+    1:                 capture_output=True,
+    1:                 text=True,
+                   )
+       
+    1:             self.assertEqual(result.returncode, 0, msg=result.stderr)
+    1:             self.assertTrue((output / "rdf.nq.gz").exists())
+    1:             self.assertTrue((output / "rdf.nq.br").exists())
+    1:             self.assertTrue((output / "rdf.hdt").exists())
+       
+    1:             row = read_metrics_row(metrics_csv, run_id, "rdf")
+    1:             self.assertEqual(row["run_id"], run_id)
+    1:             self.assertEqual(row["output_name"], "rdf")
+    1:             self.assertEqual(row["exit_code_java"], "0")
+    1:             self.assertEqual(row["compression_methods"], "gzip|brotli|hdt")
+    1:             self.assertEqual(row["exit_code_gzip"], "0")
+    1:             self.assertEqual(row["exit_code_brotli"], "0")
+    1:             self.assertEqual(row["exit_code_hdt"], "0")
+    1:             self.assertGreater(int(row["combined_nq_size_bytes"]), 0)
+       
+    1:     def test_compression_none_updates_metrics_without_generating_outputs(self):
+               """Compression mode none leaves no compressed artifacts and records zero sizes."""
+    2:         with tempfile.TemporaryDirectory() as td:
+    1:             tmp_path = Path(td)
+    1:             out_root = tmp_path / "out"
+    1:             output = out_root / "rdf"
+    1:             output.mkdir(parents=True)
+    1:             (output / "chunk-a.nq").write_text("<s> <p> <o> .\n")
+       
+    1:             logdir = tmp_path / "metrics"
+    1:             run_id = "run-compress-2"
+    1:             timestamp = "2026-01-01T00:00:00"
+    1:             metrics_csv = logdir / "metrics.csv"
+    1:             seed_conversion_metrics_row(metrics_csv, run_id, timestamp, "rdf", output)
+       
+    1:             fake_bin = tmp_path / "bin"
+    1:             fake_bin.mkdir()
+    1:             hdt_path = prepare_fake_tools(fake_bin)
+       
+    1:             env = env_with_path(fake_bin)
+    2:             env.update(
+    1:                 {
+    1:                     "OUT_ROOT_DIR": str(out_root),
+    1:                     "OUT_NAME": "rdf",
+    1:                     "LOGDIR": str(logdir),
+    1:                     "RUN_ID": run_id,
+    1:                     "TIMESTAMP": timestamp,
+    1:                     "RDF2HDT": str(hdt_path),
+                       }
+                   )
+       
+    2:             result = subprocess.run(
+    1:                 ["bash", str(SCRIPT), "-m", "none"],
+    1:                 env=env,
+    1:                 capture_output=True,
+    1:                 text=True,
+                   )
+       
+    1:             self.assertEqual(result.returncode, 0, msg=result.stderr)
+    1:             self.assertFalse((output / "rdf.nq.gz").exists())
+    1:             self.assertFalse((output / "rdf.nq.br").exists())
+    1:             self.assertFalse((output / "rdf.hdt").exists())
+       
+    1:             row = read_metrics_row(metrics_csv, run_id, "rdf")
+    1:             self.assertEqual(row["compression_methods"], "none")
+    1:             self.assertEqual(row["combined_nq_size_bytes"], "0")
+    1:             self.assertEqual(row["gzip_size_bytes"], "0")
+    1:             self.assertEqual(row["brotli_size_bytes"], "0")
+    1:             self.assertEqual(row["hdt_size_bytes"], "0")
+       
+       
+    1: if __name__ == "__main__":
+           unittest.main()

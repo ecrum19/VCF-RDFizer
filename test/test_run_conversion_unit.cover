@@ -1,0 +1,83 @@
+    1: import csv
+    1: import subprocess
+    1: import tempfile
+    1: import unittest
+    1: from pathlib import Path
+       
+    1: from test.helpers import METRICS_HEADER, VerboseTestCase, env_with_path, make_executable
+       
+       
+    1: REPO_ROOT = Path(__file__).resolve().parents[1]
+    1: SCRIPT = REPO_ROOT / "src" / "run_conversion.sh"
+       
+       
+    2: class RunConversionUnitTests(VerboseTestCase):
+    1:     def test_run_conversion_writes_nq_and_metrics_without_real_java(self):
+               """Conversion script writes .nq output and unified metrics using mocked Java."""
+    2:         with tempfile.TemporaryDirectory() as td:
+    1:             tmp_path = Path(td)
+    1:             fake_bin = tmp_path / "bin"
+    1:             fake_bin.mkdir()
+    2:             make_executable(
+    1:                 fake_bin / "java",
+    1:                 """#!/usr/bin/env bash
+       set -euo pipefail
+       if [[ "${1:-}" == "-version" ]]; then
+         echo 'openjdk version "11.0.0"' >&2
+         exit 0
+       fi
+       out=""
+       while [[ $# -gt 0 ]]; do
+         if [[ "$1" == "-o" ]]; then
+           out="$2"
+           shift 2
+           continue
+         fi
+         shift
+       done
+       mkdir -p "$out"
+       printf '<s> <p> <o> .\\n' > "$out/part-000"
+       """,
+                   )
+       
+    1:             out_dir = tmp_path / "out"
+    1:             metrics_dir = tmp_path / "metrics"
+    1:             rules = tmp_path / "rules.ttl"
+    1:             rules.write_text("@prefix ex: <http://example.org/> .\n")
+    1:             vcf = tmp_path / "input.vcf"
+    1:             vcf.write_text("##fileformat=VCFv4.2\n#CHROM\tPOS\n1\t5\n")
+       
+    1:             env = env_with_path(fake_bin)
+    2:             env.update(
+    1:                 {
+    1:                     "JAR": "fake.jar",
+    1:                     "IN": str(rules),
+    1:                     "IN_VCF": str(vcf),
+    1:                     "OUT_DIR": str(out_dir),
+    1:                     "OUT_NAME": "rdf",
+    1:                     "LOGDIR": str(metrics_dir),
+    1:                     "RUN_ID": "run123",
+    1:                     "TIMESTAMP": "2026-01-01T00:00:00",
+                       }
+                   )
+       
+    1:             result = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True)
+       
+    1:             self.assertEqual(result.returncode, 0, msg=result.stderr)
+    1:             self.assertTrue((out_dir / "rdf" / "part-000.nq").exists())
+       
+    1:             metrics_csv = metrics_dir / "metrics.csv"
+    1:             self.assertTrue(metrics_csv.exists())
+    2:             with metrics_csv.open() as f:
+    1:                 rows = list(csv.DictReader(f))
+    1:             self.assertTrue(rows)
+    1:             row = rows[0]
+    1:             self.assertEqual(list(row.keys()), METRICS_HEADER)
+    1:             self.assertEqual(row["run_id"], "run123")
+    1:             self.assertEqual(row["output_name"], "rdf")
+    1:             self.assertEqual(row["exit_code_java"], "0")
+    1:             self.assertEqual(row["compression_methods"], "")
+       
+       
+    1: if __name__ == "__main__":
+           unittest.main()

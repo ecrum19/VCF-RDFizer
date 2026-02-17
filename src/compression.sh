@@ -143,9 +143,7 @@ count_triples_json() {
   for f in "$path"/*; do
     if [[ -f "$f" ]]; then
       local count
-      count=$(
-        grep -E '^[[:space:]]*[^#].*\.[[:space:]]*$' "$f" | wc -l | tr -d ' '
-      )
+      count=$( (grep -E '^[[:space:]]*[^#].*\.[[:space:]]*$' "$f" || true) | wc -l | tr -d ' ' )
       total=$((total + count))
       printf "  \"%s\": %s,\n" "$f" "$count"
     fi
@@ -178,9 +176,12 @@ else
 fi
 
 # ---------- Main loop over output dirs ----------
+OVERALL_EXIT=0
+
 for OUT in "${OUTPUT_DIRS[@]}"; do
   if [[ ! -d "$OUT" ]]; then
     echo "WARNING: output directory '$OUT' not found, skipping." >&2
+    OVERALL_EXIT=1
     continue
   fi
 
@@ -210,9 +211,9 @@ for OUT in "${OUTPUT_DIRS[@]}"; do
     BROTLI_SIZE=0
     HDT_PATH=""
     HDT_SIZE=0
-    EXIT_CODE_GZIP=0
-    EXIT_CODE_BROTLI=0
-    EXIT_CODE_HDT=0
+    EXIT_CODE_GZIP=$(( DO_GZIP == 1 ? 1 : 0 ))
+    EXIT_CODE_BROTLI=$(( DO_BROTLI == 1 ? 1 : 0 ))
+    EXIT_CODE_HDT=$(( DO_HDT == 1 ? 1 : 0 ))
     WALL_SEC_GZIP="null"
     USER_SEC_GZIP="null"
     SYS_SEC_GZIP="null"
@@ -225,6 +226,9 @@ for OUT in "${OUTPUT_DIRS[@]}"; do
     USER_SEC_HDT="null"
     SYS_SEC_HDT="null"
     MAX_RSS_KB_HDT="null"
+    if (( ANY_COMPRESS > 0 )); then
+      OVERALL_EXIT=1
+    fi
   else
     if (( ANY_COMPRESS > 0 )); then
       BIG_NQ="$OUT/${BASENAME}.nq"
@@ -271,6 +275,9 @@ for OUT in "${OUTPUT_DIRS[@]}"; do
       fi
 
       [[ -z "$MAX_RSS_KB_GZIP" ]] && MAX_RSS_KB_GZIP="null"
+      if [[ "$EXIT_CODE_GZIP" -ne 0 ]]; then
+        OVERALL_EXIT=1
+      fi
     else
       GZ_PATH=""
       GZ_SIZE=0
@@ -313,6 +320,9 @@ for OUT in "${OUTPUT_DIRS[@]}"; do
       fi
 
       [[ -z "$MAX_RSS_KB_BROTLI" ]] && MAX_RSS_KB_BROTLI="null"
+      if [[ "$EXIT_CODE_BROTLI" -ne 0 ]]; then
+        OVERALL_EXIT=1
+      fi
     else
       BROTLI_PATH=""
       BROTLI_SIZE=0
@@ -356,6 +366,9 @@ for OUT in "${OUTPUT_DIRS[@]}"; do
       fi
 
       [[ -z "$MAX_RSS_KB_HDT" ]] && MAX_RSS_KB_HDT="null"
+      if [[ "$EXIT_CODE_HDT" -ne 0 ]]; then
+        OVERALL_EXIT=1
+      fi
     else
       HDT_PATH=""
       HDT_SIZE=0
@@ -491,3 +504,8 @@ done
 
 echo "Compression finished."
 echo "CSV summary: $METRICS_CSV"
+
+if [[ "$OVERALL_EXIT" -ne 0 ]]; then
+  echo "Compression completed with one or more errors." >&2
+fi
+exit "$OVERALL_EXIT"

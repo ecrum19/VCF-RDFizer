@@ -1,0 +1,282 @@
+       #!/usr/bin/env python3
+       
+    1: import argparse
+    1: import shutil
+    1: import subprocess
+    1: import sys
+    1: from datetime import datetime
+    1: from pathlib import Path
+       
+       
+    1: RMLSTREAMER_JAR_CONTAINER = "/opt/rmlstreamer/RMLStreamer-v2.5.0-standalone.jar"
+       
+       
+    1: def eprint(*args):
+    2:     print(*args, file=sys.stderr)
+       
+       
+    1: def run(cmd, cwd=None, env=None):
+           return subprocess.run(cmd, cwd=cwd, env=env).returncode
+       
+       
+    1: def check_docker():
+           if shutil.which("docker") is None:
+               eprint("Error: Docker is not installed or not on PATH.")
+               return False
+           code = run(["docker", "version"])
+           if code != 0:
+               eprint("Error: Docker is not available. Is the daemon running?")
+               return False
+           return True
+       
+       
+    1: def is_vcf_file(path: Path) -> bool:
+    3:     name = path.name
+    3:     return name.endswith(".vcf") or name.endswith(".vcf.gz")
+       
+       
+    1: def list_vcfs_in_dir(path: Path):
+    3:     files = []
+    6:     for item in sorted(path.iterdir()):
+    3:         if item.is_file() and is_vcf_file(item):
+    3:             files.append(item)
+    3:     return files
+       
+       
+    1: def resolve_input(input_path: Path):
+    3:     if not input_path.exists():
+               raise ValueError(f"Input path not found: {input_path}")
+       
+    3:     if input_path.is_file():
+               if not is_vcf_file(input_path):
+                   raise ValueError("Input file must end with .vcf or .vcf.gz")
+               input_dir = input_path.parent
+               container_input = f"/data/in/{input_path.name}"
+               return input_dir, container_input
+       
+    3:     if input_path.is_dir():
+    3:         vcfs = list_vcfs_in_dir(input_path)
+    3:         if not vcfs:
+                   raise ValueError("No .vcf or .vcf.gz files found in the input directory")
+    3:         container_input = "/data/in"
+    3:         return input_path, container_input
+       
+           raise ValueError("Input path must be a file or a directory")
+       
+       
+    1: def ensure_dir(path: Path):
+    3:     path.mkdir(parents=True, exist_ok=True)
+       
+       
+    1: def docker_image_exists(image: str) -> bool:
+           return run(["docker", "image", "inspect", image]) == 0
+       
+       
+    1: def docker_build_image(image: str, repo_root: Path):
+           return run(["docker", "build", "-t", image, "."], cwd=str(repo_root))
+       
+       
+    1: def docker_pull_image(image: str):
+           return run(["docker", "pull", image])
+       
+       
+    1: def resolve_image_ref(image: str, image_version: str | None):
+    4:     if ":" in image:
+               if image_version is not None:
+                   raise ValueError("Do not include a tag in --image when using --image-version.")
+               return image, False
+    4:     if image_version is None:
+    2:         return f"{image}:latest", False
+    2:     return f"{image}:{image_version}", True
+       
+       
+    1: def main():
+    3:     parser = argparse.ArgumentParser(description="VCF-RDFizer Docker wrapper")
+    3:     parser.add_argument("--input", required=True, help="VCF file or directory")
+    3:     parser.add_argument("--rules", required=True, help="RML mapping rules .ttl")
+    3:     parser.add_argument("--out", default="./out", help="RDF output directory")
+    3:     parser.add_argument("--tsv", default="./tsv", help="TSV output directory")
+    6:     parser.add_argument(
+    3:         "--image",
+    3:         default="vcf-rdfizer",
+    3:         help="Docker image repo (no tag) or full image reference",
+           )
+    6:     parser.add_argument(
+    3:         "--image-version",
+    3:         default=None,
+    3:         help="Image tag/version to use (e.g. 1.2.3). Defaults to latest if omitted.",
+           )
+    3:     parser.add_argument("--build", action="store_true", help="Force docker build")
+    3:     parser.add_argument("--no-build", action="store_true", help="Fail if image missing")
+    3:     parser.add_argument("--out-name", default="rdf", help="Output name for run_conversion.sh")
+    3:     parser.add_argument("--metrics", default="./run_metrics", help="Metrics output directory")
+    6:     parser.add_argument(
+    3:         "--compression",
+    3:         default="gzip,brotli,hdt",
+    3:         help="Compression methods for compression.sh (gzip,brotli,hdt,none)",
+           )
+    3:     parser.add_argument("--keep-tsv", action="store_true", help="Keep TSV intermediates")
+    3:     args = parser.parse_args()
+       
+    3:     if args.build and args.no_build:
+               eprint("Error: --build and --no-build are mutually exclusive.")
+               return 2
+       
+    3:     repo_root = Path(__file__).resolve().parent
+    3:     input_path = Path(args.input).expanduser().resolve()
+    3:     rules_path = Path(args.rules).expanduser().resolve()
+    3:     out_dir = Path(args.out).expanduser().resolve()
+    3:     tsv_dir = Path(args.tsv).expanduser().resolve()
+    3:     metrics_dir = Path(args.metrics).expanduser().resolve()
+       
+    3:     print("Step 1/5: Validating inputs")
+    3:     try:
+    3:         input_dir, container_input = resolve_input(input_path)
+           except ValueError as exc:
+               eprint(f"Error: {exc}")
+               return 2
+       
+    3:     if not rules_path.exists() or not rules_path.is_file():
+               eprint(f"Error: rules file not found: {rules_path}")
+               return 2
+       
+   12:     for p in [out_dir, tsv_dir, metrics_dir]:
+    9:         if p.exists() and not p.is_dir():
+                   eprint(f"Error: expected a directory path but found a file: {p}")
+                   return 2
+       
+    3:     rules_dir = rules_path.parent
+    3:     rules_name = rules_path.name
+    3:     container_rules = f"/data/rules/{rules_name}"
+    3:     run_id = datetime.now().strftime("%Y%m%dT%H%M%S")
+    3:     timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+       
+    3:     if not check_docker():
+               return 2
+       
+    3:     try:
+    3:         image_ref, version_requested = resolve_image_ref(args.image, args.image_version)
+           except ValueError as exc:
+               eprint(f"Error: {exc}")
+               return 2
+       
+    3:     print("Step 2/5: Ensuring Docker image is available")
+    3:     if args.build:
+               if docker_build_image(image_ref, repo_root) != 0:
+                   eprint("Error: docker build failed.")
+                   return 1
+           else:
+    3:         if not docker_image_exists(image_ref):
+    2:             if version_requested:
+    1:                 print(f"Image {image_ref} not found locally. Attempting to pull...")
+    1:                 if docker_pull_image(image_ref) != 0:
+    1:                     eprint(f"Error: image version '{image_ref}' not found.")
+    1:                     return 2
+                   else:
+    1:                 if args.no_build:
+    1:                     eprint(f"Error: image '{image_ref}' not found and --no-build set.")
+    1:                     return 2
+                       if docker_build_image(image_ref, repo_root) != 0:
+                           eprint("Error: docker build failed.")
+                           return 1
+       
+    1:     print("Step 3/5: Converting VCF to TSV")
+    1:     tsv_existed = tsv_dir.exists()
+    1:     ensure_dir(tsv_dir)
+    1:     tsv_cmd = [
+    1:         "docker",
+    1:         "run",
+    1:         "--rm",
+    1:         "-v",
+    1:         f"{str(input_dir)}:/data/in:ro",
+    1:         "-v",
+    1:         f"{str(tsv_dir)}:/data/tsv",
+    1:         image_ref,
+    1:         "/opt/vcf-rdfizer/vcf_as_tsv.sh",
+    1:         container_input,
+    1:         "/data/tsv",
+           ]
+    1:     if run(tsv_cmd) != 0:
+               eprint("Error: TSV conversion failed.")
+               return 1
+       
+    1:     print("Step 4/5: Running Conversion with RMLStreamer")
+    1:     ensure_dir(out_dir)
+    1:     ensure_dir(metrics_dir)
+   32:     run_cmd = [
+    1:         "docker",
+    1:         "run",
+    1:         "--rm",
+    1:         "-v",
+    1:         f"{str(rules_dir)}:/data/rules:ro",
+    1:         "-v",
+    1:         f"{str(tsv_dir)}:/data/tsv:ro",
+    1:         "-v",
+    1:         f"{str(out_dir)}:/data/out",
+    1:         "-v",
+    1:         f"{str(metrics_dir)}:/data/metrics",
+    1:         "-w",
+    1:         "/data/rules",
+    1:         "-e",
+    1:         f"JAR={RMLSTREAMER_JAR_CONTAINER}",
+    1:         "-e",
+    1:         f"IN={container_rules}",
+    1:         "-e",
+    1:         "OUT_DIR=/data/out",
+    1:         "-e",
+    1:         f"OUT_NAME={args.out_name}",
+    1:         "-e",
+    1:         f"RUN_ID={run_id}",
+    1:         "-e",
+    1:         f"TIMESTAMP={timestamp}",
+    1:         "-e",
+    1:         f"IN_VCF={container_input}",
+    1:         "-e",
+    1:         "LOGDIR=/data/metrics",
+    1:         image_ref,
+    1:         "/opt/vcf-rdfizer/run_conversion.sh",
+           ]
+    1:     if run(run_cmd) != 0:
+               eprint("Error: RMLStreamer step failed.")
+               return 1
+       
+    1:     print("Step 5/5: Compressing outputs")
+    1:     compression_cmd = [
+    1:         "docker",
+    1:         "run",
+    1:         "--rm",
+    1:         "-v",
+    1:         f"{str(out_dir)}:/data/out",
+    1:         "-v",
+    1:         f"{str(metrics_dir)}:/data/metrics",
+    1:         "-e",
+    1:         "OUT_ROOT_DIR=/data/out",
+    1:         "-e",
+    1:         f"OUT_NAME={args.out_name}",
+    1:         "-e",
+    1:         "LOGDIR=/data/metrics",
+    1:         "-e",
+    1:         f"RUN_ID={run_id}",
+    1:         "-e",
+    1:         f"TIMESTAMP={timestamp}",
+    1:         image_ref,
+    1:         "/opt/vcf-rdfizer/compression.sh",
+    1:         "-m",
+    1:         args.compression,
+           ]
+    1:     if run(compression_cmd) != 0:
+               eprint("Error: compression step failed.")
+               return 1
+       
+    1:     if not args.keep_tsv:
+               if not tsv_existed:
+                   shutil.rmtree(tsv_dir, ignore_errors=True)
+               else:
+                   print("Note: TSV directory existed; skipping cleanup.")
+       
+    1:     print("Done. See output and metrics directories for results and statistics about the conversion process.")
+    1:     return 0
+       
+       
+    1: if __name__ == "__main__":
+           raise SystemExit(main())
