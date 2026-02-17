@@ -13,3 +13,4 @@ run_metrics/
 __pycache__/
 *.py[cod]
 .venv/
+.DS_Store
