@@ -4,13 +4,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from test.helpers import VerboseTestCase
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "src" / "vcf_as_tsv.sh"
 
 
-class VcfAsTsvUnitTests(unittest.TestCase):
+class VcfAsTsvUnitTests(VerboseTestCase):
     def test_vcf_as_tsv_directory_mode(self):
+        """Directory input: converts VCF and normalizes #CHROM header to CHROM."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             input_dir = tmp_path / "in"
@@ -34,6 +37,7 @@ class VcfAsTsvUnitTests(unittest.TestCase):
             self.assertEqual(lines[1], "1\t10\trs1")
 
     def test_vcf_as_tsv_single_gz_file_mode(self):
+        """Single .vcf.gz input: decompresses and writes expected TSV output."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             input_file = tmp_path / "sample.vcf.gz"
@@ -53,6 +57,7 @@ class VcfAsTsvUnitTests(unittest.TestCase):
             self.assertIn("CHROM\tPOS", out_file.read_text())
 
     def test_vcf_as_tsv_errors_when_no_vcf_files_found(self):
+        """Empty directory input: exits non-zero with a clear no-files message."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             input_dir = tmp_path / "empty"

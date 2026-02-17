@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from test.helpers import env_with_path, make_executable, seed_conversion_metrics_row
+from test.helpers import VerboseTestCase, env_with_path, make_executable, seed_conversion_metrics_row
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -48,8 +48,9 @@ def read_metrics_row(metrics_csv: Path, run_id: str, output_name: str):
     raise AssertionError(f"Metrics row not found for run_id={run_id}, output_name={output_name}")
 
 
-class CompressionUnitTests(unittest.TestCase):
+class CompressionUnitTests(VerboseTestCase):
     def test_compression_updates_existing_metrics_row_with_mocked_tools(self):
+        """Compression mode gzip|brotli|hdt updates existing metrics row and writes artifacts."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             out_root = tmp_path / "out"
@@ -103,6 +104,7 @@ class CompressionUnitTests(unittest.TestCase):
             self.assertGreater(int(row["combined_nq_size_bytes"]), 0)
 
     def test_compression_none_updates_metrics_without_generating_outputs(self):
+        """Compression mode none leaves no compressed artifacts and records zero sizes."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             out_root = tmp_path / "out"

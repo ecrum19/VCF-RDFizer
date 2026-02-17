@@ -29,3 +29,31 @@ This repository uses `unittest` (Python standard library) to isolate orchestrati
 - It tests the highest-risk logic in this codebase: orchestration, branching, path wiring, and metrics consistency.
 - It catches regressions in command construction without requiring heavyweight dependencies.
 - It validates that metrics remain comparable across runs by enforcing one shared CSV schema.
+
+## What a successful run looks like
+
+Run:
+
+```bash
+python -m unittest discover -s test -p "test_*_unit.py" -v
+```
+
+Success indicators:
+
+- Each test prints a clear marker:
+  - `[TEST] <description>`
+  - `[PASS] <description>`
+- `unittest` prints `ok` next to each test.
+- Final summary ends with:
+  - `Ran <N> tests ...`
+  - `OK`
+
+Example (truncated):
+
+```text
+[TEST] Wrapper runs all pipeline steps and forwards compression arguments.
+[PASS] Wrapper runs all pipeline steps and forwards compression arguments.
+...
+Ran 10 tests in 0.90s
+OK
+```

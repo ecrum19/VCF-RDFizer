@@ -4,15 +4,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from test.helpers import METRICS_HEADER, env_with_path, make_executable
+from test.helpers import METRICS_HEADER, VerboseTestCase, env_with_path, make_executable
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "src" / "run_conversion.sh"
 
 
-class RunConversionUnitTests(unittest.TestCase):
+class RunConversionUnitTests(VerboseTestCase):
     def test_run_conversion_writes_nq_and_metrics_without_real_java(self):
+        """Conversion script writes .nq output and unified metrics using mocked Java."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             fake_bin = tmp_path / "bin"

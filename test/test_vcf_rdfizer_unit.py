@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest import mock
 
 import vcf_rdfizer
+from test.helpers import VerboseTestCase
 
 
 def invoke_main(argv):
@@ -22,8 +23,9 @@ def prepare_inputs(base: Path):
     return input_dir, rules_path
 
 
-class WrapperUnitTests(unittest.TestCase):
+class WrapperUnitTests(VerboseTestCase):
     def test_main_happy_path_runs_pipeline_and_passes_compression(self):
+        """Wrapper runs all pipeline steps and forwards compression arguments."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             input_dir, rules_path = prepare_inputs(tmp_path)
@@ -67,6 +69,7 @@ class WrapperUnitTests(unittest.TestCase):
             self.assertEqual(commands[2][-2:], ["-m", "none"])
 
     def test_main_errors_when_versioned_image_does_not_exist(self):
+        """Wrapper returns a user error when a requested image version cannot be pulled."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             input_dir, rules_path = prepare_inputs(tmp_path)
@@ -99,6 +102,7 @@ class WrapperUnitTests(unittest.TestCase):
             self.assertEqual(rc, 2)
 
     def test_main_no_build_fails_if_local_image_missing(self):
+        """Wrapper fails fast with --no-build when no local image is available."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             input_dir, rules_path = prepare_inputs(tmp_path)
@@ -126,6 +130,7 @@ class WrapperUnitTests(unittest.TestCase):
             self.assertEqual(rc, 2)
 
     def test_resolve_image_ref_accepts_repo_plus_version(self):
+        """Image repository and explicit version resolve to a tagged image reference."""
         ref, requested = vcf_rdfizer.resolve_image_ref("vcf-rdfizer", "1.2.3")
         self.assertEqual(ref, "vcf-rdfizer:1.2.3")
         self.assertTrue(requested)

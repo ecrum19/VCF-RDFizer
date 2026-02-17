@@ -1,5 +1,6 @@
 import csv
 import os
+import unittest
 from pathlib import Path
 
 
@@ -82,3 +83,34 @@ def env_with_path(bin_dir: Path) -> dict[str, str]:
     env = os.environ.copy()
     env["PATH"] = f"{bin_dir}:{env['PATH']}"
     return env
+
+
+class VerboseTestCase(unittest.TestCase):
+    """Print explicit test start/end markers to make outcomes easy to scan."""
+
+    def run(self, result=None):
+        label = self.shortDescription() or self.id().split(".")[-1]
+        print(f"\n[TEST] {label}")
+
+        if result is None:
+            result = self.defaultTestResult()
+
+        failures_before = len(result.failures)
+        errors_before = len(result.errors)
+        skips_before = len(result.skipped)
+        unexpected_before = len(result.unexpectedSuccesses)
+
+        super().run(result)
+
+        failed = (len(result.failures) > failures_before) or (len(result.errors) > errors_before)
+        failed = failed or (len(result.unexpectedSuccesses) > unexpected_before)
+        skipped = len(result.skipped) > skips_before
+
+        if skipped:
+            print(f"[SKIP] {label}")
+        elif failed:
+            print(f"[FAIL] {label}")
+        else:
+            print(f"[PASS] {label}")
+
+        return result

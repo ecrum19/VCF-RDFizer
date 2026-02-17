@@ -82,6 +82,8 @@ Test suite notes:
 - Tests live in `test/`.
 - External tools are mocked (Docker, Java/RMLStreamer, gzip, brotli, rdf2hdt).
 - GitHub Actions runs this suite on each push and pull request (`.github/workflows/tests.yml`).
+- A successful run prints `[PASS]` markers for each test and ends with `OK`.
+- See `test/README.md` for an example of successful output.
 
 
 ## Manual Setup (Legacy)
