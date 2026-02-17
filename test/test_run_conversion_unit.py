@@ -13,7 +13,7 @@ SCRIPT = REPO_ROOT / "src" / "run_conversion.sh"
 
 class RunConversionUnitTests(VerboseTestCase):
     def test_run_conversion_writes_nq_and_metrics_without_real_java(self):
-        """Conversion script writes .nq output and unified metrics using mocked Java."""
+        """Conversion script writes a single merged .nq output and unified metrics."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             fake_bin = tmp_path / "bin"
@@ -64,7 +64,9 @@ printf '<s> <p> <o> .\\n' > "$out/part-000"
             result = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True)
 
             self.assertEqual(result.returncode, 0, msg=result.stderr)
-            self.assertTrue((out_dir / "rdf" / "part-000.nq").exists())
+            merged_nq = out_dir / "rdf" / "rdf.nq"
+            self.assertTrue(merged_nq.exists())
+            self.assertIn("<s> <p> <o> .", merged_nq.read_text())
 
             metrics_csv = metrics_dir / "metrics.csv"
             self.assertTrue(metrics_csv.exists())
@@ -237,7 +239,7 @@ printf '# only comments\\n' > "$out/comments-only.nq"
             self.assertEqual(rows[0]["output_triples"], "0")
 
     def test_run_conversion_only_renames_non_nq_outputs(self):
-        """Normalization step appends .nq only to extensionless files and leaves existing .nq untouched."""
+        """Normalization + merge writes rdf.nq with combined converted content."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             fake_bin = tmp_path / "bin"
@@ -288,8 +290,11 @@ printf '<s2> <p2> <o2> .\\n' > "$out/already.nq"
 
             result = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, msg=result.stderr)
-            self.assertTrue((out_dir / "rdf" / "no-ext.nq").exists())
-            self.assertTrue((out_dir / "rdf" / "already.nq").exists())
+            merged_nq = out_dir / "rdf" / "rdf.nq"
+            self.assertTrue(merged_nq.exists())
+            text = merged_nq.read_text()
+            self.assertIn("<s> <p> <o> .", text)
+            self.assertIn("<s2> <p2> <o2> .", text)
 
 
 if __name__ == "__main__":

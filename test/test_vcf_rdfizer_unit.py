@@ -23,6 +23,17 @@ def prepare_inputs(base: Path):
     return input_dir, rules_path
 
 
+def mocked_triplets():
+    return [
+        {
+            "prefix": "sample",
+            "records": Path("sample.records.tsv"),
+            "headers": Path("sample.header_lines.tsv"),
+            "metadata": Path("sample.file_metadata.tsv"),
+        }
+    ]
+
+
 class WrapperUnitTests(VerboseTestCase):
     def test_main_rejects_build_and_no_build_together(self):
         """Wrapper rejects mutually exclusive --build and --no-build options."""
@@ -63,6 +74,8 @@ class WrapperUnitTests(VerboseTestCase):
                     vcf_rdfizer, "docker_build_image", return_value=1
                 ), mock.patch.object(
                     vcf_rdfizer, "docker_pull_image", return_value=1
+                ), mock.patch.object(
+                    vcf_rdfizer, "discover_tsv_triplets", return_value=mocked_triplets()
                 ):
                     rc = invoke_main(
                         [
@@ -85,6 +98,77 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertIn("/opt/vcf-rdfizer/compression.sh", commands[2])
             self.assertEqual(commands[2][-2:], ["-m", "none"])
 
+    def test_main_multiple_triplets_run_multiple_conversions_and_compress_all_outputs(self):
+        """Multiple input triplets trigger per-sample conversion runs and all-output compression."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+            commands = []
+
+            def fake_run(cmd, cwd=None, env=None):
+                commands.append(cmd)
+                return 0
+
+            multi_triplets = [
+                {
+                    "prefix": "sample_a",
+                    "records": Path("sample_a.records.tsv"),
+                    "headers": Path("sample_a.header_lines.tsv"),
+                    "metadata": Path("sample_a.file_metadata.tsv"),
+                },
+                {
+                    "prefix": "sample_b",
+                    "records": Path("sample_b.records.tsv"),
+                    "headers": Path("sample_b.header_lines.tsv"),
+                    "metadata": Path("sample_b.file_metadata.tsv"),
+                },
+            ]
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch.object(
+                    vcf_rdfizer, "check_docker", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "docker_image_exists", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "discover_tsv_triplets", return_value=multi_triplets
+                ):
+                    rc = invoke_main(["--input", str(input_dir), "--rules", str(rules_path), "--keep-tsv"])
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(commands), 4)
+            self.assertIn("OUT_NAME=sample_a", commands[1])
+            self.assertIn("OUT_NAME=sample_b", commands[2])
+            self.assertIn("OUT_NAME=", commands[3])
+
+    def test_main_uses_default_rules_when_flag_is_omitted(self):
+        """Wrapper uses repository default rules file when --rules is omitted."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, _ = prepare_inputs(tmp_path)
+
+            def fake_run(cmd, cwd=None, env=None):
+                return 0
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch.object(
+                    vcf_rdfizer, "check_docker", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "docker_image_exists", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "discover_tsv_triplets", return_value=mocked_triplets()
+                ):
+                    rc = invoke_main(["--input", str(input_dir), "--keep-tsv"])
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 0)
+
     def test_main_removes_tsv_when_wrapper_created_it(self):
         """Wrapper removes TSV directory when it created it and --keep-tsv is not set."""
         with tempfile.TemporaryDirectory() as td:
@@ -102,6 +186,8 @@ class WrapperUnitTests(VerboseTestCase):
                     vcf_rdfizer, "check_docker", return_value=True
                 ), mock.patch.object(
                     vcf_rdfizer, "docker_image_exists", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "discover_tsv_triplets", return_value=mocked_triplets()
                 ):
                     rc = invoke_main(
                         [
@@ -139,6 +225,8 @@ class WrapperUnitTests(VerboseTestCase):
                     vcf_rdfizer, "check_docker", return_value=True
                 ), mock.patch.object(
                     vcf_rdfizer, "docker_image_exists", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "discover_tsv_triplets", return_value=mocked_triplets()
                 ):
                     rc = invoke_main(
                         [
@@ -174,6 +262,8 @@ class WrapperUnitTests(VerboseTestCase):
                     vcf_rdfizer, "check_docker", return_value=True
                 ), mock.patch.object(
                     vcf_rdfizer, "docker_image_exists", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "discover_tsv_triplets", return_value=mocked_triplets()
                 ):
                     rc = invoke_main(["--input", str(input_dir), "--rules", str(rules_path)])
             finally:
@@ -199,6 +289,8 @@ class WrapperUnitTests(VerboseTestCase):
                     vcf_rdfizer, "check_docker", return_value=True
                 ), mock.patch.object(
                     vcf_rdfizer, "docker_image_exists", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "discover_tsv_triplets", return_value=mocked_triplets()
                 ):
                     rc = invoke_main(["--input", str(input_dir), "--rules", str(rules_path)])
             finally:
@@ -224,6 +316,8 @@ class WrapperUnitTests(VerboseTestCase):
                     vcf_rdfizer, "check_docker", return_value=True
                 ), mock.patch.object(
                     vcf_rdfizer, "docker_image_exists", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "discover_tsv_triplets", return_value=mocked_triplets()
                 ):
                     rc = invoke_main(["--input", str(input_dir), "--rules", str(rules_path)])
             finally:

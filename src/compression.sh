@@ -11,7 +11,7 @@ OUT_NAME=${OUT_NAME:-}
 LOGDIR=${LOGDIR:-run_metrics}
 
 # rdf2hdt binary
-HDT=${RDF2HDT:-/opt/hdt-java/hdt-java-cli/rdf2hdt.sh}
+HDT=${RDF2HDT:-/opt/hdt-java/hdt-java-cli/bin/rdf2hdt.sh}
 
 # Base URI for rdf2hdt (reserved for future use)
 BASE_URI=${BASE_URI:-http://example.org/base}
@@ -77,12 +77,30 @@ if (( DO_HDT == 1 )) && [[ ! -x "$HDT" ]]; then
   exit 2
 fi
 
+GZIP_ROOT="$OUT_ROOT_DIR/gzip"
+BROTLI_ROOT="$OUT_ROOT_DIR/brotli"
+HDT_ROOT="$OUT_ROOT_DIR/hdt"
+
+if (( DO_GZIP == 1 )); then
+  mkdir -p "$GZIP_ROOT"
+fi
+if (( DO_BROTLI == 1 )); then
+  mkdir -p "$BROTLI_ROOT"
+fi
+if (( DO_HDT == 1 )); then
+  mkdir -p "$HDT_ROOT"
+fi
+
 # Resolve output directories to compress
 OUTPUT_DIRS=()
 if [[ -n "$OUT_NAME" ]]; then
   OUTPUT_DIRS=("$OUT_ROOT_DIR/$OUT_NAME")
 else
-  mapfile -t OUTPUT_DIRS < <(find "$OUT_ROOT_DIR" -maxdepth 1 -type d ! -path "$OUT_ROOT_DIR" | sort)
+  mapfile -t OUTPUT_DIRS < <(find "$OUT_ROOT_DIR" -maxdepth 1 -type d \
+    ! -path "$OUT_ROOT_DIR" \
+    ! -path "$GZIP_ROOT" \
+    ! -path "$BROTLI_ROOT" \
+    ! -path "$HDT_ROOT" | sort)
   if (( ${#OUTPUT_DIRS[@]} == 0 )); then
     OUTPUT_DIRS=("$OUT_ROOT_DIR")
   fi
@@ -200,10 +218,11 @@ for OUT in "${OUTPUT_DIRS[@]}"; do
   shopt -s nullglob
   NQ_FILES=("$OUT"/*.nq)
   shopt -u nullglob
+  PRIMARY_NQ="$OUT/${BASENAME}.nq"
 
   if (( ${#NQ_FILES[@]} == 0 )); then
     echo "WARNING: no .nq files found in '$OUT'; skipping compression for this output." >&2
-    BIG_NQ=""
+    SOURCE_NQ=""
     NQ_SIZE=0
     GZ_PATH=""
     GZ_SIZE=0
@@ -231,26 +250,50 @@ for OUT in "${OUTPUT_DIRS[@]}"; do
     fi
   else
     if (( ANY_COMPRESS > 0 )); then
-      BIG_NQ="$OUT/${BASENAME}.nq"
-      > "$BIG_NQ"
-      for f in "${NQ_FILES[@]}"; do
-        cat "$f" >> "$BIG_NQ"
-      done
-      NQ_SIZE=$(stat_size "$BIG_NQ")
+      if [[ -f "$PRIMARY_NQ" ]]; then
+        SOURCE_NQ="$PRIMARY_NQ"
+      elif (( ${#NQ_FILES[@]} == 1 )); then
+        SOURCE_NQ="${NQ_FILES[0]}"
+      else
+        echo "WARNING: expected primary N-Quads '$PRIMARY_NQ' but found multiple .nq files; using '$PRIMARY_NQ' is required." >&2
+        SOURCE_NQ=""
+      fi
+
+      if [[ -z "$SOURCE_NQ" ]]; then
+        NQ_SIZE=0
+        EXIT_CODE_GZIP=$(( DO_GZIP == 1 ? 1 : 0 ))
+        EXIT_CODE_BROTLI=$(( DO_BROTLI == 1 ? 1 : 0 ))
+        EXIT_CODE_HDT=$(( DO_HDT == 1 ? 1 : 0 ))
+        WALL_SEC_GZIP="null"
+        USER_SEC_GZIP="null"
+        SYS_SEC_GZIP="null"
+        MAX_RSS_KB_GZIP="null"
+        WALL_SEC_BROTLI="null"
+        USER_SEC_BROTLI="null"
+        SYS_SEC_BROTLI="null"
+        MAX_RSS_KB_BROTLI="null"
+        WALL_SEC_HDT="null"
+        USER_SEC_HDT="null"
+        SYS_SEC_HDT="null"
+        MAX_RSS_KB_HDT="null"
+        OVERALL_EXIT=1
+      else
+        NQ_SIZE=$(stat_size "$SOURCE_NQ")
+      fi
     else
-      BIG_NQ=""
+      SOURCE_NQ=""
       NQ_SIZE=0
     fi
 
     # ----- gzip combined.nq with timing -----
-    if (( DO_GZIP == 1 )); then
-      GZ_PATH="$BIG_NQ.gz"
+    if (( DO_GZIP == 1 )) && [[ -n "${SOURCE_NQ:-}" ]]; then
+      GZ_PATH="$GZIP_ROOT/${BASENAME}.nq.gz"
       EXIT_CODE_GZIP=0
 
       if have_gnu_time; then
-        /usr/bin/time -v -o "$TIME_LOG_GZIP" -- gzip -kf "$BIG_NQ" || EXIT_CODE_GZIP=$?
+        /usr/bin/time -v -o "$TIME_LOG_GZIP" -- gzip -c "$SOURCE_NQ" > "$GZ_PATH" || EXIT_CODE_GZIP=$?
       else
-        { time -p gzip -kf "$BIG_NQ"; } >"$TIME_LOG_GZIP" 2>&1 || EXIT_CODE_GZIP=$?
+        { time -p gzip -c "$SOURCE_NQ" > "$GZ_PATH"; } >"$TIME_LOG_GZIP" 2>&1 || EXIT_CODE_GZIP=$?
       fi
 
       GZ_SIZE=$(stat_size "$GZ_PATH")
@@ -289,14 +332,14 @@ for OUT in "${OUTPUT_DIRS[@]}"; do
     fi
 
     # ----- brotli combined.nq with timing -----
-    if (( DO_BROTLI == 1 )); then
-      BROTLI_PATH="$BIG_NQ.br"
+    if (( DO_BROTLI == 1 )) && [[ -n "${SOURCE_NQ:-}" ]]; then
+      BROTLI_PATH="$BROTLI_ROOT/${BASENAME}.nq.br"
       EXIT_CODE_BROTLI=0
 
       if have_gnu_time; then
-        /usr/bin/time -v -o "$TIME_LOG_BROTLI" -- brotli -q 7 -k "$BIG_NQ" || EXIT_CODE_BROTLI=$?
+        /usr/bin/time -v -o "$TIME_LOG_BROTLI" -- brotli -q 7 -c "$SOURCE_NQ" > "$BROTLI_PATH" || EXIT_CODE_BROTLI=$?
       else
-        { time -p brotli -q 7 -k "$BIG_NQ"; } >"$TIME_LOG_BROTLI" 2>&1 || EXIT_CODE_BROTLI=$?
+        { time -p brotli -q 7 -c "$SOURCE_NQ" > "$BROTLI_PATH"; } >"$TIME_LOG_BROTLI" 2>&1 || EXIT_CODE_BROTLI=$?
       fi
 
       BROTLI_SIZE=$(stat_size "$BROTLI_PATH")
@@ -334,14 +377,14 @@ for OUT in "${OUTPUT_DIRS[@]}"; do
     fi
 
     # ----- Convert combined.nq to HDT with timing -----
-    if (( DO_HDT == 1 )); then
-      HDT_PATH="$OUT/$BASENAME.hdt"
+    if (( DO_HDT == 1 )) && [[ -n "${SOURCE_NQ:-}" ]]; then
+      HDT_PATH="$HDT_ROOT/$BASENAME.hdt"
       EXIT_CODE_HDT=0
 
       if have_gnu_time; then
-        /usr/bin/time -v -o "$TIME_LOG_HDT" -- bash "$HDT" "$BIG_NQ" "$HDT_PATH" || EXIT_CODE_HDT=$?
+        /usr/bin/time -v -o "$TIME_LOG_HDT" -- bash "$HDT" "$SOURCE_NQ" "$HDT_PATH" || EXIT_CODE_HDT=$?
       else
-        { time -p bash "$HDT" "$BIG_NQ" "$HDT_PATH"; } >"$TIME_LOG_HDT" 2>&1 || EXIT_CODE_HDT=$?
+        { time -p bash "$HDT" "$SOURCE_NQ" "$HDT_PATH"; } >"$TIME_LOG_HDT" 2>&1 || EXIT_CODE_HDT=$?
       fi
 
       HDT_SIZE=$(stat_size "$HDT_PATH")
@@ -388,7 +431,7 @@ for OUT in "${OUTPUT_DIRS[@]}"; do
   "output_name": "$BASENAME",
   "compression_methods": "$COMPRESSION_METHODS",
   "output_triples": $TRIPLES_JSON,
-  "combined_nq_path": "${BIG_NQ:-}",
+  "combined_nq_path": "${SOURCE_NQ:-}",
   "combined_nq_size_bytes": ${NQ_SIZE:-0},
   "gzip": {
     "output_gz_path": "${GZ_PATH:-}",

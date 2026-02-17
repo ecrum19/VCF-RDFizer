@@ -11,6 +11,7 @@ This repository uses `unittest` (Python standard library) to isolate orchestrati
 
 - `test/test_vcf_as_tsv_unit.py`
   - Verifies `.vcf` and `.vcf.gz` input handling.
+  - Verifies header extraction and per-VCF TSV generation (`<sample>.records.tsv`, `<sample>.header_lines.tsv`, `<sample>.file_metadata.tsv`).
   - Verifies header normalization (`#CHROM` -> `CHROM`) and data row retention.
   - Verifies error path for empty input directories.
 

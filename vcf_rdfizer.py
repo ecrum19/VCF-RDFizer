@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import re
 import shutil
 import subprocess
 import sys
@@ -68,6 +69,62 @@ def ensure_dir(path: Path):
     path.mkdir(parents=True, exist_ok=True)
 
 
+def slugify(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_") or "vcf"
+
+
+def discover_tsv_triplets(tsv_dir: Path):
+    triplets = []
+    for records_path in sorted(tsv_dir.glob("*.records.tsv")):
+        prefix = records_path.name[: -len(".records.tsv")]
+        header_path = tsv_dir / f"{prefix}.header_lines.tsv"
+        metadata_path = tsv_dir / f"{prefix}.file_metadata.tsv"
+        if not header_path.exists():
+            raise ValueError(f"Missing header TSV for '{prefix}': {header_path}")
+        if not metadata_path.exists():
+            raise ValueError(f"Missing metadata TSV for '{prefix}': {metadata_path}")
+        triplets.append(
+            {
+                "prefix": prefix,
+                "records": records_path,
+                "headers": header_path,
+                "metadata": metadata_path,
+            }
+        )
+
+    if triplets:
+        return triplets
+
+    # Backward-compatible fallback for legacy aggregate TSV naming.
+    legacy_records = tsv_dir / "records.tsv"
+    legacy_headers = tsv_dir / "header_lines.tsv"
+    legacy_metadata = tsv_dir / "file_metadata.tsv"
+    if legacy_records.exists() and legacy_headers.exists() and legacy_metadata.exists():
+        return [
+            {
+                "prefix": "records",
+                "records": legacy_records,
+                "headers": legacy_headers,
+                "metadata": legacy_metadata,
+            }
+        ]
+
+    tsv_files = sorted(p.name for p in tsv_dir.glob("*.tsv"))
+    tsv_preview = ", ".join(tsv_files) if tsv_files else "(none)"
+    raise ValueError(
+        f"No per-VCF records TSV files found in {tsv_dir}. "
+        f"Expected '*.records.tsv'. Found: {tsv_preview}"
+    )
+
+
+def render_rules_for_triplet(template_rules: Path, output_rules: Path, records_name: str, headers_name: str, metadata_name: str):
+    text = template_rules.read_text()
+    text = text.replace('/data/tsv/records.tsv', f'/data/tsv/{records_name}')
+    text = text.replace('/data/tsv/header_lines.tsv', f'/data/tsv/{headers_name}')
+    text = text.replace('/data/tsv/file_metadata.tsv', f'/data/tsv/{metadata_name}')
+    output_rules.write_text(text)
+
+
 def docker_image_exists(image: str) -> bool:
     return run(["docker", "image", "inspect", image]) == 0
 
@@ -93,7 +150,11 @@ def resolve_image_ref(image: str, image_version: str | None):
 def main():
     parser = argparse.ArgumentParser(description="VCF-RDFizer Docker wrapper")
     parser.add_argument("--input", required=True, help="VCF file or directory")
-    parser.add_argument("--rules", required=True, help="RML mapping rules .ttl")
+    parser.add_argument(
+        "--rules",
+        default=None,
+        help="RML mapping rules .ttl (default: <repo>/rules/default_rules.ttl)",
+    )
     parser.add_argument("--out", default="./out", help="RDF output directory")
     parser.add_argument("--tsv", default="./tsv", help="TSV output directory")
     parser.add_argument(
@@ -108,7 +169,11 @@ def main():
     )
     parser.add_argument("--build", action="store_true", help="Force docker build")
     parser.add_argument("--no-build", action="store_true", help="Fail if image missing")
-    parser.add_argument("--out-name", default="rdf", help="Output name for run_conversion.sh")
+    parser.add_argument(
+        "--out-name",
+        default="rdf",
+        help="Fallback output directory/file basename when a TSV basename cannot be inferred",
+    )
     parser.add_argument("--metrics", default="./run_metrics", help="Metrics output directory")
     parser.add_argument(
         "--compression",
@@ -124,7 +189,10 @@ def main():
 
     repo_root = Path(__file__).resolve().parent
     input_path = Path(args.input).expanduser().resolve()
-    rules_path = Path(args.rules).expanduser().resolve()
+    if args.rules is None:
+        rules_path = (repo_root / "rules" / "default_rules.ttl").resolve()
+    else:
+        rules_path = Path(args.rules).expanduser().resolve()
     out_dir = Path(args.out).expanduser().resolve()
     tsv_dir = Path(args.tsv).expanduser().resolve()
     metrics_dir = Path(args.metrics).expanduser().resolve()
@@ -145,9 +213,6 @@ def main():
             eprint(f"Error: expected a directory path but found a file: {p}")
             return 2
 
-    rules_dir = rules_path.parent
-    rules_name = rules_path.name
-    container_rules = f"/data/rules/{rules_name}"
     run_id = datetime.now().strftime("%Y%m%dT%H%M%S")
     timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
@@ -203,44 +268,75 @@ def main():
     print("Step 4/5: Running Conversion with RMLStreamer")
     ensure_dir(out_dir)
     ensure_dir(metrics_dir)
-    run_cmd = [
-        "docker",
-        "run",
-        "--rm",
-        "-v",
-        f"{str(rules_dir)}:/data/rules:ro",
-        "-v",
-        f"{str(tsv_dir)}:/data/tsv:ro",
-        "-v",
-        f"{str(out_dir)}:/data/out",
-        "-v",
-        f"{str(metrics_dir)}:/data/metrics",
-        "-w",
-        "/data/rules",
-        "-e",
-        f"JAR={RMLSTREAMER_JAR_CONTAINER}",
-        "-e",
-        f"IN={container_rules}",
-        "-e",
-        "OUT_DIR=/data/out",
-        "-e",
-        f"OUT_NAME={args.out_name}",
-        "-e",
-        f"RUN_ID={run_id}",
-        "-e",
-        f"TIMESTAMP={timestamp}",
-        "-e",
-        f"IN_VCF={container_input}",
-        "-e",
-        "LOGDIR=/data/metrics",
-        image_ref,
-        "/opt/vcf-rdfizer/run_conversion.sh",
-    ]
-    if run(run_cmd) != 0:
-        eprint("Error: RMLStreamer step failed.")
+
+    try:
+        tsv_triplets = discover_tsv_triplets(tsv_dir)
+    except ValueError as exc:
+        eprint(f"Error: {exc}")
         return 1
 
+    generated_rules_dir = metrics_dir / "_generated_rules"
+    if generated_rules_dir.exists():
+        shutil.rmtree(generated_rules_dir, ignore_errors=True)
+    ensure_dir(generated_rules_dir)
+
+    conversion_output_names = []
+    for triplet in tsv_triplets:
+        prefix = triplet["prefix"]
+        safe_prefix = slugify(prefix)
+        generated_rules = generated_rules_dir / f"{safe_prefix}.rules.ttl"
+        render_rules_for_triplet(
+            rules_path,
+            generated_rules,
+            triplet["records"].name,
+            triplet["headers"].name,
+            triplet["metadata"].name,
+        )
+
+        output_name = safe_prefix or slugify(args.out_name)
+        conversion_output_names.append(output_name)
+        container_generated_rules = f"/data/rules/{generated_rules.name}"
+
+        print(f"  - Converting '{prefix}' -> out/{output_name}")
+        run_cmd = [
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            f"{str(generated_rules_dir)}:/data/rules:ro",
+            "-v",
+            f"{str(tsv_dir)}:/data/tsv:ro",
+            "-v",
+            f"{str(out_dir)}:/data/out",
+            "-v",
+            f"{str(metrics_dir)}:/data/metrics",
+            "-w",
+            "/data/rules",
+            "-e",
+            f"JAR={RMLSTREAMER_JAR_CONTAINER}",
+            "-e",
+            f"IN={container_generated_rules}",
+            "-e",
+            "OUT_DIR=/data/out",
+            "-e",
+            f"OUT_NAME={output_name}",
+            "-e",
+            f"RUN_ID={run_id}",
+            "-e",
+            f"TIMESTAMP={timestamp}",
+            "-e",
+            f"IN_VCF={container_input}",
+            "-e",
+            "LOGDIR=/data/metrics",
+            image_ref,
+            "/opt/vcf-rdfizer/run_conversion.sh",
+        ]
+        if run(run_cmd) != 0:
+            eprint(f"Error: RMLStreamer step failed for '{prefix}'.")
+            return 1
+
     print("Step 5/5: Compressing outputs")
+    compression_out_name = conversion_output_names[0] if len(conversion_output_names) == 1 else ""
     compression_cmd = [
         "docker",
         "run",
@@ -252,7 +348,7 @@ def main():
         "-e",
         "OUT_ROOT_DIR=/data/out",
         "-e",
-        f"OUT_NAME={args.out_name}",
+        f"OUT_NAME={compression_out_name}",
         "-e",
         "LOGDIR=/data/metrics",
         "-e",

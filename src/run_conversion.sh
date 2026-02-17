@@ -5,9 +5,9 @@ set -euo pipefail
 
 # ---------- Config ----------
 JAR=${JAR:-RMLStreamer-v2.5.0-standalone.jar}
-IN=${IN:-rules.ttl}
-IN_VCF=${IN_VCF:-vcf_files/0GOOR_HG002.vcf}
-OUT_NAME=${OUT_NAME:-0GOOR_HG002_out}
+IN=${IN:-rules/default_rules.ttl}
+IN_VCF=${IN_VCF:-input.vcf}
+OUT_NAME=${OUT_NAME:-rdf}
 OUT_DIR=${OUT_DIR:-run_output}
 OUT="$OUT_DIR/$OUT_NAME"
 LOGDIR=${LOGDIR:-run_metrics}
@@ -111,12 +111,42 @@ else
 fi
 
 # ---------- Post-run ----------
+mkdir -p "$OUT_DIR/$OUT_NAME"
+
 # Normalize output files to .nq for downstream compression
 for NO_EXT_FILE in "$OUT_DIR/$OUT_NAME"/*; do
   if [[ -f "$NO_EXT_FILE" && "$NO_EXT_FILE" != *.nq ]]; then
     mv "$NO_EXT_FILE" "${NO_EXT_FILE}.nq"
   fi
 done
+
+# Merge all RMLStreamer output parts into one N-Quads file named after the TSV basename/output name.
+MERGED_NQ="$OUT_DIR/$OUT_NAME/$OUT_NAME.nq"
+MERGED_TMP="$OUT_DIR/$OUT_NAME/$OUT_NAME.nq.tmp"
+
+shopt -s nullglob
+PART_FILES=("$OUT_DIR/$OUT_NAME"/*.nq)
+if (( ${#PART_FILES[@]} > 0 )); then
+  : > "$MERGED_TMP"
+  for PART_NQ in "${PART_FILES[@]}"; do
+    if [[ "$PART_NQ" == "$MERGED_TMP" ]]; then
+      continue
+    fi
+    cat "$PART_NQ" >> "$MERGED_TMP"
+    if [[ "$PART_NQ" != "$MERGED_NQ" ]]; then
+      rm -f "$PART_NQ"
+    fi
+  done
+  mv -f "$MERGED_TMP" "$MERGED_NQ"
+else
+  : > "$MERGED_NQ"
+fi
+for PART_NQ in "$OUT_DIR/$OUT_NAME"/*.nq; do
+  if [[ "$PART_NQ" != "$MERGED_NQ" ]]; then
+    rm -f "$PART_NQ"
+  fi
+done
+shopt -u nullglob
 
 OUT_SIZE=$(stat_size "$OUT_DIR/$OUT_NAME")
 TRIPLES_JSON=$(count_triples_json "$OUT_DIR/$OUT_NAME")

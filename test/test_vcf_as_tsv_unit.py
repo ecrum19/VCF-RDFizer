@@ -47,7 +47,7 @@ class VcfAsTsvUnitTests(VerboseTestCase):
             self.assertIn("must end with .vcf or .vcf.gz", result.stdout)
 
     def test_vcf_as_tsv_directory_mode(self):
-        """Directory input: converts VCF and normalizes #CHROM header to CHROM."""
+        """Directory input: writes per-file TSV plus per-VCF records/header/metadata TSVs."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             input_dir = tmp_path / "in"
@@ -69,9 +69,18 @@ class VcfAsTsvUnitTests(VerboseTestCase):
             lines = out_file.read_text().splitlines()
             self.assertEqual(lines[0], "CHROM\tPOS\tID")
             self.assertEqual(lines[1], "1\t10\trs1")
+            records_all = output_dir / "sample.records.tsv"
+            headers_all = output_dir / "sample.header_lines.tsv"
+            metadata_all = output_dir / "sample.file_metadata.tsv"
+            self.assertTrue(records_all.exists())
+            self.assertTrue(headers_all.exists())
+            self.assertTrue(metadata_all.exists())
+            self.assertIn("sample.vcf", records_all.read_text())
+            self.assertIn("fileformat", headers_all.read_text().lower())
+            self.assertIn("sample.vcf", metadata_all.read_text())
 
     def test_vcf_as_tsv_single_gz_file_mode(self):
-        """Single .vcf.gz input: decompresses and writes expected TSV output."""
+        """Single .vcf.gz input: decompresses and writes per-VCF split TSV outputs."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             input_file = tmp_path / "sample.vcf.gz"
@@ -89,6 +98,9 @@ class VcfAsTsvUnitTests(VerboseTestCase):
             out_file = output_dir / "sample.tsv"
             self.assertTrue(out_file.exists())
             self.assertIn("CHROM\tPOS", out_file.read_text())
+            self.assertTrue((output_dir / "sample.records.tsv").exists())
+            self.assertTrue((output_dir / "sample.header_lines.tsv").exists())
+            self.assertTrue((output_dir / "sample.file_metadata.tsv").exists())
 
     def test_vcf_as_tsv_errors_when_no_vcf_files_found(self):
         """Empty directory input: exits non-zero with a clear no-files message."""
@@ -127,6 +139,12 @@ class VcfAsTsvUnitTests(VerboseTestCase):
             self.assertIn("b.tsv", result.stdout)
             self.assertTrue((output_dir / "a.tsv").exists())
             self.assertTrue((output_dir / "b.tsv").exists())
+            a_records = (output_dir / "a.records.tsv").read_text().splitlines()
+            b_records = (output_dir / "b.records.tsv").read_text().splitlines()
+            self.assertEqual(len(a_records), 2)
+            self.assertEqual(len(b_records), 2)
+            self.assertIn("a.vcf", a_records[1])
+            self.assertIn("b.vcf", b_records[1])
 
 
 if __name__ == "__main__":

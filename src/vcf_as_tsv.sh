@@ -36,6 +36,7 @@ fi
 
 for infile in "${files[@]}"; do
   base="$(basename "$infile")"
+  source_file="$base"
   if [[ "$base" == *.vcf.gz ]]; then
     reader_cmd=(gzip -dc)
     base="${base%.vcf.gz}"
@@ -48,17 +49,97 @@ for infile in "${files[@]}"; do
   fi
 
   outfile="${output_dir}/${base}.tsv"
+  records_out="${output_dir}/${base}.records.tsv"
+  headers_out="${output_dir}/${base}.header_lines.tsv"
+  metadata_out="${output_dir}/${base}.file_metadata.tsv"
 
-  # Process: skip metadata, find #CHROM line, strip '#', and output variants
+  printf "SOURCE_FILE\tROW_ID\tCHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLES\n" > "$records_out"
+  printf "SOURCE_FILE\tHEADER_INDEX\tHEADER_KEY\tHEADER_VALUE\tRAW_LINE\n" > "$headers_out"
+  printf "SOURCE_FILE\tFILE_FORMAT\tFILE_DATE\tSOURCE_SOFTWARE\tREFERENCE_GENOME\tHEADER_COUNT\tRECORD_COUNT\n" > "$metadata_out"
+
+  # Writes:
+  # 1) Backward-compatible per-file TSV (<base>.tsv)
+  # 2) Aggregated records/header/metadata TSVs used by default RML rules
   "${reader_cmd[@]}" "$infile" | awk '
+    function trim_cr(s) {
+      sub(/\r$/, "", s)
+      return s
+    }
+
     BEGIN { FS = OFS = "\t" }
-    /^#CHROM\t/ {
-      sub(/^#/, "", $1);  # remove leading # from first field (#CHROM -> CHROM)
-      print;
+    /^##/ {
+      raw = trim_cr(substr($0, 3))
+      key = raw
+      value = ""
+      eq_pos = index(raw, "=")
+      if (eq_pos > 0) {
+        key = substr(raw, 1, eq_pos - 1)
+        value = substr(raw, eq_pos + 1)
+      }
+      header_index++
+      print source_file, header_index, key, value, raw >> headers_out
+
+      key_lc = tolower(key)
+      if (key_lc == "fileformat") {
+        file_format = value
+      } else if (key_lc == "filedate") {
+        file_date = value
+      } else if (key_lc == "source") {
+        source_software = value
+      } else if (key_lc == "reference") {
+        reference_genome = value
+      }
       next
     }
-    /^[^#]/ { print }
-  ' > "$outfile"
+    /^#CHROM\t/ {
+      for (i = 1; i <= NF; i++) {
+        $i = trim_cr($i)
+      }
+      sub(/^#/, "", $1)
+      print > per_file_out
+      header_index++
+      print source_file, header_index, "CHROM_HEADER", $0, $0 >> headers_out
+      next
+    }
+    /^[^#]/ {
+      for (i = 1; i <= NF; i++) {
+        $i = trim_cr($i)
+      }
+
+      print > per_file_out
+
+      row_id++
+      chrom = $1
+      pos = $2
+      rec_id = $3
+      ref = $4
+      alt = $5
+      qual = (NF >= 6 ? $6 : "")
+      filter = (NF >= 7 ? $7 : "")
+      info = (NF >= 8 ? $8 : "")
+      format = (NF >= 9 ? $9 : "")
+      samples = ""
+      if (NF >= 10) {
+        samples = $10
+        for (i = 11; i <= NF; i++) {
+          samples = samples "|" $i
+        }
+      }
+
+      print source_file, row_id, chrom, pos, rec_id, ref, alt, qual, filter, info, format, samples >> records_out
+      next
+    }
+    END {
+      print source_file, file_format, file_date, source_software, reference_genome, header_index + 0, row_id + 0 >> metadata_out
+    }
+  ' source_file="$source_file" \
+    per_file_out="$outfile" \
+    records_out="$records_out" \
+    headers_out="$headers_out" \
+    metadata_out="$metadata_out"
 
   echo "✅ Wrote: $outfile"
+  echo "✅ Wrote: $records_out"
+  echo "✅ Wrote: $headers_out"
+  echo "✅ Wrote: $metadata_out"
 done

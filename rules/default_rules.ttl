@@ -1,0 +1,192 @@
+@prefix rr:    <http://www.w3.org/ns/r2rml#> .
+@prefix rml:   <http://semweb.mmlab.be/ns/rml#> .
+@prefix ql:    <http://semweb.mmlab.be/ns/ql#> .
+@prefix csvw:  <http://www.w3.org/ns/csvw#> .
+@prefix xsd:   <http://www.w3.org/2001/XMLSchema#> .
+@prefix vcfr:  <https://w3id.org/vcf-rdfizer/vocab#> .
+
+# Default VCF-RDFizer RML rules.
+#
+# Expected TSV inputs produced by src/vcf_as_tsv.sh:
+# - /data/tsv/<sample>.file_metadata.tsv
+# - /data/tsv/<sample>.header_lines.tsv
+# - /data/tsv/<sample>.records.tsv
+# The wrapper rewrites the template paths below for each input sample.
+#
+# Graph separation:
+# - Header/file metadata triples -> https://w3id.org/vcf-rdfizer/graph/header
+# - Record/call triples         -> https://w3id.org/vcf-rdfizer/graph/records
+
+<#VCFFileMap>
+  a rr:TriplesMap ;
+  rml:logicalSource [
+    rml:source [
+      a csvw:Table ;
+      csvw:url "/data/tsv/file_metadata.tsv" ;
+      csvw:dialect [
+        a csvw:Dialect ;
+        csvw:delimiter "\t" ;
+        csvw:headerRowCount 1
+      ]
+    ] ;
+    rml:referenceFormulation ql:CSV
+  ] ;
+  rr:subjectMap [
+    rr:template "https://w3id.org/vcf-rdfizer/resource/vcf-file/{SOURCE_FILE}" ;
+    rr:class vcfr:VCFFile ;
+    rr:graphMap [ rr:constant <https://w3id.org/vcf-rdfizer/graph/header> ]
+  ] ;
+  rr:predicateObjectMap [
+    rr:predicate vcfr:hasHeader ;
+    rr:objectMap [ rr:template "https://w3id.org/vcf-rdfizer/resource/vcf-header/{SOURCE_FILE}" ]
+  ] ;
+  rr:predicateObjectMap [
+    rr:predicate vcfr:hasRecord ;
+    rr:objectMap [
+      rr:parentTriplesMap <#VCFRecordMap> ;
+      rr:joinCondition [ rr:child "SOURCE_FILE" ; rr:parent "SOURCE_FILE" ]
+    ]
+  ] ;
+  rr:predicateObjectMap [
+    rr:predicate vcfr:fileFormat ;
+    rr:objectMap [ rml:reference "FILE_FORMAT" ]
+  ] ;
+  rr:predicateObjectMap [
+    rr:predicate vcfr:sourceSoftware ;
+    rr:objectMap [ rml:reference "SOURCE_SOFTWARE" ]
+  ] ;
+  rr:predicateObjectMap [
+    rr:predicate vcfr:referenceGenome ;
+    rr:objectMap [ rml:reference "REFERENCE_GENOME" ]
+  ] .
+
+<#VCFHeaderMap>
+  a rr:TriplesMap ;
+  rml:logicalSource [
+    rml:source [
+      a csvw:Table ;
+      csvw:url "/data/tsv/file_metadata.tsv" ;
+      csvw:dialect [
+        a csvw:Dialect ;
+        csvw:delimiter "\t" ;
+        csvw:headerRowCount 1
+      ]
+    ] ;
+    rml:referenceFormulation ql:CSV
+  ] ;
+  rr:subjectMap [
+    rr:template "https://w3id.org/vcf-rdfizer/resource/vcf-header/{SOURCE_FILE}" ;
+    rr:class vcfr:VCFHeader ;
+    rr:graphMap [ rr:constant <https://w3id.org/vcf-rdfizer/graph/header> ]
+  ] ;
+  rr:predicateObjectMap [
+    rr:predicate vcfr:hasHeaderLine ;
+    rr:objectMap [
+      rr:parentTriplesMap <#HeaderLineMap> ;
+      rr:joinCondition [ rr:child "SOURCE_FILE" ; rr:parent "SOURCE_FILE" ]
+    ]
+  ] .
+
+<#HeaderLineMap>
+  a rr:TriplesMap ;
+  rml:logicalSource [
+    rml:source [
+      a csvw:Table ;
+      csvw:url "/data/tsv/header_lines.tsv" ;
+      csvw:dialect [
+        a csvw:Dialect ;
+        csvw:delimiter "\t" ;
+        csvw:headerRowCount 1
+      ]
+    ] ;
+    rml:referenceFormulation ql:CSV
+  ] ;
+  rr:subjectMap [
+    rr:template "https://w3id.org/vcf-rdfizer/resource/header-line/{SOURCE_FILE}/{HEADER_INDEX}" ;
+    rr:class vcfr:HeaderLine ;
+    rr:graphMap [ rr:constant <https://w3id.org/vcf-rdfizer/graph/header> ]
+  ] ;
+  rr:predicateObjectMap [
+    rr:predicate vcfr:headerKey ;
+    rr:objectMap [ rml:reference "HEADER_KEY" ]
+  ] ;
+  rr:predicateObjectMap [
+    rr:predicate vcfr:headerValue ;
+    rr:objectMap [ rml:reference "HEADER_VALUE" ]
+  ] .
+
+<#VCFRecordMap>
+  a rr:TriplesMap ;
+  rml:logicalSource [
+    rml:source [
+      a csvw:Table ;
+      csvw:url "/data/tsv/records.tsv" ;
+      csvw:dialect [
+        a csvw:Dialect ;
+        csvw:delimiter "\t" ;
+        csvw:headerRowCount 1
+      ]
+    ] ;
+    rml:referenceFormulation ql:CSV
+  ] ;
+  rr:subjectMap [
+    rr:template "https://w3id.org/vcf-rdfizer/resource/record/{SOURCE_FILE}/{ROW_ID}" ;
+    rr:class vcfr:VCFRecord ;
+    rr:graphMap [ rr:constant <https://w3id.org/vcf-rdfizer/graph/records> ]
+  ] ;
+  rr:predicateObjectMap [
+    rr:predicate vcfr:chrom ;
+    rr:objectMap [ rml:reference "CHROM" ]
+  ] ;
+  rr:predicateObjectMap [
+    rr:predicate vcfr:pos ;
+    rr:objectMap [ rml:reference "POS" ; rr:datatype xsd:integer ]
+  ] ;
+  rr:predicateObjectMap [
+    rr:predicate vcfr:recordId ;
+    rr:objectMap [ rml:reference "ID" ]
+  ] ;
+  rr:predicateObjectMap [
+    rr:predicate vcfr:ref ;
+    rr:objectMap [ rml:reference "REF" ]
+  ] ;
+  rr:predicateObjectMap [
+    rr:predicate vcfr:alt ;
+    rr:objectMap [ rml:reference "ALT" ]
+  ] ;
+  rr:predicateObjectMap [
+    rr:predicate vcfr:hasCall ;
+    rr:objectMap [ rr:template "https://w3id.org/vcf-rdfizer/resource/call/{SOURCE_FILE}/{ROW_ID}" ]
+  ] .
+
+<#VariantCallMap>
+  a rr:TriplesMap ;
+  rml:logicalSource [
+    rml:source [
+      a csvw:Table ;
+      csvw:url "/data/tsv/records.tsv" ;
+      csvw:dialect [
+        a csvw:Dialect ;
+        csvw:delimiter "\t" ;
+        csvw:headerRowCount 1
+      ]
+    ] ;
+    rml:referenceFormulation ql:CSV
+  ] ;
+  rr:subjectMap [
+    rr:template "https://w3id.org/vcf-rdfizer/resource/call/{SOURCE_FILE}/{ROW_ID}" ;
+    rr:class vcfr:VariantCall ;
+    rr:graphMap [ rr:constant <https://w3id.org/vcf-rdfizer/graph/records> ]
+  ] ;
+  rr:predicateObjectMap [
+    rr:predicate vcfr:filter ;
+    rr:objectMap [ rml:reference "FILTER" ]
+  ] ;
+  rr:predicateObjectMap [
+    rr:predicate vcfr:infoRaw ;
+    rr:objectMap [ rml:reference "INFO" ]
+  ] ;
+  rr:predicateObjectMap [
+    rr:predicate vcfr:formatRaw ;
+    rr:objectMap [ rml:reference "FORMAT" ]
+  ] .

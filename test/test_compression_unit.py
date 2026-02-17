@@ -21,8 +21,12 @@ def prepare_fake_tools(bin_dir: Path, fail_gzip: bool = False, fail_brotli: bool
         """#!/usr/bin/env bash
 set -euo pipefail
 {gzip_fail}file=""
-for arg in "$@"; do file="$arg"; done
-cp "$file" "$file.gz"
+for arg in "$@"; do
+  if [[ "$arg" != -* ]]; then
+    file="$arg"
+  fi
+done
+cat "$file"
 """.format(gzip_fail=gzip_fail),
     )
     make_executable(
@@ -30,8 +34,12 @@ cp "$file" "$file.gz"
         """#!/usr/bin/env bash
 set -euo pipefail
 {brotli_fail}file=""
-for arg in "$@"; do file="$arg"; done
-cp "$file" "$file.br"
+for arg in "$@"; do
+  if [[ "$arg" != -* ]]; then
+    file="$arg"
+  fi
+done
+cat "$file"
 """.format(brotli_fail=brotli_fail),
     )
     hdt = bin_dir / "rdf2hdt.sh"
@@ -92,7 +100,7 @@ class CompressionUnitTests(VerboseTestCase):
             out_root = tmp_path / "out"
             output = out_root / "rdf"
             output.mkdir(parents=True)
-            (output / "chunk-a.nq").write_text("<s> <p> <o> .\n")
+            (output / "rdf.nq").write_text("<s> <p> <o> .\n")
             env = {"OUT_ROOT_DIR": str(out_root), "OUT_NAME": "rdf", "LOGDIR": str(tmp_path / "metrics")}
             env.update({"PATH": os.environ["PATH"], "RDF2HDT": str(tmp_path / "missing.sh")})
             result = subprocess.run(
@@ -111,8 +119,7 @@ class CompressionUnitTests(VerboseTestCase):
             out_root = tmp_path / "out"
             output = out_root / "rdf"
             output.mkdir(parents=True)
-            (output / "chunk-a.nq").write_text("<s> <p> <o> .\n")
-            (output / "chunk-b.nq").write_text("<s2> <p2> <o2> .\n")
+            (output / "rdf.nq").write_text("<s> <p> <o> .\n<s2> <p2> <o2> .\n")
 
             logdir = tmp_path / "metrics"
             run_id = "run-compress-1"
@@ -144,9 +151,9 @@ class CompressionUnitTests(VerboseTestCase):
             )
 
             self.assertEqual(result.returncode, 0, msg=result.stderr)
-            self.assertTrue((output / "rdf.nq.gz").exists())
-            self.assertTrue((output / "rdf.nq.br").exists())
-            self.assertTrue((output / "rdf.hdt").exists())
+            self.assertTrue((out_root / "gzip" / "rdf.nq.gz").exists())
+            self.assertTrue((out_root / "brotli" / "rdf.nq.br").exists())
+            self.assertTrue((out_root / "hdt" / "rdf.hdt").exists())
 
             row = read_metrics_row(metrics_csv, run_id, "rdf")
             self.assertEqual(row["run_id"], run_id)
@@ -165,7 +172,7 @@ class CompressionUnitTests(VerboseTestCase):
             out_root = tmp_path / "out"
             output = out_root / "rdf"
             output.mkdir(parents=True)
-            (output / "chunk-a.nq").write_text("<s> <p> <o> .\n")
+            (output / "rdf.nq").write_text("<s> <p> <o> .\n")
 
             logdir = tmp_path / "metrics"
             run_id = "run-compress-2"
@@ -197,9 +204,9 @@ class CompressionUnitTests(VerboseTestCase):
             )
 
             self.assertEqual(result.returncode, 0, msg=result.stderr)
-            self.assertFalse((output / "rdf.nq.gz").exists())
-            self.assertFalse((output / "rdf.nq.br").exists())
-            self.assertFalse((output / "rdf.hdt").exists())
+            self.assertFalse((out_root / "gzip").exists())
+            self.assertFalse((out_root / "brotli").exists())
+            self.assertFalse((out_root / "hdt").exists())
 
             row = read_metrics_row(metrics_csv, run_id, "rdf")
             self.assertEqual(row["compression_methods"], "none")
@@ -253,7 +260,7 @@ class CompressionUnitTests(VerboseTestCase):
             out_root = tmp_path / "out"
             output = out_root / "rdf"
             output.mkdir(parents=True)
-            (output / "chunk-a.nq").write_text("<s> <p> <o> .\n")
+            (output / "rdf.nq").write_text("<s> <p> <o> .\n")
             logdir = tmp_path / "metrics"
             logdir.mkdir(parents=True, exist_ok=True)
             (logdir / "metrics.csv").write_text("bad,header\nx,y\n")
@@ -293,7 +300,7 @@ class CompressionUnitTests(VerboseTestCase):
             out_root = tmp_path / "out"
             output = out_root / "rdf"
             output.mkdir(parents=True)
-            (output / "chunk-a.nq").write_text("<s> <p> <o> .\n")
+            (output / "rdf.nq").write_text("<s> <p> <o> .\n")
             logdir = tmp_path / "metrics"
             run_id = f"run-{methods}-fail"
             timestamp = "2026-01-01T00:00:00"

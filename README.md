@@ -7,8 +7,22 @@ using [RML](http://rml.io/) rules and the [RMLStreamer](https://github.com/RMLio
 ## Overview
 
 Pipeline steps:
-1. Convert VCF to TSV (`vcf_as_tsv.sh`)
-2. Convert TSV to RDF with RMLStreamer (`run_conversion.sh`)
+1. Convert VCF to TSV (`src/vcf_as_tsv.sh`)
+2. Convert TSV to RDF with RMLStreamer (`src/run_conversion.sh`)
+3. Compress resultant RDF (`src/compression.sh`)
+
+`src/vcf_as_tsv.sh` now writes:
+- Per-file TSVs (legacy-compatible): `<sample>.tsv`
+- Per-VCF intermediate TSVs:
+  - `<sample>.records.tsv`
+  - `<sample>.header_lines.tsv`
+  - `<sample>.file_metadata.tsv`
+
+The default mapping stores header/file metadata triples and record/call triples in separate RDF graphs. The conversion step then compiles all RMLStreamer output parts into one N-Quads file named after the TSV basename (for example `sample.nq` in `out/sample/`).
+
+Vocabulary references:
+- Ontology: [vcf-rdfizer-vocabulary.ttl](https://github.com/ecrum19/VCF-RDFizer-vocabulary/blob/main/ontology/vcf-rdfizer-vocabulary.ttl)
+- SHACL: [vcf-rdfizer-vocabulary.shacl.ttl](https://github.com/ecrum19/VCF-RDFizer-vocabulary/blob/main/shacl/vcf-rdfizer-vocabulary.shacl.ttl)
 
 ## Quick Start (Docker + Python)
 
@@ -18,12 +32,25 @@ Prereqs:
 
 Example:
 ```
-python vcf_rdfizer.py --input vcf_files/ --rules rules.ttl
+python3 vcf_rdfizer.py --input vcf_files/
+```
+
+Use a custom mapping:
+```
+python3 vcf_rdfizer.py --input vcf_files/ --rules rules/my_rules.ttl
 ```
 
 Outputs:
 - `./tsv` for TSV intermediates
 - `./out` for RDF output
+  - conversion outputs per TSV basename in `./out/<sample>/`
+  - each conversion output directory contains one merged N-Quads file:
+    - `./out/<sample>/<sample>.nq`
+  - the merged file contains both header and record quads in their respective named graphs
+  - compressed outputs:
+    - `./out/gzip/*.gz`
+    - `./out/brotli/*.br`
+    - `./out/hdt/*.hdt`
 - `./run_metrics` for logs and metrics
   - `run_metrics/metrics.csv` includes both conversion and compression metrics per run
 
@@ -48,34 +75,45 @@ The wrapper validates:
 
 CLI usage:
 ```
-python vcf_rdfizer.py --input <file|dir> --rules <rules.ttl> [options]
+python3 vcf_rdfizer.py --input <file|dir> [--rules <path/to/custom_rules.ttl>] [options]
 ```
 
 Options:
 - `--input` (required): path to `.vcf` or `.vcf.gz`, or a directory containing them
-- `--rules` (required): path to RML mapping `.ttl`
+- `--rules` (optional): path to RML mapping `.ttl`
+  - default: `rules/default_rules.ttl`
 - `--out` (default `./out`): RDF output directory
 - `--tsv` (default `./tsv`): TSV output directory
 - `--image` (default `vcf-rdfizer`): Docker image repo (no tag) or full image reference
 - `--image-version` (default `latest`): image tag/version to use when `--image` has no tag
 - `--build`: force docker build
 - `--no-build`: fail if image missing
-- `--out-name` (default `rdf`): output name for `run_conversion.sh`
+- `--out-name` (default `rdf`): fallback output basename only used if a TSV basename cannot be inferred
 - `--metrics` (default `./run_metrics`): metrics/log directory
 - `--compression` (default `gzip,brotli,hdt`): compression methods for `compression.sh` (gzip,brotli,hdt,none)
 - `--keep-tsv`: keep TSV intermediates (otherwise removed after RDF generation if created by the wrapper)
 
+## Rules Directory
+
+- `rules/default_rules.ttl`: active default mapping aligned to `https://w3id.org/vcf-rdfizer/vocab#`
+- `rules/rules.ttl`: preserved legacy mapping (for comparison/migration)
+- `rules/README.md`: guide for extending `default_rules.ttl` with custom triples maps
+
 ## Notes On Mappings
 
 The wrapper runs RMLStreamer with working directory `/data/rules`.
-If your mapping refers to TSVs using relative paths, make them relative to the rules file.
-You can also use absolute container paths like `/data/tsv/<file>.tsv`.
+`rules/default_rules.ttl` is a template. During execution, the wrapper creates per-input rules files that point to each VCF's per-file TSV triplet:
+- `/data/tsv/file_metadata.tsv`
+- `/data/tsv/header_lines.tsv`
+- `/data/tsv/records.tsv`
+
+If you create custom rules, keep these template TSV paths in your mapping so the wrapper can rewrite them per input file.
 
 ## Testing
 
 Run unit tests:
 ```
-python -m unittest discover -s test -p "test_*_unit.py" -v
+python3 -m unittest discover -s test -p "test_*_unit.py" -v
 ```
 
 Test suite notes:
@@ -121,12 +159,12 @@ mvn clean install -DskipTests
 
 Generate tsv representations of vcf files (for all VCFs to be converted):
 ```
-bash vcf_as_tsv.sh vcf_files/ tsv/
+bash src/vcf_as_tsv.sh vcf_files/ tsv/
 ```
 
 Run VCF Conversion:
 ```
-bash run_test.sh
+bash src/run_conversion.sh
 ```
 
 ## TODO:

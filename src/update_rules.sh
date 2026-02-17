@@ -2,30 +2,47 @@
 set -euo pipefail
 
 # Script: update_rules.sh
-# Usage: ./update_rules.sh NEW_FILE_NAME
-# Example: ./update_rules.sh my_sample.tsv
+# Usage: ./update_rules.sh RECORDS_TSV [HEADERS_TSV] [METADATA_TSV] [RULES_FILE]
+# Example: ./update_rules.sh /data/tsv/records.tsv /data/tsv/header_lines.tsv /data/tsv/file_metadata.tsv rules/default_rules.ttl
 
-RULES_FILE="rules.ttl"
+RULES_FILE=${RULES_FILE:-rules/default_rules.ttl}
 
-if [ "$#" -ne 1 ]; then
-  echo "Usage: $0 NEW_FILE_NAME" >&2
+if [ "$#" -lt 1 ] || [ "$#" -gt 4 ]; then
+  echo "Usage: $0 RECORDS_TSV [HEADERS_TSV] [METADATA_TSV] [RULES_FILE]" >&2
   exit 1
 fi
 
-NEW_FILE="$1"
+RECORDS_TSV="$1"
+HEADERS_TSV="${2:-/data/tsv/header_lines.tsv}"
+METADATA_TSV="${3:-/data/tsv/file_metadata.tsv}"
+if [ "$#" -eq 4 ]; then
+  RULES_FILE="$4"
+fi
 
-# Make sure rules.ttl exists
+# Make sure rules file exists
 if [ ! -f "$RULES_FILE" ]; then
   echo "Error: $RULES_FILE not found in current directory." >&2
   exit 1
 fi
 
-# Escape '&' in the replacement text for sed
-ESCAPED_NEW_FILE=${NEW_FILE//&/\\&}
+escape_replacement() {
+  # Escape characters meaningful to sed replacement text.
+  printf '%s' "$1" | sed -e 's/[&#]/\\&/g'
+}
 
-# Replace the value in the csvw:url line, keep the rest intact
-# Changes: csvw:url "something";  ->  csvw:url "NEW_FILE";
-sed -i.bak -E "s#(csvw:url \")[^\"]*(\";)#\1${ESCAPED_NEW_FILE}\2#" "$RULES_FILE"
+ESCAPED_RECORDS_TSV=$(escape_replacement "$RECORDS_TSV")
+ESCAPED_HEADERS_TSV=$(escape_replacement "$HEADERS_TSV")
+ESCAPED_METADATA_TSV=$(escape_replacement "$METADATA_TSV")
 
-echo "Updated csvw:url in $RULES_FILE to \"${NEW_FILE}\""
+# Replace default TSV locations in the mapping.
+sed -i.bak -E \
+  -e "s#(csvw:url \")/data/tsv/records\\.tsv(\";)#\1${ESCAPED_RECORDS_TSV}\2#g" \
+  -e "s#(csvw:url \")/data/tsv/header_lines\\.tsv(\";)#\1${ESCAPED_HEADERS_TSV}\2#g" \
+  -e "s#(csvw:url \")/data/tsv/file_metadata\\.tsv(\";)#\1${ESCAPED_METADATA_TSV}\2#g" \
+  "$RULES_FILE"
+
+echo "Updated TSV source paths in $RULES_FILE"
+echo "  records:  $RECORDS_TSV"
+echo "  headers:  $HEADERS_TSV"
+echo "  metadata: $METADATA_TSV"
 echo "Backup created as ${RULES_FILE}.bak"
