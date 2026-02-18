@@ -98,6 +98,11 @@ GC_OPTS=${GC_OPTS:-}
 
 JAVA_CMD=(java -jar "$JAR" toFile -m "$IN" -o "$OUT_DIR/$OUT_NAME")
 
+# Ensure repeated runs with the same OUT_NAME do not accumulate old artifacts.
+if [[ -d "$OUT_DIR/$OUT_NAME" ]]; then
+  rm -rf "$OUT_DIR/$OUT_NAME"
+fi
+
 # ---------- Pre-run ----------
 IN_SIZE=$(stat_size "$IN")
 VCF_SIZE=$(stat_size "$IN_VCF")
@@ -121,31 +126,23 @@ for NO_EXT_FILE in "$OUT_DIR/$OUT_NAME"/*; do
 done
 
 # Merge all RMLStreamer output parts into one N-Quads file named after the TSV basename/output name.
+# Stream merge + delete each part immediately to avoid temporary 2x disk spikes.
 MERGED_NQ="$OUT_DIR/$OUT_NAME/$OUT_NAME.nq"
-MERGED_TMP="$OUT_DIR/$OUT_NAME/$OUT_NAME.nq.tmp"
 
 shopt -s nullglob
 PART_FILES=("$OUT_DIR/$OUT_NAME"/*.nq)
 if (( ${#PART_FILES[@]} > 0 )); then
-  : > "$MERGED_TMP"
+  : > "$MERGED_NQ"
   for PART_NQ in "${PART_FILES[@]}"; do
-    if [[ "$PART_NQ" == "$MERGED_TMP" ]]; then
+    if [[ "$PART_NQ" == "$MERGED_NQ" ]]; then
       continue
     fi
-    cat "$PART_NQ" >> "$MERGED_TMP"
-    if [[ "$PART_NQ" != "$MERGED_NQ" ]]; then
-      rm -f "$PART_NQ"
-    fi
+    cat "$PART_NQ" >> "$MERGED_NQ"
+    rm -f "$PART_NQ"
   done
-  mv -f "$MERGED_TMP" "$MERGED_NQ"
 else
   : > "$MERGED_NQ"
 fi
-for PART_NQ in "$OUT_DIR/$OUT_NAME"/*.nq; do
-  if [[ "$PART_NQ" != "$MERGED_NQ" ]]; then
-    rm -f "$PART_NQ"
-  fi
-done
 shopt -u nullglob
 
 OUT_SIZE=$(stat_size "$OUT_DIR/$OUT_NAME")

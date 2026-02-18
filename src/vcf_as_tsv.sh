@@ -48,7 +48,6 @@ for infile in "${files[@]}"; do
     continue
   fi
 
-  outfile="${output_dir}/${base}.tsv"
   records_out="${output_dir}/${base}.records.tsv"
   headers_out="${output_dir}/${base}.header_lines.tsv"
   metadata_out="${output_dir}/${base}.file_metadata.tsv"
@@ -57,9 +56,7 @@ for infile in "${files[@]}"; do
   printf "SOURCE_FILE\tHEADER_INDEX\tHEADER_KEY\tHEADER_VALUE\tRAW_LINE\n" > "$headers_out"
   printf "SOURCE_FILE\tFILE_FORMAT\tFILE_DATE\tSOURCE_SOFTWARE\tREFERENCE_GENOME\tHEADER_COUNT\tRECORD_COUNT\n" > "$metadata_out"
 
-  # Writes:
-  # 1) Backward-compatible per-file TSV (<base>.tsv)
-  # 2) Aggregated records/header/metadata TSVs used by default RML rules
+  # Writes per-VCF records/header/metadata TSVs used by the mapping pipeline.
   "${reader_cmd[@]}" "$infile" | awk '
     function trim_cr(s) {
       sub(/\r$/, "", s)
@@ -96,7 +93,6 @@ for infile in "${files[@]}"; do
         $i = trim_cr($i)
       }
       sub(/^#/, "", $1)
-      print > per_file_out
       header_index++
       print source_file, header_index, "CHROM_HEADER", $0, $0 >> headers_out
       next
@@ -105,8 +101,6 @@ for infile in "${files[@]}"; do
       for (i = 1; i <= NF; i++) {
         $i = trim_cr($i)
       }
-
-      print > per_file_out
 
       row_id++
       chrom = $1
@@ -133,12 +127,10 @@ for infile in "${files[@]}"; do
       print source_file, file_format, file_date, source_software, reference_genome, header_index + 0, row_id + 0 >> metadata_out
     }
   ' source_file="$source_file" \
-    per_file_out="$outfile" \
     records_out="$records_out" \
     headers_out="$headers_out" \
     metadata_out="$metadata_out"
 
-  echo "✅ Wrote: $outfile"
   echo "✅ Wrote: $records_out"
   echo "✅ Wrote: $headers_out"
   echo "✅ Wrote: $metadata_out"

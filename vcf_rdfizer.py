@@ -13,6 +13,11 @@ from pathlib import Path
 RMLSTREAMER_JAR_CONTAINER = "/opt/rmlstreamer/RMLStreamer-v2.5.0-standalone.jar"
 _COMMAND_LOGGER = None
 
+COMPRESSED_VCF_EXPANSION_FACTOR = 5.0
+TSV_OVERHEAD_FACTOR = 1.10
+RDF_EXPANSION_LOW_FACTOR = 4.0
+RDF_EXPANSION_HIGH_FACTOR = 12.0
+
 
 class CommandLogger:
     def __init__(self, path: Path):
@@ -102,6 +107,66 @@ def resolve_input(input_path: Path):
 
 def ensure_dir(path: Path):
     path.mkdir(parents=True, exist_ok=True)
+
+
+def format_bytes(num_bytes: int) -> str:
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    value = float(num_bytes)
+    for unit in units:
+        if value < 1024.0 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.2f} {unit}"
+        value /= 1024.0
+    return f"{num_bytes} B"
+
+
+def existing_parent(path: Path) -> Path:
+    cur = path
+    while not cur.exists():
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    return cur
+
+
+def collect_input_vcfs(input_path: Path):
+    if input_path.is_file():
+        return [input_path]
+    if input_path.is_dir():
+        return list_vcfs_in_dir(input_path)
+    return []
+
+
+def estimate_pipeline_sizes(vcf_files, out_dir: Path):
+    input_bytes = 0
+    est_tsv_bytes = 0
+    est_rdf_low_bytes = 0
+    est_rdf_high_bytes = 0
+
+    for vcf in vcf_files:
+        size = vcf.stat().st_size
+        input_bytes += size
+        if vcf.name.endswith(".vcf.gz"):
+            expanded_vcf = size * COMPRESSED_VCF_EXPANSION_FACTOR
+        else:
+            expanded_vcf = float(size)
+
+        est_tsv_bytes += expanded_vcf * TSV_OVERHEAD_FACTOR
+        est_rdf_low_bytes += expanded_vcf * RDF_EXPANSION_LOW_FACTOR
+        est_rdf_high_bytes += expanded_vcf * RDF_EXPANSION_HIGH_FACTOR
+
+    out_anchor = existing_parent(out_dir)
+    free_disk_bytes = shutil.disk_usage(out_anchor).free
+
+    return {
+        "input_bytes": int(input_bytes),
+        "tsv_bytes": int(est_tsv_bytes),
+        "rdf_low_bytes": int(est_rdf_low_bytes),
+        "rdf_high_bytes": int(est_rdf_high_bytes),
+        "free_disk_bytes": int(free_disk_bytes),
+        "disk_anchor": out_anchor,
+    }
 
 
 def slugify(value: str) -> str:
@@ -216,6 +281,11 @@ def main():
         help="Compression methods for compression.sh (gzip,brotli,hdt,none)",
     )
     parser.add_argument("--keep-tsv", action="store_true", help="Keep TSV intermediates")
+    parser.add_argument(
+        "--estimate-size",
+        action="store_true",
+        help="Print a rough storage estimate before running conversion",
+    )
     args = parser.parse_args()
 
     if args.build and args.no_build:
@@ -247,6 +317,25 @@ def main():
         if p.exists() and not p.is_dir():
             eprint(f"Error: expected a directory path but found a file: {p}")
             return 2
+
+    if args.estimate_size:
+        vcf_files = collect_input_vcfs(input_path)
+        estimate = estimate_pipeline_sizes(vcf_files, out_dir)
+        print("Preflight size estimate (rough):")
+        print(f"  - Input VCF total: {format_bytes(estimate['input_bytes'])}")
+        print(f"  - Estimated TSV intermediates: {format_bytes(estimate['tsv_bytes'])}")
+        print(
+            "  - Estimated RDF N-Quads output: "
+            f"{format_bytes(estimate['rdf_low_bytes'])} to {format_bytes(estimate['rdf_high_bytes'])}"
+        )
+        print(
+            f"  - Free disk at {estimate['disk_anchor']}: {format_bytes(estimate['free_disk_bytes'])}"
+        )
+        if estimate["rdf_high_bytes"] > estimate["free_disk_bytes"]:
+            eprint(
+                "Warning: Estimated upper-bound RDF size exceeds currently free disk. "
+                "You may run out of space."
+            )
 
     run_id = datetime.now().strftime("%Y%m%dT%H%M%S")
     timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")

@@ -12,7 +12,6 @@ Pipeline steps:
 3. Compress resultant RDF (`src/compression.sh`)
 
 `src/vcf_as_tsv.sh` now writes:
-- Per-file TSVs (legacy-compatible): `<sample>.tsv`
 - Per-VCF intermediate TSVs:
   - `<sample>.records.tsv`
   - `<sample>.header_lines.tsv`
@@ -80,6 +79,22 @@ The wrapper validates:
 - Rules file exists
 - Docker image exists or is built (if `--image-version` is set, it will attempt to pull that version and fail if missing)
 - Raw command output is written to a hidden wrapper log file instead of printed directly to the terminal
+- Optional preflight storage estimate (`--estimate-size`) with a disk-space warning if the upper-bound estimate exceeds free space
+
+## Size Estimation Logic
+
+Use `--estimate-size` to print a rough preflight estimate before conversion starts.
+
+Current heuristic per input file:
+- If input is `.vcf`: use on-disk size as the expanded VCF size
+- If input is `.vcf.gz`: estimate expanded VCF as `compressed_size * 5.0`
+- Estimate TSV intermediates as `expanded_vcf * 1.10`
+- Estimate RDF N-Quads as a range: `expanded_vcf * 4.0` to `expanded_vcf * 12.0`
+
+Accuracy statement:
+- This is a coarse planning estimate, not a guarantee.
+- Real output size depends heavily on record count, INFO/FORMAT richness, and mapping complexity.
+- Treat it as a risk indicator for disk exhaustion, especially the upper bound.
 
 ## Configuration
 
@@ -102,6 +117,7 @@ Options:
 - `--metrics` (default `./run_metrics`): metrics/log directory
 - `--compression` (default `gzip,brotli,hdt`): compression methods for `compression.sh` (gzip,brotli,hdt,none)
 - `--keep-tsv`: keep TSV intermediates (otherwise removed after RDF generation if created by the wrapper)
+- `--estimate-size`: print rough input/TSV/RDF size estimates and free disk before running
 
 ## Rules Directory
 

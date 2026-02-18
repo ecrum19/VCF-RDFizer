@@ -47,7 +47,7 @@ class VcfAsTsvUnitTests(VerboseTestCase):
             self.assertIn("must end with .vcf or .vcf.gz", result.stdout)
 
     def test_vcf_as_tsv_directory_mode(self):
-        """Directory input: writes per-file TSV plus per-VCF records/header/metadata TSVs."""
+        """Directory input: writes per-VCF records/header/metadata TSVs."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             input_dir = tmp_path / "in"
@@ -64,11 +64,6 @@ class VcfAsTsvUnitTests(VerboseTestCase):
             )
 
             self.assertEqual(result.returncode, 0, msg=result.stderr)
-            out_file = output_dir / "sample.tsv"
-            self.assertTrue(out_file.exists())
-            lines = out_file.read_text().splitlines()
-            self.assertEqual(lines[0], "CHROM\tPOS\tID")
-            self.assertEqual(lines[1], "1\t10\trs1")
             records_all = output_dir / "sample.records.tsv"
             headers_all = output_dir / "sample.header_lines.tsv"
             metadata_all = output_dir / "sample.file_metadata.tsv"
@@ -95,9 +90,6 @@ class VcfAsTsvUnitTests(VerboseTestCase):
             )
 
             self.assertEqual(result.returncode, 0, msg=result.stderr)
-            out_file = output_dir / "sample.tsv"
-            self.assertTrue(out_file.exists())
-            self.assertIn("CHROM\tPOS", out_file.read_text())
             self.assertTrue((output_dir / "sample.records.tsv").exists())
             self.assertTrue((output_dir / "sample.header_lines.tsv").exists())
             self.assertTrue((output_dir / "sample.file_metadata.tsv").exists())
@@ -120,7 +112,7 @@ class VcfAsTsvUnitTests(VerboseTestCase):
             self.assertIn("No .vcf or .vcf.gz files found", result.stdout)
 
     def test_vcf_as_tsv_processes_multiple_files_in_sorted_order(self):
-        """Directory with multiple files: outputs one TSV per VCF in sorted filename order."""
+        """Directory with multiple files: outputs per-VCF split TSV files in sorted order."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             input_dir = tmp_path / "in"
@@ -135,10 +127,8 @@ class VcfAsTsvUnitTests(VerboseTestCase):
                 text=True,
             )
             self.assertEqual(result.returncode, 0, msg=result.stderr)
-            self.assertIn("a.tsv", result.stdout)
-            self.assertIn("b.tsv", result.stdout)
-            self.assertTrue((output_dir / "a.tsv").exists())
-            self.assertTrue((output_dir / "b.tsv").exists())
+            self.assertIn("a.records.tsv", result.stdout)
+            self.assertIn("b.records.tsv", result.stdout)
             a_records = (output_dir / "a.records.tsv").read_text().splitlines()
             b_records = (output_dir / "b.records.tsv").read_text().splitlines()
             self.assertEqual(len(a_records), 2)

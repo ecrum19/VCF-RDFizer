@@ -1,7 +1,10 @@
 import os
+import shutil
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 from pathlib import Path
 from unittest import mock
 
@@ -35,6 +38,71 @@ def mocked_triplets():
 
 
 class WrapperUnitTests(VerboseTestCase):
+    def test_estimate_pipeline_sizes_handles_plain_and_gz_inputs(self):
+        """Size estimation scales gzipped inputs and reports free disk bytes."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            plain = tmp_path / "plain.vcf"
+            gz = tmp_path / "compressed.vcf.gz"
+            plain.write_bytes(b"a" * 100)
+            gz.write_bytes(b"b" * 50)
+
+            with mock.patch("vcf_rdfizer.shutil.disk_usage") as disk_usage:
+                disk_usage.return_value = shutil._ntuple_diskusage(1_000_000, 100_000, 42_000)
+                estimate = vcf_rdfizer.estimate_pipeline_sizes([plain, gz], tmp_path / "out")
+
+            self.assertEqual(estimate["input_bytes"], 150)
+            self.assertEqual(estimate["tsv_bytes"], 385)
+            self.assertEqual(estimate["rdf_low_bytes"], 1400)
+            self.assertEqual(estimate["rdf_high_bytes"], 4200)
+            self.assertEqual(estimate["free_disk_bytes"], 42_000)
+
+    def test_main_estimate_size_prints_summary_and_warning(self):
+        """Estimate mode prints preflight ranges and warns when free disk is too low."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+            commands = []
+
+            def fake_run(cmd, cwd=None, env=None):
+                commands.append(cmd)
+                return 0
+
+            fake_disk = shutil._ntuple_diskusage(10_000_000, 9_900_000, 64)
+            out_buf = StringIO()
+            err_buf = StringIO()
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch.object(
+                    vcf_rdfizer, "check_docker", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "docker_image_exists", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "discover_tsv_triplets", return_value=mocked_triplets()
+                ), mock.patch(
+                    "vcf_rdfizer.shutil.disk_usage", return_value=fake_disk
+                ), redirect_stdout(out_buf), redirect_stderr(err_buf):
+                    rc = invoke_main(
+                        [
+                            "--input",
+                            str(input_dir),
+                            "--rules",
+                            str(rules_path),
+                            "--estimate-size",
+                            "--keep-tsv",
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 0)
+            self.assertIn("Preflight size estimate (rough):", out_buf.getvalue())
+            self.assertIn("Estimated RDF N-Quads output:", out_buf.getvalue())
+            self.assertIn("Warning: Estimated upper-bound RDF size exceeds currently free disk.", err_buf.getvalue())
+            self.assertEqual(len(commands), 3)
+
     def test_main_rejects_build_and_no_build_together(self):
         """Wrapper rejects mutually exclusive --build and --no-build options."""
         with tempfile.TemporaryDirectory() as td:
