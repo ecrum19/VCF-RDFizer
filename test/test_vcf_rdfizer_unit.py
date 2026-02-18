@@ -38,6 +38,19 @@ def mocked_triplets():
 
 
 class WrapperUnitTests(VerboseTestCase):
+    def test_help_flag_prints_usage_guide(self):
+        """Help flag exits cleanly and prints mode usage examples."""
+        out_buf = StringIO()
+        with mock.patch.object(sys, "argv", ["vcf_rdfizer.py", "--help"]), redirect_stdout(out_buf):
+            with self.assertRaises(SystemExit) as exc:
+                vcf_rdfizer.main()
+
+        self.assertEqual(exc.exception.code, 0)
+        text = out_buf.getvalue()
+        self.assertIn("Examples:", text)
+        self.assertIn("-m {full,compress,decompress}", text)
+        self.assertIn("-i INPUT", text)
+
     def test_estimate_pipeline_sizes_handles_plain_and_gz_inputs(self):
         """Size estimation scales gzipped inputs and reports free disk bytes."""
         with tempfile.TemporaryDirectory() as td:
@@ -101,6 +114,46 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertIn("Preflight size estimate (rough):", out_buf.getvalue())
             self.assertIn("Estimated RDF N-Quads output:", out_buf.getvalue())
             self.assertIn("Warning: Estimated upper-bound RDF size exceeds currently free disk.", err_buf.getvalue())
+            self.assertEqual(len(commands), 3)
+
+    def test_main_short_flags_work_for_full_mode(self):
+        """Short aliases run full mode successfully."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+            commands = []
+
+            def fake_run(cmd, cwd=None, env=None):
+                commands.append(cmd)
+                return 0
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch.object(
+                    vcf_rdfizer, "check_docker", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "docker_image_exists", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "discover_tsv_triplets", return_value=mocked_triplets()
+                ):
+                    rc = invoke_main(
+                        [
+                            "-m",
+                            "full",
+                            "-i",
+                            str(input_dir),
+                            "-r",
+                            str(rules_path),
+                            "-c",
+                            "none",
+                            "-k",
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 0)
             self.assertEqual(len(commands), 3)
 
     def test_main_compress_mode_runs_selected_methods(self):

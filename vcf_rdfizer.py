@@ -590,57 +590,83 @@ def run_decompress_mode(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="VCF-RDFizer Docker wrapper")
+    parser = argparse.ArgumentParser(
+        description="VCF-RDFizer Docker wrapper",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  Full pipeline:\n"
+            "    vcf_rdfizer.py -m full -i ./vcf_files -r ./rules/default_rules.ttl\n"
+            "  Compression-only:\n"
+            "    vcf_rdfizer.py -m compress -q ./out/sample/sample.nq -c gzip,brotli\n"
+            "  Decompression-only:\n"
+            "    vcf_rdfizer.py -m decompress -C ./out/gzip/sample.nq.gz\n"
+        ),
+    )
     parser.add_argument(
+        "-m",
         "--mode",
         choices=["full", "compress", "decompress"],
         default="full",
         help="Run mode: full VCF->RDF pipeline, compression-only, or decompression-only",
     )
-    parser.add_argument("--input", default=None, help="VCF file or directory (required for --mode full)")
-    parser.add_argument("--nq", default=None, help="Input .nq file for --mode compress")
     parser.add_argument(
+        "-i",
+        "--input",
+        default=None,
+        help="VCF file or directory (required for --mode full)",
+    )
+    parser.add_argument("-q", "--nq", default=None, help="Input .nq file for --mode compress")
+    parser.add_argument(
+        "-C",
         "--compressed-input",
         default=None,
         help="Compressed RDF input (.gz/.br/.hdt) for --mode decompress",
     )
     parser.add_argument(
+        "-d",
         "--decompress-out",
         default=None,
         help="Output .nq file path for --mode decompress (default: <out>/decompressed/<name>.nq)",
     )
     parser.add_argument(
+        "-r",
         "--rules",
         default=None,
         help="RML mapping rules .ttl (default: <repo>/rules/default_rules.ttl)",
     )
-    parser.add_argument("--out", default="./out", help="RDF output directory")
-    parser.add_argument("--tsv", default="./tsv", help="TSV output directory")
+    parser.add_argument("-o", "--out", default="./out", help="RDF output directory")
+    parser.add_argument("-t", "--tsv", default="./tsv", help="TSV output directory")
     parser.add_argument(
+        "-I",
         "--image",
         default="ecrum19/vcf-rdfizer",
         help="Docker image repo (no tag) or full image reference",
     )
     parser.add_argument(
+        "-v",
         "--image-version",
         default=None,
         help="Image tag/version to use (e.g. 1.2.3). Defaults to latest if omitted.",
     )
-    parser.add_argument("--build", action="store_true", help="Force docker build")
-    parser.add_argument("--no-build", action="store_true", help="Fail if image missing")
+    parser.add_argument("-b", "--build", action="store_true", help="Force docker build")
+    parser.add_argument("-B", "--no-build", action="store_true", help="Fail if image missing")
     parser.add_argument(
+        "-n",
         "--out-name",
         default="rdf",
         help="Fallback output directory/file basename when a TSV basename cannot be inferred",
     )
-    parser.add_argument("--metrics", default="./run_metrics", help="Metrics output directory")
+    parser.add_argument("-M", "--metrics", default="./run_metrics", help="Metrics output directory")
     parser.add_argument(
+        "-c",
         "--compression",
         default="gzip,brotli,hdt",
         help="Compression methods for compression.sh (gzip,brotli,hdt,none)",
     )
-    parser.add_argument("--keep-tsv", action="store_true", help="Keep TSV intermediates")
+    parser.add_argument("-k", "--keep-tsv", action="store_true", help="Keep TSV intermediates")
     parser.add_argument(
+        "-e",
         "--estimate-size",
         action="store_true",
         help="Print a rough storage estimate before running conversion",

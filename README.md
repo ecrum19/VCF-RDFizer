@@ -34,7 +34,7 @@ Prereqs:
 - Docker (running)
 - Python 3.9+
 
-If you need help installing Docker see here.
+If you need help installing Docker see [here](https://docs.docker.com/engine/install/).
 
 Once Docker is installed activate it via the CLI command:
 ```
@@ -42,24 +42,36 @@ sudo systemctl enable --now docker
 ```
 
 
-Example:
-```
-python3 vcf_rdfizer.py --input vcf_files/
+Example usage:
+
+1. Show CLI help (all modes and options):
+```bash
+python3 vcf_rdfizer.py -h
 ```
 
-Use a custom mapping:
-```
-python3 vcf_rdfizer.py --input vcf_files/ --rules rules/my_rules.ttl
-```
-
-Compress only:
-```
-python3 vcf_rdfizer.py --mode compress --nq out/sample/sample.nq --compression gzip,brotli
+2. Full pipeline with default mapping (`rules/default_rules.ttl`):
+```bash
+python3 vcf_rdfizer.py --mode full --input ./vcf_files
 ```
 
-Decompress only:
+3. Full pipeline with a custom mapping and size pre-check:
+```bash
+python3 vcf_rdfizer.py --mode full --input ./vcf_files --rules ./rules/my_rules.ttl --estimate-size
 ```
-python3 vcf_rdfizer.py --mode decompress --compressed-input out/gzip/sample.nq.gz
+
+4. Compression-only mode (compress one `.nq` into selected formats):
+```bash
+python3 vcf_rdfizer.py --mode compress --nq ./out/sample/sample.nq --compression gzip,brotli
+```
+
+5. Decompression-only mode (auto output path under `./out/decompressed/`):
+```bash
+python3 vcf_rdfizer.py --mode decompress --compressed-input ./out/gzip/sample.nq.gz
+```
+
+6. Decompression-only mode with explicit output file:
+```bash
+python3 vcf_rdfizer.py --mode decompress --compressed-input ./out/hdt/sample.hdt --decompress-out ./out/decompressed/sample_from_hdt.nq
 ```
 
 Outputs:
@@ -124,23 +136,24 @@ python3 vcf_rdfizer.py --mode <full|compress|decompress> [mode-specific options]
 ```
 
 Options:
-- `--mode` (default `full`): execution mode (`full`, `compress`, `decompress`)
-- `--input`: full mode input path (`.vcf` / `.vcf.gz` file or directory)
-- `--rules`: full mode RML mapping `.ttl` (default `rules/default_rules.ttl`)
-- `--nq`: compression mode input `.nq` file
-- `--compressed-input`: decompression mode input (`.gz`, `.br`, or `.hdt`)
-- `--decompress-out`: decompression mode output `.nq` file path
-- `--out` (default `./out`): RDF output directory (and compression/decompression output root)
-- `--tsv` (default `./tsv`): TSV output directory (full mode)
-- `--image` (default `ecrum19/vcf-rdfizer`): Docker image repo (no tag) or full image reference
-- `--image-version` (default `1.0.0` effective tag when omitted): image tag/version to use when `--image` has no tag
-- `--build`: force docker build
-- `--no-build`: fail if image missing
-- `--out-name` (default `rdf`): fallback output basename in full mode
-- `--metrics` (default `./run_metrics`): metrics/log directory
-- `--compression` (default `gzip,brotli,hdt`): compression methods (`gzip,brotli,hdt,none`)
-- `--keep-tsv`: keep TSV intermediates (full mode)
-- `--estimate-size`: print rough input/TSV/RDF size estimates and free disk before running (full mode)
+- `-m, --mode` (default `full`): execution mode (`full`, `compress`, `decompress`)
+- `-i, --input`: full mode input path (`.vcf` / `.vcf.gz` file or directory)
+- `-r, --rules`: full mode RML mapping `.ttl` (default `rules/default_rules.ttl`)
+- `-q, --nq`: compression mode input `.nq` file
+- `-C, --compressed-input`: decompression mode input (`.gz`, `.br`, or `.hdt`)
+- `-d, --decompress-out`: decompression mode output `.nq` file path
+- `-o, --out` (default `./out`): RDF output directory (and compression/decompression output root)
+- `-t, --tsv` (default `./tsv`): TSV output directory (full mode)
+- `-I, --image` (default `ecrum19/vcf-rdfizer`): Docker image repo (no tag) or full image reference
+- `-v, --image-version` (default `1.0.0` effective tag when omitted): image tag/version to use when `--image` has no tag
+- `-b, --build`: force docker build
+- `-B, --no-build`: fail if image missing
+- `-n, --out-name` (default `rdf`): fallback output basename in full mode
+- `-M, --metrics` (default `./run_metrics`): metrics/log directory
+- `-c, --compression` (default `gzip,brotli,hdt`): compression methods (`gzip,brotli,hdt,none`)
+- `-k, --keep-tsv`: keep TSV intermediates (full mode)
+- `-e, --estimate-size`: print rough input/TSV/RDF size estimates and free disk before running (full mode)
+- `-h, --help`: show usage guide and exit
 
 ## Rules Directory
 
