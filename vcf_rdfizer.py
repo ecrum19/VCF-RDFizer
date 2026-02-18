@@ -143,7 +143,7 @@ def resolve_image_ref(image: str, image_version: str | None):
             raise ValueError("Do not include a tag in --image when using --image-version.")
         return image, False
     if image_version is None:
-        return f"{image}:latest", False
+        return f"{image}:1.0.0", False
     return f"{image}:{image_version}", True
 
 
@@ -159,7 +159,7 @@ def main():
     parser.add_argument("--tsv", default="./tsv", help="TSV output directory")
     parser.add_argument(
         "--image",
-        default="vcf-rdfizer",
+        default="ecrum19/vcf-rdfizer",
         help="Docker image repo (no tag) or full image reference",
     )
     parser.add_argument(
@@ -249,6 +249,7 @@ def main():
     tsv_existed = tsv_dir.exists()
     ensure_dir(tsv_dir)
     tsv_cmd = [
+        "sudo",
         "docker",
         "run",
         "--rm",
@@ -299,6 +300,7 @@ def main():
 
         print(f"  - Converting '{prefix}' -> out/{output_name}")
         run_cmd = [
+            "sudo",
             "docker",
             "run",
             "--rm",
@@ -338,6 +340,7 @@ def main():
     print("Step 5/5: Compressing outputs")
     compression_out_name = conversion_output_names[0] if len(conversion_output_names) == 1 else ""
     compression_cmd = [
+        "sudo",
         "docker",
         "run",
         "--rm",
