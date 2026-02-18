@@ -126,15 +126,15 @@ def render_rules_for_triplet(template_rules: Path, output_rules: Path, records_n
 
 
 def docker_image_exists(image: str) -> bool:
-    return run(["docker", "image", "inspect", image]) == 0
+    return run(["sudo", "docker", "image", "inspect", image]) == 0
 
 
 def docker_build_image(image: str, repo_root: Path):
-    return run(["docker", "build", "-t", image, "."], cwd=str(repo_root))
+    return run(["sudo", "docker", "build", "-t", image, "."], cwd=str(repo_root))
 
 
 def docker_pull_image(image: str):
-    return run(["docker", "pull", image])
+    return run(["sudo", "docker", "pull", image])
 
 
 def resolve_image_ref(image: str, image_version: str | None):
