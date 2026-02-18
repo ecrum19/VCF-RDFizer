@@ -11,6 +11,11 @@ Pipeline steps:
 2. Convert TSV to RDF with RMLStreamer (`src/run_conversion.sh`)
 3. Compress resultant RDF (`src/compression.sh`)
 
+Wrapper modes:
+- `full`: run the entire VCF -> TSV -> RDF -> compression pipeline
+- `compress`: compress a designated `.nq` file only
+- `decompress`: decompress a designated `.gz`, `.br`, or `.hdt` RDF file
+
 `src/vcf_as_tsv.sh` now writes:
 - Per-VCF intermediate TSVs:
   - `<sample>.records.tsv`
@@ -47,6 +52,16 @@ Use a custom mapping:
 python3 vcf_rdfizer.py --input vcf_files/ --rules rules/my_rules.ttl
 ```
 
+Compress only:
+```
+python3 vcf_rdfizer.py --mode compress --nq out/sample/sample.nq --compression gzip,brotli
+```
+
+Decompress only:
+```
+python3 vcf_rdfizer.py --mode decompress --compressed-input out/gzip/sample.nq.gz
+```
+
 Outputs:
 - `./tsv` for TSV intermediates
 - `./out` for RDF output
@@ -58,6 +73,8 @@ Outputs:
     - `./out/gzip/*.gz`
     - `./out/brotli/*.br`
     - `./out/hdt/*.hdt`
+  - decompressed outputs (decompression mode default):
+    - `./out/decompressed/*.nq`
 - `./run_metrics` for logs and metrics
   - `run_metrics/metrics.csv` includes both conversion and compression metrics per run
   - `run_metrics/.wrapper_logs/wrapper-<timestamp>.log` stores detailed Docker/stdout/stderr command output
@@ -75,8 +92,11 @@ The Docker image bundles:
 
 The wrapper validates:
 - Docker is installed and running
-- Input path exists and contains `.vcf` or `.vcf.gz`
-- Rules file exists
+- Mode-specific required inputs are provided
+- Full mode input path exists and contains `.vcf` or `.vcf.gz`
+- Full mode rules file exists
+- Compression mode input is a `.nq` file
+- Decompression mode input is `.gz`, `.br`, or `.hdt`
 - Docker image exists or is built (if `--image-version` is set, it will attempt to pull that version and fail if missing)
 - Raw command output is written to a hidden wrapper log file instead of printed directly to the terminal
 - Optional preflight storage estimate (`--estimate-size`) with a disk-space warning if the upper-bound estimate exceeds free space
@@ -100,24 +120,27 @@ Accuracy statement:
 
 CLI usage:
 ```
-python3 vcf_rdfizer.py --input <file|dir> [--rules <path/to/custom_rules.ttl>] [options]
+python3 vcf_rdfizer.py --mode <full|compress|decompress> [mode-specific options] [global options]
 ```
 
 Options:
-- `--input` (required): path to `.vcf` or `.vcf.gz`, or a directory containing them
-- `--rules` (optional): path to RML mapping `.ttl`
-  - default: `rules/default_rules.ttl`
-- `--out` (default `./out`): RDF output directory
-- `--tsv` (default `./tsv`): TSV output directory
-- `--image` (default `vcf-rdfizer`): Docker image repo (no tag) or full image reference
-- `--image-version` (default `latest`): image tag/version to use when `--image` has no tag
+- `--mode` (default `full`): execution mode (`full`, `compress`, `decompress`)
+- `--input`: full mode input path (`.vcf` / `.vcf.gz` file or directory)
+- `--rules`: full mode RML mapping `.ttl` (default `rules/default_rules.ttl`)
+- `--nq`: compression mode input `.nq` file
+- `--compressed-input`: decompression mode input (`.gz`, `.br`, or `.hdt`)
+- `--decompress-out`: decompression mode output `.nq` file path
+- `--out` (default `./out`): RDF output directory (and compression/decompression output root)
+- `--tsv` (default `./tsv`): TSV output directory (full mode)
+- `--image` (default `ecrum19/vcf-rdfizer`): Docker image repo (no tag) or full image reference
+- `--image-version` (default `1.0.0` effective tag when omitted): image tag/version to use when `--image` has no tag
 - `--build`: force docker build
 - `--no-build`: fail if image missing
-- `--out-name` (default `rdf`): fallback output basename only used if a TSV basename cannot be inferred
+- `--out-name` (default `rdf`): fallback output basename in full mode
 - `--metrics` (default `./run_metrics`): metrics/log directory
-- `--compression` (default `gzip,brotli,hdt`): compression methods for `compression.sh` (gzip,brotli,hdt,none)
-- `--keep-tsv`: keep TSV intermediates (otherwise removed after RDF generation if created by the wrapper)
-- `--estimate-size`: print rough input/TSV/RDF size estimates and free disk before running
+- `--compression` (default `gzip,brotli,hdt`): compression methods (`gzip,brotli,hdt,none`)
+- `--keep-tsv`: keep TSV intermediates (full mode)
+- `--estimate-size`: print rough input/TSV/RDF size estimates and free disk before running (full mode)
 
 ## Rules Directory
 

@@ -247,9 +247,368 @@ def resolve_image_ref(image: str, image_version: str | None):
     return f"{image}:{image_version}", True
 
 
+def parse_compression_methods(raw: str):
+    value = (raw or "").strip()
+    if value == "" or value == "none":
+        return []
+
+    methods = []
+    for token in value.split(","):
+        method = token.strip()
+        if not method:
+            continue
+        if method not in {"gzip", "brotli", "hdt"}:
+            raise ValueError(
+                f"Unsupported compression method '{method}'. Use gzip,brotli,hdt, or none."
+            )
+        if method not in methods:
+            methods.append(method)
+    return methods
+
+
+def validate_mode_dirs(paths):
+    for p in paths:
+        if p.exists() and not p.is_dir():
+            raise ValueError(f"expected a directory path but found a file: {p}")
+
+
+def ensure_image_available(
+    image_ref: str,
+    *,
+    step_label: str,
+    version_requested: bool,
+    build: bool,
+    no_build: bool,
+    repo_root: Path,
+    wrapper_log_path: Path,
+):
+    print(f"{step_label}: Ensuring Docker image is available")
+    if build:
+        print("  - Building Docker image")
+        if docker_build_image(image_ref, repo_root) != 0:
+            eprint(f"Error: docker build failed. See log: {wrapper_log_path}")
+            return 1
+        return 0
+
+    if docker_image_exists(image_ref):
+        return 0
+
+    if version_requested:
+        print(f"  - Pulling image: {image_ref}")
+        if docker_pull_image(image_ref) != 0:
+            eprint(f"Error: image version '{image_ref}' not found. See log: {wrapper_log_path}")
+            return 2
+        return 0
+
+    if no_build:
+        eprint(f"Error: image '{image_ref}' not found and --no-build set.")
+        return 2
+
+    print("  - Image missing locally, building")
+    if docker_build_image(image_ref, repo_root) != 0:
+        eprint(f"Error: docker build failed. See log: {wrapper_log_path}")
+        return 1
+    return 0
+
+
+def run_full_mode(
+    *,
+    input_dir: Path,
+    container_input: str,
+    rules_path: Path,
+    out_dir: Path,
+    tsv_dir: Path,
+    metrics_dir: Path,
+    image_ref: str,
+    out_name: str,
+    compression: str,
+    keep_tsv: bool,
+    run_id: str,
+    timestamp: str,
+    wrapper_log_path: Path,
+):
+    print("Step 3/5: Converting VCF to TSV")
+    tsv_existed = tsv_dir.exists()
+    ensure_dir(tsv_dir)
+    tsv_cmd = [
+        "sudo",
+        "docker",
+        "run",
+        "--rm",
+        "-v",
+        f"{str(input_dir)}:/data/in:ro",
+        "-v",
+        f"{str(tsv_dir)}:/data/tsv",
+        image_ref,
+        "/opt/vcf-rdfizer/vcf_as_tsv.sh",
+        container_input,
+        "/data/tsv",
+    ]
+    if run(tsv_cmd) != 0:
+        eprint(f"Error: TSV conversion failed. See log: {wrapper_log_path}")
+        return 1
+
+    print("Step 4/5: Running Conversion with RMLStreamer")
+    ensure_dir(out_dir)
+    ensure_dir(metrics_dir)
+
+    try:
+        tsv_triplets = discover_tsv_triplets(tsv_dir)
+    except ValueError as exc:
+        eprint(f"Error: {exc}")
+        eprint(f"See log for details: {wrapper_log_path}")
+        return 1
+
+    generated_rules_dir = metrics_dir / "_generated_rules"
+    if generated_rules_dir.exists():
+        shutil.rmtree(generated_rules_dir, ignore_errors=True)
+    ensure_dir(generated_rules_dir)
+
+    conversion_output_names = []
+    for triplet in tsv_triplets:
+        prefix = triplet["prefix"]
+        safe_prefix = slugify(prefix)
+        generated_rules = generated_rules_dir / f"{safe_prefix}.rules.ttl"
+        render_rules_for_triplet(
+            rules_path,
+            generated_rules,
+            triplet["records"].name,
+            triplet["headers"].name,
+            triplet["metadata"].name,
+        )
+
+        output_name = safe_prefix or slugify(out_name)
+        conversion_output_names.append(output_name)
+        container_generated_rules = f"/data/rules/{generated_rules.name}"
+
+        print(f"  - Converting '{prefix}' into RDF")
+        run_cmd = [
+            "sudo",
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            f"{str(generated_rules_dir)}:/data/rules:ro",
+            "-v",
+            f"{str(tsv_dir)}:/data/tsv:ro",
+            "-v",
+            f"{str(out_dir)}:/data/out",
+            "-v",
+            f"{str(metrics_dir)}:/data/metrics",
+            "-w",
+            "/data/rules",
+            "-e",
+            f"JAR={RMLSTREAMER_JAR_CONTAINER}",
+            "-e",
+            f"IN={container_generated_rules}",
+            "-e",
+            "OUT_DIR=/data/out",
+            "-e",
+            f"OUT_NAME={output_name}",
+            "-e",
+            f"RUN_ID={run_id}",
+            "-e",
+            f"TIMESTAMP={timestamp}",
+            "-e",
+            f"IN_VCF={container_input}",
+            "-e",
+            "LOGDIR=/data/metrics",
+            image_ref,
+            "/opt/vcf-rdfizer/run_conversion.sh",
+        ]
+        if run(run_cmd) != 0:
+            eprint(f"Error: RMLStreamer step failed for '{prefix}'. See log: {wrapper_log_path}")
+            return 1
+
+    print("Step 5/5: Compressing outputs")
+    compression_out_name = conversion_output_names[0] if len(conversion_output_names) == 1 else ""
+    compression_cmd = [
+        "sudo",
+        "docker",
+        "run",
+        "--rm",
+        "-v",
+        f"{str(out_dir)}:/data/out",
+        "-v",
+        f"{str(metrics_dir)}:/data/metrics",
+        "-e",
+        "OUT_ROOT_DIR=/data/out",
+        "-e",
+        f"OUT_NAME={compression_out_name}",
+        "-e",
+        "LOGDIR=/data/metrics",
+        "-e",
+        f"RUN_ID={run_id}",
+        "-e",
+        f"TIMESTAMP={timestamp}",
+        image_ref,
+        "/opt/vcf-rdfizer/compression.sh",
+        "-m",
+        compression,
+    ]
+    if run(compression_cmd) != 0:
+        eprint(f"Error: compression step failed. See log: {wrapper_log_path}")
+        return 1
+
+    if not keep_tsv:
+        if not tsv_existed:
+            shutil.rmtree(tsv_dir, ignore_errors=True)
+        else:
+            print("Note: TSV directory existed; skipping cleanup.")
+
+    print("Done. See output and metrics directories for results.")
+    return 0
+
+
+def run_compress_mode(
+    *,
+    nq_path: Path,
+    out_dir: Path,
+    image_ref: str,
+    methods: list[str],
+    wrapper_log_path: Path,
+):
+    print("Step 3/3: Compressing RDF input")
+    if not methods:
+        print("No compression methods selected (`none`). Nothing to do.")
+        return 0
+
+    ensure_dir(out_dir)
+    in_dir = nq_path.parent
+    input_container = f"/data/in/{nq_path.name}"
+    input_stem = nq_path.stem
+
+    for method in methods:
+        method_dir = out_dir / method
+        ensure_dir(method_dir)
+
+        if method == "gzip":
+            output_name = f"{nq_path.name}.gz"
+            out_container = f"/data/out/{method}/{output_name}"
+            command = f"gzip -c {shlex.quote(input_container)} > {shlex.quote(out_container)}"
+        elif method == "brotli":
+            output_name = f"{nq_path.name}.br"
+            out_container = f"/data/out/{method}/{output_name}"
+            command = f"brotli -q 7 -c {shlex.quote(input_container)} > {shlex.quote(out_container)}"
+        else:
+            output_name = f"{input_stem}.hdt"
+            out_container = f"/data/out/{method}/{output_name}"
+            command = (
+                "bash /opt/hdt-java/hdt-java-cli/bin/rdf2hdt.sh "
+                f"{shlex.quote(input_container)} {shlex.quote(out_container)}"
+            )
+
+        print(f"  - {method}: {output_name}")
+        cmd = [
+            "sudo",
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            f"{str(in_dir)}:/data/in:ro",
+            "-v",
+            f"{str(out_dir)}:/data/out",
+            image_ref,
+            "bash",
+            "-lc",
+            command,
+        ]
+        if run(cmd) != 0:
+            eprint(f"Error: {method} compression failed. See log: {wrapper_log_path}")
+            return 1
+
+    print("Done. Compressed outputs written to mode subdirectories in --out.")
+    return 0
+
+
+def detect_compressed_format(path: Path):
+    if path.name.endswith(".nq.gz") or path.suffix == ".gz":
+        return "gzip"
+    if path.name.endswith(".nq.br") or path.suffix == ".br":
+        return "brotli"
+    if path.suffix == ".hdt":
+        return "hdt"
+    raise ValueError("Compressed input must end with .gz, .br, or .hdt")
+
+
+def default_decompressed_name(path: Path, fmt: str):
+    if fmt == "gzip":
+        if path.name.endswith(".nq.gz"):
+            return path.name[: -len(".gz")]
+        return f"{path.stem}.nq"
+    if fmt == "brotli":
+        if path.name.endswith(".nq.br"):
+            return path.name[: -len(".br")]
+        return f"{path.stem}.nq"
+    return f"{path.stem}.nq"
+
+
+def run_decompress_mode(
+    *,
+    compressed_path: Path,
+    decompressed_out: Path,
+    image_ref: str,
+    wrapper_log_path: Path,
+):
+    print("Step 3/3: Decompressing RDF input")
+    fmt = detect_compressed_format(compressed_path)
+    ensure_dir(decompressed_out.parent)
+
+    source_container = f"/data/in/{compressed_path.name}"
+    output_container = f"/data/out/{decompressed_out.name}"
+
+    if fmt == "gzip":
+        command = f"gzip -dc {shlex.quote(source_container)} > {shlex.quote(output_container)}"
+    elif fmt == "brotli":
+        command = f"brotli -d -c {shlex.quote(source_container)} > {shlex.quote(output_container)}"
+    else:
+        command = (
+            "bash /opt/hdt-java/hdt-java-cli/bin/hdt2rdf.sh "
+            f"{shlex.quote(source_container)} {shlex.quote(output_container)}"
+        )
+
+    cmd = [
+        "sudo",
+        "docker",
+        "run",
+        "--rm",
+        "-v",
+        f"{str(compressed_path.parent)}:/data/in:ro",
+        "-v",
+        f"{str(decompressed_out.parent)}:/data/out",
+        image_ref,
+        "bash",
+        "-lc",
+        command,
+    ]
+    if run(cmd) != 0:
+        eprint(f"Error: decompression failed. See log: {wrapper_log_path}")
+        return 1
+
+    print(f"Done. Decompressed file: {decompressed_out}")
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description="VCF-RDFizer Docker wrapper")
-    parser.add_argument("--input", required=True, help="VCF file or directory")
+    parser.add_argument(
+        "--mode",
+        choices=["full", "compress", "decompress"],
+        default="full",
+        help="Run mode: full VCF->RDF pipeline, compression-only, or decompression-only",
+    )
+    parser.add_argument("--input", default=None, help="VCF file or directory (required for --mode full)")
+    parser.add_argument("--nq", default=None, help="Input .nq file for --mode compress")
+    parser.add_argument(
+        "--compressed-input",
+        default=None,
+        help="Compressed RDF input (.gz/.br/.hdt) for --mode decompress",
+    )
+    parser.add_argument(
+        "--decompress-out",
+        default=None,
+        help="Output .nq file path for --mode decompress (default: <out>/decompressed/<name>.nq)",
+    )
     parser.add_argument(
         "--rules",
         default=None,
@@ -293,32 +652,63 @@ def main():
         return 2
 
     repo_root = Path(__file__).resolve().parent
-    input_path = Path(args.input).expanduser().resolve()
-    if args.rules is None:
-        rules_path = (repo_root / "rules" / "default_rules.ttl").resolve()
-    else:
-        rules_path = Path(args.rules).expanduser().resolve()
     out_dir = Path(args.out).expanduser().resolve()
     tsv_dir = Path(args.tsv).expanduser().resolve()
     metrics_dir = Path(args.metrics).expanduser().resolve()
+    mode = args.mode
 
-    print("Step 1/5: Validating inputs")
+    if mode == "full":
+        print("Step 1/5: Validating inputs")
+    else:
+        print("Step 1/3: Validating inputs")
+
     try:
-        input_dir, container_input = resolve_input(input_path)
+        if mode == "full":
+            if args.input is None:
+                raise ValueError("--input is required in --mode full")
+            input_path = Path(args.input).expanduser().resolve()
+            input_dir, container_input = resolve_input(input_path)
+            if args.rules is None:
+                rules_path = (repo_root / "rules" / "default_rules.ttl").resolve()
+            else:
+                rules_path = Path(args.rules).expanduser().resolve()
+            if not rules_path.exists() or not rules_path.is_file():
+                raise ValueError(f"rules file not found: {rules_path}")
+            validate_mode_dirs([out_dir, tsv_dir, metrics_dir])
+            parse_compression_methods(args.compression)
+        elif mode == "compress":
+            if not args.nq:
+                raise ValueError("--nq is required in --mode compress")
+            nq_path = Path(args.nq).expanduser().resolve()
+            if not nq_path.exists() or not nq_path.is_file():
+                raise ValueError(f"N-Quads input file not found: {nq_path}")
+            if nq_path.suffix != ".nq":
+                raise ValueError("Compression input must be a .nq file")
+            methods = parse_compression_methods(args.compression)
+            validate_mode_dirs([out_dir, metrics_dir])
+        else:
+            if not args.compressed_input:
+                raise ValueError("--compressed-input is required in --mode decompress")
+            compressed_path = Path(args.compressed_input).expanduser().resolve()
+            if not compressed_path.exists() or not compressed_path.is_file():
+                raise ValueError(f"Compressed input file not found: {compressed_path}")
+            fmt = detect_compressed_format(compressed_path)
+            validate_mode_dirs([out_dir, metrics_dir])
+            if args.decompress_out is None:
+                decompressed_out = out_dir / "decompressed" / default_decompressed_name(compressed_path, fmt)
+            else:
+                decompressed_out = Path(args.decompress_out).expanduser().resolve()
+            if decompressed_out.exists() and decompressed_out.is_dir():
+                raise ValueError(f"decompression output path is a directory: {decompressed_out}")
+            if decompressed_out.parent.exists() and not decompressed_out.parent.is_dir():
+                raise ValueError(
+                    f"decompression output parent is not a directory: {decompressed_out.parent}"
+                )
     except ValueError as exc:
         eprint(f"Error: {exc}")
         return 2
 
-    if not rules_path.exists() or not rules_path.is_file():
-        eprint(f"Error: rules file not found: {rules_path}")
-        return 2
-
-    for p in [out_dir, tsv_dir, metrics_dir]:
-        if p.exists() and not p.is_dir():
-            eprint(f"Error: expected a directory path but found a file: {p}")
-            return 2
-
-    if args.estimate_size:
+    if mode == "full" and args.estimate_size:
         vcf_files = collect_input_vcfs(input_path)
         estimate = estimate_pipeline_sizes(vcf_files, out_dir)
         print("Preflight size estimate (rough):")
@@ -355,159 +745,48 @@ def main():
             eprint(f"Error: {exc}")
             return 2
 
-        print("Step 2/5: Ensuring Docker image is available")
-        if args.build:
-            print("  - Building Docker image")
-            if docker_build_image(image_ref, repo_root) != 0:
-                eprint(f"Error: docker build failed. See log: {wrapper_log_path}")
-                return 1
-        else:
-            if not docker_image_exists(image_ref):
-                if version_requested:
-                    print(f"  - Pulling image: {image_ref}")
-                    if docker_pull_image(image_ref) != 0:
-                        eprint(f"Error: image version '{image_ref}' not found. See log: {wrapper_log_path}")
-                        return 2
-                else:
-                    if args.no_build:
-                        eprint(f"Error: image '{image_ref}' not found and --no-build set.")
-                        return 2
-                    print("  - Image missing locally, building")
-                    if docker_build_image(image_ref, repo_root) != 0:
-                        eprint(f"Error: docker build failed. See log: {wrapper_log_path}")
-                        return 1
-
-        print("Step 3/5: Converting VCF to TSV")
-        tsv_existed = tsv_dir.exists()
-        ensure_dir(tsv_dir)
-        tsv_cmd = [
-            "sudo",
-            "docker",
-            "run",
-            "--rm",
-            "-v",
-            f"{str(input_dir)}:/data/in:ro",
-            "-v",
-            f"{str(tsv_dir)}:/data/tsv",
+        image_code = ensure_image_available(
             image_ref,
-            "/opt/vcf-rdfizer/vcf_as_tsv.sh",
-            container_input,
-            "/data/tsv",
-        ]
-        if run(tsv_cmd) != 0:
-            eprint(f"Error: TSV conversion failed. See log: {wrapper_log_path}")
-            return 1
+            step_label="Step 2/5" if mode == "full" else "Step 2/3",
+            version_requested=version_requested,
+            build=args.build,
+            no_build=args.no_build,
+            repo_root=repo_root,
+            wrapper_log_path=wrapper_log_path,
+        )
+        if image_code != 0:
+            return image_code
 
-        print("Step 4/5: Running Conversion with RMLStreamer")
-        ensure_dir(out_dir)
-        ensure_dir(metrics_dir)
-
-        try:
-            tsv_triplets = discover_tsv_triplets(tsv_dir)
-        except ValueError as exc:
-            eprint(f"Error: {exc}")
-            eprint(f"See log for details: {wrapper_log_path}")
-            return 1
-
-        generated_rules_dir = metrics_dir / "_generated_rules"
-        if generated_rules_dir.exists():
-            shutil.rmtree(generated_rules_dir, ignore_errors=True)
-        ensure_dir(generated_rules_dir)
-
-        conversion_output_names = []
-        for triplet in tsv_triplets:
-            prefix = triplet["prefix"]
-            safe_prefix = slugify(prefix)
-            generated_rules = generated_rules_dir / f"{safe_prefix}.rules.ttl"
-            render_rules_for_triplet(
-                rules_path,
-                generated_rules,
-                triplet["records"].name,
-                triplet["headers"].name,
-                triplet["metadata"].name,
+        if mode == "full":
+            return run_full_mode(
+                input_dir=input_dir,
+                container_input=container_input,
+                rules_path=rules_path,
+                out_dir=out_dir,
+                tsv_dir=tsv_dir,
+                metrics_dir=metrics_dir,
+                image_ref=image_ref,
+                out_name=args.out_name,
+                compression=args.compression,
+                keep_tsv=args.keep_tsv,
+                run_id=run_id,
+                timestamp=timestamp,
+                wrapper_log_path=wrapper_log_path,
             )
-
-            output_name = safe_prefix or slugify(args.out_name)
-            conversion_output_names.append(output_name)
-            container_generated_rules = f"/data/rules/{generated_rules.name}"
-
-            print(f"  - Converting '{prefix}' into RDF")
-            run_cmd = [
-                "sudo",
-                "docker",
-                "run",
-                "--rm",
-                "-v",
-                f"{str(generated_rules_dir)}:/data/rules:ro",
-                "-v",
-                f"{str(tsv_dir)}:/data/tsv:ro",
-                "-v",
-                f"{str(out_dir)}:/data/out",
-                "-v",
-                f"{str(metrics_dir)}:/data/metrics",
-                "-w",
-                "/data/rules",
-                "-e",
-                f"JAR={RMLSTREAMER_JAR_CONTAINER}",
-                "-e",
-                f"IN={container_generated_rules}",
-                "-e",
-                "OUT_DIR=/data/out",
-                "-e",
-                f"OUT_NAME={output_name}",
-                "-e",
-                f"RUN_ID={run_id}",
-                "-e",
-                f"TIMESTAMP={timestamp}",
-                "-e",
-                f"IN_VCF={container_input}",
-                "-e",
-                "LOGDIR=/data/metrics",
-                image_ref,
-                "/opt/vcf-rdfizer/run_conversion.sh",
-            ]
-            if run(run_cmd) != 0:
-                eprint(f"Error: RMLStreamer step failed for '{prefix}'. See log: {wrapper_log_path}")
-                return 1
-
-        print("Step 5/5: Compressing outputs")
-        compression_out_name = conversion_output_names[0] if len(conversion_output_names) == 1 else ""
-        compression_cmd = [
-            "sudo",
-            "docker",
-            "run",
-            "--rm",
-            "-v",
-            f"{str(out_dir)}:/data/out",
-            "-v",
-            f"{str(metrics_dir)}:/data/metrics",
-            "-e",
-            "OUT_ROOT_DIR=/data/out",
-            "-e",
-            f"OUT_NAME={compression_out_name}",
-            "-e",
-            "LOGDIR=/data/metrics",
-            "-e",
-            f"RUN_ID={run_id}",
-            "-e",
-            f"TIMESTAMP={timestamp}",
-            image_ref,
-            "/opt/vcf-rdfizer/compression.sh",
-            "-m",
-            args.compression,
-        ]
-        if run(compression_cmd) != 0:
-            eprint(f"Error: compression step failed. See log: {wrapper_log_path}")
-            return 1
-
-        if not args.keep_tsv:
-            if not tsv_existed:
-                shutil.rmtree(tsv_dir, ignore_errors=True)
-            else:
-                print("Note: TSV directory existed; skipping cleanup.")
-
-        print("Done. See output and metrics directories for results.")
-        return 0
+        if mode == "compress":
+            return run_compress_mode(
+                nq_path=nq_path,
+                out_dir=out_dir,
+                image_ref=image_ref,
+                methods=methods,
+                wrapper_log_path=wrapper_log_path,
+            )
+        return run_decompress_mode(
+            compressed_path=compressed_path,
+            decompressed_out=decompressed_out,
+            image_ref=image_ref,
+            wrapper_log_path=wrapper_log_path,
+        )
     finally:
         if _COMMAND_LOGGER is not None:
             _COMMAND_LOGGER.close()
