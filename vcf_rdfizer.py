@@ -2,6 +2,7 @@
 
 import argparse
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -10,6 +11,38 @@ from pathlib import Path
 
 
 RMLSTREAMER_JAR_CONTAINER = "/opt/rmlstreamer/RMLStreamer-v2.5.0-standalone.jar"
+_COMMAND_LOGGER = None
+
+
+class CommandLogger:
+    def __init__(self, path: Path):
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle = self.path.open("a", encoding="utf-8")
+
+    def run(self, cmd, cwd=None, env=None):
+        timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        rendered = " ".join(shlex.quote(str(part)) for part in cmd)
+        self._handle.write(f"\n[{timestamp}] $ {rendered}\n")
+        if cwd is not None:
+            self._handle.write(f"cwd={cwd}\n")
+        self._handle.flush()
+
+        result = subprocess.run(
+            cmd,
+            cwd=cwd,
+            env=env,
+            stdout=self._handle,
+            stderr=self._handle,
+            text=True,
+        )
+        self._handle.write(f"[exit {result.returncode}]\n")
+        self._handle.flush()
+        return result.returncode
+
+    def close(self):
+        if not self._handle.closed:
+            self._handle.close()
 
 
 def eprint(*args):
@@ -17,7 +50,9 @@ def eprint(*args):
 
 
 def run(cmd, cwd=None, env=None):
-    return subprocess.run(cmd, cwd=cwd, env=env).returncode
+    if _COMMAND_LOGGER is not None:
+        return _COMMAND_LOGGER.run(cmd, cwd=cwd, env=env)
+    return subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True).returncode
 
 
 def check_docker():
@@ -215,166 +250,179 @@ def main():
 
     run_id = datetime.now().strftime("%Y%m%dT%H%M%S")
     timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-
-    if not check_docker():
-        return 2
-
-    try:
-        image_ref, version_requested = resolve_image_ref(args.image, args.image_version)
-    except ValueError as exc:
-        eprint(f"Error: {exc}")
-        return 2
-
-    print("Step 2/5: Ensuring Docker image is available")
-    if args.build:
-        if docker_build_image(image_ref, repo_root) != 0:
-            eprint("Error: docker build failed.")
-            return 1
-    else:
-        if not docker_image_exists(image_ref):
-            if version_requested:
-                print(f"Image {image_ref} not found locally. Attempting to pull...")
-                if docker_pull_image(image_ref) != 0:
-                    eprint(f"Error: image version '{image_ref}' not found.")
-                    return 2
-            else:
-                if args.no_build:
-                    eprint(f"Error: image '{image_ref}' not found and --no-build set.")
-                    return 2
-                if docker_build_image(image_ref, repo_root) != 0:
-                    eprint("Error: docker build failed.")
-                    return 1
-
-    print("Step 3/5: Converting VCF to TSV")
-    tsv_existed = tsv_dir.exists()
-    ensure_dir(tsv_dir)
-    tsv_cmd = [
-        "sudo",
-        "docker",
-        "run",
-        "--rm",
-        "-v",
-        f"{str(input_dir)}:/data/in:ro",
-        "-v",
-        f"{str(tsv_dir)}:/data/tsv",
-        image_ref,
-        "/opt/vcf-rdfizer/vcf_as_tsv.sh",
-        container_input,
-        "/data/tsv",
-    ]
-    if run(tsv_cmd) != 0:
-        eprint("Error: TSV conversion failed.")
-        return 1
-
-    print("Step 4/5: Running Conversion with RMLStreamer")
-    ensure_dir(out_dir)
-    ensure_dir(metrics_dir)
+    wrapper_log_path = metrics_dir / ".wrapper_logs" / f"wrapper-{run_id}.log"
+    global _COMMAND_LOGGER
+    _COMMAND_LOGGER = CommandLogger(wrapper_log_path)
+    print(f"Detailed logs: {wrapper_log_path}")
 
     try:
-        tsv_triplets = discover_tsv_triplets(tsv_dir)
-    except ValueError as exc:
-        eprint(f"Error: {exc}")
-        return 1
+        if not check_docker():
+            eprint(f"See log for details: {wrapper_log_path}")
+            return 2
 
-    generated_rules_dir = metrics_dir / "_generated_rules"
-    if generated_rules_dir.exists():
-        shutil.rmtree(generated_rules_dir, ignore_errors=True)
-    ensure_dir(generated_rules_dir)
+        try:
+            image_ref, version_requested = resolve_image_ref(args.image, args.image_version)
+        except ValueError as exc:
+            eprint(f"Error: {exc}")
+            return 2
 
-    conversion_output_names = []
-    for triplet in tsv_triplets:
-        prefix = triplet["prefix"]
-        safe_prefix = slugify(prefix)
-        generated_rules = generated_rules_dir / f"{safe_prefix}.rules.ttl"
-        render_rules_for_triplet(
-            rules_path,
-            generated_rules,
-            triplet["records"].name,
-            triplet["headers"].name,
-            triplet["metadata"].name,
-        )
+        print("Step 2/5: Ensuring Docker image is available")
+        if args.build:
+            print("  - Building Docker image")
+            if docker_build_image(image_ref, repo_root) != 0:
+                eprint(f"Error: docker build failed. See log: {wrapper_log_path}")
+                return 1
+        else:
+            if not docker_image_exists(image_ref):
+                if version_requested:
+                    print(f"  - Pulling image: {image_ref}")
+                    if docker_pull_image(image_ref) != 0:
+                        eprint(f"Error: image version '{image_ref}' not found. See log: {wrapper_log_path}")
+                        return 2
+                else:
+                    if args.no_build:
+                        eprint(f"Error: image '{image_ref}' not found and --no-build set.")
+                        return 2
+                    print("  - Image missing locally, building")
+                    if docker_build_image(image_ref, repo_root) != 0:
+                        eprint(f"Error: docker build failed. See log: {wrapper_log_path}")
+                        return 1
 
-        output_name = safe_prefix or slugify(args.out_name)
-        conversion_output_names.append(output_name)
-        container_generated_rules = f"/data/rules/{generated_rules.name}"
-
-        print(f"  - Converting '{prefix}' -> out/{output_name}")
-        run_cmd = [
+        print("Step 3/5: Converting VCF to TSV")
+        tsv_existed = tsv_dir.exists()
+        ensure_dir(tsv_dir)
+        tsv_cmd = [
             "sudo",
             "docker",
             "run",
             "--rm",
             "-v",
-            f"{str(generated_rules_dir)}:/data/rules:ro",
+            f"{str(input_dir)}:/data/in:ro",
             "-v",
-            f"{str(tsv_dir)}:/data/tsv:ro",
+            f"{str(tsv_dir)}:/data/tsv",
+            image_ref,
+            "/opt/vcf-rdfizer/vcf_as_tsv.sh",
+            container_input,
+            "/data/tsv",
+        ]
+        if run(tsv_cmd) != 0:
+            eprint(f"Error: TSV conversion failed. See log: {wrapper_log_path}")
+            return 1
+
+        print("Step 4/5: Running Conversion with RMLStreamer")
+        ensure_dir(out_dir)
+        ensure_dir(metrics_dir)
+
+        try:
+            tsv_triplets = discover_tsv_triplets(tsv_dir)
+        except ValueError as exc:
+            eprint(f"Error: {exc}")
+            eprint(f"See log for details: {wrapper_log_path}")
+            return 1
+
+        generated_rules_dir = metrics_dir / "_generated_rules"
+        if generated_rules_dir.exists():
+            shutil.rmtree(generated_rules_dir, ignore_errors=True)
+        ensure_dir(generated_rules_dir)
+
+        conversion_output_names = []
+        for triplet in tsv_triplets:
+            prefix = triplet["prefix"]
+            safe_prefix = slugify(prefix)
+            generated_rules = generated_rules_dir / f"{safe_prefix}.rules.ttl"
+            render_rules_for_triplet(
+                rules_path,
+                generated_rules,
+                triplet["records"].name,
+                triplet["headers"].name,
+                triplet["metadata"].name,
+            )
+
+            output_name = safe_prefix or slugify(args.out_name)
+            conversion_output_names.append(output_name)
+            container_generated_rules = f"/data/rules/{generated_rules.name}"
+
+            print(f"  - Converting '{prefix}'")
+            run_cmd = [
+                "sudo",
+                "docker",
+                "run",
+                "--rm",
+                "-v",
+                f"{str(generated_rules_dir)}:/data/rules:ro",
+                "-v",
+                f"{str(tsv_dir)}:/data/tsv:ro",
+                "-v",
+                f"{str(out_dir)}:/data/out",
+                "-v",
+                f"{str(metrics_dir)}:/data/metrics",
+                "-w",
+                "/data/rules",
+                "-e",
+                f"JAR={RMLSTREAMER_JAR_CONTAINER}",
+                "-e",
+                f"IN={container_generated_rules}",
+                "-e",
+                "OUT_DIR=/data/out",
+                "-e",
+                f"OUT_NAME={output_name}",
+                "-e",
+                f"RUN_ID={run_id}",
+                "-e",
+                f"TIMESTAMP={timestamp}",
+                "-e",
+                f"IN_VCF={container_input}",
+                "-e",
+                "LOGDIR=/data/metrics",
+                image_ref,
+                "/opt/vcf-rdfizer/run_conversion.sh",
+            ]
+            if run(run_cmd) != 0:
+                eprint(f"Error: RMLStreamer step failed for '{prefix}'. See log: {wrapper_log_path}")
+                return 1
+
+        print("Step 5/5: Compressing outputs")
+        compression_out_name = conversion_output_names[0] if len(conversion_output_names) == 1 else ""
+        compression_cmd = [
+            "sudo",
+            "docker",
+            "run",
+            "--rm",
             "-v",
             f"{str(out_dir)}:/data/out",
             "-v",
             f"{str(metrics_dir)}:/data/metrics",
-            "-w",
-            "/data/rules",
             "-e",
-            f"JAR={RMLSTREAMER_JAR_CONTAINER}",
+            "OUT_ROOT_DIR=/data/out",
             "-e",
-            f"IN={container_generated_rules}",
+            f"OUT_NAME={compression_out_name}",
             "-e",
-            "OUT_DIR=/data/out",
-            "-e",
-            f"OUT_NAME={output_name}",
+            "LOGDIR=/data/metrics",
             "-e",
             f"RUN_ID={run_id}",
             "-e",
             f"TIMESTAMP={timestamp}",
-            "-e",
-            f"IN_VCF={container_input}",
-            "-e",
-            "LOGDIR=/data/metrics",
             image_ref,
-            "/opt/vcf-rdfizer/run_conversion.sh",
+            "/opt/vcf-rdfizer/compression.sh",
+            "-m",
+            args.compression,
         ]
-        if run(run_cmd) != 0:
-            eprint(f"Error: RMLStreamer step failed for '{prefix}'.")
+        if run(compression_cmd) != 0:
+            eprint(f"Error: compression step failed. See log: {wrapper_log_path}")
             return 1
 
-    print("Step 5/5: Compressing outputs")
-    compression_out_name = conversion_output_names[0] if len(conversion_output_names) == 1 else ""
-    compression_cmd = [
-        "sudo",
-        "docker",
-        "run",
-        "--rm",
-        "-v",
-        f"{str(out_dir)}:/data/out",
-        "-v",
-        f"{str(metrics_dir)}:/data/metrics",
-        "-e",
-        "OUT_ROOT_DIR=/data/out",
-        "-e",
-        f"OUT_NAME={compression_out_name}",
-        "-e",
-        "LOGDIR=/data/metrics",
-        "-e",
-        f"RUN_ID={run_id}",
-        "-e",
-        f"TIMESTAMP={timestamp}",
-        image_ref,
-        "/opt/vcf-rdfizer/compression.sh",
-        "-m",
-        args.compression,
-    ]
-    if run(compression_cmd) != 0:
-        eprint("Error: compression step failed.")
-        return 1
+        if not args.keep_tsv:
+            if not tsv_existed:
+                shutil.rmtree(tsv_dir, ignore_errors=True)
+            else:
+                print("Note: TSV directory existed; skipping cleanup.")
 
-    if not args.keep_tsv:
-        if not tsv_existed:
-            shutil.rmtree(tsv_dir, ignore_errors=True)
-        else:
-            print("Note: TSV directory existed; skipping cleanup.")
-
-    print("Done. See output and metrics directories for results and statistics about the conversion process.")
-    return 0
+        print("Done. See output and metrics directories for results.")
+        return 0
+    finally:
+        if _COMMAND_LOGGER is not None:
+            _COMMAND_LOGGER.close()
+            _COMMAND_LOGGER = None
 
 
 if __name__ == "__main__":

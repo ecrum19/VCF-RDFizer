@@ -61,6 +61,7 @@ Outputs:
     - `./out/hdt/*.hdt`
 - `./run_metrics` for logs and metrics
   - `run_metrics/metrics.csv` includes both conversion and compression metrics per run
+  - `run_metrics/.wrapper_logs/wrapper-<timestamp>.log` stores detailed Docker/stdout/stderr command output
 
 ## How Dependencies Are Handled
 
@@ -78,6 +79,7 @@ The wrapper validates:
 - Input path exists and contains `.vcf` or `.vcf.gz`
 - Rules file exists
 - Docker image exists or is built (if `--image-version` is set, it will attempt to pull that version and fail if missing)
+- Raw command output is written to a hidden wrapper log file instead of printed directly to the terminal
 
 ## Configuration
 
