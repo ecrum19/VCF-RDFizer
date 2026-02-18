@@ -24,7 +24,7 @@ def check_docker():
     if shutil.which("docker") is None:
         eprint("Error: Docker is not installed or not on PATH.")
         return False
-    code = run(["docker", "version"])
+    code = run(["sudo", "docker", "version"])
     if code != 0:
         eprint("Error: Docker is not available. Is the daemon running?")
         return False
@@ -96,18 +96,18 @@ def discover_tsv_triplets(tsv_dir: Path):
         return triplets
 
     # Backward-compatible fallback for legacy aggregate TSV naming.
-    legacy_records = tsv_dir / "records.tsv"
-    legacy_headers = tsv_dir / "header_lines.tsv"
-    legacy_metadata = tsv_dir / "file_metadata.tsv"
-    if legacy_records.exists() and legacy_headers.exists() and legacy_metadata.exists():
-        return [
-            {
-                "prefix": "records",
-                "records": legacy_records,
-                "headers": legacy_headers,
-                "metadata": legacy_metadata,
-            }
-        ]
+    # legacy_records = tsv_dir / "records.tsv"
+    # legacy_headers = tsv_dir / "header_lines.tsv"
+    # legacy_metadata = tsv_dir / "file_metadata.tsv"
+    # if legacy_records.exists() and legacy_headers.exists() and legacy_metadata.exists():
+    #     return [
+    #         {
+    #             "prefix": "records",
+    #             "records": legacy_records,
+    #             "headers": legacy_headers,
+    #             "metadata": legacy_metadata,
+    #         }
+    #     ]
 
     tsv_files = sorted(p.name for p in tsv_dir.glob("*.tsv"))
     tsv_preview = ", ".join(tsv_files) if tsv_files else "(none)"

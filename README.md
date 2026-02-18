@@ -30,6 +30,14 @@ Prereqs:
 - Docker (running)
 - Python 3.9+
 
+If you need help installing Docker see here.
+
+Once Docker is installed activate it via the CLI command:
+```
+sudo systemctl enable --now docker
+```
+
+
 Example:
 ```
 python3 vcf_rdfizer.py --input vcf_files/
