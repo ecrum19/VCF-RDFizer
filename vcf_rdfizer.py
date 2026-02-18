@@ -342,7 +342,7 @@ def main():
             conversion_output_names.append(output_name)
             container_generated_rules = f"/data/rules/{generated_rules.name}"
 
-            print(f"  - Converting '{prefix}'")
+            print(f"  - Converting '{prefix}' into RDF")
             run_cmd = [
                 "sudo",
                 "docker",
