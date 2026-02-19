@@ -28,6 +28,7 @@ RUN apt-get update \
     findutils \
     gawk \
     gzip \
+    maven \
     nodejs \
   && rm -rf /var/lib/apt/lists/*
 
@@ -40,6 +41,7 @@ ENV RMLSTREAMER_JAR=/opt/rmlstreamer/RMLStreamer-v${RMLSTREAMER_VERSION}-standal
 ENV JAR=/opt/rmlstreamer/RMLStreamer-v${RMLSTREAMER_VERSION}-standalone.jar
 
 COPY --from=build-hdt /opt/hdt-java /opt/hdt-java
+COPY --from=build-hdt /root/.m2 /root/.m2
 COPY src/*.sh /opt/vcf-rdfizer/
 
 RUN chmod +x /opt/vcf-rdfizer/*.sh \
