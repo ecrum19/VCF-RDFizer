@@ -565,8 +565,10 @@ def run_compress_mode(
             command = (
                 "set -euo pipefail; "
                 "HDT_BIN=/opt/hdt-java/hdt-java-cli/bin/rdf2hdt.sh; "
+                "HDT_PROJECT_DIR=/opt/hdt-java/hdt-java-cli; "
                 'if [[ ! -x "$HDT_BIN" ]]; then echo "Missing rdf2hdt.sh at $HDT_BIN" >&2; exit 127; fi; '
                 'if ! command -v java >/dev/null 2>&1; then echo "Java runtime not found on PATH" >&2; exit 127; fi; '
+                'if [[ -f "$HDT_PROJECT_DIR/pom.xml" ]]; then cd "$HDT_PROJECT_DIR"; fi; '
                 'bash "$HDT_BIN" '
                 f"{shlex.quote(input_container)} {shlex.quote(out_container)}"
             )
@@ -642,8 +644,10 @@ def run_decompress_mode(
         command = (
             "set -euo pipefail; "
             "HDT2RDF_BIN=/opt/hdt-java/hdt-java-cli/bin/hdt2rdf.sh; "
+            "HDT_PROJECT_DIR=/opt/hdt-java/hdt-java-cli; "
             'if [[ ! -x "$HDT2RDF_BIN" ]]; then echo "Missing hdt2rdf.sh at $HDT2RDF_BIN" >&2; exit 127; fi; '
             'if ! command -v java >/dev/null 2>&1; then echo "Java runtime not found on PATH" >&2; exit 127; fi; '
+            'if [[ -f "$HDT_PROJECT_DIR/pom.xml" ]]; then cd "$HDT_PROJECT_DIR"; fi; '
             'bash "$HDT2RDF_BIN" '
             f"{shlex.quote(source_container)} {shlex.quote(output_container)}"
         )

@@ -12,6 +12,10 @@ LOGDIR=${LOGDIR:-run_metrics}
 
 # rdf2hdt binary
 HDT=${RDF2HDT:-/opt/hdt-java/hdt-java-cli/bin/rdf2hdt.sh}
+HDT_PROJECT_DIR=${HDT_PROJECT_DIR:-}
+if [[ -z "$HDT_PROJECT_DIR" ]]; then
+  HDT_PROJECT_DIR="$(cd "$(dirname "$HDT")/.." 2>/dev/null && pwd || true)"
+fi
 
 # Base URI for rdf2hdt (reserved for future use)
 BASE_URI=${BASE_URI:-http://example.org/base}
@@ -403,10 +407,15 @@ for OUT in "${OUTPUT_DIRS[@]}"; do
       HDT_PATH="$HDT_ROOT/$BASENAME.hdt"
       EXIT_CODE_HDT=0
 
+      HDT_CMD="bash \"$HDT\" \"$SOURCE_RDF\" \"$HDT_PATH\""
+      if [[ -n "$HDT_PROJECT_DIR" && -f "$HDT_PROJECT_DIR/pom.xml" ]]; then
+        HDT_CMD="cd \"$HDT_PROJECT_DIR\" && $HDT_CMD"
+      fi
+
       if have_gnu_time; then
-        /usr/bin/time -v -o "$TIME_LOG_HDT" -- bash "$HDT" "$SOURCE_RDF" "$HDT_PATH" || EXIT_CODE_HDT=$?
+        /usr/bin/time -v -o "$TIME_LOG_HDT" -- bash -lc "$HDT_CMD" || EXIT_CODE_HDT=$?
       else
-        { time -p bash "$HDT" "$SOURCE_RDF" "$HDT_PATH"; } >"$TIME_LOG_HDT" 2>&1 || EXIT_CODE_HDT=$?
+        { time -p bash -lc "$HDT_CMD"; } >"$TIME_LOG_HDT" 2>&1 || EXIT_CODE_HDT=$?
       fi
 
       HDT_SIZE=$(stat_size "$HDT_PATH")
