@@ -154,6 +154,10 @@ class CompressionUnitTests(VerboseTestCase):
             self.assertTrue((out_root / "gzip" / "rdf.nq.gz").exists())
             self.assertTrue((out_root / "brotli" / "rdf.nq.br").exists())
             self.assertTrue((out_root / "hdt" / "rdf.hdt").exists())
+            self.assertTrue((logdir / "compression-time-gzip-rdf-run-compress-1.txt").exists())
+            self.assertTrue((logdir / "compression-time-brotli-rdf-run-compress-1.txt").exists())
+            self.assertTrue((logdir / "compression-time-hdt-rdf-run-compress-1.txt").exists())
+            self.assertTrue((logdir / "compression-metrics-rdf-run-compress-1.json").exists())
 
             row = read_metrics_row(metrics_csv, run_id, "rdf")
             self.assertEqual(row["run_id"], run_id)

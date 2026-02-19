@@ -67,6 +67,8 @@ printf '<s> <p> <o> .\\n' > "$out/part-000"
             merged_nq = out_dir / "rdf" / "rdf.nq"
             self.assertTrue(merged_nq.exists())
             self.assertIn("<s> <p> <o> .", merged_nq.read_text())
+            self.assertTrue((metrics_dir / "conversion-time-rdf-run123.txt").exists())
+            self.assertTrue((metrics_dir / "conversion-metrics-rdf-run123.json").exists())
 
             metrics_csv = metrics_dir / "metrics.csv"
             self.assertTrue(metrics_csv.exists())

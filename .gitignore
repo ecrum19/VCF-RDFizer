@@ -4,8 +4,10 @@ scripts/node_modules
 !time-*
 
 run_output/
-tsv_vcf_files/
-test_vcf_files/
+test_vcf_files/*
+!test_vcf_files/test-100.vcf
+!test_vcf_files/test-1k.vcf
+!test_vcf_files/test-10k.vcf
 RMLStreamer-v2.5.0-standalone.jar
 out/
 tsv/

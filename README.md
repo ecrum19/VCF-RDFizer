@@ -89,7 +89,24 @@ Outputs:
     - `./out/decompressed/*.nq`
 - `./run_metrics` for logs and metrics
   - `run_metrics/metrics.csv` includes both conversion and compression metrics per run
+  - conversion step artifacts:
+    - `run_metrics/conversion-time-<output_name>-<run_id>.txt`
+    - `run_metrics/conversion-metrics-<output_name>-<run_id>.json`
+  - compression step artifacts:
+    - `run_metrics/compression-time-<method>-<output_name>-<run_id>.txt`
+    - `run_metrics/compression-metrics-<output_name>-<run_id>.json`
   - `run_metrics/.wrapper_logs/wrapper-<timestamp>.log` stores detailed Docker/stdout/stderr command output
+
+Small VCF fixtures for RDF size/inflation test runs:
+- `test_vcf_files/test-100.vcf` (100 total lines)
+- `test_vcf_files/test-1k.vcf` (1000 total lines)
+- `test_vcf_files/test-10k.vcf` (10000 total lines)
+
+Example inflation check:
+```bash
+python3 vcf_rdfizer.py --mode full --input test_vcf_files/infl1k.vcf --compression none --keep-tsv
+wc -l out/infl1k/infl1k.nq
+```
 
 ## How Dependencies Are Handled
 

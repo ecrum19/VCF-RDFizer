@@ -204,12 +204,15 @@ for OUT in "${OUTPUT_DIRS[@]}"; do
   fi
 
   BASENAME=$(basename "$OUT")
-  RUN_KEY="${RUN_ID}-${BASENAME}"
+  SAFE_BASENAME=$(printf "%s" "$BASENAME" | tr -cs 'A-Za-z0-9._-' '_')
+  if [[ -z "$SAFE_BASENAME" ]]; then
+    SAFE_BASENAME="rdf"
+  fi
 
-  TIME_LOG_GZIP="$LOGDIR/time-gzip-$RUN_KEY.txt"
-  TIME_LOG_BROTLI="$LOGDIR/time-brotli-$RUN_KEY.txt"
-  TIME_LOG_HDT="$LOGDIR/time-hdt-$RUN_KEY.txt"
-  METRICS_JSON="$LOGDIR/compression-$RUN_KEY.json"
+  TIME_LOG_GZIP="$LOGDIR/compression-time-gzip-${SAFE_BASENAME}-${RUN_ID}.txt"
+  TIME_LOG_BROTLI="$LOGDIR/compression-time-brotli-${SAFE_BASENAME}-${RUN_ID}.txt"
+  TIME_LOG_HDT="$LOGDIR/compression-time-hdt-${SAFE_BASENAME}-${RUN_ID}.txt"
+  METRICS_JSON="$LOGDIR/compression-metrics-${SAFE_BASENAME}-${RUN_ID}.json"
 
   OUT_SIZE=$(stat_size "$OUT")
   TRIPLES_JSON=$(count_triples_json "$OUT")
