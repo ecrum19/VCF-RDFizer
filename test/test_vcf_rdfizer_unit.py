@@ -412,7 +412,12 @@ class WrapperUnitTests(VerboseTestCase):
         """Multiple input triplets trigger per-sample conversion runs and all-output compression."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
-            input_dir, rules_path = prepare_inputs(tmp_path)
+            input_dir = tmp_path / "input"
+            input_dir.mkdir()
+            (input_dir / "sample_a.vcf").write_text("##fileformat=VCFv4.2\n#CHROM\tPOS\n1\t10\n")
+            (input_dir / "sample_b.vcf").write_text("##fileformat=VCFv4.2\n#CHROM\tPOS\n1\t20\n")
+            rules_path = tmp_path / "rules.ttl"
+            rules_path.write_text("@prefix ex: <http://example.org/> .\n")
             commands = []
 
             def fake_run(cmd, cwd=None, env=None):
@@ -449,10 +454,60 @@ class WrapperUnitTests(VerboseTestCase):
                 os.chdir(old_cwd)
 
             self.assertEqual(rc, 0)
-            self.assertEqual(len(commands), 4)
-            self.assertIn("OUT_NAME=sample_a", commands[1])
-            self.assertIn("OUT_NAME=sample_b", commands[2])
-            self.assertIn("OUT_NAME=", commands[3])
+            self.assertEqual(len(commands), 5)
+            self.assertIn("/opt/vcf-rdfizer/vcf_as_tsv.sh", commands[0])
+            self.assertIn("/data/in/sample_a.vcf", commands[0])
+            self.assertIn("/opt/vcf-rdfizer/vcf_as_tsv.sh", commands[1])
+            self.assertIn("/data/in/sample_b.vcf", commands[1])
+            self.assertIn("OUT_NAME=sample_a", commands[2])
+            self.assertIn("OUT_NAME=sample_b", commands[3])
+            self.assertIn("OUT_NAME=", commands[4])
+
+    def test_main_ignores_unrelated_existing_tsv_triplets(self):
+        """Wrapper converts only triplets that match the CLI-selected VCF snapshot."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+            commands = []
+
+            def fake_run(cmd, cwd=None, env=None):
+                commands.append(cmd)
+                return 0
+
+            triplets = [
+                {
+                    "prefix": "sample",
+                    "records": Path("sample.records.tsv"),
+                    "headers": Path("sample.header_lines.tsv"),
+                    "metadata": Path("sample.file_metadata.tsv"),
+                },
+                {
+                    "prefix": "stale",
+                    "records": Path("stale.records.tsv"),
+                    "headers": Path("stale.header_lines.tsv"),
+                    "metadata": Path("stale.file_metadata.tsv"),
+                },
+            ]
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch.object(
+                    vcf_rdfizer, "check_docker", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "docker_image_exists", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "discover_tsv_triplets", return_value=triplets
+                ):
+                    rc = invoke_main(["--input", str(input_dir), "--rules", str(rules_path), "--keep-tsv"])
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(commands), 3)
+            conversion_cmd = commands[1]
+            self.assertIn("OUT_NAME=sample", conversion_cmd)
+            self.assertNotIn("OUT_NAME=stale", conversion_cmd)
 
     def test_main_uses_default_rules_when_flag_is_omitted(self):
         """Wrapper uses repository default rules file when --rules is omitted."""

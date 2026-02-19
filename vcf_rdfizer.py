@@ -105,6 +105,52 @@ def resolve_input(input_path: Path):
     raise ValueError("Input path must be a file or a directory")
 
 
+def vcf_output_prefix(path: Path) -> str:
+    name = path.name
+    if name.endswith(".vcf.gz"):
+        return name[: -len(".vcf.gz")]
+    if name.endswith(".vcf"):
+        return name[: -len(".vcf")]
+    return path.stem
+
+
+def unique_in_order(items):
+    seen = set()
+    ordered = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        ordered.append(item)
+    return ordered
+
+
+def resolve_input_snapshot(input_path: Path):
+    if not input_path.exists():
+        raise ValueError(f"Input path not found: {input_path}")
+
+    if input_path.is_file():
+        if not is_vcf_file(input_path):
+            raise ValueError("Input file must end with .vcf or .vcf.gz")
+        mount_dir = input_path.parent
+        container_inputs = [f"/data/in/{input_path.name}"]
+        input_metrics_target = container_inputs[0]
+        prefixes = [vcf_output_prefix(input_path)]
+        return mount_dir, container_inputs, input_metrics_target, prefixes
+
+    if input_path.is_dir():
+        snapshot_files = list_vcfs_in_dir(input_path)
+        if not snapshot_files:
+            raise ValueError("No .vcf or .vcf.gz files found in the input directory")
+        mount_dir = input_path
+        container_inputs = [f"/data/in/{p.name}" for p in snapshot_files]
+        input_metrics_target = "/data/in"
+        prefixes = [vcf_output_prefix(p) for p in snapshot_files]
+        return mount_dir, container_inputs, input_metrics_target, prefixes
+
+    raise ValueError("Input path must be a file or a directory")
+
+
 def ensure_dir(path: Path):
     path.mkdir(parents=True, exist_ok=True)
 
@@ -313,8 +359,10 @@ def ensure_image_available(
 
 def run_full_mode(
     *,
-    input_dir: Path,
-    container_input: str,
+    input_mount_dir: Path,
+    container_inputs: list[str],
+    input_metrics_target: str,
+    expected_prefixes: list[str],
     rules_path: Path,
     out_dir: Path,
     tsv_dir: Path,
@@ -330,23 +378,26 @@ def run_full_mode(
     print("Step 3/5: Converting VCF to TSV")
     tsv_existed = tsv_dir.exists()
     ensure_dir(tsv_dir)
-    tsv_cmd = [
-        "sudo",
-        "docker",
-        "run",
-        "--rm",
-        "-v",
-        f"{str(input_dir)}:/data/in:ro",
-        "-v",
-        f"{str(tsv_dir)}:/data/tsv",
-        image_ref,
-        "/opt/vcf-rdfizer/vcf_as_tsv.sh",
-        container_input,
-        "/data/tsv",
-    ]
-    if run(tsv_cmd) != 0:
-        eprint(f"Error: TSV conversion failed. See log: {wrapper_log_path}")
-        return 1
+    total_inputs = len(container_inputs)
+    for idx, container_input in enumerate(container_inputs, start=1):
+        print(f"  - TSV conversion {idx}/{total_inputs}: {Path(container_input).name}")
+        tsv_cmd = [
+            "sudo",
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            f"{str(input_mount_dir)}:/data/in:ro",
+            "-v",
+            f"{str(tsv_dir)}:/data/tsv",
+            image_ref,
+            "/opt/vcf-rdfizer/vcf_as_tsv.sh",
+            container_input,
+            "/data/tsv",
+        ]
+        if run(tsv_cmd) != 0:
+            eprint(f"Error: TSV conversion failed. See log: {wrapper_log_path}")
+            return 1
 
     print("Step 4/5: Running Conversion with RMLStreamer")
     ensure_dir(out_dir)
@@ -358,6 +409,23 @@ def run_full_mode(
         eprint(f"Error: {exc}")
         eprint(f"See log for details: {wrapper_log_path}")
         return 1
+
+    expected_order = unique_in_order(expected_prefixes)
+    triplets_by_prefix = {triplet["prefix"]: triplet for triplet in tsv_triplets}
+    missing_prefixes = [prefix for prefix in expected_order if prefix not in triplets_by_prefix]
+    if missing_prefixes:
+        eprint(
+            "Error: TSV conversion did not produce expected triplets for: "
+            + ", ".join(missing_prefixes)
+        )
+        eprint(f"See log for details: {wrapper_log_path}")
+        return 1
+
+    ignored_prefixes = sorted(set(triplets_by_prefix.keys()) - set(expected_order))
+    if ignored_prefixes:
+        print("  - Ignoring unrelated TSV triplets in output directory")
+
+    tsv_triplets = [triplets_by_prefix[prefix] for prefix in expected_order]
 
     generated_rules_dir = metrics_dir / "_generated_rules"
     if generated_rules_dir.exists():
@@ -407,13 +475,13 @@ def run_full_mode(
             f"OUT_NAME={output_name}",
             "-e",
             f"RUN_ID={run_id}",
-            "-e",
-            f"TIMESTAMP={timestamp}",
-            "-e",
-            f"IN_VCF={container_input}",
-            "-e",
-            "LOGDIR=/data/metrics",
-            image_ref,
+                "-e",
+                f"TIMESTAMP={timestamp}",
+                "-e",
+                f"IN_VCF={input_metrics_target}",
+                "-e",
+                "LOGDIR=/data/metrics",
+                image_ref,
             "/opt/vcf-rdfizer/run_conversion.sh",
         ]
         if run(run_cmd) != 0:
@@ -693,7 +761,12 @@ def main():
             if args.input is None:
                 raise ValueError("--input is required in --mode full")
             input_path = Path(args.input).expanduser().resolve()
-            input_dir, container_input = resolve_input(input_path)
+            (
+                input_mount_dir,
+                container_inputs,
+                input_metrics_target,
+                expected_prefixes,
+            ) = resolve_input_snapshot(input_path)
             if args.rules is None:
                 rules_path = (repo_root / "rules" / "default_rules.ttl").resolve()
             else:
@@ -785,8 +858,10 @@ def main():
 
         if mode == "full":
             return run_full_mode(
-                input_dir=input_dir,
-                container_input=container_input,
+                input_mount_dir=input_mount_dir,
+                container_inputs=container_inputs,
+                input_metrics_target=input_metrics_target,
+                expected_prefixes=expected_prefixes,
                 rules_path=rules_path,
                 out_dir=out_dir,
                 tsv_dir=tsv_dir,

@@ -98,9 +98,9 @@ Outputs:
   - `run_metrics/.wrapper_logs/wrapper-<timestamp>.log` stores detailed Docker/stdout/stderr command output
 
 Small VCF fixtures for RDF size/inflation test runs:
-- `test_vcf_files/test-100.vcf` (100 total lines)
-- `test_vcf_files/test-1k.vcf` (1000 total lines)
-- `test_vcf_files/test-10k.vcf` (10000 total lines)
+- `test_vcf_files/infl100.vcf` (100 total lines)
+- `test_vcf_files/infl1k.vcf` (1000 total lines)
+- `test_vcf_files/infl10k.vcf` (10000 total lines)
 
 Example inflation check:
 ```bash
@@ -124,6 +124,7 @@ The wrapper validates:
 - Mode-specific required inputs are provided
 - Full mode input path exists and contains `.vcf` or `.vcf.gz`
 - Full mode rules file exists
+- Full mode converts only the VCF file(s) selected at pipeline start (ignores unrelated preexisting TSV intermediates)
 - Compression mode input is a `.nq` file
 - Decompression mode input is `.gz`, `.br`, or `.hdt`
 - Docker image exists or is built (if `--image-version` is set, it will attempt to pull that version and fail if missing)
