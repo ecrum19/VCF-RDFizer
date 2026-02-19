@@ -1,7 +1,7 @@
 ## VCF-RDFizer
 
 VCF-RDFizer generates [RDF](https://www.w3.org/2001/sw/wiki/RDF) serializations 
-of [VCF files](https://samtools.github.io/hts-specs/VCFv4.2.pdf) as [N-Quads](https://www.w3.org/TR/n-quads/)
+of [VCF files](https://samtools.github.io/hts-specs/VCFv4.2.pdf) as [N-Triples](https://www.w3.org/TR/n-triples/)
 using [RML](http://rml.io/) rules and the [RMLStreamer](https://github.com/RMLio/RMLStreamer) application. 
 
 ## Overview
@@ -13,7 +13,7 @@ Pipeline steps:
 
 Wrapper modes:
 - `full`: run the entire VCF -> TSV -> RDF -> compression pipeline
-- `compress`: compress a designated `.nq` file only
+- `compress`: compress a designated RDF file (`.nt` or `.nq`) only
 - `decompress`: decompress a designated `.gz`, `.br`, or `.hdt` RDF file
 
 `src/vcf_as_tsv.sh` now writes:
@@ -22,7 +22,7 @@ Wrapper modes:
   - `<sample>.header_lines.tsv`
   - `<sample>.file_metadata.tsv`
 
-The default mapping stores header/file metadata triples and record/call triples in separate RDF graphs. The conversion step then compiles all RMLStreamer output parts into one N-Quads file named after the TSV basename (for example `sample.nq` in `out/sample/`).
+The default mapping emits triples (no graph term). The conversion step compiles all RMLStreamer output parts into one N-Triples file named after the TSV basename (for example `sample.nt` in `out/sample/`).
 
 Vocabulary references:
 - Ontology: [vcf-rdfizer-vocabulary.ttl](https://github.com/ecrum19/VCF-RDFizer-vocabulary/blob/main/ontology/vcf-rdfizer-vocabulary.ttl)
@@ -59,34 +59,34 @@ python3 vcf_rdfizer.py --mode full --input ./vcf_files
 python3 vcf_rdfizer.py --mode full --input ./vcf_files --rules ./rules/my_rules.ttl --estimate-size
 ```
 
-4. Compression-only mode (compress one `.nq` into selected formats):
+4. Compression-only mode (compress one `.nt` into selected formats):
 ```bash
-python3 vcf_rdfizer.py --mode compress --nq ./out/sample/sample.nq --compression gzip,brotli
+python3 vcf_rdfizer.py --mode compress --nq ./out/sample/sample.nt --compression gzip,brotli
 ```
 
 5. Decompression-only mode (auto output path under `./out/decompressed/`):
 ```bash
-python3 vcf_rdfizer.py --mode decompress --compressed-input ./out/gzip/sample.nq.gz
+python3 vcf_rdfizer.py --mode decompress --compressed-input ./out/gzip/sample.nt.gz
 ```
 
 6. Decompression-only mode with explicit output file:
 ```bash
-python3 vcf_rdfizer.py --mode decompress --compressed-input ./out/hdt/sample.hdt --decompress-out ./out/decompressed/sample_from_hdt.nq
+python3 vcf_rdfizer.py --mode decompress --compressed-input ./out/hdt/sample.hdt --decompress-out ./out/decompressed/sample_from_hdt.nt
 ```
 
 Outputs:
 - `./tsv` for TSV intermediates
 - `./out` for RDF output
   - conversion outputs per TSV basename in `./out/<sample>/`
-  - each conversion output directory contains one merged N-Quads file:
-    - `./out/<sample>/<sample>.nq`
-  - the merged file contains both header and record quads in their respective named graphs
+  - each conversion output directory contains one merged N-Triples file:
+    - `./out/<sample>/<sample>.nt`
+  - compressed outputs preserve source RDF extension (for example `sample.nt.gz`, `sample.nt.br`)
   - compressed outputs:
     - `./out/gzip/*.gz`
     - `./out/brotli/*.br`
     - `./out/hdt/*.hdt`
   - decompressed outputs (decompression mode default):
-    - `./out/decompressed/*.nq`
+    - `./out/decompressed/*.nt`
 - `./run_metrics` for logs and metrics
   - `run_metrics/metrics.csv` includes both conversion and compression metrics per run
   - conversion step artifacts:
@@ -105,7 +105,7 @@ Small VCF fixtures for RDF size/inflation test runs:
 Example inflation check:
 ```bash
 python3 vcf_rdfizer.py --mode full --input test_vcf_files/infl1k.vcf --compression none --keep-tsv
-wc -l out/infl1k/infl1k.nq
+wc -l out/infl1k/infl1k.nt
 ```
 
 ## How Dependencies Are Handled
@@ -125,8 +125,9 @@ The wrapper validates:
 - Full mode input path exists and contains `.vcf` or `.vcf.gz`
 - Full mode rules file exists
 - Full mode converts only the VCF file(s) selected at pipeline start (ignores unrelated preexisting TSV intermediates)
-- Compression mode input is a `.nq` file
+- Compression mode input is an RDF file (`.nt` or `.nq`)
 - Decompression mode input is `.gz`, `.br`, or `.hdt`
+- HDT mode pre-checks that `rdf2hdt.sh` is executable and that Java is available
 - Docker image exists or is built (if `--image-version` is set, it will attempt to pull that version and fail if missing)
 - Raw command output is written to a hidden wrapper log file instead of printed directly to the terminal
 - Optional preflight storage estimate (`--estimate-size`) with a disk-space warning if the upper-bound estimate exceeds free space
@@ -139,7 +140,7 @@ Current heuristic per input file:
 - If input is `.vcf`: use on-disk size as the expanded VCF size
 - If input is `.vcf.gz`: estimate expanded VCF as `compressed_size * 5.0`
 - Estimate TSV intermediates as `expanded_vcf * 1.10`
-- Estimate RDF N-Quads as a range: `expanded_vcf * 4.0` to `expanded_vcf * 12.0`
+- Estimate RDF N-Triples as a range: `expanded_vcf * 4.0` to `expanded_vcf * 12.0`
 
 Accuracy statement:
 - This is a coarse planning estimate, not a guarantee.
@@ -157,9 +158,9 @@ Options:
 - `-m, --mode` (default `full`): execution mode (`full`, `compress`, `decompress`)
 - `-i, --input`: full mode input path (`.vcf` / `.vcf.gz` file or directory)
 - `-r, --rules`: full mode RML mapping `.ttl` (default `rules/default_rules.ttl`)
-- `-q, --nq`: compression mode input `.nq` file
+- `-q, --nq, --rdf`: compression mode input RDF file (`.nt` or `.nq`)
 - `-C, --compressed-input`: decompression mode input (`.gz`, `.br`, or `.hdt`)
-- `-d, --decompress-out`: decompression mode output `.nq` file path
+- `-d, --decompress-out`: decompression mode output RDF file path (default `.nt`)
 - `-o, --out` (default `./out`): RDF output directory (and compression/decompression output root)
 - `-t, --tsv` (default `./tsv`): TSV output directory (full mode)
 - `-I, --image` (default `ecrum19/vcf-rdfizer`): Docker image repo (no tag) or full image reference

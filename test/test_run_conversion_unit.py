@@ -12,8 +12,8 @@ SCRIPT = REPO_ROOT / "src" / "run_conversion.sh"
 
 
 class RunConversionUnitTests(VerboseTestCase):
-    def test_run_conversion_writes_nq_and_metrics_without_real_java(self):
-        """Conversion script writes a single merged .nq output and unified metrics."""
+    def test_run_conversion_writes_nt_and_metrics_without_real_java(self):
+        """Conversion script writes a single merged .nt output and unified metrics."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             fake_bin = tmp_path / "bin"
@@ -64,9 +64,9 @@ printf '<s> <p> <o> .\\n' > "$out/part-000"
             result = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True)
 
             self.assertEqual(result.returncode, 0, msg=result.stderr)
-            merged_nq = out_dir / "rdf" / "rdf.nq"
-            self.assertTrue(merged_nq.exists())
-            self.assertIn("<s> <p> <o> .", merged_nq.read_text())
+            merged_nt = out_dir / "rdf" / "rdf.nt"
+            self.assertTrue(merged_nt.exists())
+            self.assertIn("<s> <p> <o> .", merged_nt.read_text())
             self.assertTrue((metrics_dir / "conversion-time-rdf-run123.txt").exists())
             self.assertTrue((metrics_dir / "conversion-metrics-rdf-run123.json").exists())
 
@@ -240,8 +240,8 @@ printf '# only comments\\n' > "$out/comments-only.nq"
                 rows = list(csv.DictReader(f))
             self.assertEqual(rows[0]["output_triples"], "0")
 
-    def test_run_conversion_only_renames_non_nq_outputs(self):
-        """Normalization + merge writes rdf.nq with combined converted content."""
+    def test_run_conversion_normalizes_legacy_and_writes_merged_nt(self):
+        """Normalization + merge writes rdf.nt with combined converted content."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             fake_bin = tmp_path / "bin"
@@ -292,9 +292,9 @@ printf '<s2> <p2> <o2> .\\n' > "$out/already.nq"
 
             result = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, msg=result.stderr)
-            merged_nq = out_dir / "rdf" / "rdf.nq"
-            self.assertTrue(merged_nq.exists())
-            text = merged_nq.read_text()
+            merged_nt = out_dir / "rdf" / "rdf.nt"
+            self.assertTrue(merged_nt.exists())
+            text = merged_nt.read_text()
             self.assertIn("<s> <p> <o> .", text)
             self.assertIn("<s2> <p2> <o2> .", text)
 

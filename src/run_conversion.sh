@@ -1,5 +1,3 @@
-#!/bin/bash
-
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -122,30 +120,34 @@ fi
 # ---------- Post-run ----------
 mkdir -p "$OUT_DIR/$OUT_NAME"
 
-# Normalize output files to .nq for downstream compression
-for NO_EXT_FILE in "$OUT_DIR/$OUT_NAME"/*; do
-  if [[ -f "$NO_EXT_FILE" && "$NO_EXT_FILE" != *.nq ]]; then
-    mv "$NO_EXT_FILE" "${NO_EXT_FILE}.nq"
+# Normalize output files to .nt for downstream compression/HDT conversion.
+for RDF_FILE in "$OUT_DIR/$OUT_NAME"/*; do
+  if [[ ! -f "$RDF_FILE" ]]; then
+    continue
   fi
+  if [[ "$RDF_FILE" == *.nt ]]; then
+    continue
+  fi
+  mv "$RDF_FILE" "${RDF_FILE}.nt"
 done
 
-# Merge all RMLStreamer output parts into one N-Quads file named after the TSV basename/output name.
+# Merge all RMLStreamer output parts into one N-Triples file named after the TSV basename/output name.
 # Stream merge + delete each part immediately to avoid temporary 2x disk spikes.
-MERGED_NQ="$OUT_DIR/$OUT_NAME/$OUT_NAME.nq"
+MERGED_NT="$OUT_DIR/$OUT_NAME/$OUT_NAME.nt"
 
 shopt -s nullglob
-PART_FILES=("$OUT_DIR/$OUT_NAME"/*.nq)
+PART_FILES=("$OUT_DIR/$OUT_NAME"/*.nt)
 if (( ${#PART_FILES[@]} > 0 )); then
-  : > "$MERGED_NQ"
-  for PART_NQ in "${PART_FILES[@]}"; do
-    if [[ "$PART_NQ" == "$MERGED_NQ" ]]; then
+  : > "$MERGED_NT"
+  for PART_NT in "${PART_FILES[@]}"; do
+    if [[ "$PART_NT" == "$MERGED_NT" ]]; then
       continue
     fi
-    cat "$PART_NQ" >> "$MERGED_NQ"
-    rm -f "$PART_NQ"
+    cat "$PART_NT" >> "$MERGED_NT"
+    rm -f "$PART_NT"
   done
 else
-  : > "$MERGED_NQ"
+  : > "$MERGED_NT"
 fi
 shopt -u nullglob
 

@@ -72,9 +72,15 @@ fi
 
 ANY_COMPRESS=$((DO_GZIP + DO_BROTLI + DO_HDT))
 
-if (( DO_HDT == 1 )) && [[ ! -x "$HDT" ]]; then
-  echo "Error: rdf2hdt script not found or not executable at '$HDT'." >&2
-  exit 2
+if (( DO_HDT == 1 )); then
+  if [[ ! -x "$HDT" ]]; then
+    echo "Error: rdf2hdt script not found or not executable at '$HDT'." >&2
+    exit 2
+  fi
+  if ! command -v java >/dev/null 2>&1; then
+    echo "Error: Java runtime is required for HDT conversion but was not found on PATH." >&2
+    exit 2
+  fi
 fi
 
 GZIP_ROOT="$OUT_ROOT_DIR/gzip"
@@ -219,13 +225,16 @@ for OUT in "${OUTPUT_DIRS[@]}"; do
   TOTAL_TRIPLES=$(echo "$TRIPLES_JSON" | grep '"TOTAL"' | awk -F': ' '{print $2}' | tr -d '", ')
 
   shopt -s nullglob
+  NT_FILES=("$OUT"/*.nt)
   NQ_FILES=("$OUT"/*.nq)
   shopt -u nullglob
+  PRIMARY_NT="$OUT/${BASENAME}.nt"
   PRIMARY_NQ="$OUT/${BASENAME}.nq"
 
-  if (( ${#NQ_FILES[@]} == 0 )); then
-    echo "WARNING: no .nq files found in '$OUT'; skipping compression for this output." >&2
-    SOURCE_NQ=""
+  if (( ${#NT_FILES[@]} == 0 && ${#NQ_FILES[@]} == 0 )); then
+    echo "WARNING: no .nt or .nq files found in '$OUT'; skipping compression for this output." >&2
+    SOURCE_RDF=""
+    SOURCE_EXT=""
     NQ_SIZE=0
     GZ_PATH=""
     GZ_SIZE=0
@@ -253,16 +262,25 @@ for OUT in "${OUTPUT_DIRS[@]}"; do
     fi
   else
     if (( ANY_COMPRESS > 0 )); then
-      if [[ -f "$PRIMARY_NQ" ]]; then
-        SOURCE_NQ="$PRIMARY_NQ"
+      if [[ -f "$PRIMARY_NT" ]]; then
+        SOURCE_RDF="$PRIMARY_NT"
+        SOURCE_EXT="nt"
+      elif (( ${#NT_FILES[@]} == 1 )); then
+        SOURCE_RDF="${NT_FILES[0]}"
+        SOURCE_EXT="nt"
+      elif [[ -f "$PRIMARY_NQ" ]]; then
+        SOURCE_RDF="$PRIMARY_NQ"
+        SOURCE_EXT="nq"
       elif (( ${#NQ_FILES[@]} == 1 )); then
-        SOURCE_NQ="${NQ_FILES[0]}"
+        SOURCE_RDF="${NQ_FILES[0]}"
+        SOURCE_EXT="nq"
       else
-        echo "WARNING: expected primary N-Quads '$PRIMARY_NQ' but found multiple .nq files; using '$PRIMARY_NQ' is required." >&2
-        SOURCE_NQ=""
+        echo "WARNING: unable to determine a unique primary RDF file in '$OUT'." >&2
+        SOURCE_RDF=""
+        SOURCE_EXT=""
       fi
 
-      if [[ -z "$SOURCE_NQ" ]]; then
+      if [[ -z "$SOURCE_RDF" ]]; then
         NQ_SIZE=0
         EXIT_CODE_GZIP=$(( DO_GZIP == 1 ? 1 : 0 ))
         EXIT_CODE_BROTLI=$(( DO_BROTLI == 1 ? 1 : 0 ))
@@ -281,22 +299,23 @@ for OUT in "${OUTPUT_DIRS[@]}"; do
         MAX_RSS_KB_HDT="null"
         OVERALL_EXIT=1
       else
-        NQ_SIZE=$(stat_size "$SOURCE_NQ")
+        NQ_SIZE=$(stat_size "$SOURCE_RDF")
       fi
     else
-      SOURCE_NQ=""
+      SOURCE_RDF=""
+      SOURCE_EXT=""
       NQ_SIZE=0
     fi
 
-    # ----- gzip combined.nq with timing -----
-    if (( DO_GZIP == 1 )) && [[ -n "${SOURCE_NQ:-}" ]]; then
-      GZ_PATH="$GZIP_ROOT/${BASENAME}.nq.gz"
+    # ----- gzip combined RDF with timing -----
+    if (( DO_GZIP == 1 )) && [[ -n "${SOURCE_RDF:-}" ]]; then
+      GZ_PATH="$GZIP_ROOT/${BASENAME}.${SOURCE_EXT}.gz"
       EXIT_CODE_GZIP=0
 
       if have_gnu_time; then
-        /usr/bin/time -v -o "$TIME_LOG_GZIP" -- gzip -c "$SOURCE_NQ" > "$GZ_PATH" || EXIT_CODE_GZIP=$?
+        /usr/bin/time -v -o "$TIME_LOG_GZIP" -- gzip -c "$SOURCE_RDF" > "$GZ_PATH" || EXIT_CODE_GZIP=$?
       else
-        { time -p gzip -c "$SOURCE_NQ" > "$GZ_PATH"; } >"$TIME_LOG_GZIP" 2>&1 || EXIT_CODE_GZIP=$?
+        { time -p gzip -c "$SOURCE_RDF" > "$GZ_PATH"; } >"$TIME_LOG_GZIP" 2>&1 || EXIT_CODE_GZIP=$?
       fi
 
       GZ_SIZE=$(stat_size "$GZ_PATH")
@@ -334,15 +353,15 @@ for OUT in "${OUTPUT_DIRS[@]}"; do
       MAX_RSS_KB_GZIP="null"
     fi
 
-    # ----- brotli combined.nq with timing -----
-    if (( DO_BROTLI == 1 )) && [[ -n "${SOURCE_NQ:-}" ]]; then
-      BROTLI_PATH="$BROTLI_ROOT/${BASENAME}.nq.br"
+    # ----- brotli combined RDF with timing -----
+    if (( DO_BROTLI == 1 )) && [[ -n "${SOURCE_RDF:-}" ]]; then
+      BROTLI_PATH="$BROTLI_ROOT/${BASENAME}.${SOURCE_EXT}.br"
       EXIT_CODE_BROTLI=0
 
       if have_gnu_time; then
-        /usr/bin/time -v -o "$TIME_LOG_BROTLI" -- brotli -q 7 -c "$SOURCE_NQ" > "$BROTLI_PATH" || EXIT_CODE_BROTLI=$?
+        /usr/bin/time -v -o "$TIME_LOG_BROTLI" -- brotli -q 7 -c "$SOURCE_RDF" > "$BROTLI_PATH" || EXIT_CODE_BROTLI=$?
       else
-        { time -p brotli -q 7 -c "$SOURCE_NQ" > "$BROTLI_PATH"; } >"$TIME_LOG_BROTLI" 2>&1 || EXIT_CODE_BROTLI=$?
+        { time -p brotli -q 7 -c "$SOURCE_RDF" > "$BROTLI_PATH"; } >"$TIME_LOG_BROTLI" 2>&1 || EXIT_CODE_BROTLI=$?
       fi
 
       BROTLI_SIZE=$(stat_size "$BROTLI_PATH")
@@ -379,15 +398,15 @@ for OUT in "${OUTPUT_DIRS[@]}"; do
       MAX_RSS_KB_BROTLI="null"
     fi
 
-    # ----- Convert combined.nq to HDT with timing -----
-    if (( DO_HDT == 1 )) && [[ -n "${SOURCE_NQ:-}" ]]; then
+    # ----- Convert combined RDF to HDT with timing -----
+    if (( DO_HDT == 1 )) && [[ -n "${SOURCE_RDF:-}" ]]; then
       HDT_PATH="$HDT_ROOT/$BASENAME.hdt"
       EXIT_CODE_HDT=0
 
       if have_gnu_time; then
-        /usr/bin/time -v -o "$TIME_LOG_HDT" -- bash "$HDT" "$SOURCE_NQ" "$HDT_PATH" || EXIT_CODE_HDT=$?
+        /usr/bin/time -v -o "$TIME_LOG_HDT" -- bash "$HDT" "$SOURCE_RDF" "$HDT_PATH" || EXIT_CODE_HDT=$?
       else
-        { time -p bash "$HDT" "$SOURCE_NQ" "$HDT_PATH"; } >"$TIME_LOG_HDT" 2>&1 || EXIT_CODE_HDT=$?
+        { time -p bash "$HDT" "$SOURCE_RDF" "$HDT_PATH"; } >"$TIME_LOG_HDT" 2>&1 || EXIT_CODE_HDT=$?
       fi
 
       HDT_SIZE=$(stat_size "$HDT_PATH")
@@ -413,6 +432,13 @@ for OUT in "${OUTPUT_DIRS[@]}"; do
 
       [[ -z "$MAX_RSS_KB_HDT" ]] && MAX_RSS_KB_HDT="null"
       if [[ "$EXIT_CODE_HDT" -ne 0 ]]; then
+        if [[ "$EXIT_CODE_HDT" -eq 127 ]]; then
+          echo "ERROR: HDT conversion failed with exit code 127 (command not found)." >&2
+          echo "ERROR: Check dependencies used by '$HDT' and the timing log '$TIME_LOG_HDT'." >&2
+          if [[ -f "$TIME_LOG_HDT" ]]; then
+            tail -n 20 "$TIME_LOG_HDT" >&2 || true
+          fi
+        fi
         OVERALL_EXIT=1
       fi
     else
@@ -434,7 +460,7 @@ for OUT in "${OUTPUT_DIRS[@]}"; do
   "output_name": "$BASENAME",
   "compression_methods": "$COMPRESSION_METHODS",
   "output_triples": $TRIPLES_JSON,
-  "combined_nq_path": "${SOURCE_NQ:-}",
+  "combined_nq_path": "${SOURCE_RDF:-}",
   "combined_nq_size_bytes": ${NQ_SIZE:-0},
   "gzip": {
     "output_gz_path": "${GZ_PATH:-}",

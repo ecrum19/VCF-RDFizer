@@ -43,6 +43,7 @@ COPY --from=build-hdt /opt/hdt-java /opt/hdt-java
 COPY src/*.sh /opt/vcf-rdfizer/
 
 RUN chmod +x /opt/vcf-rdfizer/*.sh \
-  && chmod +x /opt/hdt-java/hdt-java-cli/bin/rdf2hdt.sh
+  && chmod +x /opt/hdt-java/hdt-java-cli/bin/rdf2hdt.sh \
+  && chmod +x /opt/hdt-java/hdt-java-cli/bin/hdt2rdf.sh
 
 WORKDIR /work

@@ -112,7 +112,7 @@ class WrapperUnitTests(VerboseTestCase):
 
             self.assertEqual(rc, 0)
             self.assertIn("Preflight size estimate (rough):", out_buf.getvalue())
-            self.assertIn("Estimated RDF N-Quads output:", out_buf.getvalue())
+            self.assertIn("Estimated RDF N-Triples output:", out_buf.getvalue())
             self.assertIn("Warning: Estimated upper-bound RDF size exceeds currently free disk.", err_buf.getvalue())
             self.assertEqual(len(commands), 3)
 
@@ -199,13 +199,53 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertIn("brotli -q 7 -c", commands[1][-1])
             self.assertIn("/data/out/brotli/", commands[1][-1])
 
+    def test_main_compress_mode_accepts_nt_and_preserves_extension(self):
+        """Compression mode accepts .nt input and emits extension-aware output names."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            nt_path = tmp_path / "sample.nt"
+            nt_path.write_text("<s> <p> <o> .\n")
+            out_dir = tmp_path / "out"
+            commands = []
+
+            def fake_run(cmd, cwd=None, env=None):
+                commands.append(cmd)
+                return 0
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch.object(
+                    vcf_rdfizer, "check_docker", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "docker_image_exists", return_value=True
+                ):
+                    rc = invoke_main(
+                        [
+                            "--mode",
+                            "compress",
+                            "--nq",
+                            str(nt_path),
+                            "--compression",
+                            "gzip",
+                            "--out",
+                            str(out_dir),
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(commands), 1)
+            self.assertIn("/data/out/gzip/sample.nt.gz", commands[0][-1])
+
     def test_main_compress_mode_requires_nq_argument(self):
         """Compression mode fails validation when --nq is missing."""
         rc = invoke_main(["--mode", "compress"])
         self.assertEqual(rc, 2)
 
-    def test_main_compress_mode_rejects_non_nq_input(self):
-        """Compression mode rejects non-.nq input files."""
+    def test_main_compress_mode_rejects_non_rdf_input(self):
+        """Compression mode rejects non-RDF input files."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             bad_input = tmp_path / "sample.txt"
@@ -327,7 +367,7 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertEqual(rc, 0)
             self.assertEqual(len(commands), 1)
             self.assertIn("/opt/hdt-java/hdt-java-cli/bin/hdt2rdf.sh", commands[0][-1])
-            self.assertIn("/data/out/sample.nq", commands[0][-1])
+            self.assertIn("/data/out/sample.nt", commands[0][-1])
 
     def test_main_decompress_mode_rejects_unknown_extension(self):
         """Decompression mode rejects unsupported compressed RDF extensions."""

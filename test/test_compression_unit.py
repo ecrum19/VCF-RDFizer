@@ -169,6 +169,49 @@ class CompressionUnitTests(VerboseTestCase):
             self.assertEqual(row["exit_code_hdt"], "0")
             self.assertGreater(int(row["combined_nq_size_bytes"]), 0)
 
+    def test_compression_prefers_nt_when_present(self):
+        """Compression mode uses primary .nt output when both .nt and .nq files are present."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            out_root = tmp_path / "out"
+            output = out_root / "rdf"
+            output.mkdir(parents=True)
+            (output / "rdf.nt").write_text("<s_nt> <p> <o> .\n")
+            (output / "rdf.nq").write_text("<s_nq> <p> <o> <g> .\n")
+
+            logdir = tmp_path / "metrics"
+            run_id = "run-prefers-nt"
+            timestamp = "2026-01-01T00:00:00"
+            metrics_csv = logdir / "metrics.csv"
+            seed_conversion_metrics_row(metrics_csv, run_id, timestamp, "rdf", output)
+
+            fake_bin = tmp_path / "bin"
+            fake_bin.mkdir()
+            hdt_path = prepare_fake_tools(fake_bin)
+
+            env = env_with_path(fake_bin)
+            env.update(
+                {
+                    "OUT_ROOT_DIR": str(out_root),
+                    "OUT_NAME": "rdf",
+                    "LOGDIR": str(logdir),
+                    "RUN_ID": run_id,
+                    "TIMESTAMP": timestamp,
+                    "RDF2HDT": str(hdt_path),
+                }
+            )
+
+            result = subprocess.run(
+                ["bash", str(SCRIPT), "-m", "gzip,brotli,hdt"],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertTrue((out_root / "gzip" / "rdf.nt.gz").exists())
+            self.assertTrue((out_root / "brotli" / "rdf.nt.br").exists())
+            self.assertTrue((out_root / "hdt" / "rdf.hdt").exists())
+
     def test_compression_none_updates_metrics_without_generating_outputs(self):
         """Compression mode none leaves no compressed artifacts and records zero sizes."""
         with tempfile.TemporaryDirectory() as td:

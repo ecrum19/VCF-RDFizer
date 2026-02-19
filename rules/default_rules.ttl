@@ -13,9 +13,8 @@
 # - /data/tsv/<sample>.records.tsv
 # The wrapper rewrites the template paths below for each input sample.
 #
-# Graph separation:
-# - Header/file metadata triples -> https://w3id.org/vcf-rdfizer/graph/header
-# - Record/call triples         -> https://w3id.org/vcf-rdfizer/graph/records
+# Output format:
+# - The default conversion now targets triples (N-Triples) without named graph terms.
 
 <#VCFFileMap>
   a rr:TriplesMap ;
@@ -33,8 +32,7 @@
   ] ;
   rr:subjectMap [
     rr:template "https://w3id.org/vcf-rdfizer/resource/vcf-file/{SOURCE_FILE}" ;
-    rr:class vcfr:VCFFile ;
-    rr:graphMap [ rr:constant <https://w3id.org/vcf-rdfizer/graph/header> ]
+    rr:class vcfr:VCFFile
   ] ;
   rr:predicateObjectMap [
     rr:predicate vcfr:hasHeader ;
@@ -76,8 +74,7 @@
   ] ;
   rr:subjectMap [
     rr:template "https://w3id.org/vcf-rdfizer/resource/vcf-header/{SOURCE_FILE}" ;
-    rr:class vcfr:VCFHeader ;
-    rr:graphMap [ rr:constant <https://w3id.org/vcf-rdfizer/graph/header> ]
+    rr:class vcfr:VCFHeader
   ] ;
   rr:predicateObjectMap [
     rr:predicate vcfr:hasHeaderLine ;
@@ -103,8 +100,7 @@
   ] ;
   rr:subjectMap [
     rr:template "https://w3id.org/vcf-rdfizer/resource/header-line/{SOURCE_FILE}/{HEADER_INDEX}" ;
-    rr:class vcfr:HeaderLine ;
-    rr:graphMap [ rr:constant <https://w3id.org/vcf-rdfizer/graph/header> ]
+    rr:class vcfr:HeaderLine
   ] ;
   rr:predicateObjectMap [
     rr:predicate vcfr:headerKey ;
@@ -131,8 +127,7 @@
   ] ;
   rr:subjectMap [
     rr:template "https://w3id.org/vcf-rdfizer/resource/record/{SOURCE_FILE}/{ROW_ID}" ;
-    rr:class vcfr:VCFRecord ;
-    rr:graphMap [ rr:constant <https://w3id.org/vcf-rdfizer/graph/records> ]
+    rr:class vcfr:VCFRecord
   ] ;
   rr:predicateObjectMap [
     rr:predicate vcfr:chrom ;
@@ -175,8 +170,7 @@
   ] ;
   rr:subjectMap [
     rr:template "https://w3id.org/vcf-rdfizer/resource/call/{SOURCE_FILE}/{ROW_ID}" ;
-    rr:class vcfr:VariantCall ;
-    rr:graphMap [ rr:constant <https://w3id.org/vcf-rdfizer/graph/records> ]
+    rr:class vcfr:VariantCall
   ] ;
   rr:predicateObjectMap [
     rr:predicate vcfr:filter ;

@@ -545,24 +545,29 @@ def run_compress_mode(
     in_dir = nq_path.parent
     input_container = f"/data/in/{nq_path.name}"
     input_stem = nq_path.stem
+    input_ext = nq_path.suffix.lstrip(".") or "nt"
 
     for method in methods:
         method_dir = out_dir / method
         ensure_dir(method_dir)
 
         if method == "gzip":
-            output_name = f"{nq_path.name}.gz"
+            output_name = f"{input_stem}.{input_ext}.gz"
             out_container = f"/data/out/{method}/{output_name}"
             command = f"gzip -c {shlex.quote(input_container)} > {shlex.quote(out_container)}"
         elif method == "brotli":
-            output_name = f"{nq_path.name}.br"
+            output_name = f"{input_stem}.{input_ext}.br"
             out_container = f"/data/out/{method}/{output_name}"
             command = f"brotli -q 7 -c {shlex.quote(input_container)} > {shlex.quote(out_container)}"
         else:
             output_name = f"{input_stem}.hdt"
             out_container = f"/data/out/{method}/{output_name}"
             command = (
-                "bash /opt/hdt-java/hdt-java-cli/bin/rdf2hdt.sh "
+                "set -euo pipefail; "
+                "HDT_BIN=/opt/hdt-java/hdt-java-cli/bin/rdf2hdt.sh; "
+                'if [[ ! -x "$HDT_BIN" ]]; then echo "Missing rdf2hdt.sh at $HDT_BIN" >&2; exit 127; fi; '
+                'if ! command -v java >/dev/null 2>&1; then echo "Java runtime not found on PATH" >&2; exit 127; fi; '
+                'bash "$HDT_BIN" '
                 f"{shlex.quote(input_container)} {shlex.quote(out_container)}"
             )
 
@@ -590,9 +595,9 @@ def run_compress_mode(
 
 
 def detect_compressed_format(path: Path):
-    if path.name.endswith(".nq.gz") or path.suffix == ".gz":
+    if path.name.endswith(".nq.gz") or path.name.endswith(".nt.gz") or path.suffix == ".gz":
         return "gzip"
-    if path.name.endswith(".nq.br") or path.suffix == ".br":
+    if path.name.endswith(".nq.br") or path.name.endswith(".nt.br") or path.suffix == ".br":
         return "brotli"
     if path.suffix == ".hdt":
         return "hdt"
@@ -603,12 +608,16 @@ def default_decompressed_name(path: Path, fmt: str):
     if fmt == "gzip":
         if path.name.endswith(".nq.gz"):
             return path.name[: -len(".gz")]
-        return f"{path.stem}.nq"
+        if path.name.endswith(".nt.gz"):
+            return path.name[: -len(".gz")]
+        return f"{path.stem}.nt"
     if fmt == "brotli":
         if path.name.endswith(".nq.br"):
             return path.name[: -len(".br")]
-        return f"{path.stem}.nq"
-    return f"{path.stem}.nq"
+        if path.name.endswith(".nt.br"):
+            return path.name[: -len(".br")]
+        return f"{path.stem}.nt"
+    return f"{path.stem}.nt"
 
 
 def run_decompress_mode(
@@ -631,7 +640,11 @@ def run_decompress_mode(
         command = f"brotli -d -c {shlex.quote(source_container)} > {shlex.quote(output_container)}"
     else:
         command = (
-            "bash /opt/hdt-java/hdt-java-cli/bin/hdt2rdf.sh "
+            "set -euo pipefail; "
+            "HDT2RDF_BIN=/opt/hdt-java/hdt-java-cli/bin/hdt2rdf.sh; "
+            'if [[ ! -x "$HDT2RDF_BIN" ]]; then echo "Missing hdt2rdf.sh at $HDT2RDF_BIN" >&2; exit 127; fi; '
+            'if ! command -v java >/dev/null 2>&1; then echo "Java runtime not found on PATH" >&2; exit 127; fi; '
+            'bash "$HDT2RDF_BIN" '
             f"{shlex.quote(source_container)} {shlex.quote(output_container)}"
         )
 
@@ -666,9 +679,9 @@ def main():
             "  Full pipeline:\n"
             "    vcf_rdfizer.py -m full -i ./vcf_files -r ./rules/default_rules.ttl\n"
             "  Compression-only:\n"
-            "    vcf_rdfizer.py -m compress -q ./out/sample/sample.nq -c gzip,brotli\n"
+            "    vcf_rdfizer.py -m compress -q ./out/sample/sample.nt -c gzip,brotli\n"
             "  Decompression-only:\n"
-            "    vcf_rdfizer.py -m decompress -C ./out/gzip/sample.nq.gz\n"
+            "    vcf_rdfizer.py -m decompress -C ./out/gzip/sample.nt.gz\n"
         ),
     )
     parser.add_argument(
@@ -684,7 +697,14 @@ def main():
         default=None,
         help="VCF file or directory (required for --mode full)",
     )
-    parser.add_argument("-q", "--nq", default=None, help="Input .nq file for --mode compress")
+    parser.add_argument(
+        "-q",
+        "--nq",
+        "--rdf",
+        dest="nq",
+        default=None,
+        help="Input RDF file (.nt or .nq) for --mode compress",
+    )
     parser.add_argument(
         "-C",
         "--compressed-input",
@@ -695,7 +715,7 @@ def main():
         "-d",
         "--decompress-out",
         default=None,
-        help="Output .nq file path for --mode decompress (default: <out>/decompressed/<name>.nq)",
+        help="Output RDF file path for --mode decompress (default: <out>/decompressed/<name>.nt)",
     )
     parser.add_argument(
         "-r",
@@ -715,7 +735,7 @@ def main():
         "-v",
         "--image-version",
         default=None,
-        help="Image tag/version to use (e.g. 1.2.3). Defaults to latest if omitted.",
+        help="Image tag/version to use (e.g. 1.2.3). Defaults to 1.0.0 if omitted and --image has no tag.",
     )
     parser.add_argument("-b", "--build", action="store_true", help="Force docker build")
     parser.add_argument("-B", "--no-build", action="store_true", help="Fail if image missing")
@@ -780,9 +800,9 @@ def main():
                 raise ValueError("--nq is required in --mode compress")
             nq_path = Path(args.nq).expanduser().resolve()
             if not nq_path.exists() or not nq_path.is_file():
-                raise ValueError(f"N-Quads input file not found: {nq_path}")
-            if nq_path.suffix != ".nq":
-                raise ValueError("Compression input must be a .nq file")
+                raise ValueError(f"RDF input file not found: {nq_path}")
+            if nq_path.suffix not in {".nq", ".nt"}:
+                raise ValueError("Compression input must be a .nq or .nt file")
             methods = parse_compression_methods(args.compression)
             validate_mode_dirs([out_dir, metrics_dir])
         else:
@@ -814,7 +834,7 @@ def main():
         print(f"  - Input VCF total: {format_bytes(estimate['input_bytes'])}")
         print(f"  - Estimated TSV intermediates: {format_bytes(estimate['tsv_bytes'])}")
         print(
-            "  - Estimated RDF N-Quads output: "
+            "  - Estimated RDF N-Triples output: "
             f"{format_bytes(estimate['rdf_low_bytes'])} to {format_bytes(estimate['rdf_high_bytes'])}"
         )
         print(

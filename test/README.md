@@ -17,7 +17,7 @@ This repository uses `unittest` (Python standard library) to isolate orchestrati
 
 - `test/test_run_conversion_unit.py`
   - Replaces `java` with a fake executable to avoid real RMLStreamer.
-  - Verifies output normalization to `.nq`.
+  - Verifies output normalization to `.nt`.
   - Verifies unified metrics CSV row creation and schema consistency.
 
 - `test/test_compression_unit.py`
