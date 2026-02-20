@@ -494,14 +494,112 @@ class WrapperUnitTests(VerboseTestCase):
                 os.chdir(old_cwd)
 
             self.assertEqual(rc, 0)
-            self.assertEqual(len(commands), 5)
+            self.assertEqual(len(commands), 6)
             self.assertIn("/opt/vcf-rdfizer/vcf_as_tsv.sh", commands[0])
             self.assertIn("/data/in/sample_a.vcf", commands[0])
-            self.assertIn("/opt/vcf-rdfizer/vcf_as_tsv.sh", commands[1])
-            self.assertIn("/data/in/sample_b.vcf", commands[1])
+            self.assertIn("OUT_NAME=sample_a", commands[1])
             self.assertIn("OUT_NAME=sample_a", commands[2])
-            self.assertIn("OUT_NAME=sample_b", commands[3])
-            self.assertIn("OUT_NAME=", commands[4])
+            self.assertIn("/opt/vcf-rdfizer/vcf_as_tsv.sh", commands[3])
+            self.assertIn("/data/in/sample_b.vcf", commands[3])
+            self.assertIn("OUT_NAME=sample_b", commands[4])
+            self.assertIn("OUT_NAME=sample_b", commands[5])
+
+    def test_main_full_mode_deletes_nt_after_compression_by_default(self):
+        """Full mode removes merged .nt outputs after successful compression unless --keep-rdf is set."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+            out_dir = tmp_path / "out"
+
+            def fake_run(cmd, cwd=None, env=None):
+                if "/opt/vcf-rdfizer/run_conversion.sh" in cmd:
+                    output_name = next(part.split("=", 1)[1] for part in cmd if part.startswith("OUT_NAME="))
+                    out_sample_dir = out_dir / output_name
+                    out_sample_dir.mkdir(parents=True, exist_ok=True)
+                    (out_sample_dir / f"{output_name}.nt").write_text("<s> <p> <o> .\n")
+                if "/opt/vcf-rdfizer/compression.sh" in cmd:
+                    output_name = next(part.split("=", 1)[1] for part in cmd if part.startswith("OUT_NAME="))
+                    hdt_dir = out_dir / "hdt"
+                    hdt_dir.mkdir(parents=True, exist_ok=True)
+                    (hdt_dir / f"{output_name}.hdt").write_text("fake-hdt\n")
+                return 0
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch.object(
+                    vcf_rdfizer, "check_docker", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "docker_image_exists", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "discover_tsv_triplets", return_value=mocked_triplets()
+                ):
+                    rc = invoke_main(
+                        [
+                            "--input",
+                            str(input_dir),
+                            "--rules",
+                            str(rules_path),
+                            "--out",
+                            str(out_dir),
+                            "--keep-tsv",
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 0)
+            self.assertFalse((out_dir / "sample" / "sample.nt").exists())
+            self.assertTrue((out_dir / "hdt" / "sample.hdt").exists())
+
+    def test_main_full_mode_keep_rdf_preserves_nt_after_compression(self):
+        """Full mode keeps merged .nt outputs when --keep-rdf is provided."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+            out_dir = tmp_path / "out"
+
+            def fake_run(cmd, cwd=None, env=None):
+                if "/opt/vcf-rdfizer/run_conversion.sh" in cmd:
+                    output_name = next(part.split("=", 1)[1] for part in cmd if part.startswith("OUT_NAME="))
+                    out_sample_dir = out_dir / output_name
+                    out_sample_dir.mkdir(parents=True, exist_ok=True)
+                    (out_sample_dir / f"{output_name}.nt").write_text("<s> <p> <o> .\n")
+                if "/opt/vcf-rdfizer/compression.sh" in cmd:
+                    output_name = next(part.split("=", 1)[1] for part in cmd if part.startswith("OUT_NAME="))
+                    hdt_dir = out_dir / "hdt"
+                    hdt_dir.mkdir(parents=True, exist_ok=True)
+                    (hdt_dir / f"{output_name}.hdt").write_text("fake-hdt\n")
+                return 0
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch.object(
+                    vcf_rdfizer, "check_docker", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "docker_image_exists", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "discover_tsv_triplets", return_value=mocked_triplets()
+                ):
+                    rc = invoke_main(
+                        [
+                            "--input",
+                            str(input_dir),
+                            "--rules",
+                            str(rules_path),
+                            "--out",
+                            str(out_dir),
+                            "--keep-tsv",
+                            "--keep-rdf",
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 0)
+            self.assertTrue((out_dir / "sample" / "sample.nt").exists())
+            self.assertTrue((out_dir / "hdt" / "sample.hdt").exists())
 
     def test_main_ignores_unrelated_existing_tsv_triplets(self):
         """Wrapper converts only triplets that match the CLI-selected VCF snapshot."""

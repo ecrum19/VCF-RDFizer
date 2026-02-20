@@ -7,9 +7,10 @@ using [RML](http://rml.io/) rules and the [RMLStreamer](https://github.com/RMLio
 ## Overview
 
 Pipeline steps:
-1. Convert VCF to TSV (`src/vcf_as_tsv.sh`)
+1. Convert one VCF to TSV (`src/vcf_as_tsv.sh`)
 2. Convert TSV to RDF with RMLStreamer (`src/run_conversion.sh`)
-3. Compress resultant RDF (`src/compression.sh`)
+3. Compress RDF (`src/compression.sh`)
+4. Repeat per input VCF (for directory/multi-file inputs)
 
 Wrapper modes:
 - `full`: run the entire VCF -> TSV -> RDF -> compression pipeline
@@ -23,6 +24,7 @@ Wrapper modes:
   - `<sample>.file_metadata.tsv`
 
 The default mapping emits triples (no graph term). The conversion step compiles all RMLStreamer output parts into one N-Triples file named after the TSV basename (for example `sample.nt` in `out/sample/`).
+By default, that merged `.nt` file is removed after compression to save disk space. Use `--keep-rdf` to keep it.
 
 Vocabulary references:
 - Ontology: [vcf-rdfizer-vocabulary.ttl](https://github.com/ecrum19/VCF-RDFizer-vocabulary/blob/main/ontology/vcf-rdfizer-vocabulary.ttl)
@@ -59,6 +61,11 @@ python3 vcf_rdfizer.py --mode full --input ./vcf_files
 python3 vcf_rdfizer.py --mode full --input ./vcf_files --rules ./rules/my_rules.ttl --estimate-size
 ```
 
+3b. Full pipeline while keeping merged `.nt` files:
+```bash
+python3 vcf_rdfizer.py --mode full --input ./vcf_files --keep-rdf
+```
+
 4. Compression-only mode (compress one `.nt` into selected formats):
 ```bash
 python3 vcf_rdfizer.py --mode compress --nq ./out/sample/sample.nt --compression gzip,brotli
@@ -78,8 +85,8 @@ Outputs:
 - `./tsv` for TSV intermediates
 - `./out` for RDF output
   - conversion outputs per TSV basename in `./out/<sample>/`
-  - each conversion output directory contains one merged N-Triples file:
-    - `./out/<sample>/<sample>.nt`
+  - merged N-Triples file:
+    - `./out/<sample>/<sample>.nt` (retained only when `--keep-rdf` is set)
   - compressed outputs preserve source RDF extension (for example `sample.nt.gz`, `sample.nt.br`)
   - compressed outputs:
     - `./out/gzip/*.gz`
@@ -125,6 +132,7 @@ The wrapper validates:
 - Full mode input path exists and contains `.vcf` or `.vcf.gz`
 - Full mode rules file exists
 - Full mode converts only the VCF file(s) selected at pipeline start (ignores unrelated preexisting TSV intermediates)
+- Full mode runs TSV -> RDF -> compression sequentially per selected VCF to reduce peak disk usage
 - Compression mode input is an RDF file (`.nt` or `.nq`)
 - Decompression mode input is `.gz`, `.br`, or `.hdt`
 - HDT mode pre-checks that `rdf2hdt.sh` is executable and that Java is available
@@ -158,19 +166,20 @@ Options:
 - `-m, --mode` (default `full`): execution mode (`full`, `compress`, `decompress`)
 - `-i, --input`: full mode input path (`.vcf` / `.vcf.gz` file or directory)
 - `-r, --rules`: full mode RML mapping `.ttl` (default `rules/default_rules.ttl`)
-- `-q, --nq, --rdf`: compression mode input RDF file (`.nt` or `.nq`)
+- `-q, --nt, --rdf`: compression mode input RDF file (`.nt` or `.nq`)
 - `-C, --compressed-input`: decompression mode input (`.gz`, `.br`, or `.hdt`)
 - `-d, --decompress-out`: decompression mode output RDF file path (default `.nt`)
 - `-o, --out` (default `./out`): RDF output directory (and compression/decompression output root)
 - `-t, --tsv` (default `./tsv`): TSV output directory (full mode)
 - `-I, --image` (default `ecrum19/vcf-rdfizer`): Docker image repo (no tag) or full image reference
-- `-v, --image-version` (default `1.0.0` effective tag when omitted): image tag/version to use when `--image` has no tag
+- `-v, --image-version` (default `latest` effective tag when omitted): image tag/version to use when `--image` has no tag
 - `-b, --build`: force docker build
 - `-B, --no-build`: fail if image missing
 - `-n, --out-name` (default `rdf`): fallback output basename in full mode
 - `-M, --metrics` (default `./run_metrics`): metrics/log directory
-- `-c, --compression` (default `gzip,brotli,hdt`): compression methods (`gzip,brotli,hdt,none`)
+- `-c, --compression` (default `hdt`): compression methods (`gzip,brotli,hdt,none`)
 - `-k, --keep-tsv`: keep TSV intermediates (full mode)
+- `-R, --keep-rdf`: keep merged `.nt` RDF outputs after compression (full mode; default is delete)
 - `-e, --estimate-size`: print rough input/TSV/RDF size estimates and free disk before running (full mode)
 - `-h, --help`: show usage guide and exit
 

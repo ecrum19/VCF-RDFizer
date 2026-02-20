@@ -167,6 +167,28 @@ def format_bytes(num_bytes: int) -> str:
     return f"{num_bytes} B"
 
 
+def file_size_bytes(path: Path):
+    if not path.exists() or not path.is_file():
+        return None
+    return path.stat().st_size
+
+
+def print_nt_hdt_summary(*, output_root: Path, nt_path: Path, hdt_path: Path):
+    print(f"Compression output directory: {output_root}")
+    nt_size = file_size_bytes(nt_path)
+    hdt_size = file_size_bytes(hdt_path)
+
+    if nt_size is None:
+        print(f"  - N-Triples (.nt): not found at {nt_path}")
+    else:
+        print(f"  - N-Triples (.nt): {format_bytes(nt_size)} ({nt_path})")
+
+    if hdt_size is None:
+        print(f"  - HDT (.hdt): not generated at {hdt_path}")
+    else:
+        print(f"  - HDT (.hdt): {format_bytes(hdt_size)} ({hdt_path})")
+
+
 def existing_parent(path: Path) -> Path:
     cur = path
     while not cur.exists():
@@ -241,20 +263,6 @@ def discover_tsv_triplets(tsv_dir: Path):
     if triplets:
         return triplets
 
-    # Backward-compatible fallback for legacy aggregate TSV naming.
-    # legacy_records = tsv_dir / "records.tsv"
-    # legacy_headers = tsv_dir / "header_lines.tsv"
-    # legacy_metadata = tsv_dir / "file_metadata.tsv"
-    # if legacy_records.exists() and legacy_headers.exists() and legacy_metadata.exists():
-    #     return [
-    #         {
-    #             "prefix": "records",
-    #             "records": legacy_records,
-    #             "headers": legacy_headers,
-    #             "metadata": legacy_metadata,
-    #         }
-    #     ]
-
     tsv_files = sorted(p.name for p in tsv_dir.glob("*.tsv"))
     tsv_preview = ", ".join(tsv_files) if tsv_files else "(none)"
     raise ValueError(
@@ -289,7 +297,7 @@ def resolve_image_ref(image: str, image_version: str | None):
             raise ValueError("Do not include a tag in --image when using --image-version.")
         return image, False
     if image_version is None:
-        return f"{image}:1.0.0", False
+        return f"{image}:latest", False
     return f"{image}:{image_version}", True
 
 
@@ -371,16 +379,32 @@ def run_full_mode(
     out_name: str,
     compression: str,
     keep_tsv: bool,
+    keep_rdf: bool,
     run_id: str,
     timestamp: str,
     wrapper_log_path: Path,
 ):
-    print("Step 3/5: Converting VCF to TSV")
+    print("Step 3/5: Processing per-input pipeline (TSV -> RDF -> compression)")
     tsv_existed = tsv_dir.exists()
     ensure_dir(tsv_dir)
+    ensure_dir(out_dir)
+    ensure_dir(metrics_dir)
+
+    selected_methods = parse_compression_methods(compression)
+
+    generated_rules_dir = metrics_dir / "_generated_rules"
+    if generated_rules_dir.exists():
+        shutil.rmtree(generated_rules_dir, ignore_errors=True)
+    ensure_dir(generated_rules_dir)
+
     total_inputs = len(container_inputs)
-    for idx, container_input in enumerate(container_inputs, start=1):
-        print(f"  - TSV conversion {idx}/{total_inputs}: {Path(container_input).name}")
+    for idx, (container_input, expected_prefix) in enumerate(
+        zip(container_inputs, expected_prefixes),
+        start=1,
+    ):
+        print(f"  - Input {idx}/{total_inputs}: {Path(container_input).name}")
+
+        print("    * TSV conversion")
         tsv_cmd = [
             "sudo",
             "docker",
@@ -399,41 +423,26 @@ def run_full_mode(
             eprint(f"Error: TSV conversion failed. See log: {wrapper_log_path}")
             return 1
 
-    print("Step 4/5: Running Conversion with RMLStreamer")
-    ensure_dir(out_dir)
-    ensure_dir(metrics_dir)
+        try:
+            tsv_triplets = discover_tsv_triplets(tsv_dir)
+        except ValueError as exc:
+            eprint(f"Error: {exc}")
+            eprint(f"See log for details: {wrapper_log_path}")
+            return 1
 
-    try:
-        tsv_triplets = discover_tsv_triplets(tsv_dir)
-    except ValueError as exc:
-        eprint(f"Error: {exc}")
-        eprint(f"See log for details: {wrapper_log_path}")
-        return 1
+        triplets_by_prefix = {triplet["prefix"]: triplet for triplet in tsv_triplets}
+        if expected_prefix not in triplets_by_prefix:
+            eprint(
+                f"Error: TSV conversion did not produce the expected triplet for '{expected_prefix}'."
+            )
+            eprint(f"See log for details: {wrapper_log_path}")
+            return 1
 
-    expected_order = unique_in_order(expected_prefixes)
-    triplets_by_prefix = {triplet["prefix"]: triplet for triplet in tsv_triplets}
-    missing_prefixes = [prefix for prefix in expected_order if prefix not in triplets_by_prefix]
-    if missing_prefixes:
-        eprint(
-            "Error: TSV conversion did not produce expected triplets for: "
-            + ", ".join(missing_prefixes)
-        )
-        eprint(f"See log for details: {wrapper_log_path}")
-        return 1
+        ignored_prefixes = sorted(set(triplets_by_prefix.keys()) - {expected_prefix})
+        if ignored_prefixes:
+            print("    * Ignoring unrelated TSV triplets already in output directory")
 
-    ignored_prefixes = sorted(set(triplets_by_prefix.keys()) - set(expected_order))
-    if ignored_prefixes:
-        print("  - Ignoring unrelated TSV triplets in output directory")
-
-    tsv_triplets = [triplets_by_prefix[prefix] for prefix in expected_order]
-
-    generated_rules_dir = metrics_dir / "_generated_rules"
-    if generated_rules_dir.exists():
-        shutil.rmtree(generated_rules_dir, ignore_errors=True)
-    ensure_dir(generated_rules_dir)
-
-    conversion_output_names = []
-    for triplet in tsv_triplets:
+        triplet = triplets_by_prefix[expected_prefix]
         prefix = triplet["prefix"]
         safe_prefix = slugify(prefix)
         generated_rules = generated_rules_dir / f"{safe_prefix}.rules.ttl"
@@ -446,10 +455,9 @@ def run_full_mode(
         )
 
         output_name = safe_prefix or slugify(out_name)
-        conversion_output_names.append(output_name)
         container_generated_rules = f"/data/rules/{generated_rules.name}"
 
-        print(f"  - Converting '{prefix}' into RDF")
+        print("    * RDF conversion")
         run_cmd = [
             "sudo",
             "docker",
@@ -488,35 +496,52 @@ def run_full_mode(
             eprint(f"Error: RMLStreamer step failed for '{prefix}'. See log: {wrapper_log_path}")
             return 1
 
-    print("Step 5/5: Compressing outputs")
-    compression_out_name = conversion_output_names[0] if len(conversion_output_names) == 1 else ""
-    compression_cmd = [
-        "sudo",
-        "docker",
-        "run",
-        "--rm",
-        "-v",
-        f"{str(out_dir)}:/data/out",
-        "-v",
-        f"{str(metrics_dir)}:/data/metrics",
-        "-e",
-        "OUT_ROOT_DIR=/data/out",
-        "-e",
-        f"OUT_NAME={compression_out_name}",
-        "-e",
-        "LOGDIR=/data/metrics",
-        "-e",
-        f"RUN_ID={run_id}",
-        "-e",
-        f"TIMESTAMP={timestamp}",
-        image_ref,
-        "/opt/vcf-rdfizer/compression.sh",
-        "-m",
-        compression,
-    ]
-    if run(compression_cmd) != 0:
-        eprint(f"Error: compression step failed. See log: {wrapper_log_path}")
-        return 1
+        print("    * Compression")
+        compression_cmd = [
+            "sudo",
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            f"{str(out_dir)}:/data/out",
+            "-v",
+            f"{str(metrics_dir)}:/data/metrics",
+            "-e",
+            "OUT_ROOT_DIR=/data/out",
+            "-e",
+            f"OUT_NAME={output_name}",
+            "-e",
+            "LOGDIR=/data/metrics",
+            "-e",
+            f"RUN_ID={run_id}",
+            "-e",
+            f"TIMESTAMP={timestamp}",
+            image_ref,
+            "/opt/vcf-rdfizer/compression.sh",
+            "-m",
+            compression,
+        ]
+        if run(compression_cmd) != 0:
+            eprint(f"Error: compression step failed for '{prefix}'. See log: {wrapper_log_path}")
+            return 1
+
+        nt_path = out_dir / output_name / f"{output_name}.nt"
+        hdt_path = out_dir / "hdt" / f"{output_name}.hdt"
+        print_nt_hdt_summary(output_root=out_dir, nt_path=nt_path, hdt_path=hdt_path)
+
+        if not keep_rdf and selected_methods:
+            if nt_path.exists():
+                nt_path.unlink()
+                print(f"    * Removed N-Triples file (set --keep-rdf to retain): {nt_path}")
+            else:
+                print(f"    * N-Triples cleanup skipped (not found): {nt_path}")
+        elif not keep_rdf and not selected_methods:
+            print("    * Compression methods set to `none`; keeping N-Triples output.")
+
+        if not keep_tsv:
+            for tsv_path in (triplet["records"], triplet["headers"], triplet["metadata"]):
+                if tsv_path.exists():
+                    tsv_path.unlink()
 
     if not keep_tsv:
         if not tsv_existed:
@@ -524,7 +549,7 @@ def run_full_mode(
         else:
             print("Note: TSV directory existed; skipping cleanup.")
 
-    print("Done. See output and metrics directories for results.")
+    print("Conversion process finished.")
     return 0
 
 
@@ -592,7 +617,10 @@ def run_compress_mode(
             eprint(f"Error: {method} compression failed. See log: {wrapper_log_path}")
             return 1
 
-    print("Done. Compressed outputs written to mode subdirectories in --out.")
+    nt_path = nq_path if nq_path.suffix == ".nt" else nq_path.with_suffix(".nt")
+    hdt_path = out_dir / "hdt" / f"{input_stem}.hdt"
+    print_nt_hdt_summary(output_root=out_dir, nt_path=nt_path, hdt_path=hdt_path)
+    print("Conversion process finished.")
     return 0
 
 
@@ -703,9 +731,9 @@ def main():
     )
     parser.add_argument(
         "-q",
-        "--nq",
+        "--nt",
         "--rdf",
-        dest="nq",
+        dest="nt",
         default=None,
         help="Input RDF file (.nt or .nq) for --mode compress",
     )
@@ -739,7 +767,7 @@ def main():
         "-v",
         "--image-version",
         default=None,
-        help="Image tag/version to use (e.g. 1.2.3). Defaults to 1.0.0 if omitted and --image has no tag.",
+        help="Image tag/version to use (e.g. 1.2.3). Defaults to 'latest' if omitted and --image has no tag.",
     )
     parser.add_argument("-b", "--build", action="store_true", help="Force docker build")
     parser.add_argument("-B", "--no-build", action="store_true", help="Fail if image missing")
@@ -762,6 +790,12 @@ def main():
         "--estimate-size",
         action="store_true",
         help="Print a rough storage estimate before running conversion",
+    )
+    parser.add_argument(
+        "-R",
+        "--keep-rdf",
+        action="store_true",
+        help="Keep merged N-Triples outputs after compression in full mode",
     )
     args = parser.parse_args()
 
@@ -894,6 +928,7 @@ def main():
                 out_name=args.out_name,
                 compression=args.compression,
                 keep_tsv=args.keep_tsv,
+                keep_rdf=args.keep_rdf,
                 run_id=run_id,
                 timestamp=timestamp,
                 wrapper_log_path=wrapper_log_path,
