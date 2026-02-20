@@ -78,8 +78,8 @@ class WrapperUnitTests(VerboseTestCase):
 
             self.assertEqual(estimate["input_bytes"], 150)
             self.assertEqual(estimate["tsv_bytes"], 385)
-            self.assertEqual(estimate["rdf_low_bytes"], 1400)
-            self.assertEqual(estimate["rdf_high_bytes"], 4200)
+            self.assertEqual(estimate["rdf_low_bytes"], 14700)
+            self.assertEqual(estimate["rdf_high_bytes"], 23450)
             self.assertEqual(estimate["free_disk_bytes"], 42_000)
 
     def test_main_estimate_size_prints_summary_and_warning(self):

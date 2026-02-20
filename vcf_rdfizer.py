@@ -19,8 +19,11 @@ _COMMAND_LOGGER = None
 
 COMPRESSED_VCF_EXPANSION_FACTOR = 5.0
 TSV_OVERHEAD_FACTOR = 1.10
-RDF_EXPANSION_LOW_FACTOR = 4.0
-RDF_EXPANSION_HIGH_FACTOR = 12.0
+# Calibrated from observed runs:
+# - small fixtures: ~42x-45x VCF->RDF inflation
+# - larger real dataset: ~66x VCF->RDF inflation
+RDF_EXPANSION_LOW_FACTOR = 42.0
+RDF_EXPANSION_HIGH_FACTOR = 67.0
 METRICS_HEADER = [
     "run_id",
     "timestamp",

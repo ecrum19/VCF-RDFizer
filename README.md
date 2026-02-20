@@ -149,7 +149,13 @@ Current heuristic per input file:
 - If input is `.vcf`: use on-disk size as the expanded VCF size
 - If input is `.vcf.gz`: estimate expanded VCF as `compressed_size * 5.0`
 - Estimate TSV intermediates as `expanded_vcf * 1.10`
-- Estimate RDF N-Triples as a range: `expanded_vcf * 4.0` to `expanded_vcf * 12.0`
+- Estimate RDF N-Triples as a range: `expanded_vcf * 42.0` to `expanded_vcf * 67.0`
+
+Current RDF inflation calibration points:
+- test1: `5.9 KB -> 248 KB` (~42x)
+- test2: `61 KB -> 2.6 MB` (~44x)
+- test3: `612 KB -> 26.6 MB` (~43x)
+- real1: `386 MB -> ~25 GB` (~66x)
 
 Accuracy statement:
 - This is a coarse planning estimate, not a guarantee.
