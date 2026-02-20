@@ -499,10 +499,6 @@ def run_full_mode(
             eprint(f"See log for details: {wrapper_log_path}")
             return 1
 
-        ignored_prefixes = sorted(set(triplets_by_prefix.keys()) - {expected_prefix})
-        if ignored_prefixes:
-            print("    * Note: ignoring unrelated TSV triplets already in output directory")
-
         triplet = triplets_by_prefix[expected_prefix]
         prefix = triplet["prefix"]
         safe_prefix = slugify(prefix)
@@ -622,7 +618,7 @@ def run_full_mode(
             else nq_size_before_cleanup
         )
         print_nt_hdt_summary(
-            output_root=out_dir,
+            output_root=out_dir / output_name,
             nt_path=summary_nt_path,
             hdt_path=hdt_path,
             indent="    ",
