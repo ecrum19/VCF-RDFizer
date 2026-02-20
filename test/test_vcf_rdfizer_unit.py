@@ -661,6 +661,53 @@ class WrapperUnitTests(VerboseTestCase):
                 )
             )
 
+    def test_main_full_mode_deletes_raw_nq_and_keeps_compressed_output(self):
+        """Full mode cleanup removes raw .nq (legacy) while preserving compressed outputs."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+            out_dir = tmp_path / "out"
+
+            def fake_run(cmd, cwd=None, env=None):
+                if "/opt/vcf-rdfizer/run_conversion.sh" in cmd:
+                    output_name = next(part.split("=", 1)[1] for part in cmd if part.startswith("OUT_NAME="))
+                    out_sample_dir = out_dir / output_name
+                    out_sample_dir.mkdir(parents=True, exist_ok=True)
+                    (out_sample_dir / f"{output_name}.nq").write_text("<s> <p> <o> <g> .\n")
+                if "/opt/vcf-rdfizer/compression.sh" in cmd:
+                    output_name = next(part.split("=", 1)[1] for part in cmd if part.startswith("OUT_NAME="))
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    (out_dir / f"{output_name}.hdt").write_text("fake-hdt\n")
+                return 0
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch.object(
+                    vcf_rdfizer, "check_docker", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "docker_image_exists", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "discover_tsv_triplets", return_value=mocked_triplets()
+                ):
+                    rc = invoke_main(
+                        [
+                            "--input",
+                            str(input_dir),
+                            "--rules",
+                            str(rules_path),
+                            "--out",
+                            str(out_dir),
+                            "--keep-tsv",
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 0)
+            self.assertFalse((out_dir / "sample" / "sample.nq").exists())
+            self.assertTrue((out_dir / "sample.hdt").exists())
+
     def test_main_ignores_unrelated_existing_tsv_triplets(self):
         """Wrapper converts only triplets that match the CLI-selected VCF snapshot."""
         with tempfile.TemporaryDirectory() as td:

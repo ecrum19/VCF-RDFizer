@@ -587,20 +587,26 @@ def run_full_mode(
         print("    * Compression ✅")
 
         nt_path = out_dir / output_name / f"{output_name}.nt"
+        nq_path = out_dir / output_name / f"{output_name}.nq"
         hdt_path = out_dir / f"{output_name}.hdt"
         nt_size_before_cleanup = file_size_bytes(nt_path)
+        nq_size_before_cleanup = file_size_bytes(nq_path)
 
         nt_note = None
         if not keep_rdf and selected_methods:
-            if nt_path.exists():
-                if not remove_file_with_docker_fallback(
-                    path=nt_path,
-                    mount_root=out_dir,
-                    mount_point="/data/out",
-                    image_ref=image_ref,
-                    wrapper_log_path=wrapper_log_path,
-                ):
-                    return 1
+            removed_any = False
+            for raw_rdf_path in (nt_path, nq_path):
+                if raw_rdf_path.exists():
+                    if not remove_file_with_docker_fallback(
+                        path=raw_rdf_path,
+                        mount_root=out_dir,
+                        mount_point="/data/out",
+                        image_ref=image_ref,
+                        wrapper_log_path=wrapper_log_path,
+                    ):
+                        return 1
+                    removed_any = True
+            if removed_any:
                 nt_note = "removed, set --keep-rdf to retain"
             else:
                 nt_note = "cleanup skipped"
@@ -609,13 +615,19 @@ def run_full_mode(
         elif keep_rdf:
             nt_note = "retained via --keep-rdf"
 
+        summary_nt_path = nt_path if nt_size_before_cleanup is not None else nq_path
+        summary_nt_size = (
+            nt_size_before_cleanup
+            if nt_size_before_cleanup is not None
+            else nq_size_before_cleanup
+        )
         print_nt_hdt_summary(
             output_root=out_dir,
-            nt_path=nt_path,
+            nt_path=summary_nt_path,
             hdt_path=hdt_path,
             indent="    ",
             nt_note=nt_note,
-            nt_size_override=nt_size_before_cleanup,
+            nt_size_override=summary_nt_size,
         )
 
         if not keep_tsv:
