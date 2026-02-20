@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -35,6 +36,17 @@ def mocked_triplets():
             "metadata": Path("sample.file_metadata.tsv"),
         }
     ]
+
+
+def output_name_from_command(cmd):
+    for part in cmd:
+        if isinstance(part, str) and part.startswith("OUT_NAME="):
+            return part.split("=", 1)[1]
+    if isinstance(cmd, list) and cmd and isinstance(cmd[-1], str):
+        match = re.search(r"/data/out/([^/]+)/\1\.hdt", cmd[-1])
+        if match:
+            return match.group(1)
+    return None
 
 
 class WrapperUnitTests(VerboseTestCase):
@@ -114,7 +126,7 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertIn("Preflight size estimate (rough):", out_buf.getvalue())
             self.assertIn("Estimated RDF N-Triples size:", out_buf.getvalue())
             self.assertIn("Warning: Estimated upper-bound RDF size exceeds currently free disk.", err_buf.getvalue())
-            self.assertEqual(len(commands), 3)
+            self.assertEqual(len(commands), 5)
 
     def test_main_short_flags_work_for_full_mode(self):
         """Short aliases run full mode successfully."""
@@ -154,7 +166,7 @@ class WrapperUnitTests(VerboseTestCase):
                 os.chdir(old_cwd)
 
             self.assertEqual(rc, 0)
-            self.assertEqual(len(commands), 3)
+            self.assertEqual(len(commands), 2)
 
     def test_main_compress_mode_runs_selected_methods(self):
         """Compression mode runs only requested methods for a designated .nq input."""
@@ -444,11 +456,9 @@ class WrapperUnitTests(VerboseTestCase):
                 os.chdir(old_cwd)
 
             self.assertEqual(rc, 0)
-            self.assertEqual(len(commands), 3)
+            self.assertEqual(len(commands), 2)
             self.assertIn("/opt/vcf-rdfizer/vcf_as_tsv.sh", commands[0])
             self.assertIn("/opt/vcf-rdfizer/run_conversion.sh", commands[1])
-            self.assertIn("/opt/vcf-rdfizer/compression.sh", commands[2])
-            self.assertEqual(commands[2][-2:], ["-m", "none"])
 
     def test_main_multiple_triplets_run_multiple_conversions_and_compress_all_outputs(self):
         """Multiple input triplets trigger per-sample conversion runs and all-output compression."""
@@ -496,15 +506,17 @@ class WrapperUnitTests(VerboseTestCase):
                 os.chdir(old_cwd)
 
             self.assertEqual(rc, 0)
-            self.assertEqual(len(commands), 6)
+            self.assertEqual(len(commands), 10)
             self.assertIn("/opt/vcf-rdfizer/vcf_as_tsv.sh", commands[0])
             self.assertIn("/data/in/sample_a.vcf", commands[0])
             self.assertIn("OUT_NAME=sample_a", commands[1])
-            self.assertIn("OUT_NAME=sample_a", commands[2])
-            self.assertIn("/opt/vcf-rdfizer/vcf_as_tsv.sh", commands[3])
-            self.assertIn("/data/in/sample_b.vcf", commands[3])
-            self.assertIn("OUT_NAME=sample_b", commands[4])
-            self.assertIn("OUT_NAME=sample_b", commands[5])
+            self.assertIn("rdf2hdt.sh", commands[4][-1])
+            self.assertIn("/data/out/sample_a/sample_a.hdt", commands[4][-1])
+            self.assertIn("/opt/vcf-rdfizer/vcf_as_tsv.sh", commands[5])
+            self.assertIn("/data/in/sample_b.vcf", commands[5])
+            self.assertIn("OUT_NAME=sample_b", commands[6])
+            self.assertIn("rdf2hdt.sh", commands[9][-1])
+            self.assertIn("/data/out/sample_b/sample_b.hdt", commands[9][-1])
 
     def test_main_full_mode_deletes_nt_after_compression_by_default(self):
         """Full mode removes merged .nt outputs after successful compression unless --keep-rdf is set."""
@@ -515,12 +527,12 @@ class WrapperUnitTests(VerboseTestCase):
 
             def fake_run(cmd, cwd=None, env=None):
                 if "/opt/vcf-rdfizer/run_conversion.sh" in cmd:
-                    output_name = next(part.split("=", 1)[1] for part in cmd if part.startswith("OUT_NAME="))
+                    output_name = output_name_from_command(cmd) or "sample"
                     out_sample_dir = out_dir / output_name
                     out_sample_dir.mkdir(parents=True, exist_ok=True)
                     (out_sample_dir / f"{output_name}.nt").write_text("<s> <p> <o> .\n")
-                if "/opt/vcf-rdfizer/compression.sh" in cmd:
-                    output_name = next(part.split("=", 1)[1] for part in cmd if part.startswith("OUT_NAME="))
+                if isinstance(cmd, list) and cmd and "rdf2hdt.sh" in cmd[-1]:
+                    output_name = output_name_from_command(cmd) or "sample"
                     out_sample_dir = out_dir / output_name
                     out_sample_dir.mkdir(parents=True, exist_ok=True)
                     (out_sample_dir / f"{output_name}.hdt").write_text("fake-hdt\n")
@@ -563,12 +575,12 @@ class WrapperUnitTests(VerboseTestCase):
 
             def fake_run(cmd, cwd=None, env=None):
                 if "/opt/vcf-rdfizer/run_conversion.sh" in cmd:
-                    output_name = next(part.split("=", 1)[1] for part in cmd if part.startswith("OUT_NAME="))
+                    output_name = output_name_from_command(cmd) or "sample"
                     out_sample_dir = out_dir / output_name
                     out_sample_dir.mkdir(parents=True, exist_ok=True)
                     (out_sample_dir / f"{output_name}.nt").write_text("<s> <p> <o> .\n")
-                if "/opt/vcf-rdfizer/compression.sh" in cmd:
-                    output_name = next(part.split("=", 1)[1] for part in cmd if part.startswith("OUT_NAME="))
+                if isinstance(cmd, list) and cmd and "rdf2hdt.sh" in cmd[-1]:
+                    output_name = output_name_from_command(cmd) or "sample"
                     out_sample_dir = out_dir / output_name
                     out_sample_dir.mkdir(parents=True, exist_ok=True)
                     (out_sample_dir / f"{output_name}.hdt").write_text("fake-hdt\n")
@@ -603,6 +615,69 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertTrue((out_dir / "sample" / "sample.nt").exists())
             self.assertTrue((out_dir / "sample" / "sample.hdt").exists())
 
+    def test_main_full_mode_writes_compression_metrics_artifacts(self):
+        """Full mode writes compression metrics JSON/time artifacts and updates metrics.csv row."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+            out_dir = tmp_path / "out"
+            metrics_dir = tmp_path / "run_metrics"
+
+            def fake_run(cmd, cwd=None, env=None):
+                if "/opt/vcf-rdfizer/run_conversion.sh" in cmd:
+                    output_name = output_name_from_command(cmd) or "sample"
+                    out_sample_dir = out_dir / output_name
+                    out_sample_dir.mkdir(parents=True, exist_ok=True)
+                    (out_sample_dir / f"{output_name}.nt").write_text("<s> <p> <o> .\n")
+                if isinstance(cmd, list) and cmd and "rdf2hdt.sh" in cmd[-1]:
+                    output_name = output_name_from_command(cmd) or "sample"
+                    out_sample_dir = out_dir / output_name
+                    out_sample_dir.mkdir(parents=True, exist_ok=True)
+                    (out_sample_dir / f"{output_name}.hdt").write_text("fake-hdt\n")
+                return 0
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch.object(
+                    vcf_rdfizer, "check_docker", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "docker_image_exists", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "discover_tsv_triplets", return_value=mocked_triplets()
+                ):
+                    rc = invoke_main(
+                        [
+                            "--input",
+                            str(input_dir),
+                            "--rules",
+                            str(rules_path),
+                            "--out",
+                            str(out_dir),
+                            "--metrics",
+                            str(metrics_dir),
+                            "--compression",
+                            "hdt",
+                            "--keep-tsv",
+                            "--keep-rdf",
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 0)
+            metrics_csv = metrics_dir / "metrics.csv"
+            self.assertTrue(metrics_csv.exists())
+            csv_text = metrics_csv.read_text()
+            self.assertIn("compression_methods", csv_text)
+            self.assertIn("sample", csv_text)
+            self.assertIn("hdt", csv_text)
+
+            json_files = list(metrics_dir.glob("compression-metrics-sample-*.json"))
+            time_files = list(metrics_dir.glob("compression-time-hdt-sample-*.txt"))
+            self.assertTrue(json_files)
+            self.assertTrue(time_files)
+
     def test_main_full_mode_deletes_nt_with_docker_fallback_on_permission_error(self):
         """Full mode falls back to Docker-based removal when .nt unlink raises PermissionError."""
         with tempfile.TemporaryDirectory() as td:
@@ -619,7 +694,7 @@ class WrapperUnitTests(VerboseTestCase):
                 if "/opt/vcf-rdfizer/run_conversion.sh" in cmd:
                     target_nt.parent.mkdir(parents=True, exist_ok=True)
                     target_nt.write_text("<s> <p> <o> .\n")
-                if "/opt/vcf-rdfizer/compression.sh" in cmd:
+                if isinstance(cmd, list) and cmd and "rdf2hdt.sh" in cmd[-1]:
                     out_sample_dir = out_dir / "sample"
                     out_sample_dir.mkdir(parents=True, exist_ok=True)
                     (out_sample_dir / "sample.hdt").write_text("fake-hdt\n")
@@ -675,12 +750,12 @@ class WrapperUnitTests(VerboseTestCase):
 
             def fake_run(cmd, cwd=None, env=None):
                 if "/opt/vcf-rdfizer/run_conversion.sh" in cmd:
-                    output_name = next(part.split("=", 1)[1] for part in cmd if part.startswith("OUT_NAME="))
+                    output_name = output_name_from_command(cmd) or "sample"
                     out_sample_dir = out_dir / output_name
                     out_sample_dir.mkdir(parents=True, exist_ok=True)
                     (out_sample_dir / f"{output_name}.nq").write_text("<s> <p> <o> <g> .\n")
-                if "/opt/vcf-rdfizer/compression.sh" in cmd:
-                    output_name = next(part.split("=", 1)[1] for part in cmd if part.startswith("OUT_NAME="))
+                if isinstance(cmd, list) and cmd and "rdf2hdt.sh" in cmd[-1]:
+                    output_name = output_name_from_command(cmd) or "sample"
                     out_sample_dir = out_dir / output_name
                     out_sample_dir.mkdir(parents=True, exist_ok=True)
                     (out_sample_dir / f"{output_name}.hdt").write_text("fake-hdt\n")
@@ -755,7 +830,7 @@ class WrapperUnitTests(VerboseTestCase):
                 os.chdir(old_cwd)
 
             self.assertEqual(rc, 0)
-            self.assertEqual(len(commands), 3)
+            self.assertEqual(len(commands), 5)
             conversion_cmd = commands[1]
             self.assertIn("OUT_NAME=sample", conversion_cmd)
             self.assertNotIn("OUT_NAME=stale", conversion_cmd)

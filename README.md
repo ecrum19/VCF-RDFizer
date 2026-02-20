@@ -9,7 +9,7 @@ using [RML](http://rml.io/) rules and the [RMLStreamer](https://github.com/RMLio
 Pipeline steps:
 1. Convert one VCF to TSV (`src/vcf_as_tsv.sh`)
 2. Convert TSV to RDF with RMLStreamer (`src/run_conversion.sh`)
-3. Compress RDF (`src/compression.sh`)
+3. Compress RDF (wrapper uses Dockerized compression commands; `src/compression.sh` remains available for standalone script use)
 4. Repeat per input VCF (for directory/multi-file inputs)
 
 Wrapper modes:

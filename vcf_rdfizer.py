@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 
 import argparse
+import csv
+import json
 import re
 import shlex
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -17,6 +20,44 @@ COMPRESSED_VCF_EXPANSION_FACTOR = 5.0
 TSV_OVERHEAD_FACTOR = 1.10
 RDF_EXPANSION_LOW_FACTOR = 4.0
 RDF_EXPANSION_HIGH_FACTOR = 12.0
+METRICS_HEADER = [
+    "run_id",
+    "timestamp",
+    "output_name",
+    "output_dir",
+    "exit_code_java",
+    "wall_seconds_java",
+    "user_seconds_java",
+    "sys_seconds_java",
+    "max_rss_kb_java",
+    "input_mapping_size_bytes",
+    "input_vcf_size_bytes",
+    "output_dir_size_bytes",
+    "output_triples",
+    "jar",
+    "mapping_file",
+    "output_path",
+    "combined_nq_size_bytes",
+    "gzip_size_bytes",
+    "brotli_size_bytes",
+    "hdt_size_bytes",
+    "exit_code_gzip",
+    "exit_code_brotli",
+    "exit_code_hdt",
+    "wall_seconds_gzip",
+    "user_seconds_gzip",
+    "sys_seconds_gzip",
+    "max_rss_kb_gzip",
+    "wall_seconds_brotli",
+    "user_seconds_brotli",
+    "sys_seconds_brotli",
+    "max_rss_kb_brotli",
+    "wall_seconds_hdt",
+    "user_seconds_hdt",
+    "sys_seconds_hdt",
+    "max_rss_kb_hdt",
+    "compression_methods",
+]
 
 
 class CommandLogger:
@@ -375,6 +416,169 @@ def parse_compression_methods(raw: str):
     return methods
 
 
+def safe_metrics_name(value: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("_")
+    return safe or "rdf"
+
+
+def update_metrics_csv_with_compression(
+    *,
+    metrics_csv: Path,
+    run_id: str,
+    timestamp: str,
+    output_name: str,
+    output_dir: Path,
+    combined_size_bytes: int,
+    selected_methods: list[str],
+    method_results: dict[str, dict],
+):
+    metrics_csv.parent.mkdir(parents=True, exist_ok=True)
+    if not metrics_csv.exists():
+        with metrics_csv.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=METRICS_HEADER)
+            writer.writeheader()
+
+    with metrics_csv.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = reader.fieldnames or METRICS_HEADER
+        rows = list(reader)
+
+    if fieldnames != METRICS_HEADER:
+        backup = metrics_csv.with_name(f"{metrics_csv.name}.bak-{run_id}")
+        shutil.copyfile(metrics_csv, backup)
+        fieldnames = METRICS_HEADER
+        rows = []
+
+    row = None
+    for existing in rows:
+        if existing.get("run_id") == run_id and existing.get("output_name") == output_name:
+            row = existing
+            break
+
+    if row is None:
+        row = {name: "" for name in METRICS_HEADER}
+        row["run_id"] = run_id
+        row["timestamp"] = timestamp
+        row["output_name"] = output_name
+        row["output_dir"] = str(output_dir)
+        rows.append(row)
+
+    row["combined_nq_size_bytes"] = str(int(combined_size_bytes))
+    row["compression_methods"] = "|".join(selected_methods) if selected_methods else "none"
+
+    defaults = {
+        "gzip_size_bytes": "0",
+        "brotli_size_bytes": "0",
+        "hdt_size_bytes": "0",
+        "exit_code_gzip": "0",
+        "exit_code_brotli": "0",
+        "exit_code_hdt": "0",
+        "wall_seconds_gzip": "null",
+        "wall_seconds_brotli": "null",
+        "wall_seconds_hdt": "null",
+        "user_seconds_gzip": "null",
+        "user_seconds_brotli": "null",
+        "user_seconds_hdt": "null",
+        "sys_seconds_gzip": "null",
+        "sys_seconds_brotli": "null",
+        "sys_seconds_hdt": "null",
+        "max_rss_kb_gzip": "null",
+        "max_rss_kb_brotli": "null",
+        "max_rss_kb_hdt": "null",
+    }
+    row.update(defaults)
+
+    for method, result in method_results.items():
+        size_key = f"{method}_size_bytes"
+        exit_key = f"exit_code_{method}"
+        wall_key = f"wall_seconds_{method}"
+        row[size_key] = str(int(result.get("output_size_bytes") or 0))
+        row[exit_key] = str(int(result.get("exit_code") or 0))
+        wall_val = result.get("wall_seconds")
+        row[wall_key] = "null" if wall_val is None else f"{float(wall_val):.6f}"
+
+    with metrics_csv.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=METRICS_HEADER)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_compression_metrics_artifacts(
+    *,
+    metrics_dir: Path,
+    run_id: str,
+    timestamp: str,
+    output_name: str,
+    source_rdf_path: Path,
+    combined_size_bytes: int,
+    selected_methods: list[str],
+    method_results: dict[str, dict],
+):
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = safe_metrics_name(output_name)
+
+    for method, result in method_results.items():
+        time_log = metrics_dir / f"compression-time-{method}-{safe_name}-{run_id}.txt"
+        lines = [
+            f"method={method}",
+            f"exit_code={result.get('exit_code', 1)}",
+            f"wall_seconds={result.get('wall_seconds', 'null')}",
+            f"output_path={result.get('output_path', '')}",
+            f"output_size_bytes={result.get('output_size_bytes', 0)}",
+        ]
+        time_log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    gzip_result = method_results.get("gzip", {})
+    brotli_result = method_results.get("brotli", {})
+    hdt_result = method_results.get("hdt", {})
+
+    payload = {
+        "run_id": run_id,
+        "timestamp": timestamp,
+        "output_dir": str(source_rdf_path.parent),
+        "output_name": output_name,
+        "compression_methods": ",".join(selected_methods) if selected_methods else "none",
+        "combined_nq_path": str(source_rdf_path),
+        "combined_nq_size_bytes": int(combined_size_bytes),
+        "gzip": {
+            "output_gz_path": gzip_result.get("output_path", ""),
+            "output_gz_size_bytes": int(gzip_result.get("output_size_bytes") or 0),
+            "exit_code": int(gzip_result.get("exit_code") or 0),
+            "timing": {
+                "wall_seconds": gzip_result.get("wall_seconds"),
+                "user_seconds": None,
+                "sys_seconds": None,
+                "max_rss_kb": None,
+            },
+        },
+        "brotli": {
+            "output_brotli_path": brotli_result.get("output_path", ""),
+            "output_brotli_size_bytes": int(brotli_result.get("output_size_bytes") or 0),
+            "exit_code": int(brotli_result.get("exit_code") or 0),
+            "timing": {
+                "wall_seconds": brotli_result.get("wall_seconds"),
+                "user_seconds": None,
+                "sys_seconds": None,
+                "max_rss_kb": None,
+            },
+        },
+        "hdt_conversion": {
+            "output_hdt_path": hdt_result.get("output_path", ""),
+            "output_hdt_size_bytes": int(hdt_result.get("output_size_bytes") or 0),
+            "exit_code": int(hdt_result.get("exit_code") or 0),
+            "timing": {
+                "wall_seconds": hdt_result.get("wall_seconds"),
+                "user_seconds": None,
+                "sys_seconds": None,
+                "max_rss_kb": None,
+            },
+        },
+    }
+
+    metrics_json = metrics_dir / f"compression-metrics-{safe_name}-{run_id}.json"
+    metrics_json.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
 def validate_mode_dirs(paths):
     for p in paths:
         if p.exists() and not p.is_dir():
@@ -424,6 +628,81 @@ def ensure_image_available(
         return 1
     print(f"{step_label}: Ensuring Docker image is available ✅")
     return 0
+
+
+def run_compression_methods_for_rdf(
+    *,
+    rdf_path: Path,
+    out_dir: Path,
+    image_ref: str,
+    methods: list[str],
+    wrapper_log_path: Path,
+    status_indent: str | None,
+):
+    in_dir = rdf_path.parent
+    input_container = f"/data/in/{rdf_path.name}"
+    input_stem = rdf_path.stem
+    input_ext = rdf_path.suffix.lstrip(".") or "nt"
+    target_out_dir = out_dir / input_stem
+    ensure_dir(target_out_dir)
+    target_out_container = f"/data/out/{input_stem}"
+
+    method_results: dict[str, dict] = {}
+
+    for method in methods:
+        if method == "gzip":
+            output_name = f"{input_stem}.{input_ext}.gz"
+            out_container = f"{target_out_container}/{output_name}"
+            command = f"gzip -c {shlex.quote(input_container)} > {shlex.quote(out_container)}"
+        elif method == "brotli":
+            output_name = f"{input_stem}.{input_ext}.br"
+            out_container = f"{target_out_container}/{output_name}"
+            command = f"brotli -q 7 -c {shlex.quote(input_container)} > {shlex.quote(out_container)}"
+        else:
+            output_name = f"{input_stem}.hdt"
+            out_container = f"{target_out_container}/{output_name}"
+            command = (
+                "set -euo pipefail; "
+                "HDT_BIN=/opt/hdt-java/hdt-java-cli/bin/rdf2hdt.sh; "
+                "HDT_PROJECT_DIR=/opt/hdt-java/hdt-java-cli; "
+                'if [[ ! -x "$HDT_BIN" ]]; then echo "Missing rdf2hdt.sh at $HDT_BIN" >&2; exit 127; fi; '
+                'if ! command -v java >/dev/null 2>&1; then echo "Java runtime not found on PATH" >&2; exit 127; fi; '
+                'if [[ -f "$HDT_PROJECT_DIR/pom.xml" ]]; then cd "$HDT_PROJECT_DIR"; fi; '
+                'bash "$HDT_BIN" '
+                f"{shlex.quote(input_container)} {shlex.quote(out_container)}"
+            )
+
+        cmd = [
+            "sudo",
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            f"{str(in_dir)}:/data/in:ro",
+            "-v",
+            f"{str(out_dir)}:/data/out",
+            image_ref,
+            "bash",
+            "-lc",
+            command,
+        ]
+        started = time.perf_counter()
+        exit_code = run(cmd)
+        elapsed = time.perf_counter() - started
+        output_path = target_out_dir / output_name
+        method_results[method] = {
+            "exit_code": exit_code,
+            "wall_seconds": elapsed,
+            "output_path": str(output_path),
+            "output_size_bytes": int(file_size_bytes(output_path) or 0),
+        }
+        if exit_code != 0:
+            eprint(f"Error: {method} compression failed. See log: {wrapper_log_path}")
+            return False, method_results
+        if status_indent is not None:
+            print(f"{status_indent}- {method}: {output_name} ✅")
+
+    return True, method_results
 
 
 def run_full_mode(
@@ -539,13 +818,13 @@ def run_full_mode(
             f"OUT_NAME={output_name}",
             "-e",
             f"RUN_ID={run_id}",
-                "-e",
-                f"TIMESTAMP={timestamp}",
-                "-e",
-                f"IN_VCF={input_metrics_target}",
-                "-e",
-                "LOGDIR=/data/metrics",
-                image_ref,
+            "-e",
+            f"TIMESTAMP={timestamp}",
+            "-e",
+            f"IN_VCF={input_metrics_target}",
+            "-e",
+            "LOGDIR=/data/metrics",
+            image_ref,
             "/opt/vcf-rdfizer/run_conversion.sh",
         ]
         if run(run_cmd) != 0:
@@ -553,54 +832,71 @@ def run_full_mode(
             return 1
         print("    * RDF conversion ✅")
 
-        compression_cmd = [
-            "sudo",
-            "docker",
-            "run",
-            "--rm",
-            "-v",
-            f"{str(out_dir)}:/data/out",
-            "-v",
-            f"{str(metrics_dir)}:/data/metrics",
-            "-e",
-            "OUT_ROOT_DIR=/data/out",
-            "-e",
-            f"OUT_NAME={output_name}",
-            "-e",
-            "LOGDIR=/data/metrics",
-            "-e",
-            f"RUN_ID={run_id}",
-            "-e",
-            f"TIMESTAMP={timestamp}",
-            image_ref,
-            "/opt/vcf-rdfizer/compression.sh",
-            "-m",
-            compression,
-        ]
-        if run(compression_cmd) != 0:
-            eprint(f"Error: compression step failed for '{prefix}'. See log: {wrapper_log_path}")
-            return 1
+        nt_path = out_dir / output_name / f"{output_name}.nt"
+        nq_path = out_dir / output_name / f"{output_name}.nq"
+
+        if nt_path.exists():
+            source_rdf_path = nt_path
+        elif nq_path.exists():
+            source_rdf_path = nq_path
+        else:
+            # Keep full mode behavior aligned with compression mode: try expected .nt path.
+            source_rdf_path = nt_path
+
+        method_results: dict[str, dict] = {}
+        if selected_methods:
+            ok, method_results = run_compression_methods_for_rdf(
+                rdf_path=source_rdf_path,
+                out_dir=out_dir,
+                image_ref=image_ref,
+                methods=selected_methods,
+                wrapper_log_path=wrapper_log_path,
+                status_indent=None,
+            )
+            if not ok:
+                return 1
         print("    * Compression ✅")
 
-        nt_path = out_dir / output_name / f"{output_name}.nt"
         hdt_path = out_dir / output_name / f"{output_name}.hdt"
         nt_size_before_cleanup = file_size_bytes(nt_path)
-        hdt_size = file_size_bytes(hdt_path)
-        print(hdt_size)
+        nq_size_before_cleanup = file_size_bytes(nq_path)
+        source_size_before_cleanup = int(file_size_bytes(source_rdf_path) or 0)
+
+        write_compression_metrics_artifacts(
+            metrics_dir=metrics_dir,
+            run_id=run_id,
+            timestamp=timestamp,
+            output_name=output_name,
+            source_rdf_path=source_rdf_path,
+            combined_size_bytes=source_size_before_cleanup,
+            selected_methods=selected_methods,
+            method_results=method_results,
+        )
+        update_metrics_csv_with_compression(
+            metrics_csv=metrics_dir / "metrics.csv",
+            run_id=run_id,
+            timestamp=timestamp,
+            output_name=output_name,
+            output_dir=out_dir / output_name,
+            combined_size_bytes=source_size_before_cleanup,
+            selected_methods=selected_methods,
+            method_results=method_results,
+        )
 
         nt_note = None
         if not keep_rdf and selected_methods:
             removed_any = False
-            if nt_path.exists():
-                if not remove_file_with_docker_fallback(
-                    path=nt_path,
-                    mount_root=out_dir,
-                    mount_point="/data/out",
-                    image_ref=image_ref,
-                    wrapper_log_path=wrapper_log_path,
-                ):
-                    return 1
-                removed_any = True
+            for raw_rdf_path in (nt_path, nq_path):
+                if raw_rdf_path.exists():
+                    if not remove_file_with_docker_fallback(
+                        path=raw_rdf_path,
+                        mount_root=out_dir,
+                        mount_point="/data/out",
+                        image_ref=image_ref,
+                        wrapper_log_path=wrapper_log_path,
+                    ):
+                        return 1
+                    removed_any = True
             if removed_any:
                 nt_note = "removed, set --keep-rdf to retain"
             else:
@@ -610,12 +906,14 @@ def run_full_mode(
         elif keep_rdf:
             nt_note = "retained via --keep-rdf"
 
-        summary_nt_path = nt_path
+        summary_nt_path = nt_path if nt_size_before_cleanup is not None else nq_path
         summary_nt_size = (
             nt_size_before_cleanup
+            if nt_size_before_cleanup is not None
+            else nq_size_before_cleanup
         )
         print_nt_hdt_summary(
-            output_root=out_dir / output_name,
+            output_root=out_dir,
             nt_path=summary_nt_path,
             hdt_path=hdt_path,
             indent="    ",
@@ -659,56 +957,19 @@ def run_compress_mode(
         return 0
 
     ensure_dir(out_dir)
-    in_dir = nq_path.parent
-    input_container = f"/data/in/{nq_path.name}"
+    ok, _method_results = run_compression_methods_for_rdf(
+        rdf_path=nq_path,
+        out_dir=out_dir,
+        image_ref=image_ref,
+        methods=methods,
+        wrapper_log_path=wrapper_log_path,
+        status_indent="  ",
+    )
+    if not ok:
+        return 1
+
     input_stem = nq_path.stem
-    input_ext = nq_path.suffix.lstrip(".") or "nt"
     target_out_dir = out_dir / input_stem
-    ensure_dir(target_out_dir)
-    target_out_container = f"/data/out/{input_stem}"
-
-    for method in methods:
-        if method == "gzip":
-            output_name = f"{input_stem}.{input_ext}.gz"
-            out_container = f"{target_out_container}/{output_name}"
-            command = f"gzip -c {shlex.quote(input_container)} > {shlex.quote(out_container)}"
-        elif method == "brotli":
-            output_name = f"{input_stem}.{input_ext}.br"
-            out_container = f"{target_out_container}/{output_name}"
-            command = f"brotli -q 7 -c {shlex.quote(input_container)} > {shlex.quote(out_container)}"
-        else:
-            output_name = f"{input_stem}.hdt"
-            out_container = f"{target_out_container}/{output_name}"
-            command = (
-                "set -euo pipefail; "
-                "HDT_BIN=/opt/hdt-java/hdt-java-cli/bin/rdf2hdt.sh; "
-                "HDT_PROJECT_DIR=/opt/hdt-java/hdt-java-cli; "
-                'if [[ ! -x "$HDT_BIN" ]]; then echo "Missing rdf2hdt.sh at $HDT_BIN" >&2; exit 127; fi; '
-                'if ! command -v java >/dev/null 2>&1; then echo "Java runtime not found on PATH" >&2; exit 127; fi; '
-                'if [[ -f "$HDT_PROJECT_DIR/pom.xml" ]]; then cd "$HDT_PROJECT_DIR"; fi; '
-                'bash "$HDT_BIN" '
-                f"{shlex.quote(input_container)} {shlex.quote(out_container)}"
-            )
-
-        cmd = [
-            "sudo",
-            "docker",
-            "run",
-            "--rm",
-            "-v",
-            f"{str(in_dir)}:/data/in:ro",
-            "-v",
-            f"{str(out_dir)}:/data/out",
-            image_ref,
-            "bash",
-            "-lc",
-            command,
-        ]
-        if run(cmd) != 0:
-            eprint(f"Error: {method} compression failed. See log: {wrapper_log_path}")
-            return 1
-        print(f"  - {method}: {output_name} ✅")
-
     nt_path = nq_path if nq_path.suffix == ".nt" else nq_path.with_suffix(".nt")
     hdt_path = target_out_dir / f"{input_stem}.hdt"
     print_nt_hdt_summary(output_root=target_out_dir, nt_path=nt_path, hdt_path=hdt_path, indent="  ")
@@ -875,7 +1136,7 @@ def main():
         "-c",
         "--compression",
         default="gzip,brotli,hdt",
-        help="Compression methods for compression.sh (gzip,brotli,hdt,none)",
+        help="Compression methods (gzip,brotli,hdt,none)",
     )
     parser.add_argument("-k", "--keep-tsv", action="store_true", help="Keep TSV intermediates")
     parser.add_argument(
@@ -997,7 +1258,7 @@ def main():
 
         image_code = ensure_image_available(
             image_ref,
-            step_label="Step 2/3" if mode == "full" else "Step 2/3",
+            step_label="Step 2/5" if mode == "full" else "Step 2/3",
             version_requested=version_requested,
             build=args.build,
             no_build=args.no_build,
