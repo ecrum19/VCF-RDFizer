@@ -225,7 +225,6 @@ def remove_file_with_docker_fallback(
         return False
 
     container_path = f"{mount_point}/{rel.as_posix()}"
-    print(container_path)
     rm_cmd = [
         "sudo",
         "docker",
@@ -587,6 +586,7 @@ def run_full_mode(
         hdt_path = out_dir / output_name / f"{output_name}.hdt"
         nt_size_before_cleanup = file_size_bytes(nt_path)
         hdt_size = file_size_bytes(hdt_path)
+        print(hdt_size)
 
         nt_note = None
         if not keep_rdf and selected_methods:
