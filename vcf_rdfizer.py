@@ -3,6 +3,7 @@
 import argparse
 import csv
 import json
+import os
 import re
 import shlex
 import shutil
@@ -99,6 +100,18 @@ def run(cmd, cwd=None, env=None):
     if _COMMAND_LOGGER is not None:
         return _COMMAND_LOGGER.run(cmd, cwd=cwd, env=env)
     return subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True).returncode
+
+
+def docker_run_base():
+    base = ["sudo", "docker", "run", "--rm"]
+    as_user = os.environ.get("VCF_RDFIZER_DOCKER_AS_USER", "1").strip().lower()
+    if as_user in {"0", "false", "no"}:
+        return base
+    getuid = getattr(os, "getuid", None)
+    getgid = getattr(os, "getgid", None)
+    if callable(getuid) and callable(getgid):
+        base.extend(["--user", f"{getuid()}:{getgid()}"])
+    return base
 
 
 def check_docker():
@@ -267,10 +280,7 @@ def remove_file_with_docker_fallback(
 
     container_path = f"{mount_point}/{rel.as_posix()}"
     rm_cmd = [
-        "sudo",
-        "docker",
-        "run",
-        "--rm",
+        *docker_run_base(),
         "-v",
         f"{str(mount_root)}:{mount_point}",
         image_ref,
@@ -673,10 +683,7 @@ def run_compression_methods_for_rdf(
             )
 
         cmd = [
-            "sudo",
-            "docker",
-            "run",
-            "--rm",
+            *docker_run_base(),
             "-v",
             f"{str(in_dir)}:/data/in:ro",
             "-v",
@@ -745,10 +752,7 @@ def run_full_mode(
         print(f"  - Input {idx}/{total_inputs}: {Path(container_input).name}")
 
         tsv_cmd = [
-            "sudo",
-            "docker",
-            "run",
-            "--rm",
+            *docker_run_base(),
             "-v",
             f"{str(input_mount_dir)}:/data/in:ro",
             "-v",
@@ -794,10 +798,7 @@ def run_full_mode(
         container_generated_rules = f"/data/rules/{generated_rules.name}"
 
         run_cmd = [
-            "sudo",
-            "docker",
-            "run",
-            "--rm",
+            *docker_run_base(),
             "-v",
             f"{str(generated_rules_dir)}:/data/rules:ro",
             "-v",
@@ -862,26 +863,36 @@ def run_full_mode(
         nq_size_before_cleanup = file_size_bytes(nq_path)
         source_size_before_cleanup = int(file_size_bytes(source_rdf_path) or 0)
 
-        write_compression_metrics_artifacts(
-            metrics_dir=metrics_dir,
-            run_id=run_id,
-            timestamp=timestamp,
-            output_name=output_name,
-            source_rdf_path=source_rdf_path,
-            combined_size_bytes=source_size_before_cleanup,
-            selected_methods=selected_methods,
-            method_results=method_results,
-        )
-        update_metrics_csv_with_compression(
-            metrics_csv=metrics_dir / "metrics.csv",
-            run_id=run_id,
-            timestamp=timestamp,
-            output_name=output_name,
-            output_dir=out_dir / output_name,
-            combined_size_bytes=source_size_before_cleanup,
-            selected_methods=selected_methods,
-            method_results=method_results,
-        )
+        try:
+            write_compression_metrics_artifacts(
+                metrics_dir=metrics_dir,
+                run_id=run_id,
+                timestamp=timestamp,
+                output_name=output_name,
+                source_rdf_path=source_rdf_path,
+                combined_size_bytes=source_size_before_cleanup,
+                selected_methods=selected_methods,
+                method_results=method_results,
+            )
+            update_metrics_csv_with_compression(
+                metrics_csv=metrics_dir / "metrics.csv",
+                run_id=run_id,
+                timestamp=timestamp,
+                output_name=output_name,
+                output_dir=out_dir / output_name,
+                combined_size_bytes=source_size_before_cleanup,
+                selected_methods=selected_methods,
+                method_results=method_results,
+            )
+        except PermissionError as exc:
+            blocked_path = exc.filename or str(metrics_dir)
+            eprint("Error: unable to write compression metrics due to file permissions.")
+            eprint(f"Blocked path: {blocked_path}")
+            eprint(
+                "Fix ownership, then rerun: "
+                f"sudo chown -R $USER:$USER {shlex.quote(str(metrics_dir))}"
+            )
+            return 1
 
         nt_note = None
         if not keep_rdf and selected_methods:
@@ -1034,10 +1045,7 @@ def run_decompress_mode(
         )
 
     cmd = [
-        "sudo",
-        "docker",
-        "run",
-        "--rm",
+        *docker_run_base(),
         "-v",
         f"{str(compressed_path.parent)}:/data/in:ro",
         "-v",
