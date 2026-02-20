@@ -189,6 +189,50 @@ def print_nt_hdt_summary(*, output_root: Path, nt_path: Path, hdt_path: Path):
         print(f"  - HDT (.hdt): {format_bytes(hdt_size)} ({hdt_path})")
 
 
+def remove_file_with_docker_fallback(
+    *,
+    path: Path,
+    mount_root: Path,
+    mount_point: str,
+    image_ref: str,
+    wrapper_log_path: Path,
+) -> bool:
+    if not path.exists():
+        return True
+
+    try:
+        path.unlink()
+        return True
+    except PermissionError:
+        pass
+
+    try:
+        rel = path.relative_to(mount_root)
+    except ValueError:
+        eprint(f"Error: cannot remove file outside mounted root: {path}")
+        eprint(f"See log for details: {wrapper_log_path}")
+        return False
+
+    container_path = f"{mount_point}/{rel.as_posix()}"
+    rm_cmd = [
+        "sudo",
+        "docker",
+        "run",
+        "--rm",
+        "-v",
+        f"{str(mount_root)}:{mount_point}",
+        image_ref,
+        "bash",
+        "-lc",
+        f"rm -f {shlex.quote(container_path)}",
+    ]
+    if run(rm_cmd) != 0:
+        eprint(f"Error: failed to remove file with Docker fallback: {path}")
+        eprint(f"See log for details: {wrapper_log_path}")
+        return False
+    return True
+
+
 def existing_parent(path: Path) -> Path:
     cur = path
     while not cur.exists():
@@ -531,7 +575,14 @@ def run_full_mode(
 
         if not keep_rdf and selected_methods:
             if nt_path.exists():
-                nt_path.unlink()
+                if not remove_file_with_docker_fallback(
+                    path=nt_path,
+                    mount_root=out_dir,
+                    mount_point="/data/out",
+                    image_ref=image_ref,
+                    wrapper_log_path=wrapper_log_path,
+                ):
+                    return 1
                 print(f"    * Removed N-Triples file (set --keep-rdf to retain): {nt_path}")
             else:
                 print(f"    * N-Triples cleanup skipped (not found): {nt_path}")
@@ -541,7 +592,14 @@ def run_full_mode(
         if not keep_tsv:
             for tsv_path in (triplet["records"], triplet["headers"], triplet["metadata"]):
                 if tsv_path.exists():
-                    tsv_path.unlink()
+                    if not remove_file_with_docker_fallback(
+                        path=tsv_path,
+                        mount_root=tsv_dir,
+                        mount_point="/data/tsv",
+                        image_ref=image_ref,
+                        wrapper_log_path=wrapper_log_path,
+                    ):
+                        return 1
 
     if not keep_tsv:
         if not tsv_existed:
@@ -731,9 +789,10 @@ def main():
     )
     parser.add_argument(
         "-q",
+        "--nq",
         "--nt",
         "--rdf",
-        dest="nt",
+        dest="nq",
         default=None,
         help="Input RDF file (.nt or .nq) for --mode compress",
     )

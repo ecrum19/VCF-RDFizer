@@ -601,6 +601,69 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertTrue((out_dir / "sample" / "sample.nt").exists())
             self.assertTrue((out_dir / "hdt" / "sample.hdt").exists())
 
+    def test_main_full_mode_deletes_nt_with_docker_fallback_on_permission_error(self):
+        """Full mode falls back to Docker-based removal when .nt unlink raises PermissionError."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+            out_dir = tmp_path / "out"
+            target_nt = out_dir / "sample" / "sample.nt"
+            target_nt_resolved = target_nt.resolve()
+            commands = []
+            original_unlink = Path.unlink
+
+            def fake_run(cmd, cwd=None, env=None):
+                commands.append(cmd)
+                if "/opt/vcf-rdfizer/run_conversion.sh" in cmd:
+                    target_nt.parent.mkdir(parents=True, exist_ok=True)
+                    target_nt.write_text("<s> <p> <o> .\n")
+                if "/opt/vcf-rdfizer/compression.sh" in cmd:
+                    hdt_dir = out_dir / "hdt"
+                    hdt_dir.mkdir(parents=True, exist_ok=True)
+                    (hdt_dir / "sample.hdt").write_text("fake-hdt\n")
+                if isinstance(cmd, list) and cmd[-1].startswith("rm -f ") and "/data/out/sample/sample.nt" in cmd[-1]:
+                    if target_nt_resolved.exists():
+                        original_unlink(target_nt_resolved)
+                return 0
+
+            def unlink_side_effect(path_obj, *args, **kwargs):
+                if path_obj.resolve() == target_nt_resolved:
+                    raise PermissionError(13, "Permission denied", str(path_obj))
+                return original_unlink(path_obj, *args, **kwargs)
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch.object(
+                    vcf_rdfizer, "check_docker", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "docker_image_exists", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "discover_tsv_triplets", return_value=mocked_triplets()
+                ), mock.patch("pathlib.Path.unlink", autospec=True, side_effect=unlink_side_effect):
+                    rc = invoke_main(
+                        [
+                            "--input",
+                            str(input_dir),
+                            "--rules",
+                            str(rules_path),
+                            "--out",
+                            str(out_dir),
+                            "--keep-tsv",
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 0)
+            self.assertFalse(target_nt.exists())
+            self.assertTrue(
+                any(
+                    isinstance(cmd, list) and cmd[-1].startswith("rm -f ") and "/data/out/sample/sample.nt" in cmd[-1]
+                    for cmd in commands
+                )
+            )
+
     def test_main_ignores_unrelated_existing_tsv_triplets(self):
         """Wrapper converts only triplets that match the CLI-selected VCF snapshot."""
         with tempfile.TemporaryDirectory() as td:
