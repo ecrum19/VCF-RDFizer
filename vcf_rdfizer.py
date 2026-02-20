@@ -843,6 +843,18 @@ def run_full_mode(
     ):
         print(f"  - Input {idx}/{total_inputs}: {Path(container_input).name}")
 
+        for suffix in ("records.tsv", "header_lines.tsv", "file_metadata.tsv"):
+            expected_tsv_output = tsv_dir / f"{expected_prefix}.{suffix}"
+            if not ensure_writable_path_or_fix(
+                target_path=expected_tsv_output,
+                is_dir=False,
+                image_ref=image_ref,
+                wrapper_log_path=wrapper_log_path,
+            ):
+                eprint(f"Error: cannot write expected TSV output '{expected_tsv_output}'.")
+                eprint(f"See log for details: {wrapper_log_path}")
+                return 1
+
         tsv_cmd = [
             *docker_run_base(),
             "-v",

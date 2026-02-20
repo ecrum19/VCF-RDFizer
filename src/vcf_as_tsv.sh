@@ -52,6 +52,9 @@ for infile in "${files[@]}"; do
   headers_out="${output_dir}/${base}.header_lines.tsv"
   metadata_out="${output_dir}/${base}.file_metadata.tsv"
 
+  # Remove stale outputs first so root-owned leftovers from prior runs do not block rewrite.
+  rm -f "$records_out" "$headers_out" "$metadata_out"
+
   printf "SOURCE_FILE\tROW_ID\tCHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLES\n" > "$records_out"
   printf "SOURCE_FILE\tHEADER_INDEX\tHEADER_KEY\tHEADER_VALUE\tRAW_LINE\n" > "$headers_out"
   printf "SOURCE_FILE\tFILE_FORMAT\tFILE_DATE\tSOURCE_SOFTWARE\tREFERENCE_GENOME\tHEADER_COUNT\tRECORD_COUNT\n" > "$metadata_out"
