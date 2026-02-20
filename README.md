@@ -136,6 +136,8 @@ The wrapper validates:
 - Decompression mode input is `.gz`, `.br`, or `.hdt`
 - HDT mode pre-checks that `rdf2hdt.sh` is executable and that Java is available
 - Docker image exists or is built (if `--image-version` is set, it will attempt to pull that version and fail if missing)
+- Docker runs as the host UID/GID by default to prevent root-owned output files on mounted volumes
+- If mounted output/metrics paths are not writable (e.g., stale root-owned files), the wrapper automatically attempts a one-time in-container permission repair before running
 - Raw command output is written to a hidden wrapper log file instead of printed directly to the terminal
 - Optional preflight storage estimate (`--estimate-size`) with a disk-space warning if the upper-bound estimate exceeds free space
 
@@ -181,6 +183,9 @@ Options:
 - `-R, --keep-rdf`: keep merged `.nt` RDF outputs after compression (full mode; default is delete)
 - `-e, --estimate-size`: print rough input/TSV/RDF size estimates and free disk before running (full mode)
 - `-h, --help`: show usage guide and exit
+
+Environment override:
+- `VCF_RDFIZER_DOCKER_AS_USER=0`: disable host UID/GID mapping for Docker runs (not recommended; can reintroduce root-owned output files)
 
 ## Rules Directory
 

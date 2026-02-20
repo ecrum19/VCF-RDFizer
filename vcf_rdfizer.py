@@ -102,8 +102,10 @@ def run(cmd, cwd=None, env=None):
     return subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True).returncode
 
 
-def docker_run_base():
+def docker_run_base(*, as_user: bool = True):
     base = ["sudo", "docker", "run", "--rm"]
+    if not as_user:
+        return base
     as_user = os.environ.get("VCF_RDFIZER_DOCKER_AS_USER", "1").strip().lower()
     if as_user in {"0", "false", "no"}:
         return base
@@ -112,6 +114,96 @@ def docker_run_base():
     if callable(getuid) and callable(getgid):
         base.extend(["--user", f"{getuid()}:{getgid()}"])
     return base
+
+
+def _can_write_dir(path: Path) -> bool:
+    try:
+        ensure_dir(path)
+        probe = path / f".vcf_rdfizer_permcheck_{os.getpid()}"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def _can_write_file(path: Path) -> bool:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8"):
+            pass
+        return True
+    except OSError:
+        return False
+
+
+def auto_fix_path_permissions(
+    *,
+    target_path: Path,
+    is_dir: bool,
+    image_ref: str,
+    wrapper_log_path: Path,
+) -> bool:
+    getuid = getattr(os, "getuid", None)
+    getgid = getattr(os, "getgid", None)
+    if not callable(getuid) or not callable(getgid):
+        return False
+    uid_gid = f"{getuid()}:{getgid()}"
+
+    if is_dir:
+        mount_host = target_path
+        mount_container = "/fix"
+        cmd_body = (
+            f"chown -R {uid_gid} {shlex.quote(mount_container)} || true; "
+            f"chmod -R u+rwX {shlex.quote(mount_container)} || true"
+        )
+    else:
+        mount_host = target_path.parent
+        mount_container = "/fix"
+        file_name = target_path.name
+        cmd_body = (
+            f"chown {uid_gid} {shlex.quote(mount_container + '/' + file_name)} || true; "
+            f"chmod u+rw {shlex.quote(mount_container + '/' + file_name)} || true"
+        )
+
+    if not mount_host.exists():
+        return False
+
+    fix_cmd = [
+        *docker_run_base(as_user=False),
+        "-v",
+        f"{str(mount_host)}:{mount_container}",
+        image_ref,
+        "bash",
+        "-lc",
+        cmd_body,
+    ]
+    if run(fix_cmd) != 0:
+        eprint(
+            f"Error: failed automatic permission recovery for '{target_path}'. "
+            f"See log: {wrapper_log_path}"
+        )
+        return False
+
+    return _can_write_dir(target_path) if is_dir else _can_write_file(target_path)
+
+
+def ensure_writable_path_or_fix(
+    *,
+    target_path: Path,
+    is_dir: bool,
+    image_ref: str,
+    wrapper_log_path: Path,
+) -> bool:
+    writable = _can_write_dir(target_path) if is_dir else _can_write_file(target_path)
+    if writable:
+        return True
+    return auto_fix_path_permissions(
+        target_path=target_path,
+        is_dir=is_dir,
+        image_ref=image_ref,
+        wrapper_log_path=wrapper_log_path,
+    )
 
 
 def check_docker():
@@ -1275,6 +1367,49 @@ def main():
         )
         if image_code != 0:
             return image_code
+
+        if mode == "full":
+            tsv_write_target = tsv_dir if tsv_dir.exists() else tsv_dir.parent
+            out_write_target = out_dir if out_dir.exists() else out_dir.parent
+            metrics_write_target = metrics_dir if metrics_dir.exists() else metrics_dir.parent
+            writable_targets = [
+                (tsv_write_target, True),
+                (out_write_target, True),
+                (metrics_write_target, True),
+                (metrics_dir / "metrics.csv", False),
+            ]
+        elif mode == "compress":
+            out_write_target = out_dir if out_dir.exists() else out_dir.parent
+            metrics_write_target = metrics_dir if metrics_dir.exists() else metrics_dir.parent
+            writable_targets = [
+                (out_write_target, True),
+                (metrics_write_target, True),
+            ]
+        else:
+            decompress_parent = (
+                decompressed_out.parent
+                if decompressed_out.parent.exists()
+                else decompressed_out.parent.parent
+            )
+            metrics_write_target = metrics_dir if metrics_dir.exists() else metrics_dir.parent
+            writable_targets = [
+                (decompress_parent, True),
+                (metrics_write_target, True),
+            ]
+
+        for target, is_dir in writable_targets:
+            if not ensure_writable_path_or_fix(
+                target_path=target,
+                is_dir=is_dir,
+                image_ref=image_ref,
+                wrapper_log_path=wrapper_log_path,
+            ):
+                eprint(f"Error: cannot write to '{target}'.")
+                eprint(
+                    "Try fixing ownership once with: "
+                    f"sudo chown -R $USER:$USER {shlex.quote(str(target if is_dir else target.parent))}"
+                )
+                return 1
 
         if mode == "full":
             return run_full_mode(
