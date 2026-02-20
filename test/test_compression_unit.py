@@ -151,9 +151,9 @@ class CompressionUnitTests(VerboseTestCase):
             )
 
             self.assertEqual(result.returncode, 0, msg=result.stderr)
-            self.assertTrue((out_root / "gzip" / "rdf.nq.gz").exists())
-            self.assertTrue((out_root / "brotli" / "rdf.nq.br").exists())
-            self.assertTrue((out_root / "hdt" / "rdf.hdt").exists())
+            self.assertTrue((out_root / "rdf.nq.gz").exists())
+            self.assertTrue((out_root / "rdf.nq.br").exists())
+            self.assertTrue((out_root / "rdf.hdt").exists())
             self.assertTrue((logdir / "compression-time-gzip-rdf-run-compress-1.txt").exists())
             self.assertTrue((logdir / "compression-time-brotli-rdf-run-compress-1.txt").exists())
             self.assertTrue((logdir / "compression-time-hdt-rdf-run-compress-1.txt").exists())
@@ -208,9 +208,9 @@ class CompressionUnitTests(VerboseTestCase):
                 text=True,
             )
             self.assertEqual(result.returncode, 0, msg=result.stderr)
-            self.assertTrue((out_root / "gzip" / "rdf.nt.gz").exists())
-            self.assertTrue((out_root / "brotli" / "rdf.nt.br").exists())
-            self.assertTrue((out_root / "hdt" / "rdf.hdt").exists())
+            self.assertTrue((out_root / "rdf.nt.gz").exists())
+            self.assertTrue((out_root / "rdf.nt.br").exists())
+            self.assertTrue((out_root / "rdf.hdt").exists())
 
     def test_compression_none_updates_metrics_without_generating_outputs(self):
         """Compression mode none leaves no compressed artifacts and records zero sizes."""
@@ -251,9 +251,9 @@ class CompressionUnitTests(VerboseTestCase):
             )
 
             self.assertEqual(result.returncode, 0, msg=result.stderr)
-            self.assertFalse((out_root / "gzip").exists())
-            self.assertFalse((out_root / "brotli").exists())
-            self.assertFalse((out_root / "hdt").exists())
+            self.assertFalse((out_root / "rdf.nq.gz").exists())
+            self.assertFalse((out_root / "rdf.nq.br").exists())
+            self.assertFalse((out_root / "rdf.hdt").exists())
 
             row = read_metrics_row(metrics_csv, run_id, "rdf")
             self.assertEqual(row["compression_methods"], "none")

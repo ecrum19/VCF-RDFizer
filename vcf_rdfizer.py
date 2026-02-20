@@ -173,20 +173,31 @@ def file_size_bytes(path: Path):
     return path.stat().st_size
 
 
-def print_nt_hdt_summary(*, output_root: Path, nt_path: Path, hdt_path: Path):
-    print(f"Compression output directory: {output_root}")
-    nt_size = file_size_bytes(nt_path)
+def print_nt_hdt_summary(
+    *,
+    output_root: Path,
+    nt_path: Path,
+    hdt_path: Path,
+    indent: str = "",
+    nt_note: str | None = None,
+    nt_size_override: int | None = None,
+):
+    print(f"{indent}* Output directory: {output_root}")
+    nt_size = nt_size_override if nt_size_override is not None else file_size_bytes(nt_path)
     hdt_size = file_size_bytes(hdt_path)
 
     if nt_size is None:
-        print(f"  - N-Triples (.nt): not found at {nt_path}")
+        nt_text = f"not found at {nt_path}"
     else:
-        print(f"  - N-Triples (.nt): {format_bytes(nt_size)} ({nt_path})")
+        nt_text = f"{format_bytes(nt_size)} ({nt_path})"
+    if nt_note:
+        nt_text = f"{nt_text} ({nt_note})"
+    print(f"{indent}  - N-Triples (.nt): {nt_text}")
 
     if hdt_size is None:
-        print(f"  - HDT (.hdt): not generated at {hdt_path}")
+        print(f"{indent}  - HDT (.hdt): not generated at {hdt_path}")
     else:
-        print(f"  - HDT (.hdt): {format_bytes(hdt_size)} ({hdt_path})")
+        print(f"{indent}  - HDT (.hdt): {format_bytes(hdt_size)} ({hdt_path})")
 
 
 def remove_file_with_docker_fallback(
@@ -380,32 +391,38 @@ def ensure_image_available(
     repo_root: Path,
     wrapper_log_path: Path,
 ):
-    print(f"{step_label}: Ensuring Docker image is available")
     if build:
+        print(f"{step_label}: Ensuring Docker image is available")
         print("  - Building Docker image")
         if docker_build_image(image_ref, repo_root) != 0:
             eprint(f"Error: docker build failed. See log: {wrapper_log_path}")
             return 1
+        print(f"{step_label}: Ensuring Docker image is available ✅")
         return 0
 
     if docker_image_exists(image_ref):
+        print(f"{step_label}: Ensuring Docker image is available ✅")
         return 0
 
     if version_requested:
+        print(f"{step_label}: Ensuring Docker image is available")
         print(f"  - Pulling image: {image_ref}")
         if docker_pull_image(image_ref) != 0:
             eprint(f"Error: image version '{image_ref}' not found. See log: {wrapper_log_path}")
             return 2
+        print(f"{step_label}: Ensuring Docker image is available ✅")
         return 0
 
     if no_build:
         eprint(f"Error: image '{image_ref}' not found and --no-build set.")
         return 2
 
+    print(f"{step_label}: Ensuring Docker image is available")
     print("  - Image missing locally, building")
     if docker_build_image(image_ref, repo_root) != 0:
         eprint(f"Error: docker build failed. See log: {wrapper_log_path}")
         return 1
+    print(f"{step_label}: Ensuring Docker image is available ✅")
     return 0
 
 
@@ -448,7 +465,6 @@ def run_full_mode(
     ):
         print(f"  - Input {idx}/{total_inputs}: {Path(container_input).name}")
 
-        print("    * TSV conversion")
         tsv_cmd = [
             "sudo",
             "docker",
@@ -466,6 +482,7 @@ def run_full_mode(
         if run(tsv_cmd) != 0:
             eprint(f"Error: TSV conversion failed. See log: {wrapper_log_path}")
             return 1
+        print("    * TSV conversion ✅")
 
         try:
             tsv_triplets = discover_tsv_triplets(tsv_dir)
@@ -484,7 +501,7 @@ def run_full_mode(
 
         ignored_prefixes = sorted(set(triplets_by_prefix.keys()) - {expected_prefix})
         if ignored_prefixes:
-            print("    * Ignoring unrelated TSV triplets already in output directory")
+            print("    * Note: ignoring unrelated TSV triplets already in output directory")
 
         triplet = triplets_by_prefix[expected_prefix]
         prefix = triplet["prefix"]
@@ -501,7 +518,6 @@ def run_full_mode(
         output_name = safe_prefix or slugify(out_name)
         container_generated_rules = f"/data/rules/{generated_rules.name}"
 
-        print("    * RDF conversion")
         run_cmd = [
             "sudo",
             "docker",
@@ -539,8 +555,8 @@ def run_full_mode(
         if run(run_cmd) != 0:
             eprint(f"Error: RMLStreamer step failed for '{prefix}'. See log: {wrapper_log_path}")
             return 1
+        print("    * RDF conversion ✅")
 
-        print("    * Compression")
         compression_cmd = [
             "sudo",
             "docker",
@@ -568,11 +584,13 @@ def run_full_mode(
         if run(compression_cmd) != 0:
             eprint(f"Error: compression step failed for '{prefix}'. See log: {wrapper_log_path}")
             return 1
+        print("    * Compression ✅")
 
         nt_path = out_dir / output_name / f"{output_name}.nt"
-        hdt_path = out_dir / "hdt" / f"{output_name}.hdt"
-        print_nt_hdt_summary(output_root=out_dir, nt_path=nt_path, hdt_path=hdt_path)
+        hdt_path = out_dir / f"{output_name}.hdt"
+        nt_size_before_cleanup = file_size_bytes(nt_path)
 
+        nt_note = None
         if not keep_rdf and selected_methods:
             if nt_path.exists():
                 if not remove_file_with_docker_fallback(
@@ -583,11 +601,22 @@ def run_full_mode(
                     wrapper_log_path=wrapper_log_path,
                 ):
                     return 1
-                print(f"    * Removed N-Triples file (set --keep-rdf to retain): {nt_path}")
+                nt_note = "removed, set --keep-rdf to retain"
             else:
-                print(f"    * N-Triples cleanup skipped (not found): {nt_path}")
+                nt_note = "cleanup skipped"
         elif not keep_rdf and not selected_methods:
-            print("    * Compression methods set to `none`; keeping N-Triples output.")
+            nt_note = "kept (compression methods set to none)"
+        elif keep_rdf:
+            nt_note = "retained via --keep-rdf"
+
+        print_nt_hdt_summary(
+            output_root=out_dir,
+            nt_path=nt_path,
+            hdt_path=hdt_path,
+            indent="    ",
+            nt_note=nt_note,
+            nt_size_override=nt_size_before_cleanup,
+        )
 
         if not keep_tsv:
             for tsv_path in (triplet["records"], triplet["headers"], triplet["metadata"]):
@@ -631,20 +660,17 @@ def run_compress_mode(
     input_ext = nq_path.suffix.lstrip(".") or "nt"
 
     for method in methods:
-        method_dir = out_dir / method
-        ensure_dir(method_dir)
-
         if method == "gzip":
             output_name = f"{input_stem}.{input_ext}.gz"
-            out_container = f"/data/out/{method}/{output_name}"
+            out_container = f"/data/out/{output_name}"
             command = f"gzip -c {shlex.quote(input_container)} > {shlex.quote(out_container)}"
         elif method == "brotli":
             output_name = f"{input_stem}.{input_ext}.br"
-            out_container = f"/data/out/{method}/{output_name}"
+            out_container = f"/data/out/{output_name}"
             command = f"brotli -q 7 -c {shlex.quote(input_container)} > {shlex.quote(out_container)}"
         else:
             output_name = f"{input_stem}.hdt"
-            out_container = f"/data/out/{method}/{output_name}"
+            out_container = f"/data/out/{output_name}"
             command = (
                 "set -euo pipefail; "
                 "HDT_BIN=/opt/hdt-java/hdt-java-cli/bin/rdf2hdt.sh; "
@@ -656,7 +682,6 @@ def run_compress_mode(
                 f"{shlex.quote(input_container)} {shlex.quote(out_container)}"
             )
 
-        print(f"  - {method}: {output_name}")
         cmd = [
             "sudo",
             "docker",
@@ -674,10 +699,11 @@ def run_compress_mode(
         if run(cmd) != 0:
             eprint(f"Error: {method} compression failed. See log: {wrapper_log_path}")
             return 1
+        print(f"  - {method}: {output_name} ✅")
 
     nt_path = nq_path if nq_path.suffix == ".nt" else nq_path.with_suffix(".nt")
-    hdt_path = out_dir / "hdt" / f"{input_stem}.hdt"
-    print_nt_hdt_summary(output_root=out_dir, nt_path=nt_path, hdt_path=hdt_path)
+    hdt_path = out_dir / f"{input_stem}.hdt"
+    print_nt_hdt_summary(output_root=out_dir, nt_path=nt_path, hdt_path=hdt_path, indent="  ")
     print("Conversion process finished.")
     return 0
 
@@ -868,10 +894,7 @@ def main():
     metrics_dir = Path(args.metrics).expanduser().resolve()
     mode = args.mode
 
-    if mode == "full":
-        print("Step 1/5: Validating inputs")
-    else:
-        print("Step 1/3: Validating inputs")
+    step1_label = "Step 1/5" if mode == "full" else "Step 1/3"
 
     try:
         if mode == "full":
@@ -911,7 +934,7 @@ def main():
             fmt = detect_compressed_format(compressed_path)
             validate_mode_dirs([out_dir, metrics_dir])
             if args.decompress_out is None:
-                decompressed_out = out_dir / "decompressed" / default_decompressed_name(compressed_path, fmt)
+                decompressed_out = out_dir / default_decompressed_name(compressed_path, fmt)
             else:
                 decompressed_out = Path(args.decompress_out).expanduser().resolve()
             if decompressed_out.exists() and decompressed_out.is_dir():
@@ -924,18 +947,20 @@ def main():
         eprint(f"Error: {exc}")
         return 2
 
+    print(f"{step1_label}: Validating inputs ✅")
+
     if mode == "full" and args.estimate_size:
         vcf_files = collect_input_vcfs(input_path)
         estimate = estimate_pipeline_sizes(vcf_files, out_dir)
-        print("Preflight size estimate (rough):")
-        print(f"  - Input VCF total: {format_bytes(estimate['input_bytes'])}")
-        print(f"  - Estimated TSV intermediates: {format_bytes(estimate['tsv_bytes'])}")
+        print("  Preflight size estimate (rough):")
+        print(f"    - Input VCF size: {format_bytes(estimate['input_bytes'])}")
+        print(f"    - Estimated TSV intermediate size: {format_bytes(estimate['tsv_bytes'])}")
         print(
-            "  - Estimated RDF N-Triples output: "
+            "    - Estimated RDF N-Triples size: "
             f"{format_bytes(estimate['rdf_low_bytes'])} to {format_bytes(estimate['rdf_high_bytes'])}"
         )
         print(
-            f"  - Free disk at {estimate['disk_anchor']}: {format_bytes(estimate['free_disk_bytes'])}"
+            f"    - Free disk space at {estimate['disk_anchor']}: {format_bytes(estimate['free_disk_bytes'])}"
         )
         if estimate["rdf_high_bytes"] > estimate["free_disk_bytes"]:
             eprint(
@@ -948,7 +973,7 @@ def main():
     wrapper_log_path = metrics_dir / ".wrapper_logs" / f"wrapper-{run_id}.log"
     global _COMMAND_LOGGER
     _COMMAND_LOGGER = CommandLogger(wrapper_log_path)
-    print(f"Detailed logs: {wrapper_log_path}")
+    print(f"  Detailed logs: {wrapper_log_path}")
 
     try:
         if not check_docker():

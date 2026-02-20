@@ -87,9 +87,9 @@ if (( DO_HDT == 1 )); then
   fi
 fi
 
-GZIP_ROOT="$OUT_ROOT_DIR/gzip"
-BROTLI_ROOT="$OUT_ROOT_DIR/brotli"
-HDT_ROOT="$OUT_ROOT_DIR/hdt"
+GZIP_ROOT="$OUT_ROOT_DIR"
+BROTLI_ROOT="$OUT_ROOT_DIR"
+HDT_ROOT="$OUT_ROOT_DIR"
 
 if (( DO_GZIP == 1 )); then
   mkdir -p "$GZIP_ROOT"
@@ -107,10 +107,7 @@ if [[ -n "$OUT_NAME" ]]; then
   OUTPUT_DIRS=("$OUT_ROOT_DIR/$OUT_NAME")
 else
   mapfile -t OUTPUT_DIRS < <(find "$OUT_ROOT_DIR" -maxdepth 1 -type d \
-    ! -path "$OUT_ROOT_DIR" \
-    ! -path "$GZIP_ROOT" \
-    ! -path "$BROTLI_ROOT" \
-    ! -path "$HDT_ROOT" | sort)
+    ! -path "$OUT_ROOT_DIR" | sort)
   if (( ${#OUTPUT_DIRS[@]} == 0 )); then
     OUTPUT_DIRS=("$OUT_ROOT_DIR")
   fi
