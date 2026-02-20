@@ -882,6 +882,7 @@ def run_full_mode(
             "-v",
             f"{str(scripts_dir)}:/opt/vcf-rdfizer:ro",
             image_ref,
+            "bash",
             "/opt/vcf-rdfizer/vcf_as_tsv.sh",
             container_input,
             "/data/tsv",
@@ -962,6 +963,7 @@ def run_full_mode(
             "-e",
             "LOGDIR=/data/metrics",
             image_ref,
+            "bash",
             "/opt/vcf-rdfizer/run_conversion.sh",
         ]
         if run(run_cmd) != 0:
