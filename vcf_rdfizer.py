@@ -747,6 +747,14 @@ def run_compression_methods_for_rdf(
     input_ext = rdf_path.suffix.lstrip(".") or "nt"
     target_out_dir = out_dir / input_stem
     ensure_dir(target_out_dir)
+    if not ensure_writable_path_or_fix(
+        target_path=target_out_dir,
+        is_dir=True,
+        image_ref=image_ref,
+        wrapper_log_path=wrapper_log_path,
+    ):
+        eprint(f"Error: cannot write compression outputs in '{target_out_dir}'.")
+        return False, {}
     target_out_container = f"/data/out/{input_stem}"
 
     method_results: dict[str, dict] = {}
@@ -755,16 +763,25 @@ def run_compression_methods_for_rdf(
         if method == "gzip":
             output_name = f"{input_stem}.{input_ext}.gz"
             out_container = f"{target_out_container}/{output_name}"
-            command = f"gzip -c {shlex.quote(input_container)} > {shlex.quote(out_container)}"
+            command = (
+                "set -euo pipefail; "
+                f"rm -f {shlex.quote(out_container)}; "
+                f"gzip -c {shlex.quote(input_container)} > {shlex.quote(out_container)}"
+            )
         elif method == "brotli":
             output_name = f"{input_stem}.{input_ext}.br"
             out_container = f"{target_out_container}/{output_name}"
-            command = f"brotli -q 7 -c {shlex.quote(input_container)} > {shlex.quote(out_container)}"
+            command = (
+                "set -euo pipefail; "
+                f"rm -f {shlex.quote(out_container)}; "
+                f"brotli -q 7 -c {shlex.quote(input_container)} > {shlex.quote(out_container)}"
+            )
         else:
             output_name = f"{input_stem}.hdt"
             out_container = f"{target_out_container}/{output_name}"
             command = (
                 "set -euo pipefail; "
+                f"rm -f {shlex.quote(out_container)}; "
                 "HDT_BIN=/opt/hdt-java/hdt-java-cli/bin/rdf2hdt.sh; "
                 "HDT_PROJECT_DIR=/opt/hdt-java/hdt-java-cli; "
                 'if [[ ! -x "$HDT_BIN" ]]; then echo "Missing rdf2hdt.sh at $HDT_BIN" >&2; exit 127; fi; '
@@ -824,6 +841,7 @@ def run_full_mode(
     wrapper_log_path: Path,
 ):
     print("Step 3/5: Processing per-input pipeline (TSV -> RDF -> compression)")
+    scripts_dir = Path(__file__).resolve().parent / "src"
     tsv_existed = tsv_dir.exists()
     ensure_dir(tsv_dir)
     ensure_dir(out_dir)
@@ -861,6 +879,8 @@ def run_full_mode(
             f"{str(input_mount_dir)}:/data/in:ro",
             "-v",
             f"{str(tsv_dir)}:/data/tsv",
+            "-v",
+            f"{str(scripts_dir)}:/opt/vcf-rdfizer:ro",
             image_ref,
             "/opt/vcf-rdfizer/vcf_as_tsv.sh",
             container_input,
@@ -899,6 +919,16 @@ def run_full_mode(
         )
 
         output_name = safe_prefix or slugify(out_name)
+        output_sample_dir = out_dir / output_name
+        if not ensure_writable_path_or_fix(
+            target_path=output_sample_dir,
+            is_dir=True,
+            image_ref=image_ref,
+            wrapper_log_path=wrapper_log_path,
+        ):
+            eprint(f"Error: cannot write output directory '{output_sample_dir}'.")
+            eprint(f"See log for details: {wrapper_log_path}")
+            return 1
         container_generated_rules = f"/data/rules/{generated_rules.name}"
 
         run_cmd = [
@@ -911,6 +941,8 @@ def run_full_mode(
             f"{str(out_dir)}:/data/out",
             "-v",
             f"{str(metrics_dir)}:/data/metrics",
+            "-v",
+            f"{str(scripts_dir)}:/opt/vcf-rdfizer:ro",
             "-w",
             "/data/rules",
             "-e",
@@ -1133,12 +1165,21 @@ def run_decompress_mode(
     output_container = f"/data/out/{decompressed_out.name}"
 
     if fmt == "gzip":
-        command = f"gzip -dc {shlex.quote(source_container)} > {shlex.quote(output_container)}"
+        command = (
+            "set -euo pipefail; "
+            f"rm -f {shlex.quote(output_container)}; "
+            f"gzip -dc {shlex.quote(source_container)} > {shlex.quote(output_container)}"
+        )
     elif fmt == "brotli":
-        command = f"brotli -d -c {shlex.quote(source_container)} > {shlex.quote(output_container)}"
+        command = (
+            "set -euo pipefail; "
+            f"rm -f {shlex.quote(output_container)}; "
+            f"brotli -d -c {shlex.quote(source_container)} > {shlex.quote(output_container)}"
+        )
     else:
         command = (
             "set -euo pipefail; "
+            f"rm -f {shlex.quote(output_container)}; "
             "HDT2RDF_BIN=/opt/hdt-java/hdt-java-cli/bin/hdt2rdf.sh; "
             "HDT_PROJECT_DIR=/opt/hdt-java/hdt-java-cli; "
             'if [[ ! -x "$HDT2RDF_BIN" ]]; then echo "Missing hdt2rdf.sh at $HDT2RDF_BIN" >&2; exit 127; fi; '
