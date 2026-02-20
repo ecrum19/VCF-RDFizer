@@ -73,12 +73,12 @@ python3 vcf_rdfizer.py --mode compress --nq ./out/sample/sample.nt --compression
 
 5. Decompression-only mode (auto output path under `./out/`):
 ```bash
-python3 vcf_rdfizer.py --mode decompress --compressed-input ./out/gzip/sample.nt.gz
+python3 vcf_rdfizer.py --mode decompress --compressed-input ./out/sample/sample.nt.gz
 ```
 
 6. Decompression-only mode with explicit output file:
 ```bash
-python3 vcf_rdfizer.py --mode decompress --compressed-input ./out/sample.hdt --decompress-out ./out/sample_from_hdt.nt
+python3 vcf_rdfizer.py --mode decompress --compressed-input ./out/sample/sample.hdt --decompress-out ./out/sample_from_hdt.nt
 ```
 
 Outputs:
@@ -87,12 +87,12 @@ Outputs:
   - conversion outputs per TSV basename in `./out/<sample>/`
   - merged N-Triples file:
     - `./out/<sample>/<sample>.nt` (retained only when `--keep-rdf` is set)
-  - compressed outputs are written directly under `./out/`:
-    - `./out/*.gz`
-    - `./out/*.br`
-    - `./out/*.hdt`
+  - compressed outputs are written in each sample directory:
+    - `./out/<sample>/<sample>.nt.gz` (or `.nq.gz` for legacy inputs)
+    - `./out/<sample>/<sample>.nt.br` (or `.nq.br` for legacy inputs)
+    - `./out/<sample>/<sample>.hdt`
   - decompressed outputs (decompression mode default):
-    - `./out/*.nt`
+    - `./out/<sample>/<sample>.nt`
 - `./run_metrics` for logs and metrics
   - `run_metrics/metrics.csv` includes both conversion and compression metrics per run
   - conversion step artifacts:

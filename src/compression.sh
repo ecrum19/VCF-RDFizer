@@ -87,20 +87,6 @@ if (( DO_HDT == 1 )); then
   fi
 fi
 
-GZIP_ROOT="$OUT_ROOT_DIR"
-BROTLI_ROOT="$OUT_ROOT_DIR"
-HDT_ROOT="$OUT_ROOT_DIR"
-
-if (( DO_GZIP == 1 )); then
-  mkdir -p "$GZIP_ROOT"
-fi
-if (( DO_BROTLI == 1 )); then
-  mkdir -p "$BROTLI_ROOT"
-fi
-if (( DO_HDT == 1 )); then
-  mkdir -p "$HDT_ROOT"
-fi
-
 # Resolve output directories to compress
 OUTPUT_DIRS=()
 if [[ -n "$OUT_NAME" ]]; then
@@ -209,6 +195,7 @@ for OUT in "${OUTPUT_DIRS[@]}"; do
     OVERALL_EXIT=1
     continue
   fi
+  mkdir -p "$OUT"
 
   BASENAME=$(basename "$OUT")
   SAFE_BASENAME=$(printf "%s" "$BASENAME" | tr -cs 'A-Za-z0-9._-' '_')
@@ -310,7 +297,7 @@ for OUT in "${OUTPUT_DIRS[@]}"; do
 
     # ----- gzip combined RDF with timing -----
     if (( DO_GZIP == 1 )) && [[ -n "${SOURCE_RDF:-}" ]]; then
-      GZ_PATH="$GZIP_ROOT/${BASENAME}.${SOURCE_EXT}.gz"
+      GZ_PATH="$OUT/${BASENAME}.${SOURCE_EXT}.gz"
       EXIT_CODE_GZIP=0
 
       if have_gnu_time; then
@@ -356,7 +343,7 @@ for OUT in "${OUTPUT_DIRS[@]}"; do
 
     # ----- brotli combined RDF with timing -----
     if (( DO_BROTLI == 1 )) && [[ -n "${SOURCE_RDF:-}" ]]; then
-      BROTLI_PATH="$BROTLI_ROOT/${BASENAME}.${SOURCE_EXT}.br"
+      BROTLI_PATH="$OUT/${BASENAME}.${SOURCE_EXT}.br"
       EXIT_CODE_BROTLI=0
 
       if have_gnu_time; then
@@ -401,7 +388,7 @@ for OUT in "${OUTPUT_DIRS[@]}"; do
 
     # ----- Convert combined RDF to HDT with timing -----
     if (( DO_HDT == 1 )) && [[ -n "${SOURCE_RDF:-}" ]]; then
-      HDT_PATH="$HDT_ROOT/$BASENAME.hdt"
+      HDT_PATH="$OUT/$BASENAME.hdt"
       EXIT_CODE_HDT=0
 
       HDT_CMD="bash \"$HDT\" \"$SOURCE_RDF\" \"$HDT_PATH\""

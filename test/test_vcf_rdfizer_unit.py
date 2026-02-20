@@ -195,9 +195,9 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertEqual(rc, 0)
             self.assertEqual(len(commands), 2)
             self.assertIn("gzip -c", commands[0][-1])
-            self.assertIn("/data/out/sample.nq.gz", commands[0][-1])
+            self.assertIn("/data/out/sample/sample.nq.gz", commands[0][-1])
             self.assertIn("brotli -q 7 -c", commands[1][-1])
-            self.assertIn("/data/out/sample.nq.br", commands[1][-1])
+            self.assertIn("/data/out/sample/sample.nq.br", commands[1][-1])
 
     def test_main_compress_mode_accepts_nt_and_preserves_extension(self):
         """Compression mode accepts .nt input and emits extension-aware output names."""
@@ -237,7 +237,7 @@ class WrapperUnitTests(VerboseTestCase):
 
             self.assertEqual(rc, 0)
             self.assertEqual(len(commands), 1)
-            self.assertIn("/data/out/sample.nt.gz", commands[0][-1])
+            self.assertIn("/data/out/sample/sample.nt.gz", commands[0][-1])
 
     def test_main_compress_mode_requires_nq_argument(self):
         """Compression mode fails validation when --nq is missing."""
@@ -331,6 +331,7 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertEqual(rc, 0)
             self.assertEqual(len(commands), 1)
             self.assertIn("gzip -dc", commands[0][-1])
+            self.assertTrue(any(arg.endswith("/out/sample:/data/out") for arg in commands[0]))
             self.assertIn("/data/out/sample.nq", commands[0][-1])
 
     def test_main_decompress_mode_hdt_uses_hdt2rdf(self):
@@ -367,6 +368,7 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertEqual(rc, 0)
             self.assertEqual(len(commands), 1)
             self.assertIn("/opt/hdt-java/hdt-java-cli/bin/hdt2rdf.sh", commands[0][-1])
+            self.assertTrue(any(arg.endswith("/out/sample:/data/out") for arg in commands[0]))
             self.assertIn("/data/out/sample.nt", commands[0][-1])
 
     def test_main_decompress_mode_rejects_unknown_extension(self):
@@ -519,8 +521,9 @@ class WrapperUnitTests(VerboseTestCase):
                     (out_sample_dir / f"{output_name}.nt").write_text("<s> <p> <o> .\n")
                 if "/opt/vcf-rdfizer/compression.sh" in cmd:
                     output_name = next(part.split("=", 1)[1] for part in cmd if part.startswith("OUT_NAME="))
-                    out_dir.mkdir(parents=True, exist_ok=True)
-                    (out_dir / f"{output_name}.hdt").write_text("fake-hdt\n")
+                    out_sample_dir = out_dir / output_name
+                    out_sample_dir.mkdir(parents=True, exist_ok=True)
+                    (out_sample_dir / f"{output_name}.hdt").write_text("fake-hdt\n")
                 return 0
 
             old_cwd = os.getcwd()
@@ -549,7 +552,7 @@ class WrapperUnitTests(VerboseTestCase):
 
             self.assertEqual(rc, 0)
             self.assertFalse((out_dir / "sample" / "sample.nt").exists())
-            self.assertTrue((out_dir / "sample.hdt").exists())
+            self.assertTrue((out_dir / "sample" / "sample.hdt").exists())
 
     def test_main_full_mode_keep_rdf_preserves_nt_after_compression(self):
         """Full mode keeps merged .nt outputs when --keep-rdf is provided."""
@@ -566,8 +569,9 @@ class WrapperUnitTests(VerboseTestCase):
                     (out_sample_dir / f"{output_name}.nt").write_text("<s> <p> <o> .\n")
                 if "/opt/vcf-rdfizer/compression.sh" in cmd:
                     output_name = next(part.split("=", 1)[1] for part in cmd if part.startswith("OUT_NAME="))
-                    out_dir.mkdir(parents=True, exist_ok=True)
-                    (out_dir / f"{output_name}.hdt").write_text("fake-hdt\n")
+                    out_sample_dir = out_dir / output_name
+                    out_sample_dir.mkdir(parents=True, exist_ok=True)
+                    (out_sample_dir / f"{output_name}.hdt").write_text("fake-hdt\n")
                 return 0
 
             old_cwd = os.getcwd()
@@ -597,7 +601,7 @@ class WrapperUnitTests(VerboseTestCase):
 
             self.assertEqual(rc, 0)
             self.assertTrue((out_dir / "sample" / "sample.nt").exists())
-            self.assertTrue((out_dir / "sample.hdt").exists())
+            self.assertTrue((out_dir / "sample" / "sample.hdt").exists())
 
     def test_main_full_mode_deletes_nt_with_docker_fallback_on_permission_error(self):
         """Full mode falls back to Docker-based removal when .nt unlink raises PermissionError."""
@@ -616,8 +620,9 @@ class WrapperUnitTests(VerboseTestCase):
                     target_nt.parent.mkdir(parents=True, exist_ok=True)
                     target_nt.write_text("<s> <p> <o> .\n")
                 if "/opt/vcf-rdfizer/compression.sh" in cmd:
-                    out_dir.mkdir(parents=True, exist_ok=True)
-                    (out_dir / "sample.hdt").write_text("fake-hdt\n")
+                    out_sample_dir = out_dir / "sample"
+                    out_sample_dir.mkdir(parents=True, exist_ok=True)
+                    (out_sample_dir / "sample.hdt").write_text("fake-hdt\n")
                 if isinstance(cmd, list) and cmd[-1].startswith("rm -f ") and "/data/out/sample/sample.nt" in cmd[-1]:
                     if target_nt_resolved.exists():
                         original_unlink(target_nt_resolved)
@@ -676,8 +681,9 @@ class WrapperUnitTests(VerboseTestCase):
                     (out_sample_dir / f"{output_name}.nq").write_text("<s> <p> <o> <g> .\n")
                 if "/opt/vcf-rdfizer/compression.sh" in cmd:
                     output_name = next(part.split("=", 1)[1] for part in cmd if part.startswith("OUT_NAME="))
-                    out_dir.mkdir(parents=True, exist_ok=True)
-                    (out_dir / f"{output_name}.hdt").write_text("fake-hdt\n")
+                    out_sample_dir = out_dir / output_name
+                    out_sample_dir.mkdir(parents=True, exist_ok=True)
+                    (out_sample_dir / f"{output_name}.hdt").write_text("fake-hdt\n")
                 return 0
 
             old_cwd = os.getcwd()
@@ -706,7 +712,7 @@ class WrapperUnitTests(VerboseTestCase):
 
             self.assertEqual(rc, 0)
             self.assertFalse((out_dir / "sample" / "sample.nq").exists())
-            self.assertTrue((out_dir / "sample.hdt").exists())
+            self.assertTrue((out_dir / "sample" / "sample.hdt").exists())
 
     def test_main_ignores_unrelated_existing_tsv_triplets(self):
         """Wrapper converts only triplets that match the CLI-selected VCF snapshot."""

@@ -588,7 +588,7 @@ def run_full_mode(
 
         nt_path = out_dir / output_name / f"{output_name}.nt"
         nq_path = out_dir / output_name / f"{output_name}.nq"
-        hdt_path = out_dir / f"{output_name}.hdt"
+        hdt_path = out_dir / output_name / f"{output_name}.hdt"
         nt_size_before_cleanup = file_size_bytes(nt_path)
         nq_size_before_cleanup = file_size_bytes(nq_path)
 
@@ -670,19 +670,22 @@ def run_compress_mode(
     input_container = f"/data/in/{nq_path.name}"
     input_stem = nq_path.stem
     input_ext = nq_path.suffix.lstrip(".") or "nt"
+    target_out_dir = out_dir / input_stem
+    ensure_dir(target_out_dir)
+    target_out_container = f"/data/out/{input_stem}"
 
     for method in methods:
         if method == "gzip":
             output_name = f"{input_stem}.{input_ext}.gz"
-            out_container = f"/data/out/{output_name}"
+            out_container = f"{target_out_container}/{output_name}"
             command = f"gzip -c {shlex.quote(input_container)} > {shlex.quote(out_container)}"
         elif method == "brotli":
             output_name = f"{input_stem}.{input_ext}.br"
-            out_container = f"/data/out/{output_name}"
+            out_container = f"{target_out_container}/{output_name}"
             command = f"brotli -q 7 -c {shlex.quote(input_container)} > {shlex.quote(out_container)}"
         else:
             output_name = f"{input_stem}.hdt"
-            out_container = f"/data/out/{output_name}"
+            out_container = f"{target_out_container}/{output_name}"
             command = (
                 "set -euo pipefail; "
                 "HDT_BIN=/opt/hdt-java/hdt-java-cli/bin/rdf2hdt.sh; "
@@ -714,8 +717,8 @@ def run_compress_mode(
         print(f"  - {method}: {output_name} ✅")
 
     nt_path = nq_path if nq_path.suffix == ".nt" else nq_path.with_suffix(".nt")
-    hdt_path = out_dir / f"{input_stem}.hdt"
-    print_nt_hdt_summary(output_root=out_dir, nt_path=nt_path, hdt_path=hdt_path, indent="  ")
+    hdt_path = target_out_dir / f"{input_stem}.hdt"
+    print_nt_hdt_summary(output_root=target_out_dir, nt_path=nt_path, hdt_path=hdt_path, indent="  ")
     print("Conversion process finished.")
     return 0
 
@@ -946,7 +949,8 @@ def main():
             fmt = detect_compressed_format(compressed_path)
             validate_mode_dirs([out_dir, metrics_dir])
             if args.decompress_out is None:
-                decompressed_out = out_dir / default_decompressed_name(compressed_path, fmt)
+                default_name = default_decompressed_name(compressed_path, fmt)
+                decompressed_out = out_dir / Path(default_name).stem / default_name
             else:
                 decompressed_out = Path(args.decompress_out).expanduser().resolve()
             if decompressed_out.exists() and decompressed_out.is_dir():
