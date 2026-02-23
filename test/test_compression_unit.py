@@ -110,7 +110,7 @@ class CompressionUnitTests(VerboseTestCase):
                 text=True,
             )
             self.assertEqual(result.returncode, 2)
-            self.assertIn("rdf2hdt script not found", result.stderr)
+            self.assertIn("rdf2hdt binary not found", result.stderr)
 
     def test_compression_updates_existing_metrics_row_with_mocked_tools(self):
         """Compression mode gzip|brotli|hdt updates existing metrics row and writes artifacts."""

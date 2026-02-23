@@ -298,6 +298,63 @@ printf '<s2> <p2> <o2> .\\n' > "$out/already.nq"
             self.assertIn("<s> <p> <o> .", text)
             self.assertIn("<s2> <p2> <o2> .", text)
 
+    def test_run_conversion_batch_mode_keeps_individual_nt_parts(self):
+        """AGGREGATE_RDF=0 preserves individual normalized .nt part files."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            fake_bin = tmp_path / "bin"
+            fake_bin.mkdir()
+            make_executable(
+                fake_bin / "java",
+                """#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "-version" ]]; then
+  echo 'openjdk version "11.0.0"' >&2
+  exit 0
+fi
+out=""
+while [[ $# -gt 0 ]]; do
+  if [[ "$1" == "-o" ]]; then
+    out="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+mkdir -p "$out"
+printf '<a> <p> <o> .\\n' > "$out/part-00000"
+printf '<b> <p> <o> .\\n' > "$out/part-00001"
+""",
+            )
+
+            out_dir = tmp_path / "out"
+            metrics_dir = tmp_path / "metrics"
+            rules = tmp_path / "rules.ttl"
+            rules.write_text("@prefix ex: <http://example.org/> .\n")
+            vcf = tmp_path / "input.vcf"
+            vcf.write_text("##fileformat=VCFv4.2\n#CHROM\tPOS\n1\t5\n")
+
+            env = env_with_path(fake_bin)
+            env.update(
+                {
+                    "JAR": "fake.jar",
+                    "IN": str(rules),
+                    "IN_VCF": str(vcf),
+                    "OUT_DIR": str(out_dir),
+                    "OUT_NAME": "rdf",
+                    "LOGDIR": str(metrics_dir),
+                    "RUN_ID": "run-batch",
+                    "TIMESTAMP": "2026-01-01T00:00:00",
+                    "AGGREGATE_RDF": "0",
+                }
+            )
+
+            result = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertTrue((out_dir / "rdf" / "part-00000.nt").exists())
+            self.assertTrue((out_dir / "rdf" / "part-00001.nt").exists())
+            self.assertFalse((out_dir / "rdf" / "rdf.nt").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

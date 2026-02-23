@@ -16,6 +16,7 @@ from pathlib import Path
 
 RMLSTREAMER_JAR_CONTAINER = "/opt/rmlstreamer/RMLStreamer-v2.5.0-standalone.jar"
 _COMMAND_LOGGER = None
+_DOCKER_USE_SUDO = False
 
 COMPRESSED_VCF_EXPANSION_FACTOR = 5.0
 TSV_OVERHEAD_FACTOR = 1.10
@@ -105,8 +106,14 @@ def run(cmd, cwd=None, env=None):
     return subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True).returncode
 
 
+def docker_cmd_prefix(*, use_sudo: bool | None = None):
+    if use_sudo is None:
+        use_sudo = _DOCKER_USE_SUDO
+    return ["sudo", "docker"] if use_sudo else ["docker"]
+
+
 def docker_run_base(*, as_user: bool = True):
-    base = ["sudo", "docker", "run", "--rm"]
+    base = [*docker_cmd_prefix(), "run", "--rm"]
     if not as_user:
         return base
     as_user = os.environ.get("VCF_RDFIZER_DOCKER_AS_USER", "1").strip().lower()
@@ -210,14 +217,26 @@ def ensure_writable_path_or_fix(
 
 
 def check_docker():
+    global _DOCKER_USE_SUDO
+
     if shutil.which("docker") is None:
         eprint("Error: Docker is not installed or not on PATH.")
         return False
-    code = run(["sudo", "docker", "version"])
-    if code != 0:
-        eprint("Error: Docker is not available. Is the daemon running?")
-        return False
-    return True
+
+    use_sudo_order = [False]
+    if shutil.which("sudo") is not None:
+        use_sudo_order.append(True)
+
+    for use_sudo in use_sudo_order:
+        code = run([*docker_cmd_prefix(use_sudo=use_sudo), "version"])
+        if code == 0:
+            _DOCKER_USE_SUDO = use_sudo
+            if use_sudo:
+                print("  Docker access requires sudo; using sudo for Docker commands.")
+            return True
+
+    eprint("Error: Docker is not available. Is the daemon running?")
+    return False
 
 
 def is_vcf_file(path: Path) -> bool:
@@ -481,15 +500,15 @@ def render_rules_for_triplet(template_rules: Path, output_rules: Path, records_n
 
 
 def docker_image_exists(image: str) -> bool:
-    return run(["sudo", "docker", "image", "inspect", image]) == 0
+    return run([*docker_cmd_prefix(), "image", "inspect", image]) == 0
 
 
 def docker_build_image(image: str, repo_root: Path):
-    return run(["sudo", "docker", "build", "-t", image, "."], cwd=str(repo_root))
+    return run([*docker_cmd_prefix(), "build", "-t", image, "."], cwd=str(repo_root))
 
 
 def docker_pull_image(image: str):
-    return run(["sudo", "docker", "pull", image])
+    return run([*docker_cmd_prefix(), "pull", image])
 
 
 def resolve_image_ref(image: str, image_version: str | None):
@@ -739,6 +758,7 @@ def run_compression_methods_for_rdf(
     *,
     rdf_path: Path,
     out_dir: Path,
+    target_out_dir: Path | None = None,
     image_ref: str,
     methods: list[str],
     wrapper_log_path: Path,
@@ -748,7 +768,8 @@ def run_compression_methods_for_rdf(
     input_container = f"/data/in/{rdf_path.name}"
     input_stem = rdf_path.stem
     input_ext = rdf_path.suffix.lstrip(".") or "nt"
-    target_out_dir = out_dir / input_stem
+    if target_out_dir is None:
+        target_out_dir = out_dir / input_stem
     ensure_dir(target_out_dir)
     if not ensure_writable_path_or_fix(
         target_path=target_out_dir,
@@ -758,7 +779,16 @@ def run_compression_methods_for_rdf(
     ):
         eprint(f"Error: cannot write compression outputs in '{target_out_dir}'.")
         return False, {}
-    target_out_container = f"/data/out/{input_stem}"
+    try:
+        relative_out = target_out_dir.resolve().relative_to(out_dir.resolve())
+    except ValueError:
+        eprint(
+            f"Error: target output directory '{target_out_dir}' is outside mounted root '{out_dir}'."
+        )
+        return False, {}
+    target_out_container = "/data/out"
+    if str(relative_out) not in {".", ""}:
+        target_out_container = f"/data/out/{relative_out.as_posix()}"
 
     method_results: dict[str, dict] = {}
 
@@ -785,12 +815,16 @@ def run_compression_methods_for_rdf(
             command = (
                 "set -euo pipefail; "
                 f"rm -f {shlex.quote(out_container)}; "
-                "HDT_BIN=/opt/hdt-java/hdt-java-cli/bin/rdf2hdt.sh; "
-                "HDT_PROJECT_DIR=/opt/hdt-java/hdt-java-cli; "
-                'if [[ ! -x "$HDT_BIN" ]]; then echo "Missing rdf2hdt.sh at $HDT_BIN" >&2; exit 127; fi; '
-                'if ! command -v java >/dev/null 2>&1; then echo "Java runtime not found on PATH" >&2; exit 127; fi; '
-                'if [[ -f "$HDT_PROJECT_DIR/pom.xml" ]]; then cd "$HDT_PROJECT_DIR"; fi; '
-                'bash "$HDT_BIN" '
+                'HDT_BIN="${RDF2HDT_BIN:-$(command -v rdf2hdt || true)}"; '
+                'if [[ -z "$HDT_BIN" ]]; then '
+                'for candidate in /usr/local/bin/rdf2hdt /opt/hdt-cpp/bin/rdf2hdt; do '
+                '[[ -x "$candidate" ]] && HDT_BIN="$candidate" && break; '
+                "done; "
+                "fi; "
+                'if [[ -z "$HDT_BIN" || ! -x "$HDT_BIN" ]]; then '
+                'echo "Missing rdf2hdt binary in container" >&2; exit 127; '
+                "fi; "
+                '"$HDT_BIN" '
                 f"{shlex.quote(input_container)} {shlex.quote(out_container)}"
             )
 
@@ -836,6 +870,7 @@ def run_full_mode(
     metrics_dir: Path,
     image_ref: str,
     out_name: str,
+    rdf_layout: str,
     compression: str,
     keep_tsv: bool,
     keep_rdf: bool,
@@ -958,6 +993,8 @@ def run_full_mode(
             "-e",
             f"OUT_NAME={output_name}",
             "-e",
+            f"AGGREGATE_RDF={'1' if rdf_layout == 'aggregate' else '0'}",
+            "-e",
             f"RUN_ID={run_id}",
             "-e",
             f"TIMESTAMP={timestamp}",
@@ -974,57 +1011,68 @@ def run_full_mode(
             return 1
         print("    * RDF conversion ✅")
 
-        nt_path = out_dir / output_name / f"{output_name}.nt"
-        nq_path = out_dir / output_name / f"{output_name}.nq"
-
-        if nt_path.exists():
-            source_rdf_path = nt_path
-        elif nq_path.exists():
-            source_rdf_path = nq_path
+        if rdf_layout == "aggregate":
+            nt_path = out_dir / output_name / f"{output_name}.nt"
+            nq_path = out_dir / output_name / f"{output_name}.nq"
+            if nt_path.exists():
+                raw_rdf_files = [nt_path]
+            elif nq_path.exists():
+                raw_rdf_files = [nq_path]
+            else:
+                raw_rdf_files = [nt_path]
         else:
-            # Keep full mode behavior aligned with compression mode: try expected .nt path.
-            source_rdf_path = nt_path
-
-        method_results: dict[str, dict] = {}
-        if selected_methods:
-            ok, method_results = run_compression_methods_for_rdf(
-                rdf_path=source_rdf_path,
-                out_dir=out_dir,
-                image_ref=image_ref,
-                methods=selected_methods,
-                wrapper_log_path=wrapper_log_path,
-                status_indent=None,
-            )
-            if not ok:
+            raw_rdf_files = sorted((out_dir / output_name).glob("*.nt"))
+            if not raw_rdf_files:
+                raw_rdf_files = sorted((out_dir / output_name).glob("*.nq"))
+            if not raw_rdf_files:
+                eprint(
+                    f"Error: no RDF part files produced in batch mode for '{output_name}'. "
+                    f"Expected .nt/.nq files in {out_dir / output_name}."
+                )
+                eprint(f"See log for details: {wrapper_log_path}")
                 return 1
+
+        method_results_by_file: dict[str, dict[str, dict]] = {}
+        if selected_methods:
+            for raw_rdf_path in raw_rdf_files:
+                ok, method_results = run_compression_methods_for_rdf(
+                    rdf_path=raw_rdf_path,
+                    out_dir=out_dir / output_name,
+                    target_out_dir=out_dir / output_name,
+                    image_ref=image_ref,
+                    methods=selected_methods,
+                    wrapper_log_path=wrapper_log_path,
+                    status_indent=None,
+                )
+                if not ok:
+                    return 1
+                method_results_by_file[raw_rdf_path.name] = method_results
         print("    * Compression ✅")
 
-        hdt_path = out_dir / output_name / f"{output_name}.hdt"
-        nt_size_before_cleanup = file_size_bytes(nt_path)
-        nq_size_before_cleanup = file_size_bytes(nq_path)
-        source_size_before_cleanup = int(file_size_bytes(source_rdf_path) or 0)
-
         try:
-            write_compression_metrics_artifacts(
-                metrics_dir=metrics_dir,
-                run_id=run_id,
-                timestamp=timestamp,
-                output_name=output_name,
-                source_rdf_path=source_rdf_path,
-                combined_size_bytes=source_size_before_cleanup,
-                selected_methods=selected_methods,
-                method_results=method_results,
-            )
-            update_metrics_csv_with_compression(
-                metrics_csv=metrics_dir / "metrics.csv",
-                run_id=run_id,
-                timestamp=timestamp,
-                output_name=output_name,
-                output_dir=out_dir / output_name,
-                combined_size_bytes=source_size_before_cleanup,
-                selected_methods=selected_methods,
-                method_results=method_results,
-            )
+            for raw_rdf_path in raw_rdf_files:
+                method_results = method_results_by_file.get(raw_rdf_path.name, {})
+                source_size_before_cleanup = int(file_size_bytes(raw_rdf_path) or 0)
+                write_compression_metrics_artifacts(
+                    metrics_dir=metrics_dir,
+                    run_id=run_id,
+                    timestamp=timestamp,
+                    output_name=raw_rdf_path.stem,
+                    source_rdf_path=raw_rdf_path,
+                    combined_size_bytes=source_size_before_cleanup,
+                    selected_methods=selected_methods,
+                    method_results=method_results,
+                )
+                update_metrics_csv_with_compression(
+                    metrics_csv=metrics_dir / "metrics.csv",
+                    run_id=run_id,
+                    timestamp=timestamp,
+                    output_name=raw_rdf_path.stem,
+                    output_dir=out_dir / output_name,
+                    combined_size_bytes=source_size_before_cleanup,
+                    selected_methods=selected_methods,
+                    method_results=method_results,
+                )
         except PermissionError as exc:
             blocked_path = exc.filename or str(metrics_dir)
             eprint("Error: unable to write compression metrics due to file permissions.")
@@ -1035,10 +1083,8 @@ def run_full_mode(
             )
             return 1
 
-        nt_note = None
         if not keep_rdf and selected_methods:
-            removed_any = False
-            for raw_rdf_path in (nt_path, nq_path):
+            for raw_rdf_path in raw_rdf_files:
                 if raw_rdf_path.exists():
                     if not remove_file_with_docker_fallback(
                         path=raw_rdf_path,
@@ -1048,30 +1094,25 @@ def run_full_mode(
                         wrapper_log_path=wrapper_log_path,
                     ):
                         return 1
-                    removed_any = True
-            if removed_any:
-                nt_note = "removed, set --keep-rdf to retain"
-            else:
-                nt_note = "cleanup skipped"
-        elif not keep_rdf and not selected_methods:
-            nt_note = "kept (compression methods set to none)"
-        elif keep_rdf:
-            nt_note = "retained via --keep-rdf"
 
-        summary_nt_path = nt_path if nt_size_before_cleanup is not None else nq_path
-        summary_nt_size = (
-            nt_size_before_cleanup
-            if nt_size_before_cleanup is not None
-            else nq_size_before_cleanup
-        )
-        print_nt_hdt_summary(
-            output_root=out_dir,
-            nt_path=summary_nt_path,
-            hdt_path=hdt_path,
-            indent="    ",
-            nt_note=nt_note,
-            nt_size_override=summary_nt_size,
-        )
+        for raw_rdf_path in raw_rdf_files:
+            hdt_path = (out_dir / output_name) / f"{raw_rdf_path.stem}.hdt"
+            rdf_size = file_size_bytes(raw_rdf_path)
+            nt_note = None
+            if raw_rdf_path.exists():
+                nt_note = "retained via --keep-rdf" if keep_rdf else "retained"
+            elif not keep_rdf and selected_methods:
+                nt_note = "removed, set --keep-rdf to retain"
+            elif not keep_rdf and not selected_methods:
+                nt_note = "kept (compression methods set to none)"
+            print_nt_hdt_summary(
+                output_root=out_dir / output_name,
+                nt_path=raw_rdf_path,
+                hdt_path=hdt_path,
+                indent="    ",
+                nt_note=nt_note,
+                nt_size_override=rdf_size,
+            )
 
         if not keep_tsv:
             for tsv_path in (triplet["records"], triplet["headers"], triplet["metadata"]):
@@ -1107,6 +1148,14 @@ def run_compress_mode(
     if not methods:
         print("No compression methods selected (`none`). Nothing to do.")
         return 0
+
+    if "hdt" in methods and nq_path.suffix == ".nt":
+        file_size = file_size_bytes(nq_path) or 0
+        if file_size > 5 * 1024 * 1024 * 1024:
+            eprint(
+                "Warning: selected HDT compression for an .nt file larger than 5 GB. "
+                "This may fail due to memory limits depending on environment."
+            )
 
     ensure_dir(out_dir)
     ok, _method_results = run_compression_methods_for_rdf(
@@ -1185,12 +1234,16 @@ def run_decompress_mode(
         command = (
             "set -euo pipefail; "
             f"rm -f {shlex.quote(output_container)}; "
-            "HDT2RDF_BIN=/opt/hdt-java/hdt-java-cli/bin/hdt2rdf.sh; "
-            "HDT_PROJECT_DIR=/opt/hdt-java/hdt-java-cli; "
-            'if [[ ! -x "$HDT2RDF_BIN" ]]; then echo "Missing hdt2rdf.sh at $HDT2RDF_BIN" >&2; exit 127; fi; '
-            'if ! command -v java >/dev/null 2>&1; then echo "Java runtime not found on PATH" >&2; exit 127; fi; '
-            'if [[ -f "$HDT_PROJECT_DIR/pom.xml" ]]; then cd "$HDT_PROJECT_DIR"; fi; '
-            'bash "$HDT2RDF_BIN" '
+            'HDT2RDF_BIN="${HDT2RDF_BIN:-$(command -v hdt2rdf || true)}"; '
+            'if [[ -z "$HDT2RDF_BIN" ]]; then '
+            'for candidate in /usr/local/bin/hdt2rdf /opt/hdt-cpp/bin/hdt2rdf; do '
+            '[[ -x "$candidate" ]] && HDT2RDF_BIN="$candidate" && break; '
+            "done; "
+            "fi; "
+            'if [[ -z "$HDT2RDF_BIN" || ! -x "$HDT2RDF_BIN" ]]; then '
+            'echo "Missing hdt2rdf binary in container" >&2; exit 127; '
+            "fi; "
+            '"$HDT2RDF_BIN" '
             f"{shlex.quote(source_container)} {shlex.quote(output_container)}"
         )
 
@@ -1220,7 +1273,9 @@ def main():
         epilog=(
             "Examples:\n"
             "  Full pipeline:\n"
-            "    vcf_rdfizer.py -m full -i ./vcf_files -r ./rules/default_rules.ttl\n"
+            "    vcf_rdfizer.py -m full -i ./vcf_files --rdf-layout aggregate -r ./rules/default_rules.ttl\n"
+            "  Full pipeline (batch RDF outputs, compress each part):\n"
+            "    vcf_rdfizer.py -m full -i ./vcf_files --rdf-layout batch -c hdt\n"
             "  Compression-only:\n"
             "    vcf_rdfizer.py -m compress -q ./out/sample/sample.nt -c gzip,brotli\n"
             "  Decompression-only:\n"
@@ -1266,6 +1321,13 @@ def main():
         "--rules",
         default=None,
         help="RML mapping rules .ttl (default: <repo>/rules/default_rules.ttl)",
+    )
+    parser.add_argument(
+        "-l",
+        "--rdf-layout",
+        choices=["aggregate", "batch"],
+        default=None,
+        help="Full mode required: aggregate merges RML output parts into one .nt; batch keeps part files separate",
     )
     parser.add_argument("-o", "--out", default="./out", help="RDF output directory")
     parser.add_argument("-t", "--tsv", default="./tsv", help="TSV output directory")
@@ -1327,6 +1389,8 @@ def main():
         if mode == "full":
             if args.input is None:
                 raise ValueError("--input is required in --mode full")
+            if args.rdf_layout is None:
+                raise ValueError("--rdf-layout is required in --mode full (aggregate|batch)")
             input_path = Path(args.input).expanduser().resolve()
             (
                 input_mount_dir,
@@ -1481,6 +1545,7 @@ def main():
                 metrics_dir=metrics_dir,
                 image_ref=image_ref,
                 out_name=args.out_name,
+                rdf_layout=args.rdf_layout,
                 compression=args.compression,
                 keep_tsv=args.keep_tsv,
                 keep_rdf=args.keep_rdf,

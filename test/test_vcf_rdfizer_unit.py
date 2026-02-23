@@ -13,8 +13,18 @@ import vcf_rdfizer
 from test.helpers import VerboseTestCase
 
 
-def invoke_main(argv):
-    with mock.patch.object(sys, "argv", ["vcf_rdfizer.py", *argv]):
+def invoke_main(argv, *, auto_layout=True):
+    args = list(argv)
+    if auto_layout:
+        mode = "full"
+        for index, token in enumerate(args):
+            if token in {"--mode", "-m"} and index + 1 < len(args):
+                mode = args[index + 1]
+                break
+        if mode == "full" and "--rdf-layout" not in args and "-l" not in args:
+            args.extend(["--rdf-layout", "aggregate"])
+
+    with mock.patch.object(sys, "argv", ["vcf_rdfizer.py", *args]):
         return vcf_rdfizer.main()
 
 
@@ -43,9 +53,9 @@ def output_name_from_command(cmd):
         if isinstance(part, str) and part.startswith("OUT_NAME="):
             return part.split("=", 1)[1]
     if isinstance(cmd, list) and cmd and isinstance(cmd[-1], str):
-        match = re.search(r"/data/out/([^/]+)/\1\.hdt", cmd[-1])
+        match = re.search(r"/data/out/(?:([^/]+)/)?([^/]+)\.hdt", cmd[-1])
         if match:
-            return match.group(1)
+            return match.group(1) or match.group(2)
     return None
 
 
@@ -270,6 +280,17 @@ class WrapperUnitTests(VerboseTestCase):
         rc = invoke_main(["--mode", "full"])
         self.assertEqual(rc, 2)
 
+    def test_main_full_mode_requires_rdf_layout_argument(self):
+        """Full mode fails validation when --rdf-layout is omitted."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+            rc = invoke_main(
+                ["--mode", "full", "--input", str(input_dir), "--rules", str(rules_path)],
+                auto_layout=False,
+            )
+            self.assertEqual(rc, 2)
+
     def test_main_compress_mode_none_skips_compression_commands(self):
         """Compression mode with method none performs no compression runs."""
         with tempfile.TemporaryDirectory() as td:
@@ -379,7 +400,7 @@ class WrapperUnitTests(VerboseTestCase):
 
             self.assertEqual(rc, 0)
             self.assertEqual(len(commands), 1)
-            self.assertIn("/opt/hdt-java/hdt-java-cli/bin/hdt2rdf.sh", commands[0][-1])
+            self.assertIn("hdt2rdf", commands[0][-1])
             self.assertTrue(any(arg.endswith("/out/sample:/data/out") for arg in commands[0]))
             self.assertIn("/data/out/sample.nt", commands[0][-1])
 
@@ -460,6 +481,98 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertIn("/opt/vcf-rdfizer/vcf_as_tsv.sh", commands[0])
             self.assertIn("/opt/vcf-rdfizer/run_conversion.sh", commands[1])
 
+    def test_main_full_mode_batch_layout_compresses_each_rml_part(self):
+        """Batch layout keeps RML output parts separate and compresses each part individually."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+            out_dir = tmp_path / "out"
+            commands = []
+
+            def fake_run(cmd, cwd=None, env=None):
+                commands.append(cmd)
+                if "/opt/vcf-rdfizer/run_conversion.sh" in cmd:
+                    sample_dir = out_dir / "sample"
+                    sample_dir.mkdir(parents=True, exist_ok=True)
+                    (sample_dir / "part-00000.nt").write_text("<s1> <p> <o> .\n")
+                    (sample_dir / "part-00001.nt").write_text("<s2> <p> <o> .\n")
+                return 0
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch.object(
+                    vcf_rdfizer, "check_docker", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "docker_image_exists", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "discover_tsv_triplets", return_value=mocked_triplets()
+                ):
+                    rc = invoke_main(
+                        [
+                            "--input",
+                            str(input_dir),
+                            "--rules",
+                            str(rules_path),
+                            "--rdf-layout",
+                            "batch",
+                            "--compression",
+                            "gzip",
+                            "--out",
+                            str(out_dir),
+                            "--keep-tsv",
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 0)
+            self.assertIn("AGGREGATE_RDF=0", commands[1])
+            gzip_cmds = [cmd for cmd in commands if isinstance(cmd, list) and cmd and "gzip -c" in cmd[-1]]
+            self.assertEqual(len(gzip_cmds), 2)
+            self.assertIn("/data/in/part-00000.nt", gzip_cmds[0][-1])
+            self.assertIn("/data/in/part-00001.nt", gzip_cmds[1][-1])
+
+    def test_main_full_mode_aggregate_layout_sets_merge_flag(self):
+        """Aggregate layout passes AGGREGATE_RDF=1 to conversion step."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+            commands = []
+
+            def fake_run(cmd, cwd=None, env=None):
+                commands.append(cmd)
+                return 0
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch.object(
+                    vcf_rdfizer, "check_docker", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "docker_image_exists", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "discover_tsv_triplets", return_value=mocked_triplets()
+                ):
+                    rc = invoke_main(
+                        [
+                            "--input",
+                            str(input_dir),
+                            "--rules",
+                            str(rules_path),
+                            "--rdf-layout",
+                            "aggregate",
+                            "--compression",
+                            "none",
+                            "--keep-tsv",
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 0)
+            self.assertIn("AGGREGATE_RDF=1", commands[1])
+
     def test_main_multiple_triplets_run_multiple_conversions_and_compress_all_outputs(self):
         """Multiple input triplets trigger per-sample conversion runs and all-output compression."""
         with tempfile.TemporaryDirectory() as td:
@@ -510,13 +623,13 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertIn("/opt/vcf-rdfizer/vcf_as_tsv.sh", commands[0])
             self.assertIn("/data/in/sample_a.vcf", commands[0])
             self.assertIn("OUT_NAME=sample_a", commands[1])
-            self.assertIn("rdf2hdt.sh", commands[4][-1])
-            self.assertIn("/data/out/sample_a/sample_a.hdt", commands[4][-1])
+            self.assertIn("rdf2hdt", commands[4][-1])
+            self.assertIn("/data/out/sample_a.hdt", commands[4][-1])
             self.assertIn("/opt/vcf-rdfizer/vcf_as_tsv.sh", commands[5])
             self.assertIn("/data/in/sample_b.vcf", commands[5])
             self.assertIn("OUT_NAME=sample_b", commands[6])
-            self.assertIn("rdf2hdt.sh", commands[9][-1])
-            self.assertIn("/data/out/sample_b/sample_b.hdt", commands[9][-1])
+            self.assertIn("rdf2hdt", commands[9][-1])
+            self.assertIn("/data/out/sample_b.hdt", commands[9][-1])
 
     def test_main_full_mode_deletes_nt_after_compression_by_default(self):
         """Full mode removes merged .nt outputs after successful compression unless --keep-rdf is set."""
@@ -531,7 +644,7 @@ class WrapperUnitTests(VerboseTestCase):
                     out_sample_dir = out_dir / output_name
                     out_sample_dir.mkdir(parents=True, exist_ok=True)
                     (out_sample_dir / f"{output_name}.nt").write_text("<s> <p> <o> .\n")
-                if isinstance(cmd, list) and cmd and "rdf2hdt.sh" in cmd[-1]:
+                if isinstance(cmd, list) and cmd and "rdf2hdt" in cmd[-1]:
                     output_name = output_name_from_command(cmd) or "sample"
                     out_sample_dir = out_dir / output_name
                     out_sample_dir.mkdir(parents=True, exist_ok=True)
@@ -579,7 +692,7 @@ class WrapperUnitTests(VerboseTestCase):
                     out_sample_dir = out_dir / output_name
                     out_sample_dir.mkdir(parents=True, exist_ok=True)
                     (out_sample_dir / f"{output_name}.nt").write_text("<s> <p> <o> .\n")
-                if isinstance(cmd, list) and cmd and "rdf2hdt.sh" in cmd[-1]:
+                if isinstance(cmd, list) and cmd and "rdf2hdt" in cmd[-1]:
                     output_name = output_name_from_command(cmd) or "sample"
                     out_sample_dir = out_dir / output_name
                     out_sample_dir.mkdir(parents=True, exist_ok=True)
@@ -629,7 +742,7 @@ class WrapperUnitTests(VerboseTestCase):
                     out_sample_dir = out_dir / output_name
                     out_sample_dir.mkdir(parents=True, exist_ok=True)
                     (out_sample_dir / f"{output_name}.nt").write_text("<s> <p> <o> .\n")
-                if isinstance(cmd, list) and cmd and "rdf2hdt.sh" in cmd[-1]:
+                if isinstance(cmd, list) and cmd and "rdf2hdt" in cmd[-1]:
                     output_name = output_name_from_command(cmd) or "sample"
                     out_sample_dir = out_dir / output_name
                     out_sample_dir.mkdir(parents=True, exist_ok=True)
@@ -694,7 +807,7 @@ class WrapperUnitTests(VerboseTestCase):
                 if "/opt/vcf-rdfizer/run_conversion.sh" in cmd:
                     target_nt.parent.mkdir(parents=True, exist_ok=True)
                     target_nt.write_text("<s> <p> <o> .\n")
-                if isinstance(cmd, list) and cmd and "rdf2hdt.sh" in cmd[-1]:
+                if isinstance(cmd, list) and cmd and "rdf2hdt" in cmd[-1]:
                     out_sample_dir = out_dir / "sample"
                     out_sample_dir.mkdir(parents=True, exist_ok=True)
                     (out_sample_dir / "sample.hdt").write_text("fake-hdt\n")
@@ -754,7 +867,7 @@ class WrapperUnitTests(VerboseTestCase):
                     out_sample_dir = out_dir / output_name
                     out_sample_dir.mkdir(parents=True, exist_ok=True)
                     (out_sample_dir / f"{output_name}.nq").write_text("<s> <p> <o> <g> .\n")
-                if isinstance(cmd, list) and cmd and "rdf2hdt.sh" in cmd[-1]:
+                if isinstance(cmd, list) and cmd and "rdf2hdt" in cmd[-1]:
                     output_name = output_name_from_command(cmd) or "sample"
                     out_sample_dir = out_dir / output_name
                     out_sample_dir.mkdir(parents=True, exist_ok=True)
@@ -1142,6 +1255,21 @@ class WrapperUnitTests(VerboseTestCase):
             vcf_rdfizer, "run", return_value=1
         ):
             self.assertFalse(vcf_rdfizer.check_docker())
+
+    def test_check_docker_falls_back_to_sudo_when_plain_docker_fails(self):
+        """Docker check retries with sudo and flips command prefix mode when needed."""
+        old_mode = vcf_rdfizer._DOCKER_USE_SUDO
+        try:
+            with mock.patch(
+                "vcf_rdfizer.shutil.which",
+                side_effect=["/usr/bin/docker", "/usr/bin/sudo"],
+            ), mock.patch.object(vcf_rdfizer, "run", side_effect=[1, 0]) as mocked_run:
+                self.assertTrue(vcf_rdfizer.check_docker())
+                self.assertEqual(mocked_run.call_args_list[0].args[0], ["docker", "version"])
+                self.assertEqual(mocked_run.call_args_list[1].args[0], ["sudo", "docker", "version"])
+                self.assertEqual(vcf_rdfizer.docker_cmd_prefix(), ["sudo", "docker"])
+        finally:
+            vcf_rdfizer._DOCKER_USE_SUDO = old_mode
 
     def test_resolve_image_ref_accepts_repo_plus_version(self):
         """Image repository and explicit version resolve to a tagged image reference."""

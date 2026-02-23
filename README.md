@@ -23,8 +23,19 @@ Wrapper modes:
   - `<sample>.header_lines.tsv`
   - `<sample>.file_metadata.tsv`
 
-The default mapping emits triples (no graph term). The conversion step compiles all RMLStreamer output parts into one N-Triples file named after the TSV basename (for example `sample.nt` in `out/sample/`).
-By default, that merged `.nt` file is removed after compression to save disk space. Use `--keep-rdf` to keep it.
+The default mapping emits triples (no graph term).
+
+Full mode requires `--rdf-layout` to choose how post-RML RDF parts are handled:
+- `aggregate`: concatenate RMLStreamer output parts into a single `<sample>.nt`, then compress that file.
+- `batch`: keep RMLStreamer output parts as separate `.nt` files and compress each file individually.
+
+Tradeoffs:
+- `aggregate` advantages: easier downstream consumption (single file per sample), simpler transfer/indexing.
+- `aggregate` disadvantages: very large intermediate files can cause disk/memory pressure.
+- `batch` advantages: lower peak file size per artifact, can improve resilience on constrained disks.
+- `batch` disadvantages: downstream consumers must handle multiple files per sample.
+
+By default, raw RDF `.nt/.nq` files are removed after compression to save disk space. Use `--keep-rdf` to keep them.
 
 Vocabulary references:
 - Ontology: [vcf-rdfizer-vocabulary.ttl](https://github.com/ecrum19/VCF-RDFizer-vocabulary/blob/main/ontology/vcf-rdfizer-vocabulary.ttl)
@@ -53,17 +64,22 @@ python3 vcf_rdfizer.py -h
 
 2. Full pipeline with default mapping (`rules/default_rules.ttl`):
 ```bash
-python3 vcf_rdfizer.py --mode full --input ./vcf_files
+python3 vcf_rdfizer.py --mode full --input ./vcf_files --rdf-layout aggregate
 ```
 
 3. Full pipeline with a custom mapping and size pre-check:
 ```bash
-python3 vcf_rdfizer.py --mode full --input ./vcf_files --rules ./rules/my_rules.ttl --estimate-size
+python3 vcf_rdfizer.py --mode full --input ./vcf_files --rdf-layout aggregate --rules ./rules/my_rules.ttl --estimate-size
 ```
 
-3b. Full pipeline while keeping merged `.nt` files:
+3b. Full pipeline in batch mode (compress each RMLStreamer output file separately):
 ```bash
-python3 vcf_rdfizer.py --mode full --input ./vcf_files --keep-rdf
+python3 vcf_rdfizer.py --mode full --input ./vcf_files --rdf-layout batch --compression hdt
+```
+
+3c. Full pipeline while keeping raw `.nt/.nq` files:
+```bash
+python3 vcf_rdfizer.py --mode full --input ./vcf_files --rdf-layout aggregate --keep-rdf
 ```
 
 4. Compression-only mode (compress one `.nt` into selected formats):
@@ -84,13 +100,13 @@ python3 vcf_rdfizer.py --mode decompress --compressed-input ./out/sample/sample.
 Outputs:
 - `./tsv` for TSV intermediates
 - `./out` for RDF output
-  - conversion outputs per TSV basename in `./out/<sample>/`
-  - merged N-Triples file:
-    - `./out/<sample>/<sample>.nt` (retained only when `--keep-rdf` is set)
-  - compressed outputs are written in each sample directory:
-    - `./out/<sample>/<sample>.nt.gz` (or `.nq.gz` for legacy inputs)
-    - `./out/<sample>/<sample>.nt.br` (or `.nq.br` for legacy inputs)
-    - `./out/<sample>/<sample>.hdt`
+  - conversion outputs per sample in `./out/<sample>/`
+  - `--rdf-layout aggregate`:
+    - merged N-Triples file: `./out/<sample>/<sample>.nt`
+    - compressed outputs: `./out/<sample>/<sample>.nt.gz`, `.br`, `.hdt`
+  - `--rdf-layout batch`:
+    - raw RMLStreamer part files stay separate (for example `part-00000.nt`, `part-00001.nt`, ...)
+    - each part is compressed individually (for example `part-00000.nt.gz`, `part-00000.hdt`, ...)
   - decompressed outputs (decompression mode default):
     - `./out/<sample>/<sample>.nt`
 - `./run_metrics` for logs and metrics
@@ -110,7 +126,7 @@ Small VCF fixtures for RDF size/inflation test runs:
 
 Example inflation check:
 ```bash
-python3 vcf_rdfizer.py --mode full --input test_vcf_files/infl1k.vcf --compression none --keep-tsv
+python3 vcf_rdfizer.py --mode full --input test_vcf_files/infl1k.vcf --rdf-layout aggregate --compression none --keep-tsv --keep-rdf
 wc -l out/infl1k/infl1k.nt
 ```
 
@@ -118,7 +134,7 @@ wc -l out/infl1k/infl1k.nt
 
 The Docker image bundles:
 - Java 11 runtime
-- HDT Java libraries
+- HDT-cpp (`rdf2hdt`, `hdt2rdf`)
 - Brotli and Node.js
 - RMLStreamer standalone jar (downloaded at build time)
 - The conversion scripts from `src/`
@@ -130,12 +146,15 @@ The wrapper validates:
 - Mode-specific required inputs are provided
 - Full mode input path exists and contains `.vcf` or `.vcf.gz`
 - Full mode rules file exists
+- Full mode requires `--rdf-layout` (`aggregate` or `batch`)
 - Full mode converts only the VCF file(s) selected at pipeline start (ignores unrelated preexisting TSV intermediates)
 - Full mode runs TSV -> RDF -> compression sequentially per selected VCF to reduce peak disk usage
 - Compression mode input is an RDF file (`.nt` or `.nq`)
 - Decompression mode input is `.gz`, `.br`, or `.hdt`
-- HDT mode pre-checks that `rdf2hdt.sh` is executable and that Java is available
+- In compression mode, a warning is shown before HDT compression if input `.nt` is larger than 5 GB
+- HDT mode uses `rdf2hdt` / `hdt2rdf` (HDT-cpp) in the container
 - Docker image exists or is built (if `--image-version` is set, it will attempt to pull that version and fail if missing)
+- Docker commands are attempted without `sudo` first, then automatically retried with `sudo` if needed
 - Docker runs as the host UID/GID by default to prevent root-owned output files on mounted volumes
 - If mounted output/metrics paths are not writable (e.g., stale root-owned files), the wrapper automatically attempts a one-time in-container permission repair before running
 - Raw command output is written to a hidden wrapper log file instead of printed directly to the terminal
@@ -173,7 +192,8 @@ Options:
 - `-m, --mode` (default `full`): execution mode (`full`, `compress`, `decompress`)
 - `-i, --input`: full mode input path (`.vcf` / `.vcf.gz` file or directory)
 - `-r, --rules`: full mode RML mapping `.ttl` (default `rules/default_rules.ttl`)
-- `-q, --nt, --rdf`: compression mode input RDF file (`.nt` or `.nq`)
+- `-l, --rdf-layout` (required in full mode): RDF post-processing strategy (`aggregate` or `batch`)
+- `-q, --nq, --nt, --rdf`: compression mode input RDF file (`.nt` or `.nq`)
 - `-C, --compressed-input`: decompression mode input (`.gz`, `.br`, or `.hdt`)
 - `-d, --decompress-out`: decompression mode output RDF file path (default `.nt`)
 - `-o, --out` (default `./out`): RDF output directory (and compression/decompression output root)
@@ -184,9 +204,9 @@ Options:
 - `-B, --no-build`: fail if image missing
 - `-n, --out-name` (default `rdf`): fallback output basename in full mode
 - `-M, --metrics` (default `./run_metrics`): metrics/log directory
-- `-c, --compression` (default `hdt`): compression methods (`gzip,brotli,hdt,none`)
+- `-c, --compression` (default `gzip,brotli,hdt`): compression methods (`gzip,brotli,hdt,none`)
 - `-k, --keep-tsv`: keep TSV intermediates (full mode)
-- `-R, --keep-rdf`: keep merged `.nt` RDF outputs after compression (full mode; default is delete)
+- `-R, --keep-rdf`: keep raw `.nt/.nq` RDF outputs after compression (full mode; default is delete)
 - `-e, --estimate-size`: print rough input/TSV/RDF size estimates and free disk before running (full mode)
 - `-h, --help`: show usage guide and exit
 
@@ -240,21 +260,17 @@ Install Brotli:
 sudo apt install brotli
 ```
 
-Install HDT library:
+Install HDT-cpp tools:
 ```
-git clone git@github.com:rdfhdt/hdt-java.git
-cd hdt-java
+git clone https://github.com/rdfhdt/hdt-cpp.git
+cd hdt-cpp
 
-sudo apt install openjdk-11-jdk
-sudo update-alternatives --config java  # and choose jdk-11 as default 
-
-export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64 \
-export PATH="$JAVA_HOME/bin:$PATH"
-
-mvn clean install -DskipTests
-
-cd hdt-java-cli
-mvn clean install -DskipTests
+sudo apt install autoconf automake build-essential libtool pkg-config zlib1g-dev libserd-dev
+./autogen.sh
+./configure
+make -j"$(nproc)"
+sudo make install
+# binaries are installed to /usr/local/bin (rdf2hdt, hdt2rdf)
 ```
 
 Generate tsv representations of vcf files (for all VCFs to be converted):

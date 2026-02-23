@@ -10,12 +10,8 @@ OUT_NAME=${OUT_NAME:-}
 # Metrics directory
 LOGDIR=${LOGDIR:-run_metrics}
 
-# rdf2hdt binary
-HDT=${RDF2HDT:-/opt/hdt-java/hdt-java-cli/bin/rdf2hdt.sh}
-HDT_PROJECT_DIR=${HDT_PROJECT_DIR:-}
-if [[ -z "$HDT_PROJECT_DIR" ]]; then
-  HDT_PROJECT_DIR="$(cd "$(dirname "$HDT")/.." 2>/dev/null && pwd || true)"
-fi
+# rdf2hdt binary (HDT-cpp)
+HDT=${RDF2HDT:-${RDF2HDT_BIN:-/usr/local/bin/rdf2hdt}}
 
 # Base URI for rdf2hdt (reserved for future use)
 BASE_URI=${BASE_URI:-http://example.org/base}
@@ -78,11 +74,7 @@ ANY_COMPRESS=$((DO_GZIP + DO_BROTLI + DO_HDT))
 
 if (( DO_HDT == 1 )); then
   if [[ ! -x "$HDT" ]]; then
-    echo "Error: rdf2hdt script not found or not executable at '$HDT'." >&2
-    exit 2
-  fi
-  if ! command -v java >/dev/null 2>&1; then
-    echo "Error: Java runtime is required for HDT conversion but was not found on PATH." >&2
+    echo "Error: rdf2hdt binary not found or not executable at '$HDT'." >&2
     exit 2
   fi
 fi
@@ -391,10 +383,7 @@ for OUT in "${OUTPUT_DIRS[@]}"; do
       HDT_PATH="$OUT/$BASENAME.hdt"
       EXIT_CODE_HDT=0
 
-      HDT_CMD="bash \"$HDT\" \"$SOURCE_RDF\" \"$HDT_PATH\""
-      if [[ -n "$HDT_PROJECT_DIR" && -f "$HDT_PROJECT_DIR/pom.xml" ]]; then
-        HDT_CMD="cd \"$HDT_PROJECT_DIR\" && $HDT_CMD"
-      fi
+      HDT_CMD="\"$HDT\" \"$SOURCE_RDF\" \"$HDT_PATH\""
 
       if have_gnu_time; then
         /usr/bin/time -v -o "$TIME_LOG_HDT" -- bash -lc "$HDT_CMD" || EXIT_CODE_HDT=$?

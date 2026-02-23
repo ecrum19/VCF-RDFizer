@@ -8,6 +8,7 @@ IN_VCF=${IN_VCF:-input.vcf}
 OUT_NAME=${OUT_NAME:-rdf}
 OUT_DIR=${OUT_DIR:-run_output}
 OUT="$OUT_DIR/$OUT_NAME"
+AGGREGATE_RDF=${AGGREGATE_RDF:-1}
 LOGDIR=${LOGDIR:-run_metrics}
 mkdir -p "$LOGDIR" "$OUT_DIR"
 
@@ -64,6 +65,16 @@ have_gnu_time() { [[ -x /usr/bin/time ]] && /usr/bin/time --version >/dev/null 2
 count_triples_json() {
   local path="$1"
   local total=0
+
+  if [[ -f "$path" ]]; then
+    local count
+    count=$( (grep -E '^[[:space:]]*[^#].*\.[[:space:]]*$' "$path" || true) | wc -l | tr -d ' ' )
+    echo "{"
+    printf "  \"%s\": %s,\n" "$path" "$count"
+    printf "  \"TOTAL\": %s\n" "$count"
+    echo "}"
+    return
+  fi
 
   echo "{"
   shopt -s nullglob
@@ -133,26 +144,30 @@ done
 
 # Merge all RMLStreamer output parts into one N-Triples file named after the TSV basename/output name.
 # Stream merge + delete each part immediately to avoid temporary 2x disk spikes.
-MERGED_NT="$OUT_DIR/$OUT_NAME/$OUT_NAME.nt"
-
-shopt -s nullglob
-PART_FILES=("$OUT_DIR/$OUT_NAME"/*.nt)
-if (( ${#PART_FILES[@]} > 0 )); then
-  : > "$MERGED_NT"
-  for PART_NT in "${PART_FILES[@]}"; do
-    if [[ "$PART_NT" == "$MERGED_NT" ]]; then
-      continue
-    fi
-    cat "$PART_NT" >> "$MERGED_NT"
-    rm -f "$PART_NT"
-  done
+if [[ "$AGGREGATE_RDF" == "1" ]]; then
+  MERGED_NT="$OUT_DIR/$OUT_NAME/$OUT_NAME.nt"
+  shopt -s nullglob
+  PART_FILES=("$OUT_DIR/$OUT_NAME"/*.nt)
+  if (( ${#PART_FILES[@]} > 0 )); then
+    : > "$MERGED_NT"
+    for PART_NT in "${PART_FILES[@]}"; do
+      if [[ "$PART_NT" == "$MERGED_NT" ]]; then
+        continue
+      fi
+      cat "$PART_NT" >> "$MERGED_NT"
+      rm -f "$PART_NT"
+    done
+  else
+    : > "$MERGED_NT"
+  fi
+  shopt -u nullglob
+  OUTPUT_PATH="$MERGED_NT"
 else
-  : > "$MERGED_NT"
+  OUTPUT_PATH="$OUT_DIR/$OUT_NAME"
 fi
-shopt -u nullglob
 
-OUT_SIZE=$(stat_size "$OUT_DIR/$OUT_NAME")
-TRIPLES_JSON=$(count_triples_json "$OUT_DIR/$OUT_NAME")
+OUT_SIZE=$(stat_size "$OUTPUT_PATH")
+TRIPLES_JSON=$(count_triples_json "$OUTPUT_PATH")
 
 # Parse timing
 WALL_SEC=""
@@ -191,7 +206,7 @@ cat > "$METRICS_JSON" <<EOF
     "input_path": "$IN",
     "input_size_bytes": $IN_SIZE,
     "input_vcf_size_bytes": $VCF_SIZE,
-    "output_path": "$OUT_DIR/$OUT_NAME",
+    "output_path": "$OUTPUT_PATH",
     "output_size_bytes": $OUT_SIZE,
     "output_triples": $TRIPLES_JSON
   },
@@ -232,7 +247,7 @@ csv_fields=(
   "$TOTAL_TRIPLES"
   "$JAR"
   "$IN"
-  "$OUT"
+  "$OUTPUT_PATH"
   "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" ""
 )
 ( IFS=,; echo "${csv_fields[*]}" ) >> "$METRICS_CSV"
