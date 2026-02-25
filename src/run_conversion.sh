@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ------------------------------------------------------------------------------
+# TSV -> RDF conversion runner (RMLStreamer)
+# ------------------------------------------------------------------------------
+# Responsibilities:
+# 1) run RMLStreamer with stable output naming
+# 2) normalize Spark part outputs to .nt
+# 3) optionally aggregate part files into a single <sample>.nt
+# 4) collect conversion timing + output metrics
+# 5) upsert conversion row in run_metrics/metrics.csv
+# ------------------------------------------------------------------------------
+
 # ---------- Config ----------
 JAR=${JAR:-RMLStreamer-v2.5.0-standalone.jar}
 IN=${IN:-rules/default_rules.ttl}
@@ -21,9 +32,10 @@ fi
 TIME_LOG="$LOGDIR/conversion-time-${SAFE_OUT_NAME}-${RUN_ID}.txt"
 METRICS_JSON="$LOGDIR/conversion-metrics-${SAFE_OUT_NAME}-${RUN_ID}.json"
 METRICS_CSV="$LOGDIR/metrics.csv"
-METRICS_HEADER="run_id,timestamp,output_name,output_dir,exit_code_java,wall_seconds_java,user_seconds_java,sys_seconds_java,max_rss_kb_java,input_mapping_size_bytes,input_vcf_size_bytes,output_dir_size_bytes,output_triples,jar,mapping_file,output_path,combined_nq_size_bytes,gzip_size_bytes,brotli_size_bytes,hdt_size_bytes,exit_code_gzip,exit_code_brotli,exit_code_hdt,wall_seconds_gzip,user_seconds_gzip,sys_seconds_gzip,max_rss_kb_gzip,wall_seconds_brotli,user_seconds_brotli,sys_seconds_brotli,max_rss_kb_brotli,wall_seconds_hdt,user_seconds_hdt,sys_seconds_hdt,max_rss_kb_hdt,compression_methods"
+METRICS_HEADER="run_id,timestamp,output_name,output_dir,exit_code_java,wall_seconds_java,user_seconds_java,sys_seconds_java,max_rss_kb_java,input_mapping_size_bytes,input_vcf_size_bytes,output_dir_size_bytes,output_triples,jar,mapping_file,output_path,combined_nq_size_bytes,gzip_size_bytes,brotli_size_bytes,hdt_size_bytes,exit_code_gzip,exit_code_brotli,exit_code_hdt,wall_seconds_gzip,user_seconds_gzip,sys_seconds_gzip,max_rss_kb_gzip,wall_seconds_brotli,user_seconds_brotli,sys_seconds_brotli,max_rss_kb_brotli,wall_seconds_hdt,user_seconds_hdt,sys_seconds_hdt,max_rss_kb_hdt,compression_methods,hdt_source,gzip_on_hdt_size_bytes,brotli_on_hdt_size_bytes,exit_code_gzip_on_hdt,exit_code_brotli_on_hdt,wall_seconds_gzip_on_hdt,user_seconds_gzip_on_hdt,sys_seconds_gzip_on_hdt,max_rss_kb_gzip_on_hdt,wall_seconds_brotli_on_hdt,user_seconds_brotli_on_hdt,sys_seconds_brotli_on_hdt,max_rss_kb_brotli_on_hdt"
 
 
+# Return byte size for file or directory (GNU + BSD compatible).
 stat_size() {
   local path="$1"
 
@@ -61,7 +73,7 @@ stat_size() {
 
 have_gnu_time() { [[ -x /usr/bin/time ]] && /usr/bin/time --version >/dev/null 2>&1; }
 
-# Count triples via the number of lines in produced output dir:
+# Count triples via non-comment RDF lines ending in '.'.
 count_triples_json() {
   local path="$1"
   local total=0
@@ -94,6 +106,7 @@ count_triples_json() {
 }
 
 
+# Convert elapsed clock text from `time` output to numeric seconds.
 elapsed_to_seconds() {
   awk -F':' '{
     if (NF==3) { h=$1+0; m=$2+0; s=$3+0; printf("%.3f", h*3600 + m*60 + s) }
@@ -120,7 +133,7 @@ fi
 IN_SIZE=$(stat_size "$IN")
 VCF_SIZE=$(stat_size "$IN_VCF")
 
-# ---------- Run with timing ----------
+# ---------- Run RMLStreamer with timing ----------
 EXIT_CODE=0
 if have_gnu_time; then
   /usr/bin/time -v -o "$TIME_LOG" -- "${JAVA_CMD[@]}" || EXIT_CODE=$?
@@ -128,7 +141,7 @@ else
   { time -p "${JAVA_CMD[@]}"; } >"$TIME_LOG" 2>&1 || EXIT_CODE=$?
 fi
 
-# ---------- Post-run ----------
+# ---------- Post-run normalization ----------
 mkdir -p "$OUT_DIR/$OUT_NAME"
 
 # Normalize output files to .nt for downstream compression/HDT conversion.
@@ -142,8 +155,9 @@ for RDF_FILE in "$OUT_DIR/$OUT_NAME"/*; do
   mv "$RDF_FILE" "${RDF_FILE}.nt"
 done
 
-# Merge all RMLStreamer output parts into one N-Triples file named after the TSV basename/output name.
-# Stream merge + delete each part immediately to avoid temporary 2x disk spikes.
+# Merge all RMLStreamer output parts into one N-Triples file named after output
+# basename when AGGREGATE_RDF=1. Stream merge + delete each part immediately to
+# avoid temporary 2x disk spikes.
 if [[ "$AGGREGATE_RDF" == "1" ]]; then
   MERGED_NT="$OUT_DIR/$OUT_NAME/$OUT_NAME.nt"
   shopt -s nullglob
@@ -188,7 +202,7 @@ else
   SYS_SEC=$(awk  '/^sys/  {print $2}' "$TIME_LOG")
 fi
 
-# ---------- Save JSON ----------
+# ---------- Persist conversion metrics JSON ----------
 cat > "$METRICS_JSON" <<EOF
 {
   "run_id": "$RUN_ID",
@@ -250,6 +264,11 @@ csv_fields=(
   "$OUTPUT_PATH"
   "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" ""
 )
+
+# Compression-related fields are initialized as empty from conversion step output.
+for _ in $(seq 1 13); do
+  csv_fields+=("")
+done
 ( IFS=,; echo "${csv_fields[*]}" ) >> "$METRICS_CSV"
 
 echo "Done."

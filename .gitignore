@@ -17,3 +17,5 @@ __pycache__/
 .venv/
 .DS_Store
 *.cover
+test/*.cover
+vcf_rdfizer.cover

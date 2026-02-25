@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+"""VCF-RDFizer wrapper.
+
+This module orchestrates the end-to-end Dockerized pipeline:
+1) validate CLI/input state
+2) convert VCF -> TSV
+3) run RMLStreamer conversion
+4) run selected compression/decompression operations
+5) persist run and compression metrics
+
+The implementation is intentionally split into small helpers so failures can be
+diagnosed at a specific stage and future workflow changes stay localized.
+"""
 
 import argparse
 import csv
@@ -25,6 +37,12 @@ TSV_OVERHEAD_FACTOR = 1.10
 # - larger real dataset: ~66x VCF->RDF inflation
 RDF_EXPANSION_LOW_FACTOR = 42.0
 RDF_EXPANSION_HIGH_FACTOR = 67.0
+# Shared CSV schema used by:
+# - src/run_conversion.sh (conversion columns)
+# - vcf_rdfizer.py / src/compression.sh (compression columns)
+#
+# Raw-RDF compression fields: gzip_*, brotli_*, hdt_*
+# HDT-compound fields: *_on_hdt_* plus hdt_source
 METRICS_HEADER = [
     "run_id",
     "timestamp",
@@ -62,10 +80,30 @@ METRICS_HEADER = [
     "sys_seconds_hdt",
     "max_rss_kb_hdt",
     "compression_methods",
+    "hdt_source",
+    "gzip_on_hdt_size_bytes",
+    "brotli_on_hdt_size_bytes",
+    "exit_code_gzip_on_hdt",
+    "exit_code_brotli_on_hdt",
+    "wall_seconds_gzip_on_hdt",
+    "user_seconds_gzip_on_hdt",
+    "sys_seconds_gzip_on_hdt",
+    "max_rss_kb_gzip_on_hdt",
+    "wall_seconds_brotli_on_hdt",
+    "user_seconds_brotli_on_hdt",
+    "sys_seconds_brotli_on_hdt",
+    "max_rss_kb_brotli_on_hdt",
 ]
+VALID_COMPRESSION_METHODS = {"gzip", "brotli", "hdt", "hdt_gzip", "hdt_brotli"}
+HDT_COMPRESSION_METHODS = {"hdt", "hdt_gzip", "hdt_brotli"}
 
 
+# ---------------------------------------------------------------------------
+# Command execution and Docker environment helpers
+# ---------------------------------------------------------------------------
 class CommandLogger:
+    """Write executed commands and their stdout/stderr to a wrapper log file."""
+
     def __init__(self, path: Path):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -97,22 +135,29 @@ class CommandLogger:
 
 
 def eprint(*args):
+    """Print to stderr."""
     print(*args, file=sys.stderr)
 
 
 def run(cmd, cwd=None, env=None):
+    """Run a command and return only its exit code.
+
+    If command logging is enabled, stream output to the wrapper log file.
+    """
     if _COMMAND_LOGGER is not None:
         return _COMMAND_LOGGER.run(cmd, cwd=cwd, env=env)
     return subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True).returncode
 
 
 def docker_cmd_prefix(*, use_sudo: bool | None = None):
+    """Return the docker executable prefix, optionally with sudo."""
     if use_sudo is None:
         use_sudo = _DOCKER_USE_SUDO
     return ["sudo", "docker"] if use_sudo else ["docker"]
 
 
 def docker_run_base(*, as_user: bool = True):
+    """Return base args for `docker run`, optionally mapped to host UID/GID."""
     base = [*docker_cmd_prefix(), "run", "--rm"]
     if not as_user:
         return base
@@ -127,6 +172,7 @@ def docker_run_base(*, as_user: bool = True):
 
 
 def _can_write_dir(path: Path) -> bool:
+    """Best-effort write probe for directories."""
     try:
         ensure_dir(path)
         probe = path / f".vcf_rdfizer_permcheck_{os.getpid()}"
@@ -138,6 +184,7 @@ def _can_write_dir(path: Path) -> bool:
 
 
 def _can_write_file(path: Path) -> bool:
+    """Best-effort write probe for files."""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8"):
@@ -154,6 +201,7 @@ def auto_fix_path_permissions(
     image_ref: str,
     wrapper_log_path: Path,
 ) -> bool:
+    """Try to recover ownership/permissions using an in-container chown/chmod pass."""
     getuid = getattr(os, "getuid", None)
     getgid = getattr(os, "getgid", None)
     if not callable(getuid) or not callable(getgid):
@@ -205,6 +253,7 @@ def ensure_writable_path_or_fix(
     image_ref: str,
     wrapper_log_path: Path,
 ) -> bool:
+    """Return whether a path is writable, attempting one automatic permission fix."""
     writable = _can_write_dir(target_path) if is_dir else _can_write_file(target_path)
     if writable:
         return True
@@ -217,6 +266,11 @@ def ensure_writable_path_or_fix(
 
 
 def check_docker():
+    """Validate Docker access.
+
+    Probes `docker version` first; if that fails and sudo is available, retries
+    with sudo and persists that mode for later Docker commands.
+    """
     global _DOCKER_USE_SUDO
 
     if shutil.which("docker") is None:
@@ -239,12 +293,17 @@ def check_docker():
     return False
 
 
+# ---------------------------------------------------------------------------
+# Input discovery and naming helpers
+# ---------------------------------------------------------------------------
 def is_vcf_file(path: Path) -> bool:
+    """Return True for .vcf and .vcf.gz files."""
     name = path.name
     return name.endswith(".vcf") or name.endswith(".vcf.gz")
 
 
 def list_vcfs_in_dir(path: Path):
+    """List VCF inputs in a stable order for deterministic processing."""
     files = []
     for item in sorted(path.iterdir()):
         if item.is_file() and is_vcf_file(item):
@@ -253,6 +312,7 @@ def list_vcfs_in_dir(path: Path):
 
 
 def resolve_input(input_path: Path):
+    """Legacy input resolver (single mount + container input path)."""
     if not input_path.exists():
         raise ValueError(f"Input path not found: {input_path}")
 
@@ -274,6 +334,7 @@ def resolve_input(input_path: Path):
 
 
 def vcf_output_prefix(path: Path) -> str:
+    """Derive stable sample prefix from VCF filename."""
     name = path.name
     if name.endswith(".vcf.gz"):
         return name[: -len(".vcf.gz")]
@@ -283,6 +344,7 @@ def vcf_output_prefix(path: Path) -> str:
 
 
 def unique_in_order(items):
+    """Deduplicate while preserving original order."""
     seen = set()
     ordered = []
     for item in items:
@@ -294,6 +356,11 @@ def unique_in_order(items):
 
 
 def resolve_input_snapshot(input_path: Path):
+    """Capture VCF inputs at start of run.
+
+    This prevents accidental inclusion of files that appear after pipeline
+    execution begins and ensures full-mode processing is deterministic.
+    """
     if not input_path.exists():
         raise ValueError(f"Input path not found: {input_path}")
 
@@ -319,11 +386,16 @@ def resolve_input_snapshot(input_path: Path):
     raise ValueError("Input path must be a file or a directory")
 
 
+# ---------------------------------------------------------------------------
+# General formatting and file-system utility helpers
+# ---------------------------------------------------------------------------
 def ensure_dir(path: Path):
+    """Create a directory tree if missing."""
     path.mkdir(parents=True, exist_ok=True)
 
 
 def format_bytes(num_bytes: int) -> str:
+    """Human-friendly byte formatter for console output."""
     units = ["B", "KB", "MB", "GB", "TB", "PB"]
     value = float(num_bytes)
     for unit in units:
@@ -335,10 +407,122 @@ def format_bytes(num_bytes: int) -> str:
     return f"{num_bytes} B"
 
 
+def format_duration(seconds: float) -> str:
+    """Human-friendly duration formatter used in end-of-run summaries."""
+    total_seconds = max(0.0, float(seconds))
+    if total_seconds < 60:
+        return f"{total_seconds:.2f}s"
+    minutes, secs = divmod(total_seconds, 60)
+    if minutes < 60:
+        return f"{int(minutes)}m {secs:.1f}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{int(hours)}h {int(minutes)}m {secs:.1f}s"
+
+
 def file_size_bytes(path: Path):
+    """File size helper that returns None when path does not exist/is not a file."""
     if not path.exists() or not path.is_file():
         return None
     return path.stat().st_size
+
+
+def _as_int(value):
+    """Loss-tolerant integer coercion for metrics values."""
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped == "":
+            return None
+        try:
+            return int(float(stripped))
+        except ValueError:
+            return None
+    return None
+
+
+def read_conversion_total_triples(metrics_dir: Path, output_name: str, run_id: str):
+    """Read TOTAL triple count for one conversion output from conversion metrics JSON."""
+    safe_name = safe_metrics_name(output_name)
+    metrics_json = metrics_dir / f"conversion-metrics-{safe_name}-{run_id}.json"
+    if not metrics_json.exists():
+        return None
+    try:
+        payload = json.loads(metrics_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    artifacts = payload.get("artifacts", {})
+    triples = artifacts.get("output_triples")
+    if isinstance(triples, dict):
+        return _as_int(triples.get("TOTAL"))
+    return _as_int(triples)
+
+
+def collect_full_mode_total_triples(metrics_dir: Path, run_id: str):
+    """Aggregate TOTAL triple counts across all conversion metrics files for a run."""
+    total = 0
+    found = False
+    for metrics_json in sorted(metrics_dir.glob(f"conversion-metrics-*-{run_id}.json")):
+        try:
+            payload = json.loads(metrics_json.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        artifacts = payload.get("artifacts", {})
+        triples = artifacts.get("output_triples")
+        if isinstance(triples, dict):
+            value = _as_int(triples.get("TOTAL"))
+        else:
+            value = _as_int(triples)
+        if value is None:
+            continue
+        total += value
+        found = True
+    return total if found else None
+
+
+def append_wrapper_timing_log(
+    *,
+    metrics_dir: Path,
+    run_id: str,
+    timestamp: str,
+    mode: str,
+    exit_code: int,
+    elapsed_seconds: float,
+    total_triples: int | None = None,
+):
+    """Append one wrapper-level execution summary row."""
+    ensure_dir(metrics_dir)
+    timings_csv = metrics_dir / "wrapper_execution_times.csv"
+    header = [
+        "run_id",
+        "timestamp",
+        "mode",
+        "exit_code",
+        "status",
+        "elapsed_seconds",
+        "elapsed_human",
+        "total_triples",
+    ]
+    write_header = not timings_csv.exists()
+    with timings_csv.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=header)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(
+            {
+                "run_id": run_id,
+                "timestamp": timestamp,
+                "mode": mode,
+                "exit_code": int(exit_code),
+                "status": "success" if int(exit_code) == 0 else "failure",
+                "elapsed_seconds": f"{float(elapsed_seconds):.6f}",
+                "elapsed_human": format_duration(elapsed_seconds),
+                "total_triples": "" if total_triples is None else str(int(total_triples)),
+            }
+        )
 
 
 def print_nt_hdt_summary(
@@ -350,6 +534,7 @@ def print_nt_hdt_summary(
     nt_note: str | None = None,
     nt_size_override: int | None = None,
 ):
+    """Print per-output size summary for RDF (.nt) and HDT artifacts."""
     print(f"{indent}* Output directory: {output_root}")
     nt_size = nt_size_override if nt_size_override is not None else file_size_bytes(nt_path)
     hdt_size = file_size_bytes(hdt_path)
@@ -376,6 +561,7 @@ def remove_file_with_docker_fallback(
     image_ref: str,
     wrapper_log_path: Path,
 ) -> bool:
+    """Delete a file directly, falling back to an in-container `rm` on permission errors."""
     if not path.exists():
         return True
 
@@ -410,6 +596,7 @@ def remove_file_with_docker_fallback(
 
 
 def existing_parent(path: Path) -> Path:
+    """Return the closest existing parent path (used for disk free-space anchor)."""
     cur = path
     while not cur.exists():
         if cur.parent == cur:
@@ -419,6 +606,7 @@ def existing_parent(path: Path) -> Path:
 
 
 def collect_input_vcfs(input_path: Path):
+    """Return VCF input list from either single-file or directory mode."""
     if input_path.is_file():
         return [input_path]
     if input_path.is_dir():
@@ -427,6 +615,7 @@ def collect_input_vcfs(input_path: Path):
 
 
 def estimate_pipeline_sizes(vcf_files, out_dir: Path):
+    """Estimate rough TSV/RDF footprint for preflight disk-space warnings."""
     input_bytes = 0
     est_tsv_bytes = 0
     est_rdf_low_bytes = 0
@@ -457,11 +646,16 @@ def estimate_pipeline_sizes(vcf_files, out_dir: Path):
     }
 
 
+# ---------------------------------------------------------------------------
+# Mapping/rules and Docker image management helpers
+# ---------------------------------------------------------------------------
 def slugify(value: str) -> str:
+    """Normalize a value for safe filesystem naming."""
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_") or "vcf"
 
 
 def discover_tsv_triplets(tsv_dir: Path):
+    """Discover per-VCF TSV triplets: records/header/metadata."""
     triplets = []
     for records_path in sorted(tsv_dir.glob("*.records.tsv")):
         prefix = records_path.name[: -len(".records.tsv")]
@@ -492,6 +686,7 @@ def discover_tsv_triplets(tsv_dir: Path):
 
 
 def render_rules_for_triplet(template_rules: Path, output_rules: Path, records_name: str, headers_name: str, metadata_name: str):
+    """Render per-input mapping rules by substituting TSV placeholders."""
     text = template_rules.read_text()
     text = text.replace('/data/tsv/records.tsv', f'/data/tsv/{records_name}')
     text = text.replace('/data/tsv/header_lines.tsv', f'/data/tsv/{headers_name}')
@@ -500,18 +695,22 @@ def render_rules_for_triplet(template_rules: Path, output_rules: Path, records_n
 
 
 def docker_image_exists(image: str) -> bool:
+    """Return True when Docker image reference exists locally."""
     return run([*docker_cmd_prefix(), "image", "inspect", image]) == 0
 
 
 def docker_build_image(image: str, repo_root: Path):
+    """Build Docker image from repository Dockerfile."""
     return run([*docker_cmd_prefix(), "build", "-t", image, "."], cwd=str(repo_root))
 
 
 def docker_pull_image(image: str):
+    """Pull Docker image from registry."""
     return run([*docker_cmd_prefix(), "pull", image])
 
 
 def resolve_image_ref(image: str, image_version: str | None):
+    """Resolve image + optional tag into a concrete Docker reference."""
     if ":" in image:
         if image_version is not None:
             raise ValueError("Do not include a tag in --image when using --image-version.")
@@ -522,6 +721,7 @@ def resolve_image_ref(image: str, image_version: str | None):
 
 
 def parse_compression_methods(raw: str):
+    """Parse and validate compression method selection from CLI."""
     value = (raw or "").strip()
     if value == "" or value == "none":
         return []
@@ -531,9 +731,10 @@ def parse_compression_methods(raw: str):
         method = token.strip()
         if not method:
             continue
-        if method not in {"gzip", "brotli", "hdt"}:
+        if method not in VALID_COMPRESSION_METHODS:
             raise ValueError(
-                f"Unsupported compression method '{method}'. Use gzip,brotli,hdt, or none."
+                "Unsupported compression method "
+                f"'{method}'. Use gzip,brotli,hdt,hdt_gzip,hdt_brotli, or none."
             )
         if method not in methods:
             methods.append(method)
@@ -541,10 +742,14 @@ def parse_compression_methods(raw: str):
 
 
 def safe_metrics_name(value: str) -> str:
+    """Sanitize names used in metrics artifact filenames."""
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("_")
     return safe or "rdf"
 
 
+# ---------------------------------------------------------------------------
+# Metrics serialization helpers
+# ---------------------------------------------------------------------------
 def update_metrics_csv_with_compression(
     *,
     metrics_csv: Path,
@@ -556,6 +761,11 @@ def update_metrics_csv_with_compression(
     selected_methods: list[str],
     method_results: dict[str, dict],
 ):
+    """Upsert compression-related columns in `metrics.csv` for one output artifact.
+
+    This function keeps raw-RDF compression metrics distinct from compound
+    HDT-first metrics (gzip_on_hdt / brotli_on_hdt) to avoid ambiguity.
+    """
     metrics_csv.parent.mkdir(parents=True, exist_ok=True)
     if not metrics_csv.exists():
         with metrics_csv.open("w", newline="", encoding="utf-8") as handle:
@@ -609,10 +819,26 @@ def update_metrics_csv_with_compression(
         "max_rss_kb_gzip": "null",
         "max_rss_kb_brotli": "null",
         "max_rss_kb_hdt": "null",
+        "hdt_source": "not_used",
+        "gzip_on_hdt_size_bytes": "0",
+        "brotli_on_hdt_size_bytes": "0",
+        "exit_code_gzip_on_hdt": "0",
+        "exit_code_brotli_on_hdt": "0",
+        "wall_seconds_gzip_on_hdt": "null",
+        "user_seconds_gzip_on_hdt": "null",
+        "sys_seconds_gzip_on_hdt": "null",
+        "max_rss_kb_gzip_on_hdt": "null",
+        "wall_seconds_brotli_on_hdt": "null",
+        "user_seconds_brotli_on_hdt": "null",
+        "sys_seconds_brotli_on_hdt": "null",
+        "max_rss_kb_brotli_on_hdt": "null",
     }
     row.update(defaults)
 
-    for method, result in method_results.items():
+    for method in ("gzip", "brotli", "hdt"):
+        result = method_results.get(method)
+        if result is None:
+            continue
         size_key = f"{method}_size_bytes"
         exit_key = f"exit_code_{method}"
         wall_key = f"wall_seconds_{method}"
@@ -620,6 +846,28 @@ def update_metrics_csv_with_compression(
         row[exit_key] = str(int(result.get("exit_code") or 0))
         wall_val = result.get("wall_seconds")
         row[wall_key] = "null" if wall_val is None else f"{float(wall_val):.6f}"
+
+    hdt_result = method_results.get("hdt")
+    if hdt_result is not None:
+        row["hdt_source"] = str(hdt_result.get("source") or "generated")
+
+    hdt_gzip_result = method_results.get("hdt_gzip")
+    if hdt_gzip_result is not None:
+        row["gzip_on_hdt_size_bytes"] = str(int(hdt_gzip_result.get("output_size_bytes") or 0))
+        row["exit_code_gzip_on_hdt"] = str(int(hdt_gzip_result.get("exit_code") or 0))
+        wall_val = hdt_gzip_result.get("wall_seconds")
+        row["wall_seconds_gzip_on_hdt"] = (
+            "null" if wall_val is None else f"{float(wall_val):.6f}"
+        )
+
+    hdt_brotli_result = method_results.get("hdt_brotli")
+    if hdt_brotli_result is not None:
+        row["brotli_on_hdt_size_bytes"] = str(int(hdt_brotli_result.get("output_size_bytes") or 0))
+        row["exit_code_brotli_on_hdt"] = str(int(hdt_brotli_result.get("exit_code") or 0))
+        wall_val = hdt_brotli_result.get("wall_seconds")
+        row["wall_seconds_brotli_on_hdt"] = (
+            "null" if wall_val is None else f"{float(wall_val):.6f}"
+        )
 
     with metrics_csv.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=METRICS_HEADER)
@@ -638,6 +886,7 @@ def write_compression_metrics_artifacts(
     selected_methods: list[str],
     method_results: dict[str, dict],
 ):
+    """Write per-output compression artifacts (time files + structured JSON)."""
     metrics_dir.mkdir(parents=True, exist_ok=True)
     safe_name = safe_metrics_name(output_name)
 
@@ -655,6 +904,8 @@ def write_compression_metrics_artifacts(
     gzip_result = method_results.get("gzip", {})
     brotli_result = method_results.get("brotli", {})
     hdt_result = method_results.get("hdt", {})
+    hdt_gzip_result = method_results.get("hdt_gzip", {})
+    hdt_brotli_result = method_results.get("hdt_brotli", {})
 
     payload = {
         "run_id": run_id,
@@ -664,7 +915,8 @@ def write_compression_metrics_artifacts(
         "compression_methods": ",".join(selected_methods) if selected_methods else "none",
         "combined_nq_path": str(source_rdf_path),
         "combined_nq_size_bytes": int(combined_size_bytes),
-        "gzip": {
+        "hdt_source": str(hdt_result.get("source") or "not_used"),
+        "gzip_raw_rdf": {
             "output_gz_path": gzip_result.get("output_path", ""),
             "output_gz_size_bytes": int(gzip_result.get("output_size_bytes") or 0),
             "exit_code": int(gzip_result.get("exit_code") or 0),
@@ -675,7 +927,7 @@ def write_compression_metrics_artifacts(
                 "max_rss_kb": None,
             },
         },
-        "brotli": {
+        "brotli_raw_rdf": {
             "output_brotli_path": brotli_result.get("output_path", ""),
             "output_brotli_size_bytes": int(brotli_result.get("output_size_bytes") or 0),
             "exit_code": int(brotli_result.get("exit_code") or 0),
@@ -697,6 +949,28 @@ def write_compression_metrics_artifacts(
                 "max_rss_kb": None,
             },
         },
+        "gzip_on_hdt": {
+            "output_hdt_gz_path": hdt_gzip_result.get("output_path", ""),
+            "output_hdt_gz_size_bytes": int(hdt_gzip_result.get("output_size_bytes") or 0),
+            "exit_code": int(hdt_gzip_result.get("exit_code") or 0),
+            "timing": {
+                "wall_seconds": hdt_gzip_result.get("wall_seconds"),
+                "user_seconds": None,
+                "sys_seconds": None,
+                "max_rss_kb": None,
+            },
+        },
+        "brotli_on_hdt": {
+            "output_hdt_br_path": hdt_brotli_result.get("output_path", ""),
+            "output_hdt_br_size_bytes": int(hdt_brotli_result.get("output_size_bytes") or 0),
+            "exit_code": int(hdt_brotli_result.get("exit_code") or 0),
+            "timing": {
+                "wall_seconds": hdt_brotli_result.get("wall_seconds"),
+                "user_seconds": None,
+                "sys_seconds": None,
+                "max_rss_kb": None,
+            },
+        },
     }
 
     metrics_json = metrics_dir / f"compression-metrics-{safe_name}-{run_id}.json"
@@ -704,11 +978,15 @@ def write_compression_metrics_artifacts(
 
 
 def validate_mode_dirs(paths):
+    """Validate that expected directory arguments are not file paths."""
     for p in paths:
         if p.exists() and not p.is_dir():
             raise ValueError(f"expected a directory path but found a file: {p}")
 
 
+# ---------------------------------------------------------------------------
+# Mode runners (full/compress/decompress)
+# ---------------------------------------------------------------------------
 def ensure_image_available(
     image_ref: str,
     *,
@@ -719,6 +997,7 @@ def ensure_image_available(
     repo_root: Path,
     wrapper_log_path: Path,
 ):
+    """Resolve image availability policy (build/pull/reuse) with clear status codes."""
     if build:
         print(f"{step_label}: Ensuring Docker image is available")
         print("  - Building Docker image")
@@ -764,6 +1043,12 @@ def run_compression_methods_for_rdf(
     wrapper_log_path: Path,
     status_indent: str | None,
 ):
+    """Run selected compression methods for a single RDF file.
+
+    Supports compound HDT-first methods by reusing an existing `.hdt` when
+    present, or generating it once and reusing it for subsequent steps.
+    Returns `(ok, method_results)`.
+    """
     in_dir = rdf_path.parent
     input_container = f"/data/in/{rdf_path.name}"
     input_stem = rdf_path.stem
@@ -791,43 +1076,14 @@ def run_compression_methods_for_rdf(
         target_out_container = f"/data/out/{relative_out.as_posix()}"
 
     method_results: dict[str, dict] = {}
+    hdt_name = f"{input_stem}.hdt"
+    hdt_path = target_out_dir / hdt_name
+    hdt_container = f"{target_out_container}/{hdt_name}"
+    hdt_is_ready = False
+    hdt_source = "generated"
 
-    for method in methods:
-        if method == "gzip":
-            output_name = f"{input_stem}.{input_ext}.gz"
-            out_container = f"{target_out_container}/{output_name}"
-            command = (
-                "set -euo pipefail; "
-                f"rm -f {shlex.quote(out_container)}; "
-                f"gzip -c {shlex.quote(input_container)} > {shlex.quote(out_container)}"
-            )
-        elif method == "brotli":
-            output_name = f"{input_stem}.{input_ext}.br"
-            out_container = f"{target_out_container}/{output_name}"
-            command = (
-                "set -euo pipefail; "
-                f"rm -f {shlex.quote(out_container)}; "
-                f"brotli -q 7 -c {shlex.quote(input_container)} > {shlex.quote(out_container)}"
-            )
-        else:
-            output_name = f"{input_stem}.hdt"
-            out_container = f"{target_out_container}/{output_name}"
-            command = (
-                "set -euo pipefail; "
-                f"rm -f {shlex.quote(out_container)}; "
-                'HDT_BIN="${RDF2HDT_BIN:-$(command -v rdf2hdt || true)}"; '
-                'if [[ -z "$HDT_BIN" ]]; then '
-                'for candidate in /usr/local/bin/rdf2hdt /opt/hdt-cpp/bin/rdf2hdt; do '
-                '[[ -x "$candidate" ]] && HDT_BIN="$candidate" && break; '
-                "done; "
-                "fi; "
-                'if [[ -z "$HDT_BIN" || ! -x "$HDT_BIN" ]]; then '
-                'echo "Missing rdf2hdt binary in container" >&2; exit 127; '
-                "fi; "
-                '"$HDT_BIN" '
-                f"{shlex.quote(input_container)} {shlex.quote(out_container)}"
-            )
-
+    def run_container_command(*, method: str, output_name: str, command: str):
+        """Execute one compression command in Docker and capture timing/size."""
         cmd = [
             *docker_run_base(),
             "-v",
@@ -849,11 +1105,122 @@ def run_compression_methods_for_rdf(
             "output_path": str(output_path),
             "output_size_bytes": int(file_size_bytes(output_path) or 0),
         }
+        if method == "hdt":
+            method_results[method]["source"] = "generated"
         if exit_code != 0:
             eprint(f"Error: {method} compression failed. See log: {wrapper_log_path}")
-            return False, method_results
-        if status_indent is not None:
-            print(f"{status_indent}- {method}: {output_name} ✅")
+            return False
+        return True
+
+    def ensure_hdt_available():
+        """Ensure `.hdt` exists for HDT-based compound methods."""
+        nonlocal hdt_is_ready, hdt_source
+        if hdt_is_ready:
+            return True
+        if hdt_path.exists():
+            hdt_is_ready = True
+            hdt_source = "existing"
+            method_results.setdefault(
+                "hdt",
+                {
+                    "exit_code": 0,
+                    "wall_seconds": 0.0,
+                    "output_path": str(hdt_path),
+                    "output_size_bytes": int(file_size_bytes(hdt_path) or 0),
+                },
+            )
+            return True
+        hdt_command = (
+            "set -euo pipefail; "
+            f"rm -f {shlex.quote(hdt_container)}; "
+            'HDT_BIN="${RDF2HDT_BIN:-$(command -v rdf2hdt || true)}"; '
+            'if [[ -z "$HDT_BIN" ]]; then '
+            'for candidate in /usr/local/bin/rdf2hdt /opt/hdt-cpp/bin/rdf2hdt; do '
+            '[[ -x "$candidate" ]] && HDT_BIN="$candidate" && break; '
+            "done; "
+            "fi; "
+            'if [[ -z "$HDT_BIN" || ! -x "$HDT_BIN" ]]; then '
+            'echo "Missing rdf2hdt binary in container" >&2; exit 127; '
+            "fi; "
+            '"$HDT_BIN" '
+            f"{shlex.quote(input_container)} {shlex.quote(hdt_container)}"
+        )
+        if not run_container_command(method="hdt", output_name=hdt_name, command=hdt_command):
+            return False
+        hdt_is_ready = True
+        hdt_source = "generated"
+        return True
+
+    for method in methods:
+        if method == "gzip":
+            output_name = f"{input_stem}.{input_ext}.gz"
+            out_container = f"{target_out_container}/{output_name}"
+            command = (
+                "set -euo pipefail; "
+                f"rm -f {shlex.quote(out_container)}; "
+                f"gzip -c {shlex.quote(input_container)} > {shlex.quote(out_container)}"
+            )
+            if not run_container_command(method=method, output_name=output_name, command=command):
+                return False, method_results
+            if status_indent is not None:
+                print(f"{status_indent}- {method}: {output_name} ✅")
+            continue
+
+        if method == "brotli":
+            output_name = f"{input_stem}.{input_ext}.br"
+            out_container = f"{target_out_container}/{output_name}"
+            command = (
+                "set -euo pipefail; "
+                f"rm -f {shlex.quote(out_container)}; "
+                f"brotli -q 7 -c {shlex.quote(input_container)} > {shlex.quote(out_container)}"
+            )
+            if not run_container_command(method=method, output_name=output_name, command=command):
+                return False, method_results
+            if status_indent is not None:
+                print(f"{status_indent}- {method}: {output_name} ✅")
+            continue
+
+        if method == "hdt":
+            if not ensure_hdt_available():
+                return False, method_results
+            if status_indent is not None:
+                suffix = " (reused existing HDT)" if hdt_source == "existing" else ""
+                print(f"{status_indent}- hdt: {hdt_name} ✅{suffix}")
+            continue
+
+        if method == "hdt_gzip":
+            if not ensure_hdt_available():
+                return False, method_results
+            output_name = f"{input_stem}.hdt.gz"
+            out_container = f"{target_out_container}/{output_name}"
+            command = (
+                "set -euo pipefail; "
+                f"rm -f {shlex.quote(out_container)}; "
+                f"gzip -c {shlex.quote(hdt_container)} > {shlex.quote(out_container)}"
+            )
+            if not run_container_command(method=method, output_name=output_name, command=command):
+                return False, method_results
+            if status_indent is not None:
+                suffix = " (using existing HDT)" if hdt_source == "existing" else ""
+                print(f"{status_indent}- {method}: {output_name} ✅{suffix}")
+            continue
+
+        if method == "hdt_brotli":
+            if not ensure_hdt_available():
+                return False, method_results
+            output_name = f"{input_stem}.hdt.br"
+            out_container = f"{target_out_container}/{output_name}"
+            command = (
+                "set -euo pipefail; "
+                f"rm -f {shlex.quote(out_container)}; "
+                f"brotli -q 7 -c {shlex.quote(hdt_container)} > {shlex.quote(out_container)}"
+            )
+            if not run_container_command(method=method, output_name=output_name, command=command):
+                return False, method_results
+            if status_indent is not None:
+                suffix = " (using existing HDT)" if hdt_source == "existing" else ""
+                print(f"{status_indent}- {method}: {output_name} ✅{suffix}")
+            continue
 
     return True, method_results
 
@@ -878,6 +1245,7 @@ def run_full_mode(
     timestamp: str,
     wrapper_log_path: Path,
 ):
+    """Execute full pipeline: per-input TSV -> RDF -> compression -> metrics."""
     print("Step 3/5: Processing per-input pipeline (TSV -> RDF -> compression)")
     scripts_dir = Path(__file__).resolve().parent / "src"
     tsv_existed = tsv_dir.exists()
@@ -892,6 +1260,9 @@ def run_full_mode(
         shutil.rmtree(generated_rules_dir, ignore_errors=True)
     ensure_dir(generated_rules_dir)
 
+    total_triples_produced = 0
+    saw_triple_counts = False
+
     total_inputs = len(container_inputs)
     for idx, (container_input, expected_prefix) in enumerate(
         zip(container_inputs, expected_prefixes),
@@ -899,6 +1270,8 @@ def run_full_mode(
     ):
         print(f"  - Input {idx}/{total_inputs}: {Path(container_input).name}")
 
+        # Pre-flight write checks for expected TSV outputs to fail fast on
+        # permission/mount problems before starting container work.
         for suffix in ("records.tsv", "header_lines.tsv", "file_metadata.tsv"):
             expected_tsv_output = tsv_dir / f"{expected_prefix}.{suffix}"
             if not ensure_writable_path_or_fix(
@@ -930,6 +1303,8 @@ def run_full_mode(
             return 1
         print("    * TSV conversion ✅")
 
+        # Discover and lock the exact triplet generated for this input; this
+        # guards against stale TSV files from previous runs.
         try:
             tsv_triplets = discover_tsv_triplets(tsv_dir)
         except ValueError as exc:
@@ -1011,7 +1386,14 @@ def run_full_mode(
             return 1
         print("    * RDF conversion ✅")
 
+        triples_produced = read_conversion_total_triples(metrics_dir, output_name, run_id)
+        if triples_produced is not None:
+            saw_triple_counts = True
+            total_triples_produced += triples_produced
+            print(f"    * Triples produced: {triples_produced:,}")
+
         if rdf_layout == "aggregate":
+            # Aggregate mode yields one merged RDF artifact per sample.
             nt_path = out_dir / output_name / f"{output_name}.nt"
             nq_path = out_dir / output_name / f"{output_name}.nq"
             if nt_path.exists():
@@ -1021,6 +1403,7 @@ def run_full_mode(
             else:
                 raw_rdf_files = [nt_path]
         else:
+            # Batch mode keeps each RMLStreamer part as its own RDF artifact.
             raw_rdf_files = sorted((out_dir / output_name).glob("*.nt"))
             if not raw_rdf_files:
                 raw_rdf_files = sorted((out_dir / output_name).glob("*.nq"))
@@ -1034,6 +1417,7 @@ def run_full_mode(
 
         method_results_by_file: dict[str, dict[str, dict]] = {}
         if selected_methods:
+            # Compress each produced RDF artifact independently.
             for raw_rdf_path in raw_rdf_files:
                 ok, method_results = run_compression_methods_for_rdf(
                     rdf_path=raw_rdf_path,
@@ -1050,6 +1434,7 @@ def run_full_mode(
         print("    * Compression ✅")
 
         try:
+            # Persist machine-readable metrics after compression succeeds.
             for raw_rdf_path in raw_rdf_files:
                 method_results = method_results_by_file.get(raw_rdf_path.name, {})
                 source_size_before_cleanup = int(file_size_bytes(raw_rdf_path) or 0)
@@ -1084,6 +1469,7 @@ def run_full_mode(
             return 1
 
         if not keep_rdf and selected_methods:
+            # Cleanup raw RDF when compression is enabled and keep-rdf is not set.
             for raw_rdf_path in raw_rdf_files:
                 if raw_rdf_path.exists():
                     if not remove_file_with_docker_fallback(
@@ -1115,6 +1501,7 @@ def run_full_mode(
             )
 
         if not keep_tsv:
+            # Cleanup only the triplet generated for this input iteration.
             for tsv_path in (triplet["records"], triplet["headers"], triplet["metadata"]):
                 if tsv_path.exists():
                     if not remove_file_with_docker_fallback(
@@ -1132,6 +1519,9 @@ def run_full_mode(
         else:
             print("Note: TSV directory existed; skipping cleanup.")
 
+    if saw_triple_counts:
+        print(f"Total triples produced (full run): {total_triples_produced:,}")
+
     print("Conversion process finished.")
     return 0
 
@@ -1144,12 +1534,13 @@ def run_compress_mode(
     methods: list[str],
     wrapper_log_path: Path,
 ):
+    """Execute compression-only mode for a designated RDF file."""
     print("Step 3/3: Compressing RDF input")
     if not methods:
         print("No compression methods selected (`none`). Nothing to do.")
         return 0
 
-    if "hdt" in methods and nq_path.suffix == ".nt":
+    if any(method in HDT_COMPRESSION_METHODS for method in methods) and nq_path.suffix == ".nt":
         file_size = file_size_bytes(nq_path) or 0
         if file_size > 5 * 1024 * 1024 * 1024:
             eprint(
@@ -1179,6 +1570,7 @@ def run_compress_mode(
 
 
 def detect_compressed_format(path: Path):
+    """Infer compressed RDF format from filename/extension."""
     if path.name.endswith(".nq.gz") or path.name.endswith(".nt.gz") or path.suffix == ".gz":
         return "gzip"
     if path.name.endswith(".nq.br") or path.name.endswith(".nt.br") or path.suffix == ".br":
@@ -1189,6 +1581,7 @@ def detect_compressed_format(path: Path):
 
 
 def default_decompressed_name(path: Path, fmt: str):
+    """Compute default output filename for decompression mode."""
     if fmt == "gzip":
         if path.name.endswith(".nq.gz"):
             return path.name[: -len(".gz")]
@@ -1211,6 +1604,7 @@ def run_decompress_mode(
     image_ref: str,
     wrapper_log_path: Path,
 ):
+    """Execute decompression-only mode (.gz/.br/.hdt -> RDF)."""
     print("Step 3/3: Decompressing RDF input")
     fmt = detect_compressed_format(compressed_path)
     ensure_dir(decompressed_out.parent)
@@ -1267,6 +1661,11 @@ def run_decompress_mode(
 
 
 def main():
+    """CLI entrypoint.
+
+    Handles argument validation, Docker/image preflight, mode dispatch, and
+    wrapper-level runtime logging.
+    """
     parser = argparse.ArgumentParser(
         description="VCF-RDFizer Docker wrapper",
         formatter_class=argparse.RawTextHelpFormatter,
@@ -1277,7 +1676,7 @@ def main():
             "  Full pipeline (batch RDF outputs, compress each part):\n"
             "    vcf_rdfizer.py -m full -i ./vcf_files --rdf-layout batch -c hdt\n"
             "  Compression-only:\n"
-            "    vcf_rdfizer.py -m compress -q ./out/sample/sample.nt -c gzip,brotli\n"
+            "    vcf_rdfizer.py -m compress -q ./out/sample/sample.nt -c gzip,hdt_gzip\n"
             "  Decompression-only:\n"
             "    vcf_rdfizer.py -m decompress -C ./out/gzip/sample.nt.gz\n"
         ),
@@ -1356,7 +1755,7 @@ def main():
         "-c",
         "--compression",
         default="gzip,brotli,hdt",
-        help="Compression methods (gzip,brotli,hdt,none)",
+        help="Compression methods (gzip,brotli,hdt,hdt_gzip,hdt_brotli,none)",
     )
     parser.add_argument("-k", "--keep-tsv", action="store_true", help="Keep TSV intermediates")
     parser.add_argument(
@@ -1386,6 +1785,7 @@ def main():
     step1_label = "Step 1/5" if mode == "full" else "Step 1/3"
 
     try:
+        # Mode-specific argument validation and canonical path resolution.
         if mode == "full":
             if args.input is None:
                 raise ValueError("--input is required in --mode full")
@@ -1442,6 +1842,7 @@ def main():
     print(f"{step1_label}: Validating inputs ✅")
 
     if mode == "full" and args.estimate_size:
+        # Optional coarse sizing estimate for disk-risk visibility.
         vcf_files = collect_input_vcfs(input_path)
         estimate = estimate_pipeline_sizes(vcf_files, out_dir)
         print("  Preflight size estimate (rough):")
@@ -1463,11 +1864,16 @@ def main():
     run_id = datetime.now().strftime("%Y%m%dT%H%M%S")
     timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     wrapper_log_path = metrics_dir / ".wrapper_logs" / f"wrapper-{run_id}.log"
+    execution_started = time.perf_counter()
     global _COMMAND_LOGGER
     _COMMAND_LOGGER = CommandLogger(wrapper_log_path)
     print(f"  Detailed logs: {wrapper_log_path}")
 
-    try:
+    result_code = 1
+    total_triples = None
+
+    def execute_mode():
+        # Shared preflight for all modes: Docker availability + image strategy.
         if not check_docker():
             eprint(f"See log for details: {wrapper_log_path}")
             return 2
@@ -1520,6 +1926,7 @@ def main():
             ]
 
         for target, is_dir in writable_targets:
+            # Proactively resolve write-permission issues on mounted paths.
             if not ensure_writable_path_or_fix(
                 target_path=target,
                 is_dir=is_dir,
@@ -1534,6 +1941,7 @@ def main():
                 return 1
 
         if mode == "full":
+            # Full-mode orchestrates conversion + compression pipeline.
             return run_full_mode(
                 input_mount_dir=input_mount_dir,
                 container_inputs=container_inputs,
@@ -1554,6 +1962,7 @@ def main():
                 wrapper_log_path=wrapper_log_path,
             )
         if mode == "compress":
+            # Compression-only mode.
             return run_compress_mode(
                 nq_path=nq_path,
                 out_dir=out_dir,
@@ -1561,16 +1970,42 @@ def main():
                 methods=methods,
                 wrapper_log_path=wrapper_log_path,
             )
+        # Decompression-only mode.
         return run_decompress_mode(
             compressed_path=compressed_path,
             decompressed_out=decompressed_out,
             image_ref=image_ref,
             wrapper_log_path=wrapper_log_path,
         )
+
+    try:
+        result_code = execute_mode()
     finally:
+        # Always report/record wrapper runtime, even on failure paths.
+        elapsed_seconds = time.perf_counter() - execution_started
+        if mode == "full" and result_code == 0:
+            total_triples = collect_full_mode_total_triples(metrics_dir, run_id)
+
+        print(f"Run time ({mode} mode): {format_duration(elapsed_seconds)}")
+        try:
+            append_wrapper_timing_log(
+                metrics_dir=metrics_dir,
+                run_id=run_id,
+                timestamp=timestamp,
+                mode=mode,
+                exit_code=result_code,
+                elapsed_seconds=elapsed_seconds,
+                total_triples=total_triples,
+            )
+            print(f"Timing log: {metrics_dir / 'wrapper_execution_times.csv'}")
+        except OSError as exc:
+            eprint(f"Warning: failed to write wrapper timing log: {exc}")
+
         if _COMMAND_LOGGER is not None:
             _COMMAND_LOGGER.close()
             _COMMAND_LOGGER = None
+
+    return result_code
 
 
 if __name__ == "__main__":

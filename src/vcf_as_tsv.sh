@@ -1,6 +1,19 @@
 #!/bin/bash
 set -euo pipefail
 
+# ------------------------------------------------------------------------------
+# VCF -> TSV splitter
+# ------------------------------------------------------------------------------
+# For each input VCF, generate three TSV files:
+#   <sample>.records.tsv
+#   <sample>.header_lines.tsv
+#   <sample>.file_metadata.tsv
+#
+# This script is intentionally strict so the wrapper can fail fast with a clear
+# error when the expected per-sample TSV triplet is not produced.
+# ------------------------------------------------------------------------------
+
+# --- CLI validation -----------------------------------------------------------
 if [ "$#" -ne 2 ]; then
   echo "Usage: $0 <input_path> <output_dir>"
   exit 1
@@ -11,6 +24,7 @@ output_dir="$2"
 
 mkdir -p "$output_dir"
 
+# --- Resolve input VCF list (single file or directory snapshot) --------------
 files=()
 if [ -f "$input_path" ]; then
   case "$input_path" in
@@ -34,6 +48,7 @@ if [ "${#files[@]}" -eq 0 ]; then
   exit 1
 fi
 
+# --- Process each VCF independently -------------------------------------------
 for infile in "${files[@]}"; do
   base="$(basename "$infile")"
   source_file="$base"
@@ -59,7 +74,8 @@ for infile in "${files[@]}"; do
   printf "SOURCE_FILE\tHEADER_INDEX\tHEADER_KEY\tHEADER_VALUE\tRAW_LINE\n" > "$headers_out"
   printf "SOURCE_FILE\tFILE_FORMAT\tFILE_DATE\tSOURCE_SOFTWARE\tREFERENCE_GENOME\tHEADER_COUNT\tRECORD_COUNT\n" > "$metadata_out"
 
-  # Writes per-VCF records/header/metadata TSVs used by the mapping pipeline.
+  # Parse one VCF stream and write per-VCF records/header/metadata TSVs.
+  # Keeping all parsing in one awk pass avoids drift across intermediate files.
   "${reader_cmd[@]}" "$infile" | awk '
     function trim_cr(s) {
       sub(/\r$/, "", s)

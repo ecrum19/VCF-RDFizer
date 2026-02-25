@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ------------------------------------------------------------------------------
+# RDF compression runner
+# ------------------------------------------------------------------------------
+# This script can be used standalone, but the Python wrapper is the primary
+# caller. It performs selected compression methods over RDF outputs and updates
+# run_metrics/metrics.csv with method-level timing/size/exit-code fields.
+#
+# NOTE: Compound HDT-first compression is orchestrated by the Python wrapper.
+# Here we maintain explicit metric columns so CSV schema stays aligned.
+# ------------------------------------------------------------------------------
+
 # ---------- Config ----------
 # Root output directory; contains one or more output subdirs
 OUT_ROOT_DIR=${OUT_ROOT_DIR:-run_output}
@@ -22,7 +33,7 @@ TIMESTAMP=${TIMESTAMP:-$(date +"%Y-%m-%dT%H:%M:%S")}
 mkdir -p "$LOGDIR" "$OUT_ROOT_DIR"
 
 METRICS_CSV="$LOGDIR/metrics.csv"
-METRICS_HEADER="run_id,timestamp,output_name,output_dir,exit_code_java,wall_seconds_java,user_seconds_java,sys_seconds_java,max_rss_kb_java,input_mapping_size_bytes,input_vcf_size_bytes,output_dir_size_bytes,output_triples,jar,mapping_file,output_path,combined_nq_size_bytes,gzip_size_bytes,brotli_size_bytes,hdt_size_bytes,exit_code_gzip,exit_code_brotli,exit_code_hdt,wall_seconds_gzip,user_seconds_gzip,sys_seconds_gzip,max_rss_kb_gzip,wall_seconds_brotli,user_seconds_brotli,sys_seconds_brotli,max_rss_kb_brotli,wall_seconds_hdt,user_seconds_hdt,sys_seconds_hdt,max_rss_kb_hdt,compression_methods"
+METRICS_HEADER="run_id,timestamp,output_name,output_dir,exit_code_java,wall_seconds_java,user_seconds_java,sys_seconds_java,max_rss_kb_java,input_mapping_size_bytes,input_vcf_size_bytes,output_dir_size_bytes,output_triples,jar,mapping_file,output_path,combined_nq_size_bytes,gzip_size_bytes,brotli_size_bytes,hdt_size_bytes,exit_code_gzip,exit_code_brotli,exit_code_hdt,wall_seconds_gzip,user_seconds_gzip,sys_seconds_gzip,max_rss_kb_gzip,wall_seconds_brotli,user_seconds_brotli,sys_seconds_brotli,max_rss_kb_brotli,wall_seconds_hdt,user_seconds_hdt,sys_seconds_hdt,max_rss_kb_hdt,compression_methods,hdt_source,gzip_on_hdt_size_bytes,brotli_on_hdt_size_bytes,exit_code_gzip_on_hdt,exit_code_brotli_on_hdt,wall_seconds_gzip_on_hdt,user_seconds_gzip_on_hdt,sys_seconds_gzip_on_hdt,max_rss_kb_gzip_on_hdt,wall_seconds_brotli_on_hdt,user_seconds_brotli_on_hdt,sys_seconds_brotli_on_hdt,max_rss_kb_brotli_on_hdt"
 
 # ---------- Compression selection ----------
 # Usage: compression.sh [-m gzip,brotli,hdt|none]
@@ -97,6 +108,7 @@ if (( ${#OUTPUT_DIRS[@]} == 0 )); then
 fi
 
 # ---------- Helper functions ----------
+# Return byte size for file or directory (GNU + BSD compatible).
 stat_size() {
   local path="$1"
 
@@ -135,7 +147,7 @@ stat_size() {
 
 have_gnu_time() { [[ -x /usr/bin/time ]] && /usr/bin/time --version >/dev/null 2>&1; }
 
-# Count triples via number of non-comment lines ending in "."
+# Count triples via number of non-comment lines ending in ".".
 count_triples_json() {
   local path="$1"
   local total=0
@@ -157,6 +169,7 @@ count_triples_json() {
   echo "}"
 }
 
+# Convert elapsed clock text from `time` output to numeric seconds.
 elapsed_to_seconds() {
   awk -F':' '{
     if (NF==3) { h=$1+0; m=$2+0; s=$3+0; printf("%.3f", h*3600 + m*60 + s) }
@@ -200,6 +213,21 @@ for OUT in "${OUTPUT_DIRS[@]}"; do
   TIME_LOG_HDT="$LOGDIR/compression-time-hdt-${SAFE_BASENAME}-${RUN_ID}.txt"
   METRICS_JSON="$LOGDIR/compression-metrics-${SAFE_BASENAME}-${RUN_ID}.json"
 
+  HDT_SOURCE="not_used"
+  GZIP_ON_HDT_SIZE=0
+  BROTLI_ON_HDT_SIZE=0
+  EXIT_CODE_GZIP_ON_HDT=0
+  EXIT_CODE_BROTLI_ON_HDT=0
+  WALL_SEC_GZIP_ON_HDT="null"
+  USER_SEC_GZIP_ON_HDT="null"
+  SYS_SEC_GZIP_ON_HDT="null"
+  MAX_RSS_KB_GZIP_ON_HDT="null"
+  WALL_SEC_BROTLI_ON_HDT="null"
+  USER_SEC_BROTLI_ON_HDT="null"
+  SYS_SEC_BROTLI_ON_HDT="null"
+  MAX_RSS_KB_BROTLI_ON_HDT="null"
+
+  # Collect current output footprint/triples before compression.
   OUT_SIZE=$(stat_size "$OUT")
   TRIPLES_JSON=$(count_triples_json "$OUT")
   TOTAL_TRIPLES=$(echo "$TRIPLES_JSON" | grep '"TOTAL"' | awk -F': ' '{print $2}' | tr -d '", ')
@@ -287,7 +315,7 @@ for OUT in "${OUTPUT_DIRS[@]}"; do
       NQ_SIZE=0
     fi
 
-    # ----- gzip combined RDF with timing -----
+    # ----- gzip raw RDF with timing -----
     if (( DO_GZIP == 1 )) && [[ -n "${SOURCE_RDF:-}" ]]; then
       GZ_PATH="$OUT/${BASENAME}.${SOURCE_EXT}.gz"
       EXIT_CODE_GZIP=0
@@ -333,7 +361,7 @@ for OUT in "${OUTPUT_DIRS[@]}"; do
       MAX_RSS_KB_GZIP="null"
     fi
 
-    # ----- brotli combined RDF with timing -----
+    # ----- brotli raw RDF with timing -----
     if (( DO_BROTLI == 1 )) && [[ -n "${SOURCE_RDF:-}" ]]; then
       BROTLI_PATH="$OUT/${BASENAME}.${SOURCE_EXT}.br"
       EXIT_CODE_BROTLI=0
@@ -378,9 +406,10 @@ for OUT in "${OUTPUT_DIRS[@]}"; do
       MAX_RSS_KB_BROTLI="null"
     fi
 
-    # ----- Convert combined RDF to HDT with timing -----
+    # ----- Convert raw RDF to HDT with timing -----
     if (( DO_HDT == 1 )) && [[ -n "${SOURCE_RDF:-}" ]]; then
       HDT_PATH="$OUT/$BASENAME.hdt"
+      HDT_SOURCE="generated"
       EXIT_CODE_HDT=0
 
       HDT_CMD="\"$HDT\" \"$SOURCE_RDF\" \"$HDT_PATH\""
@@ -434,6 +463,7 @@ for OUT in "${OUTPUT_DIRS[@]}"; do
     fi
   fi
 
+  # Persist per-output compression metrics as JSON.
   cat > "$METRICS_JSON" <<EOF
 {
   "run_id": "$RUN_ID",
@@ -441,10 +471,11 @@ for OUT in "${OUTPUT_DIRS[@]}"; do
   "output_dir": "$OUT",
   "output_name": "$BASENAME",
   "compression_methods": "$COMPRESSION_METHODS",
+  "hdt_source": "$HDT_SOURCE",
   "output_triples": $TRIPLES_JSON,
   "combined_nq_path": "${SOURCE_RDF:-}",
   "combined_nq_size_bytes": ${NQ_SIZE:-0},
-  "gzip": {
+  "gzip_raw_rdf": {
     "output_gz_path": "${GZ_PATH:-}",
     "output_gz_size_bytes": ${GZ_SIZE:-0},
     "exit_code": ${EXIT_CODE_GZIP:-0},
@@ -455,7 +486,7 @@ for OUT in "${OUTPUT_DIRS[@]}"; do
       "max_rss_kb": ${MAX_RSS_KB_GZIP:-null}
     }
   },
-  "brotli": {
+  "brotli_raw_rdf": {
     "output_brotli_path": "${BROTLI_PATH:-}",
     "output_brotli_size_bytes": ${BROTLI_SIZE:-0},
     "exit_code": ${EXIT_CODE_BROTLI:-0},
@@ -476,10 +507,33 @@ for OUT in "${OUTPUT_DIRS[@]}"; do
       "sys_seconds": ${SYS_SEC_HDT:-null},
       "max_rss_kb": ${MAX_RSS_KB_HDT:-null}
     }
+  },
+  "gzip_on_hdt": {
+    "output_hdt_gz_path": "",
+    "output_hdt_gz_size_bytes": ${GZIP_ON_HDT_SIZE:-0},
+    "exit_code": ${EXIT_CODE_GZIP_ON_HDT:-0},
+    "timing": {
+      "wall_seconds": ${WALL_SEC_GZIP_ON_HDT:-null},
+      "user_seconds": ${USER_SEC_GZIP_ON_HDT:-null},
+      "sys_seconds": ${SYS_SEC_GZIP_ON_HDT:-null},
+      "max_rss_kb": ${MAX_RSS_KB_GZIP_ON_HDT:-null}
+    }
+  },
+  "brotli_on_hdt": {
+    "output_hdt_br_path": "",
+    "output_hdt_br_size_bytes": ${BROTLI_ON_HDT_SIZE:-0},
+    "exit_code": ${EXIT_CODE_BROTLI_ON_HDT:-0},
+    "timing": {
+      "wall_seconds": ${WALL_SEC_BROTLI_ON_HDT:-null},
+      "user_seconds": ${USER_SEC_BROTLI_ON_HDT:-null},
+      "sys_seconds": ${SYS_SEC_BROTLI_ON_HDT:-null},
+      "max_rss_kb": ${MAX_RSS_KB_BROTLI_ON_HDT:-null}
+    }
   }
 }
 EOF
 
+  # Upsert compression fields into consolidated metrics.csv.
   tmp_csv=$(mktemp)
   awk -F',' -v OFS=',' \
     -v run_id="$RUN_ID" \
@@ -506,6 +560,19 @@ EOF
     -v sys_seconds_hdt="$SYS_SEC_HDT" \
     -v max_rss_kb_hdt="$MAX_RSS_KB_HDT" \
     -v compression_methods="$COMPRESSION_METHODS_CSV" \
+    -v hdt_source="$HDT_SOURCE" \
+    -v gzip_on_hdt_size_bytes="$GZIP_ON_HDT_SIZE" \
+    -v brotli_on_hdt_size_bytes="$BROTLI_ON_HDT_SIZE" \
+    -v exit_code_gzip_on_hdt="$EXIT_CODE_GZIP_ON_HDT" \
+    -v exit_code_brotli_on_hdt="$EXIT_CODE_BROTLI_ON_HDT" \
+    -v wall_seconds_gzip_on_hdt="$WALL_SEC_GZIP_ON_HDT" \
+    -v user_seconds_gzip_on_hdt="$USER_SEC_GZIP_ON_HDT" \
+    -v sys_seconds_gzip_on_hdt="$SYS_SEC_GZIP_ON_HDT" \
+    -v max_rss_kb_gzip_on_hdt="$MAX_RSS_KB_GZIP_ON_HDT" \
+    -v wall_seconds_brotli_on_hdt="$WALL_SEC_BROTLI_ON_HDT" \
+    -v user_seconds_brotli_on_hdt="$USER_SEC_BROTLI_ON_HDT" \
+    -v sys_seconds_brotli_on_hdt="$SYS_SEC_BROTLI_ON_HDT" \
+    -v max_rss_kb_brotli_on_hdt="$MAX_RSS_KB_BROTLI_ON_HDT" \
     -v conv_exit_code="" \
     -v conv_wall="" \
     -v conv_user="" \
@@ -541,12 +608,25 @@ EOF
        $34=sys_seconds_hdt
        $35=max_rss_kb_hdt
        $36=compression_methods
+       $37=hdt_source
+       $38=gzip_on_hdt_size_bytes
+       $39=brotli_on_hdt_size_bytes
+       $40=exit_code_gzip_on_hdt
+       $41=exit_code_brotli_on_hdt
+       $42=wall_seconds_gzip_on_hdt
+       $43=user_seconds_gzip_on_hdt
+       $44=sys_seconds_gzip_on_hdt
+       $45=max_rss_kb_gzip_on_hdt
+       $46=wall_seconds_brotli_on_hdt
+       $47=user_seconds_brotli_on_hdt
+       $48=sys_seconds_brotli_on_hdt
+       $49=max_rss_kb_brotli_on_hdt
        updated=1
      }
      { print }
      END {
        if (updated==0) {
-         print run_id,timestamp,output_name,output_dir,conv_exit_code,conv_wall,conv_user,conv_sys,conv_rss,conv_in_size,conv_vcf_size,conv_out_size,conv_triples,conv_jar,conv_mapping,conv_output,combined_nq_size_bytes,gzip_size_bytes,brotli_size_bytes,hdt_size_bytes,exit_code_gzip,exit_code_brotli,exit_code_hdt,wall_seconds_gzip,user_seconds_gzip,sys_seconds_gzip,max_rss_kb_gzip,wall_seconds_brotli,user_seconds_brotli,sys_seconds_brotli,max_rss_kb_brotli,wall_seconds_hdt,user_seconds_hdt,sys_seconds_hdt,max_rss_kb_hdt,compression_methods
+         print run_id,timestamp,output_name,output_dir,conv_exit_code,conv_wall,conv_user,conv_sys,conv_rss,conv_in_size,conv_vcf_size,conv_out_size,conv_triples,conv_jar,conv_mapping,conv_output,combined_nq_size_bytes,gzip_size_bytes,brotli_size_bytes,hdt_size_bytes,exit_code_gzip,exit_code_brotli,exit_code_hdt,wall_seconds_gzip,user_seconds_gzip,sys_seconds_gzip,max_rss_kb_gzip,wall_seconds_brotli,user_seconds_brotli,sys_seconds_brotli,max_rss_kb_brotli,wall_seconds_hdt,user_seconds_hdt,sys_seconds_hdt,max_rss_kb_hdt,compression_methods,hdt_source,gzip_on_hdt_size_bytes,brotli_on_hdt_size_bytes,exit_code_gzip_on_hdt,exit_code_brotli_on_hdt,wall_seconds_gzip_on_hdt,user_seconds_gzip_on_hdt,sys_seconds_gzip_on_hdt,max_rss_kb_gzip_on_hdt,wall_seconds_brotli_on_hdt,user_seconds_brotli_on_hdt,sys_seconds_brotli_on_hdt,max_rss_kb_brotli_on_hdt
        }
      }' "$METRICS_CSV" > "$tmp_csv"
   mv "$tmp_csv" "$METRICS_CSV"

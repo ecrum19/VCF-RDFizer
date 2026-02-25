@@ -41,6 +41,19 @@ METRICS_HEADER = [
     "sys_seconds_hdt",
     "max_rss_kb_hdt",
     "compression_methods",
+    "hdt_source",
+    "gzip_on_hdt_size_bytes",
+    "brotli_on_hdt_size_bytes",
+    "exit_code_gzip_on_hdt",
+    "exit_code_brotli_on_hdt",
+    "wall_seconds_gzip_on_hdt",
+    "user_seconds_gzip_on_hdt",
+    "sys_seconds_gzip_on_hdt",
+    "max_rss_kb_gzip_on_hdt",
+    "wall_seconds_brotli_on_hdt",
+    "user_seconds_brotli_on_hdt",
+    "sys_seconds_brotli_on_hdt",
+    "max_rss_kb_brotli_on_hdt",
 ]
 
 
@@ -75,7 +88,7 @@ def seed_conversion_metrics_row(
                 "rules.ttl",
                 str(output_dir),
             ]
-            + [""] * 20
+            + [""] * (len(METRICS_HEADER) - 16)
         )
 
 

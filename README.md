@@ -87,6 +87,11 @@ python3 vcf_rdfizer.py --mode full --input ./vcf_files --rdf-layout aggregate --
 python3 vcf_rdfizer.py --mode compress --nq ./out/sample/sample.nt --compression gzip,brotli
 ```
 
+4b. Compression-only mode using compound HDT-first methods:
+```bash
+python3 vcf_rdfizer.py --mode compress --nq ./out/sample/sample.nt --compression hdt_gzip,hdt_brotli
+```
+
 5. Decompression-only mode (auto output path under `./out/`):
 ```bash
 python3 vcf_rdfizer.py --mode decompress --compressed-input ./out/sample/sample.nt.gz
@@ -103,7 +108,7 @@ Outputs:
   - conversion outputs per sample in `./out/<sample>/`
   - `--rdf-layout aggregate`:
     - merged N-Triples file: `./out/<sample>/<sample>.nt`
-    - compressed outputs: `./out/<sample>/<sample>.nt.gz`, `.br`, `.hdt`
+    - compressed outputs: `./out/<sample>/<sample>.nt.gz`, `.br`, `.hdt`, `.hdt.gz`, `.hdt.br`
   - `--rdf-layout batch`:
     - raw RMLStreamer part files stay separate (for example `part-00000.nt`, `part-00001.nt`, ...)
     - each part is compressed individually (for example `part-00000.nt.gz`, `part-00000.hdt`, ...)
@@ -111,12 +116,18 @@ Outputs:
     - `./out/<sample>/<sample>.nt`
 - `./run_metrics` for logs and metrics
   - `run_metrics/metrics.csv` includes both conversion and compression metrics per run
+    - compound-compression fields are explicit and separate from raw-RDF compression:
+      - `gzip_on_hdt_*` (gzip applied to `.hdt`)
+      - `brotli_on_hdt_*` (brotli applied to `.hdt`)
+      - `hdt_source` (`generated` vs `existing` when reused)
   - conversion step artifacts:
     - `run_metrics/conversion-time-<output_name>-<run_id>.txt`
     - `run_metrics/conversion-metrics-<output_name>-<run_id>.json`
   - compression step artifacts:
     - `run_metrics/compression-time-<method>-<output_name>-<run_id>.txt`
     - `run_metrics/compression-metrics-<output_name>-<run_id>.json`
+  - wrapper runtime artifacts:
+    - `run_metrics/wrapper_execution_times.csv` (one row per wrapper run with mode, elapsed time, status, and full-mode triple totals when available)
   - `run_metrics/.wrapper_logs/wrapper-<timestamp>.log` stores detailed Docker/stdout/stderr command output
 
 Small VCF fixtures for RDF size/inflation test runs:
@@ -153,11 +164,15 @@ The wrapper validates:
 - Decompression mode input is `.gz`, `.br`, or `.hdt`
 - In compression mode, a warning is shown before HDT compression if input `.nt` is larger than 5 GB
 - HDT mode uses `rdf2hdt` / `hdt2rdf` (HDT-cpp) in the container
+- Compound methods `hdt_gzip` and `hdt_brotli` first ensure `<sample>.hdt` exists, then compress that HDT artifact
+- For compound methods, if `<sample>.hdt` already exists in the output directory, the wrapper reuses it (no extra HDT regeneration)
 - Docker image exists or is built (if `--image-version` is set, it will attempt to pull that version and fail if missing)
 - Docker commands are attempted without `sudo` first, then automatically retried with `sudo` if needed
 - Docker runs as the host UID/GID by default to prevent root-owned output files on mounted volumes
 - If mounted output/metrics paths are not writable (e.g., stale root-owned files), the wrapper automatically attempts a one-time in-container permission repair before running
 - Raw command output is written to a hidden wrapper log file instead of printed directly to the terminal
+- A concise elapsed-time summary is printed at the end of each mode run and appended to `run_metrics/wrapper_execution_times.csv`
+- Full mode prints triples produced per input (and total) when conversion metrics are available
 - Optional preflight storage estimate (`--estimate-size`) with a disk-space warning if the upper-bound estimate exceeds free space
 
 ## Size Estimation Logic
@@ -204,7 +219,7 @@ Options:
 - `-B, --no-build`: fail if image missing
 - `-n, --out-name` (default `rdf`): fallback output basename in full mode
 - `-M, --metrics` (default `./run_metrics`): metrics/log directory
-- `-c, --compression` (default `gzip,brotli,hdt`): compression methods (`gzip,brotli,hdt,none`)
+- `-c, --compression` (default `gzip,brotli,hdt`): compression methods (`gzip,brotli,hdt,hdt_gzip,hdt_brotli,none`)
 - `-k, --keep-tsv`: keep TSV intermediates (full mode)
 - `-R, --keep-rdf`: keep raw `.nt/.nq` RDF outputs after compression (full mode; default is delete)
 - `-e, --estimate-size`: print rough input/TSV/RDF size estimates and free disk before running (full mode)

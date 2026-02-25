@@ -1,3 +1,5 @@
+import csv
+import json
 import os
 import re
 import shutil
@@ -60,6 +62,44 @@ def output_name_from_command(cmd):
 
 
 class WrapperUnitTests(VerboseTestCase):
+    def test_update_metrics_csv_keeps_raw_and_hdt_compound_metrics_separate(self):
+        """Metrics CSV keeps raw RDF gzip/brotli fields separate from gzip/brotli-on-HDT fields."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            metrics_csv = tmp_path / "metrics.csv"
+
+            vcf_rdfizer.update_metrics_csv_with_compression(
+                metrics_csv=metrics_csv,
+                run_id="run-1",
+                timestamp="2026-02-25T10:00:00",
+                output_name="sample",
+                output_dir=tmp_path / "out" / "sample",
+                combined_size_bytes=100,
+                selected_methods=["hdt_gzip"],
+                method_results={
+                    "hdt": {
+                        "output_size_bytes": 40,
+                        "exit_code": 0,
+                        "wall_seconds": 1.25,
+                        "source": "existing",
+                    },
+                    "hdt_gzip": {
+                        "output_size_bytes": 12,
+                        "exit_code": 0,
+                        "wall_seconds": 0.50,
+                    },
+                },
+            )
+
+            with metrics_csv.open() as handle:
+                row = next(csv.DictReader(handle))
+
+            self.assertEqual(row["gzip_size_bytes"], "0")
+            self.assertEqual(row["gzip_on_hdt_size_bytes"], "12")
+            self.assertEqual(row["exit_code_gzip"], "0")
+            self.assertEqual(row["exit_code_gzip_on_hdt"], "0")
+            self.assertEqual(row["hdt_source"], "existing")
+
     def test_help_flag_prints_usage_guide(self):
         """Help flag exits cleanly and prints mode usage examples."""
         out_buf = StringIO()
@@ -220,6 +260,222 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertIn("/data/out/sample/sample.nq.gz", commands[0][-1])
             self.assertIn("brotli -q 7 -c", commands[1][-1])
             self.assertIn("/data/out/sample/sample.nq.br", commands[1][-1])
+
+    def test_main_compress_mode_hdt_gzip_reuses_existing_hdt(self):
+        """Compound method hdt_gzip reuses a preexisting HDT artifact instead of regenerating it."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            nt_path = tmp_path / "sample.nt"
+            nt_path.write_text("<s> <p> <o> .\n")
+            out_dir = tmp_path / "out"
+            sample_out = out_dir / "sample"
+            sample_out.mkdir(parents=True, exist_ok=True)
+            (sample_out / "sample.hdt").write_text("prebuilt-hdt\n")
+            commands = []
+
+            def fake_run(cmd, cwd=None, env=None):
+                commands.append(cmd)
+                return 0
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch.object(
+                    vcf_rdfizer, "check_docker", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "docker_image_exists", return_value=True
+                ):
+                    rc = invoke_main(
+                        [
+                            "--mode",
+                            "compress",
+                            "--nq",
+                            str(nt_path),
+                            "--compression",
+                            "hdt_gzip",
+                            "--out",
+                            str(out_dir),
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(commands), 1)
+            self.assertIn(
+                "gzip -c /data/out/sample/sample.hdt > /data/out/sample/sample.hdt.gz",
+                commands[0][-1],
+            )
+            self.assertNotIn("rdf2hdt", commands[0][-1])
+
+    def test_main_compress_mode_hdt_brotli_generates_hdt_then_compresses_hdt(self):
+        """Compound method hdt_brotli runs rdf2hdt first, then brotli on the generated HDT file."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            nt_path = tmp_path / "sample.nt"
+            nt_path.write_text("<s> <p> <o> .\n")
+            out_dir = tmp_path / "out"
+            commands = []
+
+            def fake_run(cmd, cwd=None, env=None):
+                commands.append(cmd)
+                return 0
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch.object(
+                    vcf_rdfizer, "check_docker", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "docker_image_exists", return_value=True
+                ):
+                    rc = invoke_main(
+                        [
+                            "--mode",
+                            "compress",
+                            "--nq",
+                            str(nt_path),
+                            "--compression",
+                            "hdt_brotli",
+                            "--out",
+                            str(out_dir),
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(commands), 2)
+            self.assertIn("rdf2hdt", commands[0][-1])
+            self.assertIn("/data/out/sample/sample.hdt", commands[0][-1])
+            self.assertIn(
+                "brotli -q 7 -c /data/out/sample/sample.hdt > /data/out/sample/sample.hdt.br",
+                commands[1][-1],
+            )
+
+    def test_main_compress_mode_logs_runtime_summary(self):
+        """Compression mode writes runtime timing to metrics CSV and prints elapsed time."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            nq_path = tmp_path / "sample.nq"
+            nq_path.write_text("<s> <p> <o> <g> .\n")
+            out_dir = tmp_path / "out"
+            metrics_dir = tmp_path / "metrics"
+
+            def fake_run(cmd, cwd=None, env=None):
+                return 0
+
+            out_buf = StringIO()
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch.object(
+                    vcf_rdfizer, "check_docker", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "docker_image_exists", return_value=True
+                ), redirect_stdout(out_buf):
+                    rc = invoke_main(
+                        [
+                            "--mode",
+                            "compress",
+                            "--nq",
+                            str(nq_path),
+                            "--compression",
+                            "gzip",
+                            "--out",
+                            str(out_dir),
+                            "--metrics",
+                            str(metrics_dir),
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 0)
+            self.assertIn("Run time (compress mode):", out_buf.getvalue())
+            timings_csv = metrics_dir / "wrapper_execution_times.csv"
+            self.assertTrue(timings_csv.exists())
+            with timings_csv.open() as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(rows[-1]["mode"], "compress")
+            self.assertEqual(rows[-1]["status"], "success")
+
+    def test_main_full_mode_prints_triplets_and_logs_total(self):
+        """Full mode prints produced triples and records them in runtime timing log."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+            out_dir = tmp_path / "out"
+            metrics_dir = tmp_path / "metrics"
+
+            def fake_run(cmd, cwd=None, env=None):
+                if "/opt/vcf-rdfizer/run_conversion.sh" in cmd:
+                    run_id = next(
+                        (part.split("=", 1)[1] for part in cmd if isinstance(part, str) and part.startswith("RUN_ID=")),
+                        "run",
+                    )
+                    out_name = next(
+                        (part.split("=", 1)[1] for part in cmd if isinstance(part, str) and part.startswith("OUT_NAME=")),
+                        "sample",
+                    )
+                    sample_dir = out_dir / out_name
+                    sample_dir.mkdir(parents=True, exist_ok=True)
+                    (sample_dir / f"{out_name}.nt").write_text("<s> <p> <o> .\n")
+                    payload = {"artifacts": {"output_triples": {"TOTAL": 17}}}
+                    metrics_dir.mkdir(parents=True, exist_ok=True)
+                    (metrics_dir / f"conversion-metrics-{out_name}-{run_id}.json").write_text(
+                        json.dumps(payload),
+                        encoding="utf-8",
+                    )
+                return 0
+
+            out_buf = StringIO()
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch.object(
+                    vcf_rdfizer, "check_docker", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "docker_image_exists", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "discover_tsv_triplets", return_value=mocked_triplets()
+                ), redirect_stdout(out_buf):
+                    rc = invoke_main(
+                        [
+                            "--mode",
+                            "full",
+                            "--input",
+                            str(input_dir),
+                            "--rules",
+                            str(rules_path),
+                            "--rdf-layout",
+                            "aggregate",
+                            "--compression",
+                            "none",
+                            "--out",
+                            str(out_dir),
+                            "--metrics",
+                            str(metrics_dir),
+                            "--keep-tsv",
+                            "--keep-rdf",
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 0)
+            output = out_buf.getvalue()
+            self.assertIn("Triples produced: 17", output)
+            self.assertIn("Total triples produced (full run): 17", output)
+            self.assertIn("Run time (full mode):", output)
+
+            timings_csv = metrics_dir / "wrapper_execution_times.csv"
+            self.assertTrue(timings_csv.exists())
+            with timings_csv.open() as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(rows[-1]["mode"], "full")
+            self.assertEqual(rows[-1]["status"], "success")
+            self.assertEqual(rows[-1]["total_triples"], "17")
 
     def test_main_compress_mode_accepts_nt_and_preserves_extension(self):
         """Compression mode accepts .nt input and emits extension-aware output names."""
