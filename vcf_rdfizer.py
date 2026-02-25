@@ -1560,8 +1560,24 @@ def run_full_mode(
             return 1
 
         if not keep_rdf and selected_methods:
-            # Cleanup raw RDF when compression is enabled and keep-rdf is not set.
+            # Cleanup raw RDF only after every selected compression method has
+            # completed successfully for that specific RDF artifact.
             for raw_rdf_path in raw_rdf_files:
+                method_results = method_results_by_file.get(raw_rdf_path.name, {})
+                missing_or_failed = []
+                for method in selected_methods:
+                    result = method_results.get(method)
+                    if result is None or int(result.get("exit_code", 1)) != 0:
+                        missing_or_failed.append(method)
+                if missing_or_failed:
+                    eprint(
+                        "Error: refusing to remove raw RDF before all selected compression "
+                        f"methods completed successfully for '{raw_rdf_path.name}'. "
+                        f"Pending/failed: {', '.join(missing_or_failed)}"
+                    )
+                    eprint(f"See log for details: {wrapper_log_path}")
+                    return 1
+
                 if raw_rdf_path.exists():
                     if not remove_file_with_docker_fallback(
                         path=raw_rdf_path,

@@ -1033,6 +1033,63 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertTrue((out_dir / "sample" / "sample.nt").exists())
             self.assertTrue((out_dir / "sample" / "sample.hdt").exists())
 
+    def test_main_full_mode_refuses_rdf_cleanup_until_all_methods_succeed(self):
+        """Raw RDF is not deleted if any requested compression method is missing/failed."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+            out_dir = tmp_path / "out"
+
+            def fake_run(cmd, cwd=None, env=None):
+                if "/opt/vcf-rdfizer/run_conversion.sh" in cmd:
+                    output_name = output_name_from_command(cmd) or "sample"
+                    out_sample_dir = out_dir / output_name
+                    out_sample_dir.mkdir(parents=True, exist_ok=True)
+                    (out_sample_dir / f"{output_name}.nt").write_text("<s> <p> <o> .\n")
+                return 0
+
+            # Simulate partial compression bookkeeping: gzip recorded, brotli missing.
+            def fake_compress(*, rdf_path, out_dir, target_out_dir, image_ref, methods, wrapper_log_path, status_indent):
+                return True, {
+                    "gzip": {
+                        "exit_code": 0,
+                        "wall_seconds": 0.01,
+                        "output_path": str((target_out_dir or out_dir) / f"{rdf_path.name}.gz"),
+                        "output_size_bytes": 12,
+                    }
+                }
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch.object(
+                    vcf_rdfizer, "check_docker", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "docker_image_exists", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "discover_tsv_triplets", return_value=mocked_triplets()
+                ), mock.patch.object(
+                    vcf_rdfizer, "run_compression_methods_for_rdf", side_effect=fake_compress
+                ):
+                    rc = invoke_main(
+                        [
+                            "--input",
+                            str(input_dir),
+                            "--rules",
+                            str(rules_path),
+                            "--out",
+                            str(out_dir),
+                            "--compression",
+                            "gzip,brotli",
+                            "--keep-tsv",
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 1)
+            self.assertTrue((out_dir / "sample" / "sample.nt").exists())
+
     def test_main_full_mode_writes_compression_metrics_artifacts(self):
         """Full mode writes compression metrics JSON/time artifacts and updates metrics.csv row."""
         with tempfile.TemporaryDirectory() as td:
