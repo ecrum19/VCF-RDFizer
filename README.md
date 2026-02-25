@@ -139,30 +139,32 @@ Outputs:
   - decompressed outputs (decompression mode default):
     - `./out/<sample>/<sample>.nt`
 - `./run_metrics` for logs and metrics
-  - `run_metrics/metrics.csv` includes both conversion and compression metrics per run
+  - each wrapper invocation creates a run-specific subdirectory: `run_metrics/<RUN_ID>/`
+    - example: `run_metrics/20260225T120434/`
+  - `run_metrics/<RUN_ID>/metrics.csv` includes both conversion and compression metrics for that run
     - compound-compression fields are explicit and separate from raw-RDF compression:
       - `gzip_on_hdt_*` (gzip applied to `.hdt`)
       - `brotli_on_hdt_*` (brotli applied to `.hdt`)
       - `hdt_source` (`generated` vs `existing` when reused)
   - conversion step artifacts:
-    - `run_metrics/conversion-time-<output_name>-<run_id>.txt`
-    - `run_metrics/conversion-metrics-<output_name>-<run_id>.json`
+    - `run_metrics/<RUN_ID>/conversion-time-<output_name>-<run_id>.txt`
+    - `run_metrics/<RUN_ID>/conversion-metrics-<output_name>-<run_id>.json`
   - compression step artifacts:
-    - `run_metrics/compression-time-<method>-<output_name>-<run_id>.txt`
-    - `run_metrics/compression-metrics-<output_name>-<run_id>.json`
+    - `run_metrics/<RUN_ID>/compression-time-<method>-<output_name>-<run_id>.txt`
+    - `run_metrics/<RUN_ID>/compression-metrics-<output_name>-<run_id>.json`
   - wrapper runtime artifacts:
-    - `run_metrics/wrapper_execution_times.csv` (one row per wrapper run with mode, elapsed time, status, and full-mode triple totals when available)
-  - `run_metrics/.wrapper_logs/wrapper-<timestamp>.log` stores detailed Docker/stdout/stderr command output
+    - `run_metrics/<RUN_ID>/wrapper_execution_times.csv` (one row for that run with mode, elapsed time, status, and full-mode triple totals when available)
+  - `run_metrics/<RUN_ID>/.wrapper_logs/wrapper-<run_id>.log` stores detailed Docker/stdout/stderr command output
 
 Small VCF fixtures for RDF size/inflation test runs:
-- `test_vcf_files/infl100.vcf` (100 total lines)
-- `test_vcf_files/infl1k.vcf` (1000 total lines)
-- `test_vcf_files/infl10k.vcf` (10000 total lines)
+- `test/test_vcf_files/test-100.vcf` (100 total lines)
+- `test/test_vcf_files/test-1k.vcf` (1000 total lines)
+- `test/test_vcf_files/test-10k.vcf` (10000 total lines)
 
 Example inflation check:
 ```bash
-python3 vcf_rdfizer.py --mode full --input test_vcf_files/infl1k.vcf --rdf-layout aggregate --compression none --keep-tsv --keep-rdf
-wc -l out/infl1k/infl1k.nt
+python3 vcf_rdfizer.py --mode full --input test/test_vcf_files/test-1k.vcf --rdf-layout aggregate --compression none --keep-tsv --keep-rdf
+wc -l out/test-1k/test-1k.nt
 ```
 
 ## How Dependencies Are Handled
@@ -195,7 +197,7 @@ The wrapper validates:
 - Docker runs as the host UID/GID by default to prevent root-owned output files on mounted volumes
 - If mounted output/metrics paths are not writable (e.g., stale root-owned files), the wrapper automatically attempts a one-time in-container permission repair before running
 - Raw command output is written to a hidden wrapper log file instead of printed directly to the terminal
-- A concise elapsed-time summary is printed at the end of each mode run and appended to `run_metrics/wrapper_execution_times.csv`
+- A concise elapsed-time summary is printed at the end of each mode run and written to `run_metrics/<RUN_ID>/wrapper_execution_times.csv`
 - Full mode prints triples produced per input (and total) when conversion metrics are available
 - Optional preflight storage estimate (`--estimate-size`) with a disk-space warning if the upper-bound estimate exceeds free space
 
@@ -242,7 +244,7 @@ Options:
 - `-b, --build`: force docker build
 - `-B, --no-build`: fail if image missing
 - `-n, --out-name` (default `rdf`): fallback output basename in full mode
-- `-M, --metrics` (default `./run_metrics`): metrics/log directory
+- `-M, --metrics` (default `./run_metrics`): metrics root directory (a `<RUN_ID>/` subdirectory is created per run)
 - `-c, --compression` (default `gzip,brotli,hdt`): compression methods (`gzip,brotli,hdt,hdt_gzip,hdt_brotli,none`)
 - `-k, --keep-tsv`: keep TSV intermediates (full mode)
 - `-R, --keep-rdf`: keep raw `.nt/.nq` RDF outputs after compression (full mode; default is delete)

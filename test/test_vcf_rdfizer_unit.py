@@ -61,7 +61,53 @@ def output_name_from_command(cmd):
     return None
 
 
+def latest_metrics_run_dir(metrics_root: Path) -> Path:
+    """Return the single/latest per-run metrics directory."""
+    run_dirs = sorted(
+        (
+            path
+            for path in metrics_root.iterdir()
+            if path.is_dir() and re.match(r"^\d{8}T\d{6}$", path.name)
+        ),
+        key=lambda path: path.name,
+    )
+    if not run_dirs:
+        raise AssertionError(f"No per-run metrics directories found under {metrics_root}")
+    return run_dirs[-1]
+
+
 class WrapperUnitTests(VerboseTestCase):
+    def test_print_summary_lists_all_selected_compression_sizes(self):
+        """Summary printer includes one size line per requested compression method."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            out_root = tmp_path / "out" / "sample"
+            out_root.mkdir(parents=True, exist_ok=True)
+            nt_path = tmp_path / "sample.nt"
+            nt_path.write_text("<s> <p> <o> .\n")
+            (out_root / "sample.hdt").write_text("hdt\n")
+            (out_root / "sample.nt.gz").write_text("gz\n")
+
+            out_buf = StringIO()
+            with redirect_stdout(out_buf):
+                vcf_rdfizer.print_nt_hdt_summary(
+                    output_root=out_root,
+                    nt_path=nt_path,
+                    hdt_path=out_root / "sample.hdt",
+                    selected_methods=["hdt", "gzip"],
+                    method_results={
+                        "hdt": {"output_size_bytes": 4, "exit_code": 0},
+                        "gzip": {"output_size_bytes": 3, "exit_code": 0},
+                    },
+                    indent="  ",
+                )
+
+            text = out_buf.getvalue()
+            self.assertIn("- HDT (.hdt):", text)
+            self.assertIn("- gzip (.nt.gz):", text)
+            self.assertIn(str(out_root / "sample.hdt"), text)
+            self.assertIn(str(out_root / "sample.nt.gz"), text)
+
     def test_update_metrics_csv_keeps_raw_and_hdt_compound_metrics_separate(self):
         """Metrics CSV keeps raw RDF gzip/brotli fields separate from gzip/brotli-on-HDT fields."""
         with tempfile.TemporaryDirectory() as td:
@@ -393,7 +439,8 @@ class WrapperUnitTests(VerboseTestCase):
 
             self.assertEqual(rc, 0)
             self.assertIn("Run time (compress mode):", out_buf.getvalue())
-            timings_csv = metrics_dir / "wrapper_execution_times.csv"
+            run_metrics_dir = latest_metrics_run_dir(metrics_dir)
+            timings_csv = run_metrics_dir / "wrapper_execution_times.csv"
             self.assertTrue(timings_csv.exists())
             with timings_csv.open() as handle:
                 rows = list(csv.DictReader(handle))
@@ -422,8 +469,9 @@ class WrapperUnitTests(VerboseTestCase):
                     sample_dir.mkdir(parents=True, exist_ok=True)
                     (sample_dir / f"{out_name}.nt").write_text("<s> <p> <o> .\n")
                     payload = {"artifacts": {"output_triples": {"TOTAL": 17}}}
-                    metrics_dir.mkdir(parents=True, exist_ok=True)
-                    (metrics_dir / f"conversion-metrics-{out_name}-{run_id}.json").write_text(
+                    run_metrics_dir = metrics_dir / run_id
+                    run_metrics_dir.mkdir(parents=True, exist_ok=True)
+                    (run_metrics_dir / f"conversion-metrics-{out_name}-{run_id}.json").write_text(
                         json.dumps(payload),
                         encoding="utf-8",
                     )
@@ -469,7 +517,8 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertIn("Total triples produced (full run): 17", output)
             self.assertIn("Run time (full mode):", output)
 
-            timings_csv = metrics_dir / "wrapper_execution_times.csv"
+            run_metrics_dir = latest_metrics_run_dir(metrics_dir)
+            timings_csv = run_metrics_dir / "wrapper_execution_times.csv"
             self.assertTrue(timings_csv.exists())
             with timings_csv.open() as handle:
                 rows = list(csv.DictReader(handle))
@@ -1035,15 +1084,16 @@ class WrapperUnitTests(VerboseTestCase):
                 os.chdir(old_cwd)
 
             self.assertEqual(rc, 0)
-            metrics_csv = metrics_dir / "metrics.csv"
+            run_metrics_dir = latest_metrics_run_dir(metrics_dir)
+            metrics_csv = run_metrics_dir / "metrics.csv"
             self.assertTrue(metrics_csv.exists())
             csv_text = metrics_csv.read_text()
             self.assertIn("compression_methods", csv_text)
             self.assertIn("sample", csv_text)
             self.assertIn("hdt", csv_text)
 
-            json_files = list(metrics_dir.glob("compression-metrics-sample-*.json"))
-            time_files = list(metrics_dir.glob("compression-time-hdt-sample-*.txt"))
+            json_files = list(run_metrics_dir.glob("compression-metrics-sample-*.json"))
+            time_files = list(run_metrics_dir.glob("compression-time-hdt-sample-*.txt"))
             self.assertTrue(json_files)
             self.assertTrue(time_files)
 

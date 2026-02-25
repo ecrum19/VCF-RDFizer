@@ -534,11 +534,48 @@ def print_nt_hdt_summary(
     indent: str = "",
     nt_note: str | None = None,
     nt_size_override: int | None = None,
+    selected_methods: list[str] | None = None,
+    method_results: dict[str, dict] | None = None,
 ):
-    """Print per-output size summary for RDF (.nt) and HDT artifacts."""
+    """Print per-output size summary for RDF and selected compression artifacts."""
     print(f"{indent}* Output directory: {output_root}")
+
+    def rdf_label(path: Path) -> str:
+        if path.suffix == ".nt":
+            return "N-Triples (.nt)"
+        if path.suffix == ".nq":
+            return "N-Quads (.nq)"
+        if path.suffix:
+            return f"RDF ({path.suffix})"
+        return "RDF"
+
+    def output_name_for_method(path: Path, method: str) -> str:
+        stem = path.stem
+        ext = path.suffix.lstrip(".") or "nt"
+        if method == "gzip":
+            return f"{stem}.{ext}.gz"
+        if method == "brotli":
+            return f"{stem}.{ext}.br"
+        if method == "hdt":
+            return f"{stem}.hdt"
+        if method == "hdt_gzip":
+            return f"{stem}.hdt.gz"
+        if method == "hdt_brotli":
+            return f"{stem}.hdt.br"
+        return f"{stem}.{method}"
+
+    def label_for_method(path: Path, method: str) -> str:
+        ext = path.suffix.lstrip(".") or "nt"
+        labels = {
+            "gzip": f"gzip (.{ext}.gz)",
+            "brotli": f"brotli (.{ext}.br)",
+            "hdt": "HDT (.hdt)",
+            "hdt_gzip": "gzip-on-HDT (.hdt.gz)",
+            "hdt_brotli": "brotli-on-HDT (.hdt.br)",
+        }
+        return labels.get(method, method)
+
     nt_size = nt_size_override if nt_size_override is not None else file_size_bytes(nt_path)
-    hdt_size = file_size_bytes(hdt_path)
 
     if nt_size is None:
         nt_text = f"not found at {nt_path}"
@@ -546,12 +583,43 @@ def print_nt_hdt_summary(
         nt_text = f"{format_bytes(nt_size)} ({nt_path})"
     if nt_note:
         nt_text = f"{nt_text} ({nt_note})"
-    print(f"{indent}  - N-Triples (.nt): {nt_text}")
+    print(f"{indent}  - {rdf_label(nt_path)}: {nt_text}")
 
-    if hdt_size is None:
-        print(f"{indent}  - HDT (.hdt): not generated at {hdt_path}")
-    else:
-        print(f"{indent}  - HDT (.hdt): {format_bytes(hdt_size)} ({hdt_path})")
+    # Backward-compatible fallback summary when no explicit compression method
+    # set is provided to this printer.
+    if selected_methods is None:
+        hdt_size = file_size_bytes(hdt_path)
+        if hdt_size is None:
+            print(f"{indent}  - HDT (.hdt): not generated at {hdt_path}")
+        else:
+            print(f"{indent}  - HDT (.hdt): {format_bytes(hdt_size)} ({hdt_path})")
+        return
+
+    if not selected_methods:
+        print(f"{indent}  - Compression: none selected")
+        return
+
+    results = method_results or {}
+    for method in selected_methods:
+        artifact_name = output_name_for_method(nt_path, method)
+        artifact_path = output_root / artifact_name
+        result = results.get(method, {})
+        size = result.get("output_size_bytes")
+        if size is None:
+            size = file_size_bytes(artifact_path)
+        if size is None:
+            artifact_text = f"not generated at {artifact_path}"
+        else:
+            artifact_text = f"{format_bytes(int(size))} ({artifact_path})"
+
+        if method in {"hdt", "hdt_gzip", "hdt_brotli"}:
+            source = str(result.get("source", "")).strip()
+            if not source and "hdt" in results:
+                source = str(results.get("hdt", {}).get("source", "")).strip()
+            if source == "existing":
+                artifact_text = f"{artifact_text} (reused existing HDT)"
+
+        print(f"{indent}  - {label_for_method(nt_path, method)}: {artifact_text}")
 
 
 def remove_file_with_docker_fallback(
@@ -1508,6 +1576,7 @@ def run_full_mode(
             hdt_path = (out_dir / output_name) / f"{raw_rdf_path.stem}.hdt"
             rdf_size = file_size_bytes(raw_rdf_path)
             nt_note = None
+            method_results = method_results_by_file.get(raw_rdf_path.name, {})
             if raw_rdf_path.exists():
                 nt_note = "retained via --keep-rdf" if keep_rdf else "retained"
             elif not keep_rdf and selected_methods:
@@ -1521,6 +1590,8 @@ def run_full_mode(
                 indent="    ",
                 nt_note=nt_note,
                 nt_size_override=rdf_size,
+                selected_methods=selected_methods,
+                method_results=method_results,
             )
 
         if not keep_tsv:
@@ -1572,7 +1643,7 @@ def run_compress_mode(
             )
 
     ensure_dir(out_dir)
-    ok, _method_results = run_compression_methods_for_rdf(
+    ok, method_results = run_compression_methods_for_rdf(
         rdf_path=nq_path,
         out_dir=out_dir,
         image_ref=image_ref,
@@ -1585,9 +1656,16 @@ def run_compress_mode(
 
     input_stem = nq_path.stem
     target_out_dir = out_dir / input_stem
-    nt_path = nq_path if nq_path.suffix == ".nt" else nq_path.with_suffix(".nt")
+    rdf_path = nq_path
     hdt_path = target_out_dir / f"{input_stem}.hdt"
-    print_nt_hdt_summary(output_root=target_out_dir, nt_path=nt_path, hdt_path=hdt_path, indent="  ")
+    print_nt_hdt_summary(
+        output_root=target_out_dir,
+        nt_path=rdf_path,
+        hdt_path=hdt_path,
+        indent="  ",
+        selected_methods=methods,
+        method_results=method_results,
+    )
     print("Conversion process finished.")
     return 0
 
@@ -1773,7 +1851,12 @@ def main():
         default="rdf",
         help="Fallback output directory/file basename when a TSV basename cannot be inferred",
     )
-    parser.add_argument("-M", "--metrics", default="./run_metrics", help="Metrics output directory")
+    parser.add_argument(
+        "-M",
+        "--metrics",
+        default="./run_metrics",
+        help="Metrics root directory (per-run subdirectories are created automatically)",
+    )
     parser.add_argument(
         "-c",
         "--compression",
@@ -1802,7 +1885,10 @@ def main():
     repo_root = Path(__file__).resolve().parent
     out_dir = Path(args.out).expanduser().resolve()
     tsv_dir = Path(args.tsv).expanduser().resolve()
-    metrics_dir = Path(args.metrics).expanduser().resolve()
+    metrics_root = Path(args.metrics).expanduser().resolve()
+    run_id = datetime.now().strftime("%Y%m%dT%H%M%S")
+    timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    metrics_dir = metrics_root / run_id
     mode = args.mode
 
     step1_label = "Step 1/5" if mode == "full" else "Step 1/3"
@@ -1827,7 +1913,7 @@ def main():
                 rules_path = Path(args.rules).expanduser().resolve()
             if not rules_path.exists() or not rules_path.is_file():
                 raise ValueError(f"rules file not found: {rules_path}")
-            validate_mode_dirs([out_dir, tsv_dir, metrics_dir])
+            validate_mode_dirs([out_dir, tsv_dir, metrics_root])
             parse_compression_methods(args.compression)
         elif mode == "compress":
             if not args.nq:
@@ -1838,7 +1924,7 @@ def main():
             if nq_path.suffix not in {".nq", ".nt"}:
                 raise ValueError("Compression input must be a .nq or .nt file")
             methods = parse_compression_methods(args.compression)
-            validate_mode_dirs([out_dir, metrics_dir])
+            validate_mode_dirs([out_dir, metrics_root])
         else:
             if not args.compressed_input:
                 raise ValueError("--compressed-input is required in --mode decompress")
@@ -1846,7 +1932,7 @@ def main():
             if not compressed_path.exists() or not compressed_path.is_file():
                 raise ValueError(f"Compressed input file not found: {compressed_path}")
             fmt = detect_compressed_format(compressed_path)
-            validate_mode_dirs([out_dir, metrics_dir])
+            validate_mode_dirs([out_dir, metrics_root])
             if args.decompress_out is None:
                 default_name = default_decompressed_name(compressed_path, fmt)
                 decompressed_out = out_dir / Path(default_name).stem / default_name
@@ -1884,8 +1970,6 @@ def main():
                 "You may run out of space."
             )
 
-    run_id = datetime.now().strftime("%Y%m%dT%H%M%S")
-    timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     wrapper_log_path = metrics_dir / ".wrapper_logs" / f"wrapper-{run_id}.log"
     execution_started = time.perf_counter()
     global _COMMAND_LOGGER
