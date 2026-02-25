@@ -14,6 +14,7 @@ diagnosed at a specific stage and future workflow changes stay localized.
 
 import argparse
 import csv
+import importlib.resources as importlib_resources
 import json
 import os
 import re
@@ -694,6 +695,33 @@ def render_rules_for_triplet(template_rules: Path, output_rules: Path, records_n
     output_rules.write_text(text)
 
 
+def resolve_default_rules_path(repo_root: Path) -> Path:
+    """Resolve default rules path for both source checkout and installed package.
+
+    Resolution order:
+    1) `<repo_root>/rules/default_rules.ttl` (editable/local checkout)
+    2) packaged data file in `vcf_rdfizer_data/rules/default_rules.ttl` (wheel/sdist install)
+    """
+    local_default = (repo_root / "rules" / "default_rules.ttl").resolve()
+    if local_default.exists() and local_default.is_file():
+        return local_default
+
+    try:
+        packaged = importlib_resources.files("vcf_rdfizer_data").joinpath(
+            "rules/default_rules.ttl"
+        )
+        with importlib_resources.as_file(packaged) as packaged_path:
+            packaged_resolved = packaged_path.resolve()
+            if packaged_resolved.exists() and packaged_resolved.is_file():
+                return packaged_resolved
+    except (ModuleNotFoundError, FileNotFoundError):
+        pass
+
+    raise ValueError(
+        "default rules file not found. Provide --rules explicitly or reinstall package."
+    )
+
+
 def docker_image_exists(image: str) -> bool:
     """Return True when Docker image reference exists locally."""
     return run([*docker_cmd_prefix(), "image", "inspect", image]) == 0
@@ -1247,7 +1275,6 @@ def run_full_mode(
 ):
     """Execute full pipeline: per-input TSV -> RDF -> compression -> metrics."""
     print("Step 3/5: Processing per-input pipeline (TSV -> RDF -> compression)")
-    scripts_dir = Path(__file__).resolve().parent / "src"
     tsv_existed = tsv_dir.exists()
     ensure_dir(tsv_dir)
     ensure_dir(out_dir)
@@ -1290,8 +1317,6 @@ def run_full_mode(
             f"{str(input_mount_dir)}:/data/in:ro",
             "-v",
             f"{str(tsv_dir)}:/data/tsv",
-            "-v",
-            f"{str(scripts_dir)}:/opt/vcf-rdfizer:ro",
             image_ref,
             "bash",
             "/opt/vcf-rdfizer/vcf_as_tsv.sh",
@@ -1355,8 +1380,6 @@ def run_full_mode(
             f"{str(out_dir)}:/data/out",
             "-v",
             f"{str(metrics_dir)}:/data/metrics",
-            "-v",
-            f"{str(scripts_dir)}:/opt/vcf-rdfizer:ro",
             "-w",
             "/data/rules",
             "-e",
@@ -1799,7 +1822,7 @@ def main():
                 expected_prefixes,
             ) = resolve_input_snapshot(input_path)
             if args.rules is None:
-                rules_path = (repo_root / "rules" / "default_rules.ttl").resolve()
+                rules_path = resolve_default_rules_path(repo_root)
             else:
                 rules_path = Path(args.rules).expanduser().resolve()
             if not rules_path.exists() or not rules_path.is_file():

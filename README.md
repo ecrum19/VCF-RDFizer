@@ -102,6 +102,30 @@ python3 vcf_rdfizer.py --mode decompress --compressed-input ./out/sample/sample.
 python3 vcf_rdfizer.py --mode decompress --compressed-input ./out/sample/sample.hdt --decompress-out ./out/sample_from_hdt.nt
 ```
 
+## Official Installation Paths
+
+Recommended user-facing install commands once releases are published:
+
+1. `pipx` (best for CLI tools):
+```bash
+pipx install vcf-rdfizer
+vcf-rdfizer --help
+```
+
+2. `pip`:
+```bash
+pip install vcf-rdfizer
+vcf-rdfizer --help
+```
+
+3. `conda` (after conda-forge recipe is merged):
+```bash
+conda install -c conda-forge vcf-rdfizer
+vcf-rdfizer --help
+```
+
+Note: these installs provide the Python wrapper CLI. Docker is still required at runtime.
+
 Outputs:
 - `./tsv` for TSV intermediates
 - `./out` for RDF output
@@ -228,10 +252,107 @@ Options:
 Environment override:
 - `VCF_RDFIZER_DOCKER_AS_USER=0`: disable host UID/GID mapping for Docker runs (not recommended; can reintroduce root-owned output files)
 
+## Packaging And Publishing (Step-by-Step)
+
+This repo now includes:
+- Python packaging metadata: `pyproject.toml`
+- Packaged fallback default rules data for installs outside a source checkout: `vcf_rdfizer_data/rules/default_rules.ttl`
+- CI package smoke test: `.github/workflows/tests.yml`
+- PyPI publish workflow (tag-based): `.github/workflows/publish-python.yml`
+- Docker Hub publish workflow (tag-based): `.github/workflows/publish-docker.yml`
+- Conda recipe starter: `conda-recipe/meta.yaml`
+
+### 1) Local packaging check
+
+Run this before every release:
+```bash
+python -m pip install --upgrade pip build twine
+python -m build
+python -m twine check dist/*
+python -m pip install dist/*.whl
+vcf-rdfizer --help
+```
+
+### 2) Publish to PyPI (official release)
+
+1. Bump version in `pyproject.toml`.
+2. Commit and push.
+3. Create and push a release tag that matches version:
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+4. GitHub Actions workflow `publish-python.yml` builds and publishes automatically.
+
+### 3) Configure PyPI trusted publishing (one-time)
+
+In PyPI project settings:
+1. Add a trusted publisher.
+2. Repository: `ecrum19/VCF-RDFizer`
+3. Workflow: `publish-python.yml`
+4. Environment: `pypi`
+
+Without this, the publish job will fail with an authentication/trust error.
+
+### 4) Publish to conda-forge
+
+1. Update `conda-recipe/meta.yaml`:
+  - set `version`
+  - set `sha256` for the GitHub release tarball
+2. Submit recipe PR to `conda-forge/staged-recipes`.
+3. After feedstock creation, update version/sha in feedstock PRs for each release.
+
+Detailed conda notes are in `conda-recipe/README.md`.
+
+### 5) Publish Docker image to Docker Hub
+
+1. Add GitHub repository secrets:
+  - `DOCKERHUB_USERNAME`
+  - `DOCKERHUB_TOKEN` (Docker Hub access token)
+2. Push a release tag:
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+3. GitHub Actions workflow `publish-docker.yml` publishes:
+  - `ecrum19/vcf-rdfizer:1.0.0`
+  - `ecrum19/vcf-rdfizer:1.0`
+  - `ecrum19/vcf-rdfizer:1`
+  - `ecrum19/vcf-rdfizer:latest`
+
+Then users can run:
+```bash
+docker pull ecrum19/vcf-rdfizer
+```
+
+### 6) Keep versions aligned
+
+For each release, align:
+- `pyproject.toml` version
+- Git tag (`vX.Y.Z`)
+- Docker image tag (`ecrum19/vcf-rdfizer:X.Y.Z`)
+- `conda-recipe/meta.yaml` version
+
+This keeps install methods consistent and avoids user confusion.
+
+## Packaging Troubleshooting
+
+1. `No module named vcf_rdfizer_data` after install:
+  - reinstall from fresh wheel: `pip install --force-reinstall dist/*.whl`
+2. PyPI publish job fails authentication:
+  - verify trusted publisher config and environment name (`pypi`)
+3. Conda recipe fails source hash:
+  - recompute sha256 from exact release tarball URL and update `meta.yaml`
+4. Installed CLI cannot find default rules:
+  - run `vcf-rdfizer --rules /absolute/path/to/default_rules.ttl ...` and report issue
+5. CLI installs but conversion fails:
+  - Docker not running or unavailable to current user
+6. Docker publish workflow fails:
+  - verify `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` secrets
+
 ## Rules Directory
 
 - `rules/default_rules.ttl`: active default mapping aligned to `https://w3id.org/vcf-rdfizer/vocab#`
-- `rules/rules.ttl`: preserved legacy mapping (for comparison/migration)
 - `rules/README.md`: guide for extending `default_rules.ttl` with custom triples maps
 
 ## Notes On Mappings

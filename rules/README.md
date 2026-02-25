@@ -16,10 +16,6 @@ This directory contains RML mappings used by the conversion pipeline.
     - `/data/tsv/<sample>.header_lines.tsv`
     - `/data/tsv/<sample>.records.tsv`
 
-- `rules.ttl`
-  - Preserved legacy mapping from the previous repository layout.
-  - Kept for comparison and migration reference.
-
 ## How To Create A Custom Mapping
 
 1. Copy `default_rules.ttl` to a new file (for example `my_rules.ttl`).

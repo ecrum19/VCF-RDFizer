@@ -19,3 +19,6 @@ __pycache__/
 *.cover
 test/*.cover
 vcf_rdfizer.cover
+dist/
+build/
+*.egg-info/

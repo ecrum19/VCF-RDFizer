@@ -27,3 +27,22 @@ jobs:
 
       - name: Run unit tests
         run: python -m unittest discover -s test -p "test_*_unit.py" -v
+
+  package-smoke:
+    name: package-smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build + install wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+          python -m pip install dist/*.whl
+          vcf-rdfizer --help
