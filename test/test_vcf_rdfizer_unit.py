@@ -787,12 +787,13 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertIn("/opt/vcf-rdfizer/run_conversion.sh", commands[1])
 
     def test_main_full_mode_batch_layout_compresses_each_rml_part(self):
-        """Batch layout keeps RML output parts separate and compresses each part individually."""
+        """Batch layout compresses each part and prints one consolidated size summary."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             input_dir, rules_path = prepare_inputs(tmp_path)
             out_dir = tmp_path / "out"
             commands = []
+            out_buf = StringIO()
 
             def fake_run(cmd, cwd=None, env=None):
                 commands.append(cmd)
@@ -812,7 +813,7 @@ class WrapperUnitTests(VerboseTestCase):
                     vcf_rdfizer, "docker_image_exists", return_value=True
                 ), mock.patch.object(
                     vcf_rdfizer, "discover_tsv_triplets", return_value=mocked_triplets()
-                ):
+                ), redirect_stdout(out_buf):
                     rc = invoke_main(
                         [
                             "--input",
@@ -837,6 +838,7 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertEqual(len(gzip_cmds), 2)
             self.assertIn("/data/in/part-00000.nt", gzip_cmds[0][-1])
             self.assertIn("/data/in/part-00001.nt", gzip_cmds[1][-1])
+            self.assertEqual(out_buf.getvalue().count("* Output directory:"), 1)
 
     def test_main_full_mode_aggregate_layout_sets_merge_flag(self):
         """Aggregate layout passes AGGREGATE_RDF=1 to conversion step."""

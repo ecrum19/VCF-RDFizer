@@ -540,41 +540,6 @@ def print_nt_hdt_summary(
     """Print per-output size summary for RDF and selected compression artifacts."""
     print(f"{indent}* Output directory: {output_root}")
 
-    def rdf_label(path: Path) -> str:
-        if path.suffix == ".nt":
-            return "N-Triples (.nt)"
-        if path.suffix == ".nq":
-            return "N-Quads (.nq)"
-        if path.suffix:
-            return f"RDF ({path.suffix})"
-        return "RDF"
-
-    def output_name_for_method(path: Path, method: str) -> str:
-        stem = path.stem
-        ext = path.suffix.lstrip(".") or "nt"
-        if method == "gzip":
-            return f"{stem}.{ext}.gz"
-        if method == "brotli":
-            return f"{stem}.{ext}.br"
-        if method == "hdt":
-            return f"{stem}.hdt"
-        if method == "hdt_gzip":
-            return f"{stem}.hdt.gz"
-        if method == "hdt_brotli":
-            return f"{stem}.hdt.br"
-        return f"{stem}.{method}"
-
-    def label_for_method(path: Path, method: str) -> str:
-        ext = path.suffix.lstrip(".") or "nt"
-        labels = {
-            "gzip": f"gzip (.{ext}.gz)",
-            "brotli": f"brotli (.{ext}.br)",
-            "hdt": "HDT (.hdt)",
-            "hdt_gzip": "gzip-on-HDT (.hdt.gz)",
-            "hdt_brotli": "brotli-on-HDT (.hdt.br)",
-        }
-        return labels.get(method, method)
-
     nt_size = nt_size_override if nt_size_override is not None else file_size_bytes(nt_path)
 
     if nt_size is None:
@@ -583,7 +548,7 @@ def print_nt_hdt_summary(
         nt_text = f"{format_bytes(nt_size)} ({nt_path})"
     if nt_note:
         nt_text = f"{nt_text} ({nt_note})"
-    print(f"{indent}  - {rdf_label(nt_path)}: {nt_text}")
+    print(f"{indent}  - {rdf_label_for_path(nt_path)}: {nt_text}")
 
     # Backward-compatible fallback summary when no explicit compression method
     # set is provided to this printer.
@@ -601,7 +566,7 @@ def print_nt_hdt_summary(
 
     results = method_results or {}
     for method in selected_methods:
-        artifact_name = output_name_for_method(nt_path, method)
+        artifact_name = compression_artifact_name_for_method(nt_path, method)
         artifact_path = output_root / artifact_name
         result = results.get(method, {})
         size = result.get("output_size_bytes")
@@ -619,7 +584,48 @@ def print_nt_hdt_summary(
             if source == "existing":
                 artifact_text = f"{artifact_text} (reused existing HDT)"
 
-        print(f"{indent}  - {label_for_method(nt_path, method)}: {artifact_text}")
+        print(f"{indent}  - {compression_method_label_for_path(nt_path, method)}: {artifact_text}")
+
+
+def rdf_label_for_path(path: Path) -> str:
+    """Return human-readable RDF format label for a path."""
+    if path.suffix == ".nt":
+        return "N-Triples (.nt)"
+    if path.suffix == ".nq":
+        return "N-Quads (.nq)"
+    if path.suffix:
+        return f"RDF ({path.suffix})"
+    return "RDF"
+
+
+def compression_artifact_name_for_method(path: Path, method: str) -> str:
+    """Compute expected compressed artifact filename for a method."""
+    stem = path.stem
+    ext = path.suffix.lstrip(".") or "nt"
+    if method == "gzip":
+        return f"{stem}.{ext}.gz"
+    if method == "brotli":
+        return f"{stem}.{ext}.br"
+    if method == "hdt":
+        return f"{stem}.hdt"
+    if method == "hdt_gzip":
+        return f"{stem}.hdt.gz"
+    if method == "hdt_brotli":
+        return f"{stem}.hdt.br"
+    return f"{stem}.{method}"
+
+
+def compression_method_label_for_path(path: Path, method: str) -> str:
+    """Return human-readable compression method label for a path."""
+    ext = path.suffix.lstrip(".") or "nt"
+    labels = {
+        "gzip": f"gzip (.{ext}.gz)",
+        "brotli": f"brotli (.{ext}.br)",
+        "hdt": "HDT (.hdt)",
+        "hdt_gzip": "gzip-on-HDT (.hdt.gz)",
+        "hdt_brotli": "brotli-on-HDT (.hdt.br)",
+    }
+    return labels.get(method, method)
 
 
 def remove_file_with_docker_fallback(
@@ -1524,11 +1530,13 @@ def run_full_mode(
                 method_results_by_file[raw_rdf_path.name] = method_results
         print("    * Compression ✅")
 
+        raw_size_before_cleanup_by_file: dict[str, int] = {}
         try:
             # Persist machine-readable metrics after compression succeeds.
             for raw_rdf_path in raw_rdf_files:
                 method_results = method_results_by_file.get(raw_rdf_path.name, {})
                 source_size_before_cleanup = int(file_size_bytes(raw_rdf_path) or 0)
+                raw_size_before_cleanup_by_file[raw_rdf_path.name] = source_size_before_cleanup
                 write_compression_metrics_artifacts(
                     metrics_dir=metrics_dir,
                     run_id=run_id,
@@ -1588,27 +1596,70 @@ def run_full_mode(
                     ):
                         return 1
 
-        for raw_rdf_path in raw_rdf_files:
-            hdt_path = (out_dir / output_name) / f"{raw_rdf_path.stem}.hdt"
-            rdf_size = file_size_bytes(raw_rdf_path)
-            nt_note = None
-            method_results = method_results_by_file.get(raw_rdf_path.name, {})
-            if raw_rdf_path.exists():
-                nt_note = "retained via --keep-rdf" if keep_rdf else "retained"
-            elif not keep_rdf and selected_methods:
-                nt_note = "removed, set --keep-rdf to retain"
-            elif not keep_rdf and not selected_methods:
-                nt_note = "kept (compression methods set to none)"
-            print_nt_hdt_summary(
-                output_root=out_dir / output_name,
-                nt_path=raw_rdf_path,
-                hdt_path=hdt_path,
-                indent="    ",
-                nt_note=nt_note,
-                nt_size_override=rdf_size,
-                selected_methods=selected_methods,
-                method_results=method_results,
+        if rdf_layout == "batch" and raw_rdf_files:
+            output_root = out_dir / output_name
+            part_count = len(raw_rdf_files)
+            raw_total_size = sum(raw_size_before_cleanup_by_file.values())
+
+            if keep_rdf:
+                raw_note = "retained via --keep-rdf"
+            elif selected_methods:
+                raw_note = "removed, set --keep-rdf to retain"
+            else:
+                raw_note = "kept (compression methods set to none)"
+
+            first_path = raw_rdf_files[0]
+            print(f"    * Output directory: {output_root}")
+            print(f"      - RDF part files: {part_count}")
+            raw_text = f"{format_bytes(raw_total_size)} across {part_count} files"
+            print(
+                f"      - {rdf_label_for_path(first_path)} total: {raw_text} "
+                f"({raw_note})"
             )
+
+            if selected_methods:
+                for method in selected_methods:
+                    method_total = 0
+                    method_count = 0
+                    for raw_rdf_path in raw_rdf_files:
+                        result = method_results_by_file.get(raw_rdf_path.name, {}).get(method)
+                        if not result or int(result.get("exit_code", 1)) != 0:
+                            continue
+                        method_total += int(result.get("output_size_bytes") or 0)
+                        method_count += 1
+
+                    label = compression_method_label_for_path(first_path, method)
+                    if method_count == 0:
+                        print(f"      - {label}: not generated")
+                    else:
+                        print(
+                            f"      - {label}: {format_bytes(method_total)} "
+                            f"across {method_count} files"
+                        )
+            else:
+                print("      - Compression: none selected")
+        else:
+            for raw_rdf_path in raw_rdf_files:
+                hdt_path = (out_dir / output_name) / f"{raw_rdf_path.stem}.hdt"
+                rdf_size = file_size_bytes(raw_rdf_path)
+                nt_note = None
+                method_results = method_results_by_file.get(raw_rdf_path.name, {})
+                if raw_rdf_path.exists():
+                    nt_note = "retained via --keep-rdf" if keep_rdf else "retained"
+                elif not keep_rdf and selected_methods:
+                    nt_note = "removed, set --keep-rdf to retain"
+                elif not keep_rdf and not selected_methods:
+                    nt_note = "kept (compression methods set to none)"
+                print_nt_hdt_summary(
+                    output_root=out_dir / output_name,
+                    nt_path=raw_rdf_path,
+                    hdt_path=hdt_path,
+                    indent="    ",
+                    nt_note=nt_note,
+                    nt_size_override=rdf_size,
+                    selected_methods=selected_methods,
+                    method_results=method_results,
+                )
 
         if not keep_tsv:
             # Cleanup only the triplet generated for this input iteration.
