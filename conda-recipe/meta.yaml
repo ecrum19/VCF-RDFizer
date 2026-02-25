@@ -37,7 +37,7 @@ about:
   license: MIT
   license_file: LICENSE
   description: |
-    VCF-RDFizer provides a Python CLI wrapper around a Dockerized RDF conversion pipeline.
+    VCF-RDFizer provides a Python CLI wrapper around a Dockerized VCF to RDF conversion pipeline.
     It requires a working Docker installation at runtime for conversion/compression commands.
 
 extra:
