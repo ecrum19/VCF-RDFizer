@@ -152,19 +152,20 @@ Outputs:
   - each wrapper invocation creates a run-specific subdirectory: `run_metrics/<RUN_ID>/`
     - example: `run_metrics/20260225T120434/`
   - `run_metrics/<RUN_ID>/metrics.csv` includes both conversion and compression metrics for that run
+    - in `--rdf-layout batch`, compression metrics are aggregated across all part files so CSV stays one row per sample
     - compound-compression fields are explicit and separate from raw-RDF compression:
       - `gzip_on_hdt_*` (gzip applied to `.hdt`)
       - `brotli_on_hdt_*` (brotli applied to `.hdt`)
       - `hdt_source` (`generated` vs `existing` when reused)
   - conversion step artifacts:
-    - `run_metrics/<RUN_ID>/conversion-time-<output_name>-<run_id>.txt`
-    - `run_metrics/<RUN_ID>/conversion-metrics-<output_name>-<run_id>.json`
+    - `run_metrics/<RUN_ID>/conversion_time/<output_name>/<RUN_ID>`
+    - `run_metrics/<RUN_ID>/conversion_metrics/<output_name>/<RUN_ID>`
   - compression step artifacts:
-    - `run_metrics/<RUN_ID>/compression-time-<method>-<output_name>-<run_id>.txt`
-    - `run_metrics/<RUN_ID>/compression-metrics-<output_name>-<run_id>.json`
+    - `run_metrics/<RUN_ID>/compression_time/<method>/<output_name>/<RUN_ID>`
+    - `run_metrics/<RUN_ID>/compression_metrics/<output_name>/<RUN_ID>`
   - wrapper runtime artifacts:
     - `run_metrics/<RUN_ID>/wrapper_execution_times.csv` (one row for that run with mode, elapsed time, status, and full-mode triple totals when available)
-  - `run_metrics/<RUN_ID>/.wrapper_logs/wrapper-<run_id>.log` stores detailed Docker/stdout/stderr command output
+  - `run_metrics/<RUN_ID>/wrapper_logs/<RUN_ID>` stores detailed Docker/stdout/stderr command output
 
 Small VCF fixtures for RDF size/inflation test runs:
 - `test/test_vcf_files/test-100.vcf` (100 total lines)

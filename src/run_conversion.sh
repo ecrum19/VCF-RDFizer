@@ -29,8 +29,11 @@ SAFE_OUT_NAME=$(printf "%s" "$OUT_NAME" | tr -cs 'A-Za-z0-9._-' '_')
 if [[ -z "$SAFE_OUT_NAME" ]]; then
   SAFE_OUT_NAME="rdf"
 fi
-TIME_LOG="$LOGDIR/conversion-time-${SAFE_OUT_NAME}-${RUN_ID}.txt"
-METRICS_JSON="$LOGDIR/conversion-metrics-${SAFE_OUT_NAME}-${RUN_ID}.json"
+TIME_LOG_DIR="$LOGDIR/conversion_time/${SAFE_OUT_NAME}"
+METRICS_JSON_DIR="$LOGDIR/conversion_metrics/${SAFE_OUT_NAME}"
+mkdir -p "$TIME_LOG_DIR" "$METRICS_JSON_DIR"
+TIME_LOG="$TIME_LOG_DIR/${RUN_ID}"
+METRICS_JSON="$METRICS_JSON_DIR/${RUN_ID}"
 METRICS_CSV="$LOGDIR/metrics.csv"
 METRICS_HEADER="run_id,timestamp,output_name,output_dir,exit_code_java,wall_seconds_java,user_seconds_java,sys_seconds_java,max_rss_kb_java,input_mapping_size_bytes,input_vcf_size_bytes,output_dir_size_bytes,output_triples,jar,mapping_file,output_path,combined_nq_size_bytes,gzip_size_bytes,brotli_size_bytes,hdt_size_bytes,exit_code_gzip,exit_code_brotli,exit_code_hdt,wall_seconds_gzip,user_seconds_gzip,sys_seconds_gzip,max_rss_kb_gzip,wall_seconds_brotli,user_seconds_brotli,sys_seconds_brotli,max_rss_kb_brotli,wall_seconds_hdt,user_seconds_hdt,sys_seconds_hdt,max_rss_kb_hdt,compression_methods,hdt_source,gzip_on_hdt_size_bytes,brotli_on_hdt_size_bytes,exit_code_gzip_on_hdt,exit_code_brotli_on_hdt,wall_seconds_gzip_on_hdt,user_seconds_gzip_on_hdt,sys_seconds_gzip_on_hdt,max_rss_kb_gzip_on_hdt,wall_seconds_brotli_on_hdt,user_seconds_brotli_on_hdt,sys_seconds_brotli_on_hdt,max_rss_kb_brotli_on_hdt"
 
@@ -238,7 +241,7 @@ if [[ ! -f "$METRICS_CSV" ]]; then
 else
   EXISTING_HEADER=$(head -n 1 "$METRICS_CSV")
   if [[ "$EXISTING_HEADER" != "$METRICS_HEADER" ]]; then
-    BACKUP="$METRICS_CSV.bak-$RUN_ID"
+    BACKUP="$LOGDIR/metrics_csv_bak_${RUN_ID}"
     cp "$METRICS_CSV" "$BACKUP"
     echo "WARNING: metrics header mismatch; backed up to $BACKUP and creating new metrics file." >&2
     echo "$METRICS_HEADER" > "$METRICS_CSV"

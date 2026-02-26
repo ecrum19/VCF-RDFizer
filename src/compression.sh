@@ -184,7 +184,7 @@ if [[ ! -f "$METRICS_CSV" ]]; then
 else
   EXISTING_HEADER=$(head -n 1 "$METRICS_CSV")
   if [[ "$EXISTING_HEADER" != "$METRICS_HEADER" ]]; then
-    BACKUP="$METRICS_CSV.bak-$RUN_ID"
+    BACKUP="$LOGDIR/metrics_csv_bak_${RUN_ID}"
     cp "$METRICS_CSV" "$BACKUP"
     echo "WARNING: metrics header mismatch; backed up to $BACKUP and creating new metrics file." >&2
     echo "$METRICS_HEADER" > "$METRICS_CSV"
@@ -208,10 +208,15 @@ for OUT in "${OUTPUT_DIRS[@]}"; do
     SAFE_BASENAME="rdf"
   fi
 
-  TIME_LOG_GZIP="$LOGDIR/compression-time-gzip-${SAFE_BASENAME}-${RUN_ID}.txt"
-  TIME_LOG_BROTLI="$LOGDIR/compression-time-brotli-${SAFE_BASENAME}-${RUN_ID}.txt"
-  TIME_LOG_HDT="$LOGDIR/compression-time-hdt-${SAFE_BASENAME}-${RUN_ID}.txt"
-  METRICS_JSON="$LOGDIR/compression-metrics-${SAFE_BASENAME}-${RUN_ID}.json"
+  TIME_LOG_GZIP_DIR="$LOGDIR/compression_time/gzip/${SAFE_BASENAME}"
+  TIME_LOG_BROTLI_DIR="$LOGDIR/compression_time/brotli/${SAFE_BASENAME}"
+  TIME_LOG_HDT_DIR="$LOGDIR/compression_time/hdt/${SAFE_BASENAME}"
+  METRICS_JSON_DIR="$LOGDIR/compression_metrics/${SAFE_BASENAME}"
+  mkdir -p "$TIME_LOG_GZIP_DIR" "$TIME_LOG_BROTLI_DIR" "$TIME_LOG_HDT_DIR" "$METRICS_JSON_DIR"
+  TIME_LOG_GZIP="$TIME_LOG_GZIP_DIR/${RUN_ID}"
+  TIME_LOG_BROTLI="$TIME_LOG_BROTLI_DIR/${RUN_ID}"
+  TIME_LOG_HDT="$TIME_LOG_HDT_DIR/${RUN_ID}"
+  METRICS_JSON="$METRICS_JSON_DIR/${RUN_ID}"
 
   HDT_SOURCE="not_used"
   GZIP_ON_HDT_SIZE=0

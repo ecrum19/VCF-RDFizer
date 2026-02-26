@@ -447,8 +447,13 @@ def _as_int(value):
 def read_conversion_total_triples(metrics_dir: Path, output_name: str, run_id: str):
     """Read TOTAL triple count for one conversion output from conversion metrics JSON."""
     safe_name = safe_metrics_name(output_name)
-    metrics_json = metrics_dir / f"conversion-metrics-{safe_name}-{run_id}.json"
-    if not metrics_json.exists():
+    candidates = [
+        metrics_dir / "conversion_metrics" / safe_name / run_id,
+        # Backward compatibility with older artifact names:
+        metrics_dir / f"conversion-metrics-{safe_name}-{run_id}.json",
+    ]
+    metrics_json = next((path for path in candidates if path.exists()), None)
+    if metrics_json is None:
         return None
     try:
         payload = json.loads(metrics_json.read_text(encoding="utf-8"))
@@ -466,7 +471,14 @@ def collect_full_mode_total_triples(metrics_dir: Path, run_id: str):
     """Aggregate TOTAL triple counts across all conversion metrics files for a run."""
     total = 0
     found = False
-    for metrics_json in sorted(metrics_dir.glob(f"conversion-metrics-*-{run_id}.json")):
+    candidate_files = []
+    candidate_files.extend(sorted(metrics_dir.glob("conversion_metrics/*/*")))
+    # Backward compatibility with older artifact names:
+    candidate_files.extend(sorted(metrics_dir.glob(f"conversion-metrics-*-{run_id}.json")))
+
+    for metrics_json in candidate_files:
+        if metrics_json.name != run_id and not metrics_json.name.endswith(f"-{run_id}.json"):
+            continue
         try:
             payload = json.loads(metrics_json.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -880,7 +892,7 @@ def update_metrics_csv_with_compression(
         rows = list(reader)
 
     if fieldnames != METRICS_HEADER:
-        backup = metrics_csv.with_name(f"{metrics_csv.name}.bak-{run_id}")
+        backup = metrics_csv.with_name(f"metrics_csv_bak_{run_id}")
         shutil.copyfile(metrics_csv, backup)
         fieldnames = METRICS_HEADER
         rows = []
@@ -993,7 +1005,9 @@ def write_compression_metrics_artifacts(
     safe_name = safe_metrics_name(output_name)
 
     for method, result in method_results.items():
-        time_log = metrics_dir / f"compression-time-{method}-{safe_name}-{run_id}.txt"
+        time_log_dir = metrics_dir / "compression_time" / method / safe_name
+        time_log_dir.mkdir(parents=True, exist_ok=True)
+        time_log = time_log_dir / run_id
         lines = [
             f"method={method}",
             f"exit_code={result.get('exit_code', 1)}",
@@ -1075,8 +1089,51 @@ def write_compression_metrics_artifacts(
         },
     }
 
-    metrics_json = metrics_dir / f"compression-metrics-{safe_name}-{run_id}.json"
+    metrics_json_dir = metrics_dir / "compression_metrics" / safe_name
+    metrics_json_dir.mkdir(parents=True, exist_ok=True)
+    metrics_json = metrics_json_dir / run_id
     metrics_json.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def aggregate_method_results_across_files(method_results_by_file: dict[str, dict[str, dict]]):
+    """Aggregate per-file compression results into one per-method summary.
+
+    This is used for batch RDF layout where one VCF can produce many raw RDF
+    part files. Aggregation keeps metrics comparable with aggregate layout by
+    storing one row per sample (not one row per part file).
+    """
+    aggregated: dict[str, dict] = {}
+    for file_results in method_results_by_file.values():
+        for method, result in file_results.items():
+            current = aggregated.setdefault(
+                method,
+                {
+                    "exit_code": 0,
+                    "wall_seconds": 0.0,
+                    "output_size_bytes": 0,
+                },
+            )
+            current["exit_code"] = max(
+                int(current.get("exit_code", 0)),
+                int(result.get("exit_code") or 0),
+            )
+            wall = result.get("wall_seconds")
+            if wall is not None:
+                current["wall_seconds"] = float(current.get("wall_seconds", 0.0)) + float(wall)
+            current["output_size_bytes"] = int(current.get("output_size_bytes", 0)) + int(
+                result.get("output_size_bytes") or 0
+            )
+
+            source = result.get("source")
+            if source is not None:
+                source = str(source)
+                prior = current.get("source")
+                if prior is None:
+                    current["source"] = source
+                elif prior != source:
+                    current["source"] = "mixed"
+
+    return aggregated
 
 
 def validate_mode_dirs(paths):
@@ -1530,33 +1587,61 @@ def run_full_mode(
                 method_results_by_file[raw_rdf_path.name] = method_results
         print("    * Compression ✅")
 
-        raw_size_before_cleanup_by_file: dict[str, int] = {}
+        raw_size_before_cleanup_by_file = {
+            raw_rdf_path.name: int(file_size_bytes(raw_rdf_path) or 0) for raw_rdf_path in raw_rdf_files
+        }
         try:
             # Persist machine-readable metrics after compression succeeds.
-            for raw_rdf_path in raw_rdf_files:
-                method_results = method_results_by_file.get(raw_rdf_path.name, {})
-                source_size_before_cleanup = int(file_size_bytes(raw_rdf_path) or 0)
-                raw_size_before_cleanup_by_file[raw_rdf_path.name] = source_size_before_cleanup
+            if rdf_layout == "batch":
+                # Batch mode produces many RDF parts for a single sample. Keep
+                # one metrics row per sample by aggregating per-part compression
+                # outputs and timings.
+                aggregated_results = aggregate_method_results_across_files(method_results_by_file)
+                combined_size_before_cleanup = sum(raw_size_before_cleanup_by_file.values())
                 write_compression_metrics_artifacts(
                     metrics_dir=metrics_dir,
                     run_id=run_id,
                     timestamp=timestamp,
-                    output_name=raw_rdf_path.stem,
-                    source_rdf_path=raw_rdf_path,
-                    combined_size_bytes=source_size_before_cleanup,
+                    output_name=output_name,
+                    source_rdf_path=out_dir / output_name,
+                    combined_size_bytes=combined_size_before_cleanup,
                     selected_methods=selected_methods,
-                    method_results=method_results,
+                    method_results=aggregated_results,
                 )
                 update_metrics_csv_with_compression(
                     metrics_csv=metrics_dir / "metrics.csv",
                     run_id=run_id,
                     timestamp=timestamp,
-                    output_name=raw_rdf_path.stem,
+                    output_name=output_name,
                     output_dir=out_dir / output_name,
-                    combined_size_bytes=source_size_before_cleanup,
+                    combined_size_bytes=combined_size_before_cleanup,
                     selected_methods=selected_methods,
-                    method_results=method_results,
+                    method_results=aggregated_results,
                 )
+            else:
+                for raw_rdf_path in raw_rdf_files:
+                    method_results = method_results_by_file.get(raw_rdf_path.name, {})
+                    source_size_before_cleanup = raw_size_before_cleanup_by_file[raw_rdf_path.name]
+                    write_compression_metrics_artifacts(
+                        metrics_dir=metrics_dir,
+                        run_id=run_id,
+                        timestamp=timestamp,
+                        output_name=raw_rdf_path.stem,
+                        source_rdf_path=raw_rdf_path,
+                        combined_size_bytes=source_size_before_cleanup,
+                        selected_methods=selected_methods,
+                        method_results=method_results,
+                    )
+                    update_metrics_csv_with_compression(
+                        metrics_csv=metrics_dir / "metrics.csv",
+                        run_id=run_id,
+                        timestamp=timestamp,
+                        output_name=raw_rdf_path.stem,
+                        output_dir=out_dir / output_name,
+                        combined_size_bytes=source_size_before_cleanup,
+                        selected_methods=selected_methods,
+                        method_results=method_results,
+                    )
         except PermissionError as exc:
             blocked_path = exc.filename or str(metrics_dir)
             eprint("Error: unable to write compression metrics due to file permissions.")
@@ -2037,7 +2122,7 @@ def main():
                 "You may run out of space."
             )
 
-    wrapper_log_path = metrics_dir / ".wrapper_logs" / f"wrapper-{run_id}.log"
+    wrapper_log_path = metrics_dir / "wrapper_logs" / run_id
     execution_started = time.perf_counter()
     global _COMMAND_LOGGER
     _COMMAND_LOGGER = CommandLogger(wrapper_log_path)

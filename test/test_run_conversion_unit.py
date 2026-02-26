@@ -67,8 +67,8 @@ printf '<s> <p> <o> .\\n' > "$out/part-000"
             merged_nt = out_dir / "rdf" / "rdf.nt"
             self.assertTrue(merged_nt.exists())
             self.assertIn("<s> <p> <o> .", merged_nt.read_text())
-            self.assertTrue((metrics_dir / "conversion-time-rdf-run123.txt").exists())
-            self.assertTrue((metrics_dir / "conversion-metrics-rdf-run123.json").exists())
+            self.assertTrue((metrics_dir / "conversion_time" / "rdf" / "run123").exists())
+            self.assertTrue((metrics_dir / "conversion_metrics" / "rdf" / "run123").exists())
 
             metrics_csv = metrics_dir / "metrics.csv"
             self.assertTrue(metrics_csv.exists())
@@ -183,7 +183,7 @@ printf '<s> <p> <o> .\\n' > "$out/part-000"
 
             result = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, msg=result.stderr)
-            self.assertTrue((metrics_dir / "metrics.csv.bak-run-hdr").exists())
+            self.assertTrue((metrics_dir / "metrics_csv_bak_run-hdr").exists())
 
     def test_run_conversion_handles_comment_only_output_without_crashing(self):
         """Comment-only output does not crash triple counting and records zero triples."""

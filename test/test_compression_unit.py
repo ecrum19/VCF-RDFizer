@@ -154,10 +154,10 @@ class CompressionUnitTests(VerboseTestCase):
             self.assertTrue((output / "rdf.nq.gz").exists())
             self.assertTrue((output / "rdf.nq.br").exists())
             self.assertTrue((output / "rdf.hdt").exists())
-            self.assertTrue((logdir / "compression-time-gzip-rdf-run-compress-1.txt").exists())
-            self.assertTrue((logdir / "compression-time-brotli-rdf-run-compress-1.txt").exists())
-            self.assertTrue((logdir / "compression-time-hdt-rdf-run-compress-1.txt").exists())
-            self.assertTrue((logdir / "compression-metrics-rdf-run-compress-1.json").exists())
+            self.assertTrue((logdir / "compression_time" / "gzip" / "rdf" / "run-compress-1").exists())
+            self.assertTrue((logdir / "compression_time" / "brotli" / "rdf" / "run-compress-1").exists())
+            self.assertTrue((logdir / "compression_time" / "hdt" / "rdf" / "run-compress-1").exists())
+            self.assertTrue((logdir / "compression_metrics" / "rdf" / "run-compress-1").exists())
 
             row = read_metrics_row(metrics_csv, run_id, "rdf")
             self.assertEqual(row["run_id"], run_id)
@@ -327,7 +327,7 @@ class CompressionUnitTests(VerboseTestCase):
             )
             result = subprocess.run(["bash", str(SCRIPT), "-m", "gzip"], env=env, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, msg=result.stderr)
-            self.assertTrue((logdir / "metrics.csv.bak-run-hdr").exists())
+            self.assertTrue((logdir / "metrics_csv_bak_run-hdr").exists())
 
     def test_compression_reports_failure_when_gzip_fails(self):
         """gzip failure path returns non-zero and records gzip exit code."""

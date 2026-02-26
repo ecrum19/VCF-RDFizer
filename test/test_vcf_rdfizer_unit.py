@@ -471,7 +471,9 @@ class WrapperUnitTests(VerboseTestCase):
                     payload = {"artifacts": {"output_triples": {"TOTAL": 17}}}
                     run_metrics_dir = metrics_dir / run_id
                     run_metrics_dir.mkdir(parents=True, exist_ok=True)
-                    (run_metrics_dir / f"conversion-metrics-{out_name}-{run_id}.json").write_text(
+                    conversion_metrics_dir = run_metrics_dir / "conversion_metrics" / out_name
+                    conversion_metrics_dir.mkdir(parents=True, exist_ok=True)
+                    (conversion_metrics_dir / run_id).write_text(
                         json.dumps(payload),
                         encoding="utf-8",
                     )
@@ -840,6 +842,58 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertIn("/data/in/part-00001.nt", gzip_cmds[1][-1])
             self.assertEqual(out_buf.getvalue().count("* Output directory:"), 1)
 
+    def test_main_full_mode_batch_metrics_upsert_is_sample_scoped(self):
+        """Batch layout writes compression CSV metrics once per sample, not once per RDF part."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+            out_dir = tmp_path / "out"
+            seen_output_names = []
+
+            def fake_run(cmd, cwd=None, env=None):
+                if "/opt/vcf-rdfizer/run_conversion.sh" in cmd:
+                    sample_dir = out_dir / "sample"
+                    sample_dir.mkdir(parents=True, exist_ok=True)
+                    (sample_dir / "part-00000.nt").write_text("<s1> <p> <o> .\n")
+                    (sample_dir / "part-00001.nt").write_text("<s2> <p> <o> .\n")
+                return 0
+
+            def fake_update_metrics_csv_with_compression(**kwargs):
+                seen_output_names.append(kwargs["output_name"])
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch.object(
+                    vcf_rdfizer, "check_docker", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "docker_image_exists", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "discover_tsv_triplets", return_value=mocked_triplets()
+                ), mock.patch.object(
+                    vcf_rdfizer, "update_metrics_csv_with_compression", side_effect=fake_update_metrics_csv_with_compression
+                ):
+                    rc = invoke_main(
+                        [
+                            "--input",
+                            str(input_dir),
+                            "--rules",
+                            str(rules_path),
+                            "--rdf-layout",
+                            "batch",
+                            "--compression",
+                            "gzip",
+                            "--out",
+                            str(out_dir),
+                            "--keep-tsv",
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(seen_output_names, ["sample"])
+
     def test_main_full_mode_aggregate_layout_sets_merge_flag(self):
         """Aggregate layout passes AGGREGATE_RDF=1 to conversion step."""
         with tempfile.TemporaryDirectory() as td:
@@ -1151,10 +1205,10 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertIn("sample", csv_text)
             self.assertIn("hdt", csv_text)
 
-            json_files = list(run_metrics_dir.glob("compression-metrics-sample-*.json"))
-            time_files = list(run_metrics_dir.glob("compression-time-hdt-sample-*.txt"))
-            self.assertTrue(json_files)
-            self.assertTrue(time_files)
+            json_file = run_metrics_dir / "compression_metrics" / "sample" / run_metrics_dir.name
+            time_file = run_metrics_dir / "compression_time" / "hdt" / "sample" / run_metrics_dir.name
+            self.assertTrue(json_file.exists())
+            self.assertTrue(time_file.exists())
 
     def test_main_full_mode_deletes_nt_with_docker_fallback_on_permission_error(self):
         """Full mode falls back to Docker-based removal when .nt unlink raises PermissionError."""
