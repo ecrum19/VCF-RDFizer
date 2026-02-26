@@ -473,7 +473,7 @@ class WrapperUnitTests(VerboseTestCase):
                     run_metrics_dir.mkdir(parents=True, exist_ok=True)
                     conversion_metrics_dir = run_metrics_dir / "conversion_metrics" / out_name
                     conversion_metrics_dir.mkdir(parents=True, exist_ok=True)
-                    (conversion_metrics_dir / run_id).write_text(
+                    (conversion_metrics_dir / f"{run_id}.json").write_text(
                         json.dumps(payload),
                         encoding="utf-8",
                     )
@@ -1205,8 +1205,8 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertIn("sample", csv_text)
             self.assertIn("hdt", csv_text)
 
-            json_file = run_metrics_dir / "compression_metrics" / "sample" / run_metrics_dir.name
-            time_file = run_metrics_dir / "compression_time" / "hdt" / "sample" / run_metrics_dir.name
+            json_file = run_metrics_dir / "compression_metrics" / "sample" / f"{run_metrics_dir.name}.json"
+            time_file = run_metrics_dir / "compression_time" / "hdt" / "sample" / f"{run_metrics_dir.name}.txt"
             self.assertTrue(json_file.exists())
             self.assertTrue(time_file.exists())
 

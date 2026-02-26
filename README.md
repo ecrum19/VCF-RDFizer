@@ -158,14 +158,14 @@ Outputs:
       - `brotli_on_hdt_*` (brotli applied to `.hdt`)
       - `hdt_source` (`generated` vs `existing` when reused)
   - conversion step artifacts:
-    - `run_metrics/<RUN_ID>/conversion_time/<output_name>/<RUN_ID>`
-    - `run_metrics/<RUN_ID>/conversion_metrics/<output_name>/<RUN_ID>`
+    - `run_metrics/<RUN_ID>/conversion_time/<output_name>/<RUN_ID>.txt`
+    - `run_metrics/<RUN_ID>/conversion_metrics/<output_name>/<RUN_ID>.json`
   - compression step artifacts:
-    - `run_metrics/<RUN_ID>/compression_time/<method>/<output_name>/<RUN_ID>`
-    - `run_metrics/<RUN_ID>/compression_metrics/<output_name>/<RUN_ID>`
+    - `run_metrics/<RUN_ID>/compression_time/<method>/<output_name>/<RUN_ID>.txt`
+    - `run_metrics/<RUN_ID>/compression_metrics/<output_name>/<RUN_ID>.json`
   - wrapper runtime artifacts:
     - `run_metrics/<RUN_ID>/wrapper_execution_times.csv` (one row for that run with mode, elapsed time, status, and full-mode triple totals when available)
-  - `run_metrics/<RUN_ID>/wrapper_logs/<RUN_ID>` stores detailed Docker/stdout/stderr command output
+  - `run_metrics/<RUN_ID>/wrapper_logs/<RUN_ID>.log` stores detailed Docker/stdout/stderr command output
 
 Small VCF fixtures for RDF size/inflation test runs:
 - `test/test_vcf_files/test-100.vcf` (100 total lines)

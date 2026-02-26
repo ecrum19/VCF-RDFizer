@@ -448,6 +448,7 @@ def read_conversion_total_triples(metrics_dir: Path, output_name: str, run_id: s
     """Read TOTAL triple count for one conversion output from conversion metrics JSON."""
     safe_name = safe_metrics_name(output_name)
     candidates = [
+        metrics_dir / "conversion_metrics" / safe_name / f"{run_id}.json",
         metrics_dir / "conversion_metrics" / safe_name / run_id,
         # Backward compatibility with older artifact names:
         metrics_dir / f"conversion-metrics-{safe_name}-{run_id}.json",
@@ -477,7 +478,11 @@ def collect_full_mode_total_triples(metrics_dir: Path, run_id: str):
     candidate_files.extend(sorted(metrics_dir.glob(f"conversion-metrics-*-{run_id}.json")))
 
     for metrics_json in candidate_files:
-        if metrics_json.name != run_id and not metrics_json.name.endswith(f"-{run_id}.json"):
+        if (
+            metrics_json.name != run_id
+            and metrics_json.name != f"{run_id}.json"
+            and not metrics_json.name.endswith(f"-{run_id}.json")
+        ):
             continue
         try:
             payload = json.loads(metrics_json.read_text(encoding="utf-8"))
@@ -892,7 +897,7 @@ def update_metrics_csv_with_compression(
         rows = list(reader)
 
     if fieldnames != METRICS_HEADER:
-        backup = metrics_csv.with_name(f"metrics_csv_bak_{run_id}")
+        backup = metrics_csv.with_name(f"metrics_csv_bak_{run_id}.csv")
         shutil.copyfile(metrics_csv, backup)
         fieldnames = METRICS_HEADER
         rows = []
@@ -1007,7 +1012,7 @@ def write_compression_metrics_artifacts(
     for method, result in method_results.items():
         time_log_dir = metrics_dir / "compression_time" / method / safe_name
         time_log_dir.mkdir(parents=True, exist_ok=True)
-        time_log = time_log_dir / run_id
+        time_log = time_log_dir / f"{run_id}.txt"
         lines = [
             f"method={method}",
             f"exit_code={result.get('exit_code', 1)}",
@@ -1091,7 +1096,7 @@ def write_compression_metrics_artifacts(
 
     metrics_json_dir = metrics_dir / "compression_metrics" / safe_name
     metrics_json_dir.mkdir(parents=True, exist_ok=True)
-    metrics_json = metrics_json_dir / run_id
+    metrics_json = metrics_json_dir / f"{run_id}.json"
     metrics_json.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
@@ -2122,7 +2127,7 @@ def main():
                 "You may run out of space."
             )
 
-    wrapper_log_path = metrics_dir / "wrapper_logs" / run_id
+    wrapper_log_path = metrics_dir / "wrapper_logs" / f"{run_id}.log"
     execution_started = time.perf_counter()
     global _COMMAND_LOGGER
     _COMMAND_LOGGER = CommandLogger(wrapper_log_path)
