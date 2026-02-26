@@ -39,6 +39,7 @@ RUN apt-get update \
     gzip \
     libserd-0-0 \
     nodejs \
+    time \
   && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /opt/rmlstreamer \
