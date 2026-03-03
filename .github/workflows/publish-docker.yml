@@ -4,12 +4,28 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "v*.0.0"
   workflow_dispatch:
+    inputs:
+      docker_tag:
+        description: "Optional explicit Docker tag (example: v1.0.6)"
+        required: false
+        type: string
 
 jobs:
   docker:
     name: build-and-push-docker
     runs-on: ubuntu-latest
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' ||
+        (startsWith(github.ref, 'refs/tags/v') && endsWith(github.ref_name, '.0.0')) ||
+        (github.event_name == 'push' &&
+         github.ref == 'refs/heads/main' &&
+         (contains(github.event.head_commit.message || '', '[publish-docker]') ||
+          contains(github.event.head_commit.message || '', '[docker]')))
+      }}
     permissions:
       contents: read
     steps:
@@ -30,11 +46,16 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Resolve next Docker version (v1.0.N)
+      - name: Resolve Docker image tag
         id: version
         env:
           DOCKERHUB_NAMESPACE: ecrum19
           DOCKERHUB_REPO: vcf-rdfizer
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message || '' }}
+          INPUT_DOCKER_TAG: ${{ github.event.inputs.docker_tag || '' }}
         run: |
           python - <<'PY'
           import json
@@ -45,7 +66,14 @@ jobs:
 
           namespace = os.environ["DOCKERHUB_NAMESPACE"]
           repo = os.environ["DOCKERHUB_REPO"]
+          event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+          github_ref = os.environ.get("GITHUB_REF", "")
+          ref_name = os.environ.get("GITHUB_REF_NAME", "")
+          head_message = os.environ.get("HEAD_COMMIT_MESSAGE", "")
+          manual_tag = os.environ.get("INPUT_DOCKER_TAG", "").strip()
           pattern = re.compile(r"^v1\.0\.(\d+)$")
+          major_release_pattern = re.compile(r"^v\d+\.0\.0$")
+          explicit_from_commit = re.search(r"\[(?:publish-docker|docker)=([A-Za-z0-9_.-]+)\]", head_message)
 
           def parse_max(tags):
               max_n = -1
@@ -55,23 +83,33 @@ jobs:
                       max_n = max(max_n, int(m.group(1)))
               return max_n
 
-          max_n = -1
-          try:
-              url = f"https://hub.docker.com/v2/repositories/{namespace}/{repo}/tags?page_size=100"
-              while url:
-                  with urllib.request.urlopen(url, timeout=20) as resp:
-                      payload = json.load(resp)
-                  max_n = max(max_n, parse_max([item.get("name", "") for item in payload.get("results", [])]))
-                  url = payload.get("next")
-          except Exception:
-              tags = subprocess.check_output(["git", "tag"], text=True).splitlines()
-              max_n = max(max_n, parse_max(tags))
+          resolved_tag = ""
+          if manual_tag:
+              resolved_tag = manual_tag
+          elif event_name == "push" and github_ref.startswith("refs/tags/") and major_release_pattern.match(ref_name):
+              resolved_tag = ref_name
+          elif explicit_from_commit:
+              resolved_tag = explicit_from_commit.group(1)
+          else:
+              max_n = -1
+              try:
+                  url = f"https://hub.docker.com/v2/repositories/{namespace}/{repo}/tags?page_size=100"
+                  while url:
+                      with urllib.request.urlopen(url, timeout=20) as resp:
+                          payload = json.load(resp)
+                      max_n = max(max_n, parse_max([item.get("name", "") for item in payload.get("results", [])]))
+                      url = payload.get("next")
+              except Exception:
+                  tags = subprocess.check_output(["git", "tag"], text=True).splitlines()
+                  max_n = max(max_n, parse_max(tags))
+              resolved_tag = f"v1.0.{max_n + 1}"
 
-          next_version = f"v1.0.{max_n + 1}"
-          print(f"Next Docker version: {next_version}")
+          if not re.match(r"^[A-Za-z0-9_.-]+$", resolved_tag):
+              raise SystemExit(f"Invalid Docker tag: {resolved_tag}")
+          print(f"Resolved Docker tag: {resolved_tag}")
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
-              f.write(f"next_version={next_version}\n")
+              f.write(f"next_version={resolved_tag}\n")
           PY
 
       - name: Docker metadata
