@@ -140,6 +140,22 @@ def eprint(*args):
     print(*args, file=sys.stderr)
 
 
+def ui_symbol(symbol: str, fallback: str) -> str:
+    """Return a console symbol or ASCII fallback when stdout encoding can't represent it."""
+    stream = getattr(sys, "stdout", None)
+    encoding = getattr(stream, "encoding", None) or "utf-8"
+    try:
+        symbol.encode(encoding)
+        return symbol
+    except (UnicodeEncodeError, LookupError):
+        return fallback
+
+
+def success_symbol() -> str:
+    """Unicode checkmark with ASCII fallback for Windows cp1252 consoles."""
+    return ui_symbol("✅", "[ok]")
+
+
 def run(cmd, cwd=None, env=None):
     """Run a command and return only its exit code.
 
@@ -1168,11 +1184,11 @@ def ensure_image_available(
         if docker_build_image(image_ref, repo_root) != 0:
             eprint(f"Error: docker build failed. See log: {wrapper_log_path}")
             return 1
-        print(f"{step_label}: Ensuring Docker image is available ✅")
+        print(f"{step_label}: Ensuring Docker image is available {success_symbol()}")
         return 0
 
     if docker_image_exists(image_ref):
-        print(f"{step_label}: Ensuring Docker image is available ✅")
+        print(f"{step_label}: Ensuring Docker image is available {success_symbol()}")
         return 0
 
     if version_requested:
@@ -1181,7 +1197,7 @@ def ensure_image_available(
         if docker_pull_image(image_ref) != 0:
             eprint(f"Error: image version '{image_ref}' not found. See log: {wrapper_log_path}")
             return 2
-        print(f"{step_label}: Ensuring Docker image is available ✅")
+        print(f"{step_label}: Ensuring Docker image is available {success_symbol()}")
         return 0
 
     if no_build:
@@ -1193,7 +1209,7 @@ def ensure_image_available(
     if docker_build_image(image_ref, repo_root) != 0:
         eprint(f"Error: docker build failed. See log: {wrapper_log_path}")
         return 1
-    print(f"{step_label}: Ensuring Docker image is available ✅")
+    print(f"{step_label}: Ensuring Docker image is available {success_symbol()}")
     return 0
 
 
@@ -1327,7 +1343,7 @@ def run_compression_methods_for_rdf(
             if not run_container_command(method=method, output_name=output_name, command=command):
                 return False, method_results
             if status_indent is not None:
-                print(f"{status_indent}- {method}: {output_name} ✅")
+                print(f"{status_indent}- {method}: {output_name} {success_symbol()}")
             continue
 
         if method == "brotli":
@@ -1341,7 +1357,7 @@ def run_compression_methods_for_rdf(
             if not run_container_command(method=method, output_name=output_name, command=command):
                 return False, method_results
             if status_indent is not None:
-                print(f"{status_indent}- {method}: {output_name} ✅")
+                print(f"{status_indent}- {method}: {output_name} {success_symbol()}")
             continue
 
         if method == "hdt":
@@ -1349,7 +1365,7 @@ def run_compression_methods_for_rdf(
                 return False, method_results
             if status_indent is not None:
                 suffix = " (reused existing HDT)" if hdt_source == "existing" else ""
-                print(f"{status_indent}- hdt: {hdt_name} ✅{suffix}")
+                print(f"{status_indent}- hdt: {hdt_name} {success_symbol()}{suffix}")
             continue
 
         if method == "hdt_gzip":
@@ -1366,7 +1382,7 @@ def run_compression_methods_for_rdf(
                 return False, method_results
             if status_indent is not None:
                 suffix = " (using existing HDT)" if hdt_source == "existing" else ""
-                print(f"{status_indent}- {method}: {output_name} ✅{suffix}")
+                print(f"{status_indent}- {method}: {output_name} {success_symbol()}{suffix}")
             continue
 
         if method == "hdt_brotli":
@@ -1383,7 +1399,7 @@ def run_compression_methods_for_rdf(
                 return False, method_results
             if status_indent is not None:
                 suffix = " (using existing HDT)" if hdt_source == "existing" else ""
-                print(f"{status_indent}- {method}: {output_name} ✅{suffix}")
+                print(f"{status_indent}- {method}: {output_name} {success_symbol()}{suffix}")
             continue
 
     return True, method_results
@@ -1462,7 +1478,7 @@ def run_full_mode(
         if run(tsv_cmd) != 0:
             eprint(f"Error: TSV conversion failed. See log: {wrapper_log_path}")
             return 1
-        print("    * TSV conversion ✅")
+        print(f"    * TSV conversion {success_symbol()}")
 
         # Discover and lock the exact triplet generated for this input; this
         # guards against stale TSV files from previous runs.
@@ -1543,7 +1559,7 @@ def run_full_mode(
         if run(run_cmd) != 0:
             eprint(f"Error: RMLStreamer step failed for '{prefix}'. See log: {wrapper_log_path}")
             return 1
-        print("    * RDF conversion ✅")
+        print(f"    * RDF conversion {success_symbol()}")
 
         triples_produced = read_conversion_total_triples(metrics_dir, output_name, run_id)
         if triples_produced is not None:
@@ -1590,7 +1606,7 @@ def run_full_mode(
                 if not ok:
                     return 1
                 method_results_by_file[raw_rdf_path.name] = method_results
-        print("    * Compression ✅")
+        print(f"    * Compression {success_symbol()}")
 
         raw_size_before_cleanup_by_file = {
             raw_rdf_path.name: int(file_size_bytes(raw_rdf_path) or 0) for raw_rdf_path in raw_rdf_files
@@ -2105,7 +2121,7 @@ def main():
         eprint(f"Error: {exc}")
         return 2
 
-    print(f"{step1_label}: Validating inputs ✅")
+    print(f"{step1_label}: Validating inputs {success_symbol()}")
 
     if mode == "full" and args.estimate_size:
         # Optional coarse sizing estimate for disk-risk visibility.

@@ -32,6 +32,12 @@ class WrapperCrossPlatformUnitTests(VerboseTestCase):
         self.assertEqual(image, "ecrum19/vcf-rdfizer:1.0.0")
         self.assertTrue(requested)
 
+    def test_success_symbol_falls_back_for_cp1252_console(self):
+        """Success marker uses ASCII fallback when stdout encoding cannot encode emoji."""
+        fake_stdout = type("FakeStdout", (), {"encoding": "cp1252"})()
+        with mock.patch.object(vcf_rdfizer.sys, "stdout", fake_stdout):
+            self.assertEqual(vcf_rdfizer.success_symbol(), "[ok]")
+
     def test_parse_compression_methods_none(self):
         """Compression parser accepts 'none' as no-op selection."""
         self.assertEqual(vcf_rdfizer.parse_compression_methods("none"), [])
