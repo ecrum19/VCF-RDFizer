@@ -136,6 +136,19 @@ vcf-rdfizer --help
 
 Note: these installs provide the Python wrapper CLI. Docker is still required at runtime.
 
+## Third-Party Licensing
+
+This project depends on:
+- `RMLStreamer`: <https://github.com/RMLio/RMLStreamer>
+- `HDT-cpp`: <https://github.com/rdfhdt/hdt-cpp>
+
+License/compliance handling:
+- Python/Conda package (`vcf-rdfizer`) ships the wrapper only.
+- Docker image ships third-party runtime tools and includes copied license files under:
+  - `/usr/share/licenses/vcf-rdfizer/`
+- Repository notice file:
+  - `THIRD_PARTY_NOTICES.md`
+
 Outputs:
 - `./tsv` for TSV intermediates
 - `./out` for RDF output

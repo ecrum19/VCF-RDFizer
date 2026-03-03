@@ -30,3 +30,9 @@ After the initial feedstock is created:
 
 `vcf-rdfizer` uses Docker for actual conversion/compression execution.
 Conda installs the wrapper CLI; users still need Docker installed and running.
+
+## License scope reminder
+
+The conda package distributes the Python wrapper only.
+Third-party runtime tools used by the Docker image (for example HDT-cpp and
+RMLStreamer) are documented in `THIRD_PARTY_NOTICES.md`.
