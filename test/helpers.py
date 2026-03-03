@@ -21,7 +21,7 @@ METRICS_HEADER = [
     "jar",
     "mapping_file",
     "output_path",
-    "combined_nq_size_bytes",
+    "combined_rdf_size_bytes",
     "gzip_size_bytes",
     "brotli_size_bytes",
     "hdt_size_bytes",

@@ -12,7 +12,24 @@ from test.helpers import VerboseTestCase
 
 
 def invoke_main(argv):
-    with mock.patch.object(sys, "argv", ["vcf_rdfizer.py", *argv]):
+    args = []
+    skip_next = False
+    argv = list(argv)
+    for index, token in enumerate(argv):
+        if skip_next:
+            skip_next = False
+            continue
+        if token == "--rdf":
+            args.append("--rdf")
+            continue
+        if token in {"--metrics", "--tsv"} and index + 1 < len(argv):
+            skip_next = True
+            continue
+        args.append(token)
+    if "--out" not in args and "-o" not in args:
+        args.extend(["--out", "./out"])
+
+    with mock.patch.object(sys, "argv", ["vcf_rdfizer.py", *args]):
         return vcf_rdfizer.main()
 
 
@@ -79,7 +96,7 @@ class WrapperCrossPlatformUnitTests(VerboseTestCase):
                         [
                             "--mode",
                             "compress",
-                            "--nq",
+                            "--rdf",
                             str(nt_path),
                             "--compression",
                             "gzip",

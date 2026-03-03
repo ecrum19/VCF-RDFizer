@@ -61,7 +61,7 @@ METRICS_HEADER = [
     "jar",
     "mapping_file",
     "output_path",
-    "combined_nq_size_bytes",
+    "combined_rdf_size_bytes",
     "gzip_size_bytes",
     "brotli_size_bytes",
     "hdt_size_bytes",
@@ -624,8 +624,6 @@ def rdf_label_for_path(path: Path) -> str:
     """Return human-readable RDF format label for a path."""
     if path.suffix == ".nt":
         return "N-Triples (.nt)"
-    if path.suffix == ".nq":
-        return "N-Quads (.nq)"
     if path.suffix:
         return f"RDF ({path.suffix})"
     return "RDF"
@@ -711,6 +709,15 @@ def existing_parent(path: Path) -> Path:
             break
         cur = cur.parent
     return cur
+
+
+def is_within_path(path: Path, root: Path) -> bool:
+    """Return whether `path` is located under `root` after resolution."""
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
 
 
 def collect_input_vcfs(input_path: Path):
@@ -932,7 +939,7 @@ def update_metrics_csv_with_compression(
         row["output_dir"] = str(output_dir)
         rows.append(row)
 
-    row["combined_nq_size_bytes"] = str(int(combined_size_bytes))
+    row["combined_rdf_size_bytes"] = str(int(combined_size_bytes))
     row["compression_methods"] = "|".join(selected_methods) if selected_methods else "none"
 
     defaults = {
@@ -1050,8 +1057,8 @@ def write_compression_metrics_artifacts(
         "output_dir": str(source_rdf_path.parent),
         "output_name": output_name,
         "compression_methods": ",".join(selected_methods) if selected_methods else "none",
-        "combined_nq_path": str(source_rdf_path),
-        "combined_nq_size_bytes": int(combined_size_bytes),
+        "combined_rdf_path": str(source_rdf_path),
+        "combined_rdf_size_bytes": int(combined_size_bytes),
         "hdt_source": str(hdt_result.get("source") or "not_used"),
         "gzip_raw_rdf": {
             "output_gz_path": gzip_result.get("output_path", ""),
@@ -1570,22 +1577,17 @@ def run_full_mode(
         if rdf_layout == "aggregate":
             # Aggregate mode yields one merged RDF artifact per sample.
             nt_path = out_dir / output_name / f"{output_name}.nt"
-            nq_path = out_dir / output_name / f"{output_name}.nq"
             if nt_path.exists():
                 raw_rdf_files = [nt_path]
-            elif nq_path.exists():
-                raw_rdf_files = [nq_path]
             else:
                 raw_rdf_files = [nt_path]
         else:
             # Batch mode keeps each RMLStreamer part as its own RDF artifact.
             raw_rdf_files = sorted((out_dir / output_name).glob("*.nt"))
             if not raw_rdf_files:
-                raw_rdf_files = sorted((out_dir / output_name).glob("*.nq"))
-            if not raw_rdf_files:
                 eprint(
                     f"Error: no RDF part files produced in batch mode for '{output_name}'. "
-                    f"Expected .nt/.nq files in {out_dir / output_name}."
+                    f"Expected .nt files in {out_dir / output_name}."
                 )
                 eprint(f"See log for details: {wrapper_log_path}")
                 return 1
@@ -1795,7 +1797,7 @@ def run_full_mode(
 
 def run_compress_mode(
     *,
-    nq_path: Path,
+    rdf_path: Path,
     out_dir: Path,
     image_ref: str,
     methods: list[str],
@@ -1807,8 +1809,8 @@ def run_compress_mode(
         print("No compression methods selected (`none`). Nothing to do.")
         return 0
 
-    if any(method in HDT_COMPRESSION_METHODS for method in methods) and nq_path.suffix == ".nt":
-        file_size = file_size_bytes(nq_path) or 0
+    if any(method in HDT_COMPRESSION_METHODS for method in methods):
+        file_size = file_size_bytes(rdf_path) or 0
         if file_size > 5 * 1024 * 1024 * 1024:
             eprint(
                 "Warning: selected HDT compression for an .nt file larger than 5 GB. "
@@ -1817,7 +1819,7 @@ def run_compress_mode(
 
     ensure_dir(out_dir)
     ok, method_results = run_compression_methods_for_rdf(
-        rdf_path=nq_path,
+        rdf_path=rdf_path,
         out_dir=out_dir,
         image_ref=image_ref,
         methods=methods,
@@ -1827,9 +1829,8 @@ def run_compress_mode(
     if not ok:
         return 1
 
-    input_stem = nq_path.stem
+    input_stem = rdf_path.stem
     target_out_dir = out_dir / input_stem
-    rdf_path = nq_path
     hdt_path = target_out_dir / f"{input_stem}.hdt"
     print_nt_hdt_summary(
         output_root=target_out_dir,
@@ -1845,9 +1846,9 @@ def run_compress_mode(
 
 def detect_compressed_format(path: Path):
     """Infer compressed RDF format from filename/extension."""
-    if path.name.endswith(".nq.gz") or path.name.endswith(".nt.gz") or path.suffix == ".gz":
+    if path.name.endswith(".nt.gz") or path.suffix == ".gz":
         return "gzip"
-    if path.name.endswith(".nq.br") or path.name.endswith(".nt.br") or path.suffix == ".br":
+    if path.name.endswith(".nt.br") or path.suffix == ".br":
         return "brotli"
     if path.suffix == ".hdt":
         return "hdt"
@@ -1857,14 +1858,10 @@ def detect_compressed_format(path: Path):
 def default_decompressed_name(path: Path, fmt: str):
     """Compute default output filename for decompression mode."""
     if fmt == "gzip":
-        if path.name.endswith(".nq.gz"):
-            return path.name[: -len(".gz")]
         if path.name.endswith(".nt.gz"):
             return path.name[: -len(".gz")]
         return f"{path.stem}.nt"
     if fmt == "brotli":
-        if path.name.endswith(".nq.br"):
-            return path.name[: -len(".br")]
         if path.name.endswith(".nt.br"):
             return path.name[: -len(".br")]
         return f"{path.stem}.nt"
@@ -1946,13 +1943,13 @@ def main():
         epilog=(
             "Examples:\n"
             "  Full pipeline:\n"
-            "    vcf_rdfizer.py -m full -i ./vcf_files --rdf-layout aggregate -r ./rules/default_rules.ttl\n"
+            "    vcf_rdfizer.py -m full -i ./vcf_files --rdf-layout aggregate -o ./results\n"
             "  Full pipeline (batch RDF outputs, compress each part):\n"
-            "    vcf_rdfizer.py -m full -i ./vcf_files --rdf-layout batch -c hdt\n"
+            "    vcf_rdfizer.py -m full -i ./vcf_files --rdf-layout batch -c hdt -o ./results\n"
             "  Compression-only:\n"
-            "    vcf_rdfizer.py -m compress -q ./out/sample/sample.nt -c gzip,hdt_gzip\n"
+            "    vcf_rdfizer.py -m compress -q ./results/out/sample/sample.nt -c gzip,hdt_gzip -o ./results\n"
             "  Decompression-only:\n"
-            "    vcf_rdfizer.py -m decompress -C ./out/gzip/sample.nt.gz\n"
+            "    vcf_rdfizer.py -m decompress -C ./results/out/sample/sample.nt.gz -o ./results\n"
         ),
     )
     parser.add_argument(
@@ -1970,12 +1967,11 @@ def main():
     )
     parser.add_argument(
         "-q",
-        "--nq",
-        "--nt",
         "--rdf",
-        dest="nq",
+        "--nt",
+        dest="rdf",
         default=None,
-        help="Input RDF file (.nt or .nq) for --mode compress",
+        help="Input RDF file (.nt) for --mode compress",
     )
     parser.add_argument(
         "-C",
@@ -2002,8 +1998,12 @@ def main():
         default=None,
         help="Full mode required: aggregate merges RML output parts into one .nt; batch keeps part files separate",
     )
-    parser.add_argument("-o", "--out", default="./out", help="RDF output directory")
-    parser.add_argument("-t", "--tsv", default="./tsv", help="TSV output directory")
+    parser.add_argument(
+        "-o",
+        "--out",
+        required=True,
+        help="Required output root directory for this run (stores outputs, metrics, and hidden intermediates)",
+    )
     parser.add_argument(
         "-I",
         "--image",
@@ -2025,12 +2025,6 @@ def main():
         help="Fallback output directory/file basename when a TSV basename cannot be inferred",
     )
     parser.add_argument(
-        "-M",
-        "--metrics",
-        default="./run_metrics",
-        help="Metrics root directory (per-run subdirectories are created automatically)",
-    )
-    parser.add_argument(
         "-c",
         "--compression",
         default="gzip,brotli,hdt",
@@ -2046,8 +2040,9 @@ def main():
     parser.add_argument(
         "-R",
         "--keep-rdf",
+        "--keep_rdf",
         action="store_true",
-        help="Keep merged N-Triples outputs after compression in full mode",
+        help="Keep raw N-Triples outputs after compression in full mode",
     )
     args = parser.parse_args()
 
@@ -2056,9 +2051,10 @@ def main():
         return 2
 
     repo_root = Path(__file__).resolve().parent
-    out_dir = Path(args.out).expanduser().resolve()
-    tsv_dir = Path(args.tsv).expanduser().resolve()
-    metrics_root = Path(args.metrics).expanduser().resolve()
+    out_root = Path(args.out).expanduser().resolve()
+    out_dir = out_root
+    tsv_dir = out_root / ".intermediate" / "tsv"
+    metrics_root = out_root / "run_metrics"
     run_id = datetime.now().strftime("%Y%m%dT%H%M%S")
     timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     metrics_dir = metrics_root / run_id
@@ -2086,18 +2082,18 @@ def main():
                 rules_path = Path(args.rules).expanduser().resolve()
             if not rules_path.exists() or not rules_path.is_file():
                 raise ValueError(f"rules file not found: {rules_path}")
-            validate_mode_dirs([out_dir, tsv_dir, metrics_root])
+            validate_mode_dirs([out_root, out_dir, tsv_dir, metrics_root])
             parse_compression_methods(args.compression)
         elif mode == "compress":
-            if not args.nq:
-                raise ValueError("--nq is required in --mode compress")
-            nq_path = Path(args.nq).expanduser().resolve()
-            if not nq_path.exists() or not nq_path.is_file():
-                raise ValueError(f"RDF input file not found: {nq_path}")
-            if nq_path.suffix not in {".nq", ".nt"}:
-                raise ValueError("Compression input must be a .nq or .nt file")
+            if not args.rdf:
+                raise ValueError("--rdf is required in --mode compress")
+            rdf_path = Path(args.rdf).expanduser().resolve()
+            if not rdf_path.exists() or not rdf_path.is_file():
+                raise ValueError(f"RDF input file not found: {rdf_path}")
+            if rdf_path.suffix != ".nt":
+                raise ValueError("Compression input must be a .nt file")
             methods = parse_compression_methods(args.compression)
-            validate_mode_dirs([out_dir, metrics_root])
+            validate_mode_dirs([out_root, out_dir, metrics_root])
         else:
             if not args.compressed_input:
                 raise ValueError("--compressed-input is required in --mode decompress")
@@ -2105,12 +2101,16 @@ def main():
             if not compressed_path.exists() or not compressed_path.is_file():
                 raise ValueError(f"Compressed input file not found: {compressed_path}")
             fmt = detect_compressed_format(compressed_path)
-            validate_mode_dirs([out_dir, metrics_root])
+            validate_mode_dirs([out_root, out_dir, metrics_root])
             if args.decompress_out is None:
                 default_name = default_decompressed_name(compressed_path, fmt)
                 decompressed_out = out_dir / Path(default_name).stem / default_name
             else:
                 decompressed_out = Path(args.decompress_out).expanduser().resolve()
+                if not is_within_path(decompressed_out, out_root):
+                    raise ValueError(
+                        f"--decompress-out must be inside output directory: {out_root}"
+                    )
             if decompressed_out.exists() and decompressed_out.is_dir():
                 raise ValueError(f"decompression output path is a directory: {decompressed_out}")
             if decompressed_out.parent.exists() and not decompressed_out.parent.is_dir():
@@ -2244,7 +2244,7 @@ def main():
         if mode == "compress":
             # Compression-only mode.
             return run_compress_mode(
-                nq_path=nq_path,
+                rdf_path=rdf_path,
                 out_dir=out_dir,
                 image_ref=image_ref,
                 methods=methods,

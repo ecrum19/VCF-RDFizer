@@ -17,6 +17,22 @@ from test.helpers import VerboseTestCase
 
 def invoke_main(argv, *, auto_layout=True):
     args = list(argv)
+    normalized = []
+    skip_next = False
+    for index, token in enumerate(args):
+        if skip_next:
+            skip_next = False
+            continue
+        if token == "--rdf":
+            normalized.append("--rdf")
+            continue
+        if token in {"--metrics", "--tsv"} and index + 1 < len(args):
+            # Wrapper now places metrics/intermediates under --out automatically.
+            skip_next = True
+            continue
+        normalized.append(token)
+    args = normalized
+
     if auto_layout:
         mode = "full"
         for index, token in enumerate(args):
@@ -25,6 +41,8 @@ def invoke_main(argv, *, auto_layout=True):
                 break
         if mode == "full" and "--rdf-layout" not in args and "-l" not in args:
             args.extend(["--rdf-layout", "aggregate"])
+    if "--out" not in args and "-o" not in args:
+        args.extend(["--out", "./out"])
 
     with mock.patch.object(sys, "argv", ["vcf_rdfizer.py", *args]):
         return vcf_rdfizer.main()
@@ -265,11 +283,11 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertEqual(len(commands), 2)
 
     def test_main_compress_mode_runs_selected_methods(self):
-        """Compression mode runs only requested methods for a designated .nq input."""
+        """Compression mode runs only requested methods for a designated .nt input."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
-            nq_path = tmp_path / "sample.nq"
-            nq_path.write_text("<s> <p> <o> <g> .\n")
+            rdf_path = tmp_path / "sample.nt"
+            rdf_path.write_text("<s> <p> <o> <g> .\n")
             out_dir = tmp_path / "out"
             commands = []
 
@@ -289,8 +307,8 @@ class WrapperUnitTests(VerboseTestCase):
                         [
                             "--mode",
                             "compress",
-                            "--nq",
-                            str(nq_path),
+                            "--rdf",
+                            str(rdf_path),
                             "--compression",
                             "gzip,brotli",
                             "--out",
@@ -303,9 +321,9 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertEqual(rc, 0)
             self.assertEqual(len(commands), 2)
             self.assertIn("gzip -c", commands[0][-1])
-            self.assertIn("/data/out/sample/sample.nq.gz", commands[0][-1])
+            self.assertIn("/data/out/sample/sample.nt.gz", commands[0][-1])
             self.assertIn("brotli -q 7 -c", commands[1][-1])
-            self.assertIn("/data/out/sample/sample.nq.br", commands[1][-1])
+            self.assertIn("/data/out/sample/sample.nt.br", commands[1][-1])
 
     def test_main_compress_mode_hdt_gzip_reuses_existing_hdt(self):
         """Compound method hdt_gzip reuses a preexisting HDT artifact instead of regenerating it."""
@@ -335,7 +353,7 @@ class WrapperUnitTests(VerboseTestCase):
                         [
                             "--mode",
                             "compress",
-                            "--nq",
+                            "--rdf",
                             str(nt_path),
                             "--compression",
                             "hdt_gzip",
@@ -379,7 +397,7 @@ class WrapperUnitTests(VerboseTestCase):
                         [
                             "--mode",
                             "compress",
-                            "--nq",
+                            "--rdf",
                             str(nt_path),
                             "--compression",
                             "hdt_brotli",
@@ -403,10 +421,10 @@ class WrapperUnitTests(VerboseTestCase):
         """Compression mode writes runtime timing to metrics CSV and prints elapsed time."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
-            nq_path = tmp_path / "sample.nq"
-            nq_path.write_text("<s> <p> <o> <g> .\n")
+            rdf_path = tmp_path / "sample.nt"
+            rdf_path.write_text("<s> <p> <o> <g> .\n")
             out_dir = tmp_path / "out"
-            metrics_dir = tmp_path / "metrics"
+            metrics_dir = out_dir / "run_metrics"
 
             def fake_run(cmd, cwd=None, env=None):
                 return 0
@@ -424,8 +442,8 @@ class WrapperUnitTests(VerboseTestCase):
                         [
                             "--mode",
                             "compress",
-                            "--nq",
-                            str(nq_path),
+                            "--rdf",
+                            str(rdf_path),
                             "--compression",
                             "gzip",
                             "--out",
@@ -453,7 +471,7 @@ class WrapperUnitTests(VerboseTestCase):
             tmp_path = Path(td)
             input_dir, rules_path = prepare_inputs(tmp_path)
             out_dir = tmp_path / "out"
-            metrics_dir = tmp_path / "metrics"
+            metrics_dir = out_dir / "run_metrics"
 
             def fake_run(cmd, cwd=None, env=None):
                 if "/opt/vcf-rdfizer/run_conversion.sh" in cmd:
@@ -553,7 +571,7 @@ class WrapperUnitTests(VerboseTestCase):
                         [
                             "--mode",
                             "compress",
-                            "--nq",
+                            "--rdf",
                             str(nt_path),
                             "--compression",
                             "gzip",
@@ -568,8 +586,8 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertEqual(len(commands), 1)
             self.assertIn("/data/out/sample/sample.nt.gz", commands[0][-1])
 
-    def test_main_compress_mode_requires_nq_argument(self):
-        """Compression mode fails validation when --nq is missing."""
+    def test_main_compress_mode_requires_rdf_argument(self):
+        """Compression mode fails validation when --rdf is missing."""
         rc = invoke_main(["--mode", "compress"])
         self.assertEqual(rc, 2)
 
@@ -579,7 +597,7 @@ class WrapperUnitTests(VerboseTestCase):
             tmp_path = Path(td)
             bad_input = tmp_path / "sample.txt"
             bad_input.write_text("x")
-            rc = invoke_main(["--mode", "compress", "--nq", str(bad_input)])
+            rc = invoke_main(["--mode", "compress", "--rdf", str(bad_input)])
             self.assertEqual(rc, 2)
 
     def test_main_full_mode_requires_input_argument(self):
@@ -602,8 +620,8 @@ class WrapperUnitTests(VerboseTestCase):
         """Compression mode with method none performs no compression runs."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
-            nq_path = tmp_path / "sample.nq"
-            nq_path.write_text("<s> <p> <o> <g> .\n")
+            rdf_path = tmp_path / "sample.nt"
+            rdf_path.write_text("<s> <p> <o> <g> .\n")
             commands = []
 
             def fake_run(cmd, cwd=None, env=None):
@@ -622,8 +640,8 @@ class WrapperUnitTests(VerboseTestCase):
                         [
                             "--mode",
                             "compress",
-                            "--nq",
-                            str(nq_path),
+                            "--rdf",
+                            str(rdf_path),
                             "--compression",
                             "none",
                         ]
@@ -638,7 +656,7 @@ class WrapperUnitTests(VerboseTestCase):
         """Decompression mode inflates .gz RDF into default decompressed output path."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
-            compressed = tmp_path / "sample.nq.gz"
+            compressed = tmp_path / "sample.nt.gz"
             compressed.write_bytes(b"fake-gzip-bytes")
             out_dir = tmp_path / "out"
             commands = []
@@ -672,7 +690,7 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertEqual(len(commands), 1)
             self.assertIn("gzip -dc", commands[0][-1])
             self.assertTrue(any(arg.endswith("/out/sample:/data/out") for arg in commands[0]))
-            self.assertIn("/data/out/sample.nq", commands[0][-1])
+            self.assertIn("/data/out/sample.nt", commands[0][-1])
 
     def test_main_decompress_mode_hdt_uses_hdt2rdf(self):
         """Decompression mode maps .hdt input through hdt2rdf conversion."""
@@ -1152,7 +1170,7 @@ class WrapperUnitTests(VerboseTestCase):
             tmp_path = Path(td)
             input_dir, rules_path = prepare_inputs(tmp_path)
             out_dir = tmp_path / "out"
-            metrics_dir = tmp_path / "run_metrics"
+            metrics_dir = out_dir / "run_metrics"
 
             def fake_run(cmd, cwd=None, env=None):
                 if "/opt/vcf-rdfizer/run_conversion.sh" in cmd:
@@ -1273,8 +1291,8 @@ class WrapperUnitTests(VerboseTestCase):
                 )
             )
 
-    def test_main_full_mode_deletes_raw_nq_and_keeps_compressed_output(self):
-        """Full mode cleanup removes raw .nq (legacy) while preserving compressed outputs."""
+    def test_main_full_mode_deletes_raw_nt_and_keeps_compressed_output(self):
+        """Full mode cleanup removes raw .nt while preserving compressed outputs."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             input_dir, rules_path = prepare_inputs(tmp_path)
@@ -1285,7 +1303,7 @@ class WrapperUnitTests(VerboseTestCase):
                     output_name = output_name_from_command(cmd) or "sample"
                     out_sample_dir = out_dir / output_name
                     out_sample_dir.mkdir(parents=True, exist_ok=True)
-                    (out_sample_dir / f"{output_name}.nq").write_text("<s> <p> <o> <g> .\n")
+                    (out_sample_dir / f"{output_name}.nt").write_text("<s> <p> <o> .\n")
                 if isinstance(cmd, list) and cmd and "rdf2hdt" in cmd[-1]:
                     output_name = output_name_from_command(cmd) or "sample"
                     out_sample_dir = out_dir / output_name
@@ -1318,7 +1336,7 @@ class WrapperUnitTests(VerboseTestCase):
                 os.chdir(old_cwd)
 
             self.assertEqual(rc, 0)
-            self.assertFalse((out_dir / "sample" / "sample.nq").exists())
+            self.assertFalse((out_dir / "sample" / "sample.nt").exists())
             self.assertTrue((out_dir / "sample" / "sample.hdt").exists())
 
     def test_main_ignores_unrelated_existing_tsv_triplets(self):

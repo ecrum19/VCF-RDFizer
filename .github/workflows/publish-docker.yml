@@ -2,8 +2,8 @@ name: publish-docker
 
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
@@ -15,6 +15,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -28,15 +30,57 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Resolve next Docker version (v1.0.N)
+        id: version
+        env:
+          DOCKERHUB_NAMESPACE: ecrum19
+          DOCKERHUB_REPO: vcf-rdfizer
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import urllib.request
+
+          namespace = os.environ["DOCKERHUB_NAMESPACE"]
+          repo = os.environ["DOCKERHUB_REPO"]
+          pattern = re.compile(r"^v1\.0\.(\d+)$")
+
+          def parse_max(tags):
+              max_n = -1
+              for tag in tags:
+                  m = pattern.match(tag)
+                  if m:
+                      max_n = max(max_n, int(m.group(1)))
+              return max_n
+
+          max_n = -1
+          try:
+              url = f"https://hub.docker.com/v2/repositories/{namespace}/{repo}/tags?page_size=100"
+              while url:
+                  with urllib.request.urlopen(url, timeout=20) as resp:
+                      payload = json.load(resp)
+                  max_n = max(max_n, parse_max([item.get("name", "") for item in payload.get("results", [])]))
+                  url = payload.get("next")
+          except Exception:
+              tags = subprocess.check_output(["git", "tag"], text=True).splitlines()
+              max_n = max(max_n, parse_max(tags))
+
+          next_version = f"v1.0.{max_n + 1}"
+          print(f"Next Docker version: {next_version}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"next_version={next_version}\n")
+          PY
+
       - name: Docker metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ecrum19/vcf-rdfizer
           tags: |
-            type=semver,pattern={{version}},value=${{ github.ref_name }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ github.ref_name }}
-            type=semver,pattern={{major}},value=${{ github.ref_name }}
+            type=raw,value=${{ steps.version.outputs.next_version }}
             type=raw,value=latest
 
       - name: Build and push

@@ -209,7 +209,7 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 mkdir -p "$out"
-printf '# only comments\\n' > "$out/comments-only.nq"
+printf '# only comments\\n' > "$out/comments-only.nt"
 """,
             )
 
@@ -265,7 +265,7 @@ while [[ $# -gt 0 ]]; do
 done
 mkdir -p "$out"
 printf '<s> <p> <o> .\\n' > "$out/no-ext"
-printf '<s2> <p2> <o2> .\\n' > "$out/already.nq"
+printf '<s2> <p2> <o2> .\\n' > "$out/already.nt"
 """,
             )
 
