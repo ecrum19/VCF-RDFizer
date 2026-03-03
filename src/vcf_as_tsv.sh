@@ -37,7 +37,9 @@ if [ -f "$input_path" ]; then
       ;;
   esac
 elif [ -d "$input_path" ]; then
-  mapfile -t files < <(find "$input_path" -maxdepth 1 -type f \( -name '*.vcf' -o -name '*.vcf.gz' \) | sort)
+  while IFS= read -r discovered_file; do
+    files+=("$discovered_file")
+  done < <(find "$input_path" -maxdepth 1 -type f \( -name '*.vcf' -o -name '*.vcf.gz' \) | sort)
 else
   echo "Error: input path '$input_path' not found."
   exit 1

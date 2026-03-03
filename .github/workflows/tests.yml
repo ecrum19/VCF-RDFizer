@@ -26,8 +26,8 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Run wrapper unit tests (no real external tools)
-        run: python -m unittest -v test.test_vcf_rdfizer_unit
+      - name: Run cross-platform wrapper tests (no real external tools)
+        run: python -m unittest -v test.test_vcf_rdfizer_cross_platform_unit
 
   shell-posix:
     name: shell+pipeline-unit (${{ matrix.os }})

@@ -9,6 +9,10 @@ This repository uses `unittest` (Python standard library) to isolate orchestrati
   - Verifies image/version resolution behavior and error handling.
   - Verifies CLI compression option propagation into `compression.sh`.
 
+- `test/test_vcf_rdfizer_cross_platform_unit.py`
+  - Runs a Windows/macOS/Linux-safe subset of wrapper tests.
+  - Focuses on CLI parsing, image resolution, compression method parsing, and mocked compress mode execution.
+
 - `test/test_vcf_as_tsv_unit.py`
   - Verifies `.vcf` and `.vcf.gz` input handling.
   - Verifies header extraction and per-VCF TSV generation (`<sample>.records.tsv`, `<sample>.header_lines.tsv`, `<sample>.file_metadata.tsv`).
@@ -24,6 +28,13 @@ This repository uses `unittest` (Python standard library) to isolate orchestrati
   - Replaces `gzip`, `brotli`, and `rdf2hdt` with fake executables.
   - Verifies compression artifact generation and metrics row update.
   - Verifies `-m none` behavior (no compression outputs, metrics still updated).
+
+## CI matrix behavior
+
+- Windows runners execute:
+  - `test/test_vcf_rdfizer_cross_platform_unit.py`
+  - package smoke test (`pip install` + `vcf-rdfizer --help`)
+- macOS/Linux runners execute the full suite, including shell-script unit tests.
 
 ## Why this coverage is useful
 

@@ -95,8 +95,9 @@ OUTPUT_DIRS=()
 if [[ -n "$OUT_NAME" ]]; then
   OUTPUT_DIRS=("$OUT_ROOT_DIR/$OUT_NAME")
 else
-  mapfile -t OUTPUT_DIRS < <(find "$OUT_ROOT_DIR" -maxdepth 1 -type d \
-    ! -path "$OUT_ROOT_DIR" | sort)
+  while IFS= read -r discovered_dir; do
+    OUTPUT_DIRS+=("$discovered_dir")
+  done < <(find "$OUT_ROOT_DIR" -maxdepth 1 -type d ! -path "$OUT_ROOT_DIR" | sort)
   if (( ${#OUTPUT_DIRS[@]} == 0 )); then
     OUTPUT_DIRS=("$OUT_ROOT_DIR")
   fi
