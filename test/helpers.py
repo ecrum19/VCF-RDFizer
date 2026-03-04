@@ -56,6 +56,25 @@ METRICS_HEADER = [
     "max_rss_kb_brotli_on_hdt",
 ]
 
+CONVERSION_METRICS_HEADER = [
+    "run_id",
+    "timestamp",
+    "output_name",
+    "output_dir",
+    "exit_code_java",
+    "wall_seconds_java",
+    "user_seconds_java",
+    "sys_seconds_java",
+    "max_rss_kb_java",
+    "input_mapping_size_bytes",
+    "input_vcf_size_bytes",
+    "output_dir_size_bytes",
+    "output_triples",
+    "jar",
+    "mapping_file",
+    "output_path",
+]
+
 
 def make_executable(path: Path, content: str) -> None:
     path.write_text(content)

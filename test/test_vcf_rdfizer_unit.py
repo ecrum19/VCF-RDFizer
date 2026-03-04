@@ -163,11 +163,13 @@ class WrapperUnitTests(VerboseTestCase):
             )
 
             with metrics_csv.open() as handle:
-                row = next(csv.DictReader(handle))
+                reader = csv.DictReader(handle)
+                row = next(reader)
+                fieldnames = reader.fieldnames or []
 
-            self.assertEqual(row["gzip_size_bytes"], "0")
+            self.assertNotIn("gzip_size_bytes", fieldnames)
+            self.assertIn("gzip_on_hdt_size_bytes", fieldnames)
             self.assertEqual(row["gzip_on_hdt_size_bytes"], "12")
-            self.assertEqual(row["exit_code_gzip"], "0")
             self.assertEqual(row["exit_code_gzip_on_hdt"], "0")
             self.assertEqual(row["hdt_source"], "existing")
             self.assertEqual(row["user_seconds_hdt"], "1.100000")
@@ -630,6 +632,8 @@ class WrapperUnitTests(VerboseTestCase):
             output = out_buf.getvalue()
             self.assertIn("Triples produced: 17", output)
             self.assertIn("Total triples produced (full run): 17", output)
+            self.assertIn("Final RDF size (no compression):", output)
+            self.assertIn("- N-Triples (.nt):", output)
             self.assertIn("Run time (full mode):", output)
 
             run_metrics_dir = latest_metrics_run_dir(metrics_dir)
@@ -1624,11 +1628,12 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertEqual(rc, 0)
 
     def test_main_removes_tsv_when_wrapper_created_it(self):
-        """Wrapper removes TSV directory when it created it and --keep-tsv is not set."""
+        """Wrapper removes hidden .intermediate directory when --keep-tsv is not set."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             input_dir, rules_path = prepare_inputs(tmp_path)
-            tsv_dir = tmp_path / "tsv-out"
+            intermediate_dir = tmp_path / "out" / ".intermediate"
+            tsv_dir = intermediate_dir / "tsv"
 
             def fake_run(cmd, cwd=None, env=None):
                 return 0
@@ -1649,8 +1654,6 @@ class WrapperUnitTests(VerboseTestCase):
                             str(input_dir),
                             "--rules",
                             str(rules_path),
-                            "--tsv",
-                            str(tsv_dir),
                         ]
                     )
             finally:
@@ -1658,14 +1661,16 @@ class WrapperUnitTests(VerboseTestCase):
 
             self.assertEqual(rc, 0)
             self.assertFalse(tsv_dir.exists())
+            self.assertFalse(intermediate_dir.exists())
 
-    def test_main_keeps_preexisting_tsv_directory(self):
-        """Wrapper preserves preexisting TSV directory to avoid deleting user-managed files."""
+    def test_main_keep_tsv_preserves_hidden_intermediate_directory(self):
+        """Wrapper preserves hidden intermediates when --keep-tsv is set."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             input_dir, rules_path = prepare_inputs(tmp_path)
-            tsv_dir = tmp_path / "tsv-out"
-            tsv_dir.mkdir()
+            intermediate_dir = tmp_path / "out" / ".intermediate"
+            tsv_dir = intermediate_dir / "tsv"
+            tsv_dir.mkdir(parents=True, exist_ok=True)
             sentinel = tsv_dir / "keep.me"
             sentinel.write_text("x")
 
@@ -1688,8 +1693,7 @@ class WrapperUnitTests(VerboseTestCase):
                             str(input_dir),
                             "--rules",
                             str(rules_path),
-                            "--tsv",
-                            str(tsv_dir),
+                            "--keep-tsv",
                         ]
                     )
             finally:
@@ -1697,6 +1701,7 @@ class WrapperUnitTests(VerboseTestCase):
 
             self.assertEqual(rc, 0)
             self.assertTrue(sentinel.exists())
+            self.assertTrue(intermediate_dir.exists())
 
     def test_main_fails_when_tsv_step_fails(self):
         """Wrapper stops when TSV conversion command returns non-zero."""

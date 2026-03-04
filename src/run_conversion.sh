@@ -35,7 +35,7 @@ mkdir -p "$TIME_LOG_DIR" "$METRICS_JSON_DIR"
 TIME_LOG="$TIME_LOG_DIR/${RUN_ID}.txt"
 METRICS_JSON="$METRICS_JSON_DIR/${RUN_ID}.json"
 METRICS_CSV="$LOGDIR/metrics.csv"
-METRICS_HEADER="run_id,timestamp,output_name,output_dir,exit_code_java,wall_seconds_java,user_seconds_java,sys_seconds_java,max_rss_kb_java,input_mapping_size_bytes,input_vcf_size_bytes,output_dir_size_bytes,output_triples,jar,mapping_file,output_path,combined_rdf_size_bytes,gzip_size_bytes,brotli_size_bytes,hdt_size_bytes,exit_code_gzip,exit_code_brotli,exit_code_hdt,wall_seconds_gzip,user_seconds_gzip,sys_seconds_gzip,max_rss_kb_gzip,wall_seconds_brotli,user_seconds_brotli,sys_seconds_brotli,max_rss_kb_brotli,wall_seconds_hdt,user_seconds_hdt,sys_seconds_hdt,max_rss_kb_hdt,compression_methods,hdt_source,gzip_on_hdt_size_bytes,brotli_on_hdt_size_bytes,exit_code_gzip_on_hdt,exit_code_brotli_on_hdt,wall_seconds_gzip_on_hdt,user_seconds_gzip_on_hdt,sys_seconds_gzip_on_hdt,max_rss_kb_gzip_on_hdt,wall_seconds_brotli_on_hdt,user_seconds_brotli_on_hdt,sys_seconds_brotli_on_hdt,max_rss_kb_brotli_on_hdt"
+METRICS_HEADER="run_id,timestamp,output_name,output_dir,exit_code_java,wall_seconds_java,user_seconds_java,sys_seconds_java,max_rss_kb_java,input_mapping_size_bytes,input_vcf_size_bytes,output_dir_size_bytes,output_triples,jar,mapping_file,output_path"
 
 
 # Return byte size for file or directory (GNU + BSD compatible).
@@ -75,6 +75,21 @@ stat_size() {
 }
 
 have_gnu_time() { [[ -x /usr/bin/time ]] && /usr/bin/time --version >/dev/null 2>&1; }
+
+# Return stable content hash for duplicate part detection.
+hash_file_sha256() {
+  local path="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$path" | awk '{print $1}'
+    return
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$path" | awk '{print $1}'
+    return
+  fi
+  # Last-resort fallback when SHA utilities are unavailable.
+  cksum "$path" | awk '{print $1":"$2}'
+}
 
 # Count triples via non-comment RDF lines ending in '.'.
 count_triples_json() {
@@ -167,13 +182,30 @@ if [[ "$AGGREGATE_RDF" == "1" ]]; then
   PART_FILES=("$OUT_DIR/$OUT_NAME"/*.nt)
   if (( ${#PART_FILES[@]} > 0 )); then
     : > "$MERGED_NT"
+    # Defensive dedupe: some Spark/RMLStreamer runs can emit identical part
+    # files for the same dataset. Skip exact duplicate part payloads to avoid
+    # doubling every triple in the merged output.
+    SEEN_HASH_FILE="$OUT_DIR/$OUT_NAME/.seen_part_hashes.$$"
+    SEEN_MAP_FILE="$OUT_DIR/$OUT_NAME/.seen_part_hash_map.$$"
+    : > "$SEEN_HASH_FILE"
+    : > "$SEEN_MAP_FILE"
     for PART_NT in "${PART_FILES[@]}"; do
       if [[ "$PART_NT" == "$MERGED_NT" ]]; then
         continue
       fi
+      PART_HASH=$(hash_file_sha256 "$PART_NT")
+      if grep -Fqx "$PART_HASH" "$SEEN_HASH_FILE"; then
+        FIRST_SEEN=$(awk -F'\t' -v hash="$PART_HASH" '$1 == hash { print $2; exit }' "$SEEN_MAP_FILE")
+        echo "WARNING: skipping duplicate RDF part '$PART_NT' (same content as '$FIRST_SEEN')." >&2
+        rm -f "$PART_NT"
+        continue
+      fi
+      printf "%s\n" "$PART_HASH" >> "$SEEN_HASH_FILE"
+      printf "%s\t%s\n" "$PART_HASH" "$PART_NT" >> "$SEEN_MAP_FILE"
       cat "$PART_NT" >> "$MERGED_NT"
       rm -f "$PART_NT"
     done
+    rm -f "$SEEN_HASH_FILE" "$SEEN_MAP_FILE"
   else
     : > "$MERGED_NT"
   fi
@@ -265,13 +297,7 @@ csv_fields=(
   "$JAR"
   "$IN"
   "$OUTPUT_PATH"
-  "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "" ""
 )
-
-# Compression-related fields are initialized as empty from conversion step output.
-for _ in $(seq 1 13); do
-  csv_fields+=("")
-done
 ( IFS=,; echo "${csv_fields[*]}" ) >> "$METRICS_CSV"
 
 echo "Done."

@@ -39,13 +39,8 @@ TSV_OVERHEAD_FACTOR = 1.10
 # - larger real dataset: ~66x VCF->RDF inflation
 RDF_EXPANSION_LOW_FACTOR = 42.0
 RDF_EXPANSION_HIGH_FACTOR = 67.0
-# Shared CSV schema used by:
-# - src/run_conversion.sh (conversion columns)
-# - vcf_rdfizer.py / src/compression.sh (compression columns)
-#
-# Raw-RDF compression fields: gzip_*, brotli_*, hdt_*
-# HDT-compound fields: *_on_hdt_* plus hdt_source
-METRICS_HEADER = [
+# Conversion metrics columns are always written by run_conversion.sh.
+CONVERSION_METRICS_HEADER = [
     "run_id",
     "timestamp",
     "output_name",
@@ -62,40 +57,54 @@ METRICS_HEADER = [
     "jar",
     "mapping_file",
     "output_path",
-    "combined_rdf_size_bytes",
-    "gzip_size_bytes",
-    "brotli_size_bytes",
-    "hdt_size_bytes",
-    "exit_code_gzip",
-    "exit_code_brotli",
-    "exit_code_hdt",
-    "wall_seconds_gzip",
-    "user_seconds_gzip",
-    "sys_seconds_gzip",
-    "max_rss_kb_gzip",
-    "wall_seconds_brotli",
-    "user_seconds_brotli",
-    "sys_seconds_brotli",
-    "max_rss_kb_brotli",
-    "wall_seconds_hdt",
-    "user_seconds_hdt",
-    "sys_seconds_hdt",
-    "max_rss_kb_hdt",
-    "compression_methods",
-    "hdt_source",
-    "gzip_on_hdt_size_bytes",
-    "brotli_on_hdt_size_bytes",
-    "exit_code_gzip_on_hdt",
-    "exit_code_brotli_on_hdt",
-    "wall_seconds_gzip_on_hdt",
-    "user_seconds_gzip_on_hdt",
-    "sys_seconds_gzip_on_hdt",
-    "max_rss_kb_gzip_on_hdt",
-    "wall_seconds_brotli_on_hdt",
-    "user_seconds_brotli_on_hdt",
-    "sys_seconds_brotli_on_hdt",
-    "max_rss_kb_brotli_on_hdt",
 ]
+
+COMPRESSION_COMMON_COLUMNS = ["combined_rdf_size_bytes", "compression_methods"]
+
+COMPRESSION_METHOD_COLUMNS = {
+    "gzip": [
+        "gzip_size_bytes",
+        "exit_code_gzip",
+        "wall_seconds_gzip",
+        "user_seconds_gzip",
+        "sys_seconds_gzip",
+        "max_rss_kb_gzip",
+    ],
+    "brotli": [
+        "brotli_size_bytes",
+        "exit_code_brotli",
+        "wall_seconds_brotli",
+        "user_seconds_brotli",
+        "sys_seconds_brotli",
+        "max_rss_kb_brotli",
+    ],
+    "hdt": [
+        "hdt_size_bytes",
+        "exit_code_hdt",
+        "wall_seconds_hdt",
+        "user_seconds_hdt",
+        "sys_seconds_hdt",
+        "max_rss_kb_hdt",
+    ],
+    "hdt_gzip": [
+        "gzip_on_hdt_size_bytes",
+        "exit_code_gzip_on_hdt",
+        "wall_seconds_gzip_on_hdt",
+        "user_seconds_gzip_on_hdt",
+        "sys_seconds_gzip_on_hdt",
+        "max_rss_kb_gzip_on_hdt",
+    ],
+    "hdt_brotli": [
+        "brotli_on_hdt_size_bytes",
+        "exit_code_brotli_on_hdt",
+        "wall_seconds_brotli_on_hdt",
+        "user_seconds_brotli_on_hdt",
+        "sys_seconds_brotli_on_hdt",
+        "max_rss_kb_brotli_on_hdt",
+    ],
+}
+
+HDT_SOURCE_COLUMN = "hdt_source"
 VALID_COMPRESSION_METHODS = {"gzip", "brotli", "hdt", "hdt_gzip", "hdt_brotli"}
 HDT_COMPRESSION_METHODS = {"hdt", "hdt_gzip", "hdt_brotli"}
 
@@ -1114,6 +1123,31 @@ def safe_metrics_name(value: str) -> str:
     return safe or "rdf"
 
 
+def metrics_header_for_methods(selected_methods: list[str]) -> list[str]:
+    """Build a run-specific metrics.csv header with only relevant columns."""
+    methods = list(selected_methods or [])
+    header = list(CONVERSION_METRICS_HEADER)
+    if not methods:
+        return header
+
+    header.extend(COMPRESSION_COMMON_COLUMNS)
+    if "gzip" in methods:
+        header.extend(COMPRESSION_METHOD_COLUMNS["gzip"])
+    if "brotli" in methods:
+        header.extend(COMPRESSION_METHOD_COLUMNS["brotli"])
+
+    uses_hdt = any(method in HDT_COMPRESSION_METHODS for method in methods)
+    if uses_hdt:
+        header.extend(COMPRESSION_METHOD_COLUMNS["hdt"])
+        header.append(HDT_SOURCE_COLUMN)
+    if "hdt_gzip" in methods:
+        header.extend(COMPRESSION_METHOD_COLUMNS["hdt_gzip"])
+    if "hdt_brotli" in methods:
+        header.extend(COMPRESSION_METHOD_COLUMNS["hdt_brotli"])
+
+    return unique_in_order(header)
+
+
 # ---------------------------------------------------------------------------
 # Metrics serialization helpers
 # ---------------------------------------------------------------------------
@@ -1134,20 +1168,24 @@ def update_metrics_csv_with_compression(
     HDT-first metrics (gzip_on_hdt / brotli_on_hdt) to avoid ambiguity.
     """
     metrics_csv.parent.mkdir(parents=True, exist_ok=True)
-    if not metrics_csv.exists():
-        with metrics_csv.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=METRICS_HEADER)
-            writer.writeheader()
+    target_header = metrics_header_for_methods(selected_methods)
+    rows = []
+    existing_header = []
 
-    with metrics_csv.open(newline="", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle)
-        fieldnames = reader.fieldnames or METRICS_HEADER
-        rows = list(reader)
+    if metrics_csv.exists():
+        with metrics_csv.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            existing_header = list(reader.fieldnames or [])
+            rows = list(reader)
 
-    if fieldnames != METRICS_HEADER:
-        backup = metrics_csv.with_name(f"metrics_csv_bak_{run_id}.csv")
-        shutil.copyfile(metrics_csv, backup)
-        fieldnames = METRICS_HEADER
+    # Keep only current run-relevant columns, while preserving conversion rows.
+    if existing_header:
+        header_mismatch = existing_header != target_header
+        rows = [{name: row.get(name, "") for name in target_header} for row in rows]
+        if header_mismatch:
+            backup = metrics_csv.with_name(f"metrics_csv_bak_{run_id}.csv")
+            shutil.copyfile(metrics_csv, backup)
+    else:
         rows = []
 
     row = None
@@ -1157,15 +1195,17 @@ def update_metrics_csv_with_compression(
             break
 
     if row is None:
-        row = {name: "" for name in METRICS_HEADER}
+        row = {name: "" for name in target_header}
         row["run_id"] = run_id
         row["timestamp"] = timestamp
         row["output_name"] = output_name
         row["output_dir"] = str(output_dir)
         rows.append(row)
 
-    row["combined_rdf_size_bytes"] = str(int(combined_size_bytes))
-    row["compression_methods"] = "|".join(selected_methods) if selected_methods else "none"
+    if "combined_rdf_size_bytes" in row:
+        row["combined_rdf_size_bytes"] = str(int(combined_size_bytes))
+    if "compression_methods" in row:
+        row["compression_methods"] = "|".join(selected_methods) if selected_methods else "none"
 
     defaults = {
         "gzip_size_bytes": "0",
@@ -1200,24 +1240,28 @@ def update_metrics_csv_with_compression(
         "sys_seconds_brotli_on_hdt": "null",
         "max_rss_kb_brotli_on_hdt": "null",
     }
-    row.update(defaults)
+    for key, value in defaults.items():
+        if key in row:
+            row[key] = value
 
     def assign_timing(prefix: str, result: dict):
         wall_val = result.get("wall_seconds")
         user_val = result.get("user_seconds")
         sys_val = result.get("sys_seconds")
         rss_val = result.get("max_rss_kb")
+        wall_col = f"wall_seconds_{prefix}"
+        user_col = f"user_seconds_{prefix}"
+        sys_col = f"sys_seconds_{prefix}"
+        rss_col = f"max_rss_kb_{prefix}"
 
-        row[f"wall_seconds_{prefix}"] = (
-            "null" if wall_val is None else f"{float(wall_val):.6f}"
-        )
-        row[f"user_seconds_{prefix}"] = (
-            "null" if user_val is None else f"{float(user_val):.6f}"
-        )
-        row[f"sys_seconds_{prefix}"] = (
-            "null" if sys_val is None else f"{float(sys_val):.6f}"
-        )
-        row[f"max_rss_kb_{prefix}"] = "null" if rss_val is None else str(int(rss_val))
+        if wall_col in row:
+            row[wall_col] = "null" if wall_val is None else f"{float(wall_val):.6f}"
+        if user_col in row:
+            row[user_col] = "null" if user_val is None else f"{float(user_val):.6f}"
+        if sys_col in row:
+            row[sys_col] = "null" if sys_val is None else f"{float(sys_val):.6f}"
+        if rss_col in row:
+            row[rss_col] = "null" if rss_val is None else str(int(rss_val))
 
     for method in ("gzip", "brotli", "hdt"):
         result = method_results.get(method)
@@ -1225,30 +1269,36 @@ def update_metrics_csv_with_compression(
             continue
         size_key = f"{method}_size_bytes"
         exit_key = f"exit_code_{method}"
-        row[size_key] = str(int(result.get("output_size_bytes") or 0))
-        row[exit_key] = str(int(result.get("exit_code") or 0))
+        if size_key in row:
+            row[size_key] = str(int(result.get("output_size_bytes") or 0))
+        if exit_key in row:
+            row[exit_key] = str(int(result.get("exit_code") or 0))
         assign_timing(method, result)
 
     hdt_result = method_results.get("hdt")
-    if hdt_result is not None:
+    if hdt_result is not None and "hdt_source" in row:
         row["hdt_source"] = str(hdt_result.get("source") or "generated")
 
     hdt_gzip_result = method_results.get("hdt_gzip")
     if hdt_gzip_result is not None:
-        row["gzip_on_hdt_size_bytes"] = str(int(hdt_gzip_result.get("output_size_bytes") or 0))
-        row["exit_code_gzip_on_hdt"] = str(int(hdt_gzip_result.get("exit_code") or 0))
+        if "gzip_on_hdt_size_bytes" in row:
+            row["gzip_on_hdt_size_bytes"] = str(int(hdt_gzip_result.get("output_size_bytes") or 0))
+        if "exit_code_gzip_on_hdt" in row:
+            row["exit_code_gzip_on_hdt"] = str(int(hdt_gzip_result.get("exit_code") or 0))
         assign_timing("gzip_on_hdt", hdt_gzip_result)
 
     hdt_brotli_result = method_results.get("hdt_brotli")
     if hdt_brotli_result is not None:
-        row["brotli_on_hdt_size_bytes"] = str(int(hdt_brotli_result.get("output_size_bytes") or 0))
-        row["exit_code_brotli_on_hdt"] = str(int(hdt_brotli_result.get("exit_code") or 0))
+        if "brotli_on_hdt_size_bytes" in row:
+            row["brotli_on_hdt_size_bytes"] = str(int(hdt_brotli_result.get("output_size_bytes") or 0))
+        if "exit_code_brotli_on_hdt" in row:
+            row["exit_code_brotli_on_hdt"] = str(int(hdt_brotli_result.get("exit_code") or 0))
         assign_timing("brotli_on_hdt", hdt_brotli_result)
 
     with metrics_csv.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=METRICS_HEADER)
+        writer = csv.DictWriter(handle, fieldnames=target_header)
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows({name: row.get(name, "") for name in target_header} for row in rows)
 
 
 def write_compression_metrics_artifacts(
@@ -1711,7 +1761,7 @@ def run_full_mode(
 ):
     """Execute full pipeline: per-input TSV -> RDF -> compression -> metrics."""
     print("Step 3/5: Processing per-input pipeline (TSV -> RDF -> compression)")
-    tsv_existed = tsv_dir.exists()
+    intermediate_dir = tsv_dir.parent
     ensure_dir(tsv_dir)
     ensure_dir(out_dir)
     ensure_dir(metrics_dir)
@@ -1723,6 +1773,7 @@ def run_full_mode(
         shutil.rmtree(generated_rules_dir, ignore_errors=True)
     ensure_dir(generated_rules_dir)
     if run_tracker is not None:
+        run_tracker.track_intermediate(intermediate_dir)
         run_tracker.track_intermediate(tsv_dir)
         run_tracker.track_intermediate(generated_rules_dir)
         run_tracker.mark("Full pipeline started")
@@ -2092,6 +2143,7 @@ def run_full_mode(
                         )
             else:
                 print("      - Compression: none selected")
+                print(f"      - Final RDF size (no compression): {format_bytes(raw_total_size)}")
         else:
             for raw_rdf_path in raw_rdf_files:
                 hdt_path = (out_dir / output_name) / f"{raw_rdf_path.stem}.hdt"
@@ -2114,6 +2166,9 @@ def run_full_mode(
                     selected_methods=selected_methods,
                     method_results=method_results,
                 )
+            if not selected_methods:
+                total_raw_size = sum(raw_size_before_cleanup_by_file.values())
+                print(f"    * Final RDF size (no compression): {format_bytes(total_raw_size)}")
 
         if not keep_tsv:
             # Cleanup only the triplet generated for this input iteration.
@@ -2139,14 +2194,25 @@ def run_full_mode(
         if run_tracker is not None:
             run_tracker.mark(f"Input {idx}/{total_inputs} completed: {output_name}")
 
-    if not keep_tsv:
-        if not tsv_existed:
-            shutil.rmtree(tsv_dir, ignore_errors=True)
-        else:
-            print("Note: TSV directory existed; skipping cleanup.")
+    if not keep_tsv and intermediate_dir.exists():
+        if not remove_path_with_docker_fallback(
+            path=intermediate_dir,
+            mount_root=out_dir,
+            mount_point="/data/out",
+            image_ref=image_ref,
+            wrapper_log_path=wrapper_log_path,
+        ):
+            eprint(
+                f"Warning: failed to remove intermediate directory '{intermediate_dir}'. "
+                f"See log: {wrapper_log_path}"
+            )
+            if run_tracker is not None:
+                run_tracker.mark(f"Intermediate cleanup failed for {intermediate_dir}")
 
     if saw_triple_counts:
         print(f"Total triples produced (full run): {total_triples_produced:,}")
+    elif not selected_methods:
+        print("Total triples produced (full run): unavailable")
 
     if input_failures:
         report_path = write_failed_inputs_report(metrics_dir=metrics_dir, failures=input_failures)
