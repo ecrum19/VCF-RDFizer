@@ -176,6 +176,43 @@ If Docker permission issues occur, rerun with a Docker-allowed user (or configur
 
 If HDT compression fails on very large `.nt` files, use batch layout and/or non-HDT compression methods.
 
+## Citation
+
+If you use VCF-RDFizer in a publication, please cite:
+
+VCF-RDFizer maintainers. (2026). *VCF-RDFizer* (Version 1.0.0) [Computer software]. GitHub. https://github.com/ecrum19/VCF-RDFizer
+
+BibTeX:
+
+```bibtex
+@software{vcf_rdfizer_2026,
+  author  = {{VCF-RDFizer maintainers}},
+  title   = {VCF-RDFizer},
+  year    = {2026},
+  version = {1.0.0},
+  url     = {https://github.com/ecrum19/VCF-RDFizer},
+  note    = {Computer software}
+}
+```
+
+You can also use the machine-readable citation file: `CITATION.cff`.
+
+## Contributing
+
+Contributions are welcome. If you want to improve VCF-RDFizer:
+
+- Open an issue first for bug reports, feature requests, or design changes.
+- Fork the repo and create a feature branch from `main`.
+- Keep changes focused and include/update tests for behavior changes.
+- Run the unit tests locally before opening a PR:
+
+```bash
+python3 -m unittest discover -s test -p "test_*_unit.py" -q
+```
+
+- In your PR, include what changed, why it changed, and how you validated it.
+- Use clear commit messages (for Docker publish control, include `[publish-docker]` only when intended).
+
 ## Licensing
 
 - Project license: `LICENSE` (MIT)
