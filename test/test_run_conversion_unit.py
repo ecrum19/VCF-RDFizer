@@ -532,6 +532,61 @@ printf '<uniq> <p> <o> .\\n' > "$out/part-00002"
             self.assertEqual(lines.count("<dup> <p> <o> ."), 1)
             self.assertEqual(lines.count("<uniq> <p> <o> ."), 1)
 
+    def test_run_conversion_rewrites_dot_literal_to_typed_null(self):
+        """Plain literal dot is normalized to ontology null typed literal in RDF output."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            fake_bin = tmp_path / "bin"
+            fake_bin.mkdir()
+            make_executable(
+                fake_bin / "java",
+                """#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "-version" ]]; then
+  echo 'openjdk version "11.0.0"' >&2
+  exit 0
+fi
+out=""
+while [[ $# -gt 0 ]]; do
+  if [[ "$1" == "-o" ]]; then
+    out="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+mkdir -p "$out"
+printf '<s> <p> "." .\\n' > "$out/part-000"
+""",
+            )
+
+            out_dir = tmp_path / "out"
+            metrics_dir = tmp_path / "metrics"
+            rules = tmp_path / "rules.ttl"
+            rules.write_text("@prefix ex: <http://example.org/> .\n")
+            vcf = tmp_path / "input.vcf"
+            vcf.write_text("##fileformat=VCFv4.2\n#CHROM\tPOS\n1\t5\n")
+
+            env = env_with_path(fake_bin)
+            env.update(
+                {
+                    "JAR": "fake.jar",
+                    "IN": str(rules),
+                    "IN_VCF": str(vcf),
+                    "OUT_DIR": str(out_dir),
+                    "OUT_NAME": "rdf",
+                    "LOGDIR": str(metrics_dir),
+                    "RUN_ID": "run-null-dot",
+                    "TIMESTAMP": "2026-01-01T00:00:00",
+                }
+            )
+
+            result = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            merged_nt = out_dir / "rdf" / "rdf.nt"
+            text = merged_nt.read_text()
+            self.assertIn('"."^^<https://w3id.org/vcf-rdfizer/vocab#Null> .', text)
+
 
 if __name__ == "__main__":
     unittest.main()

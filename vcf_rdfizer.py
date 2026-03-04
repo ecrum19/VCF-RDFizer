@@ -2118,6 +2118,8 @@ def run_full_mode(
         run_cmd = [
             *docker_run_base(),
             "-v",
+            f"{str(input_mount_dir)}:/data/in:ro",
+            "-v",
             f"{str(generated_rules_dir)}:/data/rules:ro",
             "-v",
             f"{str(tsv_dir)}:/data/tsv:ro",

@@ -159,6 +159,17 @@ count_triples_json() {
   echo "}"
 }
 
+# Replace plain VCF null marker literals (`"."`) with typed null literals.
+# Ontology alignment:
+#   "."  ->  "."^^vcfr:Null
+annotate_null_literals_nt() {
+  local nt_path="$1"
+  local tmp_path
+  tmp_path="$(mktemp "${nt_path}.nullfix.XXXXXX")"
+  sed -E 's/"\."([[:space:]]+\.)/"."^^<https:\/\/w3id.org\/vcf-rdfizer\/vocab#Null>\1/g' "$nt_path" > "$tmp_path"
+  mv "$tmp_path" "$nt_path"
+}
+
 
 # Convert elapsed clock text from `time` output to numeric seconds.
 elapsed_to_seconds() {
@@ -264,6 +275,17 @@ if [[ "$AGGREGATE_RDF" == "1" ]]; then
   OUTPUT_PATH="$MERGED_NT"
 else
   OUTPUT_PATH="$OUT_DIR/$OUT_NAME"
+fi
+
+# Apply ontology-compliant null datatype annotation to produced RDF files.
+if [[ -f "$OUTPUT_PATH" ]]; then
+  annotate_null_literals_nt "$OUTPUT_PATH"
+elif [[ -d "$OUTPUT_PATH" ]]; then
+  shopt -s nullglob
+  for RDF_NT in "$OUTPUT_PATH"/*.nt; do
+    annotate_null_literals_nt "$RDF_NT"
+  done
+  shopt -u nullglob
 fi
 
 OUT_SIZE=$(stat_size "$OUTPUT_PATH")

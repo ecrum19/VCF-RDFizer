@@ -1100,6 +1100,8 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertEqual(len(commands), 2)
             self.assertIn("/opt/vcf-rdfizer/vcf_as_tsv.sh", commands[0])
             self.assertIn("/opt/vcf-rdfizer/run_conversion.sh", commands[1])
+            self.assertTrue(any(str(arg).endswith(":/data/in:ro") for arg in commands[1]))
+            self.assertTrue(any(str(arg).startswith("IN_VCF=/data/in/") for arg in commands[1]))
 
     def test_main_full_mode_batch_layout_compresses_each_rml_part(self):
         """Batch layout compresses each part and prints one consolidated size summary."""
