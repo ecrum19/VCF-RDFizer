@@ -73,9 +73,10 @@ def output_name_from_command(cmd):
         if isinstance(part, str) and part.startswith("OUT_NAME="):
             return part.split("=", 1)[1]
     if isinstance(cmd, list) and cmd and isinstance(cmd[-1], str):
-        match = re.search(r"/data/out/(?:([^/]+)/)?([^/]+)\.hdt", cmd[-1])
-        if match:
-            return match.group(1) or match.group(2)
+        matches = re.findall(r"/data/out/(?:([^/]+)/)?([^/]+)\.hdt(?!\.time)", cmd[-1])
+        if matches:
+            group1, group2 = matches[-1]
+            return group1 or group2
     return None
 
 
@@ -145,12 +146,18 @@ class WrapperUnitTests(VerboseTestCase):
                         "output_size_bytes": 40,
                         "exit_code": 0,
                         "wall_seconds": 1.25,
+                        "user_seconds": 1.10,
+                        "sys_seconds": 0.10,
+                        "max_rss_kb": 2048,
                         "source": "existing",
                     },
                     "hdt_gzip": {
                         "output_size_bytes": 12,
                         "exit_code": 0,
                         "wall_seconds": 0.50,
+                        "user_seconds": 0.30,
+                        "sys_seconds": 0.05,
+                        "max_rss_kb": 512,
                     },
                 },
             )
@@ -163,6 +170,94 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertEqual(row["exit_code_gzip"], "0")
             self.assertEqual(row["exit_code_gzip_on_hdt"], "0")
             self.assertEqual(row["hdt_source"], "existing")
+            self.assertEqual(row["user_seconds_hdt"], "1.100000")
+            self.assertEqual(row["sys_seconds_hdt"], "0.100000")
+            self.assertEqual(row["max_rss_kb_hdt"], "2048")
+            self.assertEqual(row["user_seconds_gzip_on_hdt"], "0.300000")
+            self.assertEqual(row["sys_seconds_gzip_on_hdt"], "0.050000")
+            self.assertEqual(row["max_rss_kb_gzip_on_hdt"], "512")
+
+    def test_parse_time_log_metrics_reads_gnu_time_fields(self):
+        """GNU time logs are parsed for wall/user/sys/max RSS values."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            time_log = tmp_path / "time.log"
+            time_log.write_text(
+                "User time (seconds): 1.23\n"
+                "System time (seconds): 0.45\n"
+                "Elapsed (wall clock) time (h:mm:ss or m:ss): 0:02.50\n"
+                "Maximum resident set size (kbytes): 12345\n"
+            )
+            parsed = vcf_rdfizer.parse_time_log_metrics(time_log)
+
+            self.assertEqual(parsed["wall_seconds"], 2.5)
+            self.assertEqual(parsed["user_seconds"], 1.23)
+            self.assertEqual(parsed["sys_seconds"], 0.45)
+            self.assertEqual(parsed["max_rss_kb"], 12345)
+
+    def test_cleanup_interrupted_full_run_removes_intermediates(self):
+        """Interrupt cleanup removes tracked intermediate and raw RDF files."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            out_root = tmp_path / "out"
+            metrics_dir = out_root / "run_metrics" / "20260304T120000"
+            tsv_file = out_root / ".intermediate" / "tsv" / "sample.records.tsv"
+            raw_rdf = out_root / "sample" / "sample.nt"
+            tsv_file.parent.mkdir(parents=True, exist_ok=True)
+            raw_rdf.parent.mkdir(parents=True, exist_ok=True)
+            tsv_file.write_text("dummy\n")
+            raw_rdf.write_text("<s> <p> <o> .\n")
+
+            tracker = vcf_rdfizer.RunTracker(metrics_dir / "progress.log")
+            tracker.track_intermediate(tsv_file.parent)
+            tracker.track_raw_rdf(raw_rdf)
+            removed, failed = vcf_rdfizer.cleanup_interrupted_full_run(
+                run_tracker=tracker,
+                out_root=out_root,
+                image_ref=None,
+                keep_rdf=False,
+                wrapper_log_path=metrics_dir / "wrapper.log",
+            )
+            tracker.close()
+
+            self.assertGreaterEqual(removed, 2)
+            self.assertEqual(failed, 0)
+            self.assertFalse(tsv_file.parent.exists())
+            self.assertFalse(raw_rdf.exists())
+
+    def test_aggregate_method_results_includes_all_timing_types(self):
+        """Batch aggregation keeps wall/user/sys and max_rss metrics for each method."""
+        aggregated = vcf_rdfizer.aggregate_method_results_across_files(
+            {
+                "part1.nt": {
+                    "gzip": {
+                        "exit_code": 0,
+                        "wall_seconds": 1.0,
+                        "user_seconds": 0.7,
+                        "sys_seconds": 0.1,
+                        "max_rss_kb": 100,
+                        "output_size_bytes": 10,
+                    }
+                },
+                "part2.nt": {
+                    "gzip": {
+                        "exit_code": 0,
+                        "wall_seconds": 2.0,
+                        "user_seconds": 1.2,
+                        "sys_seconds": 0.2,
+                        "max_rss_kb": 150,
+                        "output_size_bytes": 20,
+                    }
+                },
+            }
+        )
+
+        gzip = aggregated["gzip"]
+        self.assertEqual(gzip["wall_seconds"], 3.0)
+        self.assertAlmostEqual(gzip["user_seconds"], 1.9, places=6)
+        self.assertAlmostEqual(gzip["sys_seconds"], 0.3, places=6)
+        self.assertEqual(gzip["max_rss_kb"], 150)
+        self.assertEqual(gzip["output_size_bytes"], 30)
 
     def test_help_flag_prints_usage_guide(self):
         """Help flag exits cleanly and prints mode usage examples."""
@@ -616,6 +711,44 @@ class WrapperUnitTests(VerboseTestCase):
             )
             self.assertEqual(rc, 2)
 
+    def test_main_full_mode_keyboard_interrupt_returns_130_and_writes_progress_log(self):
+        """Keyboard interrupt exits with 130 and records interruption in progress log."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+            out_dir = tmp_path / "out"
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "check_docker", return_value=True), mock.patch.object(
+                    vcf_rdfizer, "docker_image_exists", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "run_full_mode", side_effect=KeyboardInterrupt()
+                ):
+                    rc = invoke_main(
+                        [
+                            "--mode",
+                            "full",
+                            "--input",
+                            str(input_dir),
+                            "--rules",
+                            str(rules_path),
+                            "--rdf-layout",
+                            "aggregate",
+                            "--out",
+                            str(out_dir),
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 130)
+            run_metrics_dir = latest_metrics_run_dir(out_dir / "run_metrics")
+            progress_log = run_metrics_dir / "progress.log"
+            self.assertTrue(progress_log.exists())
+            self.assertIn("Run interrupted by user signal", progress_log.read_text())
+
     def test_main_compress_mode_none_skips_compression_commands(self):
         """Compression mode with method none performs no compression runs."""
         with tempfile.TemporaryDirectory() as td:
@@ -1009,6 +1142,86 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertIn("OUT_NAME=sample_b", commands[6])
             self.assertIn("rdf2hdt", commands[9][-1])
             self.assertIn("/data/out/sample_b.hdt", commands[9][-1])
+
+    def test_main_multiple_inputs_continue_after_one_failure_and_write_failure_report(self):
+        """Multi-input full mode continues after one input fails and writes failed_inputs.csv."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir = tmp_path / "input"
+            input_dir.mkdir()
+            (input_dir / "sample_a.vcf").write_text("##fileformat=VCFv4.2\n#CHROM\tPOS\n1\t10\n")
+            (input_dir / "sample_b.vcf").write_text("##fileformat=VCFv4.2\n#CHROM\tPOS\n1\t20\n")
+            rules_path = tmp_path / "rules.ttl"
+            rules_path.write_text("@prefix ex: <http://example.org/> .\n")
+            out_dir = tmp_path / "out"
+            commands = []
+
+            multi_triplets = [
+                {
+                    "prefix": "sample_a",
+                    "records": Path("sample_a.records.tsv"),
+                    "headers": Path("sample_a.header_lines.tsv"),
+                    "metadata": Path("sample_a.file_metadata.tsv"),
+                },
+                {
+                    "prefix": "sample_b",
+                    "records": Path("sample_b.records.tsv"),
+                    "headers": Path("sample_b.header_lines.tsv"),
+                    "metadata": Path("sample_b.file_metadata.tsv"),
+                },
+            ]
+
+            def fake_run(cmd, cwd=None, env=None):
+                commands.append(cmd)
+                if "/opt/vcf-rdfizer/run_conversion.sh" in cmd:
+                    output_name = output_name_from_command(cmd) or "sample"
+                    if output_name == "sample_a":
+                        return 1
+                    out_sample_dir = out_dir / output_name
+                    out_sample_dir.mkdir(parents=True, exist_ok=True)
+                    (out_sample_dir / f"{output_name}.nt").write_text("<s> <p> <o> .\n")
+                    return 0
+                if isinstance(cmd, list) and cmd and "rdf2hdt" in cmd[-1]:
+                    output_name = output_name_from_command(cmd) or "sample"
+                    out_sample_dir = out_dir / output_name
+                    out_sample_dir.mkdir(parents=True, exist_ok=True)
+                    (out_sample_dir / f"{output_name}.hdt").write_text("fake-hdt\n")
+                return 0
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch.object(
+                    vcf_rdfizer, "check_docker", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "docker_image_exists", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "discover_tsv_triplets", return_value=multi_triplets
+                ):
+                    rc = invoke_main(
+                        [
+                            "--input",
+                            str(input_dir),
+                            "--rules",
+                            str(rules_path),
+                            "--out",
+                            str(out_dir),
+                            "--keep-tsv",
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 1)
+            self.assertTrue(any("/data/in/sample_b.vcf" in str(cmd) for cmd in commands))
+            self.assertTrue((out_dir / "sample_b" / "sample_b.hdt").exists())
+
+            run_metrics_dir = latest_metrics_run_dir(out_dir / "run_metrics")
+            failed_report = run_metrics_dir / "failed_inputs.csv"
+            self.assertTrue(failed_report.exists())
+            report_text = failed_report.read_text()
+            self.assertIn("sample_a", report_text)
+            self.assertIn("rdf-conversion", report_text)
 
     def test_main_full_mode_deletes_nt_after_compression_by_default(self):
         """Full mode removes merged .nt outputs after successful compression unless --keep-rdf is set."""

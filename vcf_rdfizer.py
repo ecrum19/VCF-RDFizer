@@ -20,6 +20,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -154,6 +155,109 @@ def ui_symbol(symbol: str, fallback: str) -> str:
 def success_symbol() -> str:
     """Unicode checkmark with ASCII fallback for Windows cp1252 consoles."""
     return ui_symbol("✅", "[ok]")
+
+
+class RunTracker:
+    """Track run progress and intermediate artifacts for safe interruption cleanup."""
+
+    def __init__(self, log_path: Path):
+        self.log_path = log_path
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle = self.log_path.open("a", encoding="utf-8")
+        self.intermediate_paths: set[Path] = set()
+        self.raw_rdf_paths: set[Path] = set()
+
+    def mark(self, message: str):
+        timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        self._handle.write(f"[{timestamp}] {message}\n")
+        self._handle.flush()
+
+    def track_intermediate(self, path: Path):
+        self.intermediate_paths.add(path)
+
+    def track_raw_rdf(self, path: Path):
+        self.raw_rdf_paths.add(path)
+
+    def close(self):
+        if not self._handle.closed:
+            self._handle.close()
+
+
+def elapsed_to_seconds(value: str):
+    """Parse elapsed clock strings from `time` output into seconds."""
+    if value is None:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        if ":" not in text:
+            return float(text)
+        parts = text.split(":")
+        if len(parts) == 2:
+            minutes, seconds = parts
+            return float(minutes) * 60.0 + float(seconds)
+        if len(parts) == 3:
+            hours, minutes, seconds = parts
+            return float(hours) * 3600.0 + float(minutes) * 60.0 + float(seconds)
+    except ValueError:
+        return None
+    return None
+
+
+def parse_time_log_metrics(time_log: Path):
+    """Parse GNU `/usr/bin/time -v` or POSIX `time -p` logs into numeric metrics."""
+    if not time_log.exists():
+        return {
+            "wall_seconds": None,
+            "user_seconds": None,
+            "sys_seconds": None,
+            "max_rss_kb": None,
+        }
+
+    text = time_log.read_text(encoding="utf-8", errors="replace")
+
+    def first_float(pattern: str):
+        match = re.search(pattern, text, flags=re.MULTILINE)
+        if not match:
+            return None
+        try:
+            return float(match.group(1))
+        except (TypeError, ValueError):
+            return None
+
+    def first_int(pattern: str):
+        match = re.search(pattern, text, flags=re.MULTILINE)
+        if not match:
+            return None
+        try:
+            return int(float(match.group(1)))
+        except (TypeError, ValueError):
+            return None
+
+    wall_seconds = None
+    elapsed_match = re.search(r"Elapsed \(wall clock\) time.*:\s*([^\n]+)", text)
+    if elapsed_match:
+        wall_seconds = elapsed_to_seconds(elapsed_match.group(1).strip())
+    if wall_seconds is None:
+        wall_seconds = first_float(r"^real\s+([0-9]+(?:\.[0-9]+)?)$")
+
+    user_seconds = first_float(r"User time \(seconds\):\s*([0-9]+(?:\.[0-9]+)?)")
+    if user_seconds is None:
+        user_seconds = first_float(r"^user\s+([0-9]+(?:\.[0-9]+)?)$")
+
+    sys_seconds = first_float(r"System time \(seconds\):\s*([0-9]+(?:\.[0-9]+)?)")
+    if sys_seconds is None:
+        sys_seconds = first_float(r"^sys\s+([0-9]+(?:\.[0-9]+)?)$")
+
+    max_rss_kb = first_int(r"Maximum resident set size.*:\s*([0-9]+)")
+
+    return {
+        "wall_seconds": wall_seconds,
+        "user_seconds": user_seconds,
+        "sys_seconds": sys_seconds,
+        "max_rss_kb": max_rss_kb,
+    }
 
 
 def run(cmd, cwd=None, env=None):
@@ -559,6 +663,33 @@ def append_wrapper_timing_log(
         )
 
 
+def write_failed_inputs_report(*, metrics_dir: Path, failures: list[dict]):
+    """Write per-input failure summary for full-mode partial runs."""
+    ensure_dir(metrics_dir)
+    report_path = metrics_dir / "failed_inputs.csv"
+    header = [
+        "input_index",
+        "input_vcf",
+        "expected_prefix",
+        "stage",
+        "error",
+    ]
+    with report_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=header)
+        writer.writeheader()
+        for entry in failures:
+            writer.writerow(
+                {
+                    "input_index": entry.get("input_index", ""),
+                    "input_vcf": entry.get("input_vcf", ""),
+                    "expected_prefix": entry.get("expected_prefix", ""),
+                    "stage": entry.get("stage", ""),
+                    "error": entry.get("error", ""),
+                }
+            )
+    return report_path
+
+
 def print_nt_hdt_summary(
     *,
     output_root: Path,
@@ -699,6 +830,100 @@ def remove_file_with_docker_fallback(
         eprint(f"See log for details: {wrapper_log_path}")
         return False
     return True
+
+
+def remove_path_with_docker_fallback(
+    *,
+    path: Path,
+    mount_root: Path,
+    mount_point: str,
+    image_ref: str | None,
+    wrapper_log_path: Path,
+) -> bool:
+    """Delete a file/dir directly, then fall back to in-container `rm -rf` if needed."""
+    if not path.exists():
+        return True
+
+    try:
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+        return True
+    except OSError:
+        pass
+
+    if not image_ref:
+        eprint(f"Error: cannot remove '{path}' after interruption (Docker image unresolved).")
+        eprint(f"See log for details: {wrapper_log_path}")
+        return False
+
+    try:
+        rel = path.resolve().relative_to(mount_root.resolve())
+    except ValueError:
+        eprint(f"Error: cannot remove path outside mounted root: {path}")
+        eprint(f"See log for details: {wrapper_log_path}")
+        return False
+
+    if rel.as_posix() in {".", ""}:
+        eprint(f"Error: refusing to remove mounted root path via fallback: {path}")
+        eprint(f"See log for details: {wrapper_log_path}")
+        return False
+
+    container_path = f"{mount_point.rstrip('/')}/{rel.as_posix()}"
+    rm_cmd = [
+        *docker_run_base(as_user=False),
+        "-v",
+        f"{str(mount_root)}:{mount_point}",
+        image_ref,
+        "bash",
+        "-lc",
+        f"rm -rf {shlex.quote(container_path)}",
+    ]
+    if run(rm_cmd) != 0:
+        eprint(f"Error: failed to remove path with Docker fallback: {path}")
+        eprint(f"See log for details: {wrapper_log_path}")
+        return False
+    return True
+
+
+def cleanup_interrupted_full_run(
+    *,
+    run_tracker: RunTracker,
+    out_root: Path,
+    image_ref: str | None,
+    keep_rdf: bool,
+    wrapper_log_path: Path,
+):
+    """Best-effort cleanup for full-mode interruption.
+
+    Removes tracked intermediates (and raw RDF artifacts when `keep_rdf` is not set),
+    then records a compact cleanup summary in the run progress log.
+    """
+    targets: set[Path] = set(run_tracker.intermediate_paths)
+    if not keep_rdf:
+        targets.update(run_tracker.raw_rdf_paths)
+
+    removed = 0
+    failed = 0
+    for path in sorted(targets, key=lambda p: len(p.parts), reverse=True):
+        if not path.exists():
+            continue
+        if remove_path_with_docker_fallback(
+            path=path,
+            mount_root=out_root,
+            mount_point="/data/out",
+            image_ref=image_ref,
+            wrapper_log_path=wrapper_log_path,
+        ):
+            removed += 1
+        else:
+            failed += 1
+
+    run_tracker.mark(
+        f"Interrupt cleanup finished: removed={removed}, failed={failed}, keep_rdf={str(keep_rdf).lower()}"
+    )
+    return removed, failed
 
 
 def existing_parent(path: Path) -> Path:
@@ -977,17 +1202,32 @@ def update_metrics_csv_with_compression(
     }
     row.update(defaults)
 
+    def assign_timing(prefix: str, result: dict):
+        wall_val = result.get("wall_seconds")
+        user_val = result.get("user_seconds")
+        sys_val = result.get("sys_seconds")
+        rss_val = result.get("max_rss_kb")
+
+        row[f"wall_seconds_{prefix}"] = (
+            "null" if wall_val is None else f"{float(wall_val):.6f}"
+        )
+        row[f"user_seconds_{prefix}"] = (
+            "null" if user_val is None else f"{float(user_val):.6f}"
+        )
+        row[f"sys_seconds_{prefix}"] = (
+            "null" if sys_val is None else f"{float(sys_val):.6f}"
+        )
+        row[f"max_rss_kb_{prefix}"] = "null" if rss_val is None else str(int(rss_val))
+
     for method in ("gzip", "brotli", "hdt"):
         result = method_results.get(method)
         if result is None:
             continue
         size_key = f"{method}_size_bytes"
         exit_key = f"exit_code_{method}"
-        wall_key = f"wall_seconds_{method}"
         row[size_key] = str(int(result.get("output_size_bytes") or 0))
         row[exit_key] = str(int(result.get("exit_code") or 0))
-        wall_val = result.get("wall_seconds")
-        row[wall_key] = "null" if wall_val is None else f"{float(wall_val):.6f}"
+        assign_timing(method, result)
 
     hdt_result = method_results.get("hdt")
     if hdt_result is not None:
@@ -997,19 +1237,13 @@ def update_metrics_csv_with_compression(
     if hdt_gzip_result is not None:
         row["gzip_on_hdt_size_bytes"] = str(int(hdt_gzip_result.get("output_size_bytes") or 0))
         row["exit_code_gzip_on_hdt"] = str(int(hdt_gzip_result.get("exit_code") or 0))
-        wall_val = hdt_gzip_result.get("wall_seconds")
-        row["wall_seconds_gzip_on_hdt"] = (
-            "null" if wall_val is None else f"{float(wall_val):.6f}"
-        )
+        assign_timing("gzip_on_hdt", hdt_gzip_result)
 
     hdt_brotli_result = method_results.get("hdt_brotli")
     if hdt_brotli_result is not None:
         row["brotli_on_hdt_size_bytes"] = str(int(hdt_brotli_result.get("output_size_bytes") or 0))
         row["exit_code_brotli_on_hdt"] = str(int(hdt_brotli_result.get("exit_code") or 0))
-        wall_val = hdt_brotli_result.get("wall_seconds")
-        row["wall_seconds_brotli_on_hdt"] = (
-            "null" if wall_val is None else f"{float(wall_val):.6f}"
-        )
+        assign_timing("brotli_on_hdt", hdt_brotli_result)
 
     with metrics_csv.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=METRICS_HEADER)
@@ -1040,6 +1274,9 @@ def write_compression_metrics_artifacts(
             f"method={method}",
             f"exit_code={result.get('exit_code', 1)}",
             f"wall_seconds={result.get('wall_seconds', 'null')}",
+            f"user_seconds={result.get('user_seconds', 'null')}",
+            f"sys_seconds={result.get('sys_seconds', 'null')}",
+            f"max_rss_kb={result.get('max_rss_kb', 'null')}",
             f"output_path={result.get('output_path', '')}",
             f"output_size_bytes={result.get('output_size_bytes', 0)}",
         ]
@@ -1050,6 +1287,14 @@ def write_compression_metrics_artifacts(
     hdt_result = method_results.get("hdt", {})
     hdt_gzip_result = method_results.get("hdt_gzip", {})
     hdt_brotli_result = method_results.get("hdt_brotli", {})
+
+    def timing_payload(result: dict):
+        return {
+            "wall_seconds": result.get("wall_seconds"),
+            "user_seconds": result.get("user_seconds"),
+            "sys_seconds": result.get("sys_seconds"),
+            "max_rss_kb": result.get("max_rss_kb"),
+        }
 
     payload = {
         "run_id": run_id,
@@ -1064,56 +1309,31 @@ def write_compression_metrics_artifacts(
             "output_gz_path": gzip_result.get("output_path", ""),
             "output_gz_size_bytes": int(gzip_result.get("output_size_bytes") or 0),
             "exit_code": int(gzip_result.get("exit_code") or 0),
-            "timing": {
-                "wall_seconds": gzip_result.get("wall_seconds"),
-                "user_seconds": None,
-                "sys_seconds": None,
-                "max_rss_kb": None,
-            },
+            "timing": timing_payload(gzip_result),
         },
         "brotli_raw_rdf": {
             "output_brotli_path": brotli_result.get("output_path", ""),
             "output_brotli_size_bytes": int(brotli_result.get("output_size_bytes") or 0),
             "exit_code": int(brotli_result.get("exit_code") or 0),
-            "timing": {
-                "wall_seconds": brotli_result.get("wall_seconds"),
-                "user_seconds": None,
-                "sys_seconds": None,
-                "max_rss_kb": None,
-            },
+            "timing": timing_payload(brotli_result),
         },
         "hdt_conversion": {
             "output_hdt_path": hdt_result.get("output_path", ""),
             "output_hdt_size_bytes": int(hdt_result.get("output_size_bytes") or 0),
             "exit_code": int(hdt_result.get("exit_code") or 0),
-            "timing": {
-                "wall_seconds": hdt_result.get("wall_seconds"),
-                "user_seconds": None,
-                "sys_seconds": None,
-                "max_rss_kb": None,
-            },
+            "timing": timing_payload(hdt_result),
         },
         "gzip_on_hdt": {
             "output_hdt_gz_path": hdt_gzip_result.get("output_path", ""),
             "output_hdt_gz_size_bytes": int(hdt_gzip_result.get("output_size_bytes") or 0),
             "exit_code": int(hdt_gzip_result.get("exit_code") or 0),
-            "timing": {
-                "wall_seconds": hdt_gzip_result.get("wall_seconds"),
-                "user_seconds": None,
-                "sys_seconds": None,
-                "max_rss_kb": None,
-            },
+            "timing": timing_payload(hdt_gzip_result),
         },
         "brotli_on_hdt": {
             "output_hdt_br_path": hdt_brotli_result.get("output_path", ""),
             "output_hdt_br_size_bytes": int(hdt_brotli_result.get("output_size_bytes") or 0),
             "exit_code": int(hdt_brotli_result.get("exit_code") or 0),
-            "timing": {
-                "wall_seconds": hdt_brotli_result.get("wall_seconds"),
-                "user_seconds": None,
-                "sys_seconds": None,
-                "max_rss_kb": None,
-            },
+            "timing": timing_payload(hdt_brotli_result),
         },
     }
 
@@ -1138,7 +1358,14 @@ def aggregate_method_results_across_files(method_results_by_file: dict[str, dict
                 {
                     "exit_code": 0,
                     "wall_seconds": 0.0,
+                    "user_seconds": 0.0,
+                    "sys_seconds": 0.0,
+                    "max_rss_kb": 0,
                     "output_size_bytes": 0,
+                    "_seen_wall": False,
+                    "_seen_user": False,
+                    "_seen_sys": False,
+                    "_seen_rss": False,
                 },
             )
             current["exit_code"] = max(
@@ -1148,6 +1375,19 @@ def aggregate_method_results_across_files(method_results_by_file: dict[str, dict
             wall = result.get("wall_seconds")
             if wall is not None:
                 current["wall_seconds"] = float(current.get("wall_seconds", 0.0)) + float(wall)
+                current["_seen_wall"] = True
+            user = result.get("user_seconds")
+            if user is not None:
+                current["user_seconds"] = float(current.get("user_seconds", 0.0)) + float(user)
+                current["_seen_user"] = True
+            sys_seconds = result.get("sys_seconds")
+            if sys_seconds is not None:
+                current["sys_seconds"] = float(current.get("sys_seconds", 0.0)) + float(sys_seconds)
+                current["_seen_sys"] = True
+            max_rss = result.get("max_rss_kb")
+            if max_rss is not None:
+                current["max_rss_kb"] = max(int(current.get("max_rss_kb", 0)), int(max_rss))
+                current["_seen_rss"] = True
             current["output_size_bytes"] = int(current.get("output_size_bytes", 0)) + int(
                 result.get("output_size_bytes") or 0
             )
@@ -1160,6 +1400,16 @@ def aggregate_method_results_across_files(method_results_by_file: dict[str, dict
                     current["source"] = source
                 elif prior != source:
                     current["source"] = "mixed"
+
+    for current in aggregated.values():
+        if not current.pop("_seen_wall", False):
+            current["wall_seconds"] = None
+        if not current.pop("_seen_user", False):
+            current["user_seconds"] = None
+        if not current.pop("_seen_sys", False):
+            current["sys_seconds"] = None
+        if not current.pop("_seen_rss", False):
+            current["max_rss_kb"] = None
 
     return aggregated
 
@@ -1271,6 +1521,18 @@ def run_compression_methods_for_rdf(
 
     def run_container_command(*, method: str, output_name: str, command: str):
         """Execute one compression command in Docker and capture timing/size."""
+        timing_name = f".{input_stem}.{method}.time"
+        timing_container = f"{target_out_container}/{timing_name}"
+        timing_host = target_out_dir / timing_name
+        wrapped_command = (
+            "set -euo pipefail; "
+            f"rm -f {shlex.quote(timing_container)}; "
+            'if [[ -x /usr/bin/time ]] && /usr/bin/time --version >/dev/null 2>&1; then '
+            f"/usr/bin/time -v -o {shlex.quote(timing_container)} -- bash -lc {shlex.quote(command)}; "
+            "else "
+            f"{{ time -p bash -lc {shlex.quote(command)}; }} > {shlex.quote(timing_container)} 2>&1; "
+            "fi"
+        )
         cmd = [
             *docker_run_base(),
             "-v",
@@ -1280,18 +1542,29 @@ def run_compression_methods_for_rdf(
             image_ref,
             "bash",
             "-lc",
-            command,
+            wrapped_command,
         ]
         started = time.perf_counter()
         exit_code = run(cmd)
         elapsed = time.perf_counter() - started
+        timing = parse_time_log_metrics(timing_host)
         output_path = target_out_dir / output_name
         method_results[method] = {
             "exit_code": exit_code,
-            "wall_seconds": elapsed,
+            "wall_seconds": timing.get("wall_seconds")
+            if timing.get("wall_seconds") is not None
+            else elapsed,
+            "user_seconds": timing.get("user_seconds"),
+            "sys_seconds": timing.get("sys_seconds"),
+            "max_rss_kb": timing.get("max_rss_kb"),
             "output_path": str(output_path),
             "output_size_bytes": int(file_size_bytes(output_path) or 0),
         }
+        if timing_host.exists():
+            try:
+                timing_host.unlink()
+            except OSError:
+                pass
         if method == "hdt":
             method_results[method]["source"] = "generated"
         if exit_code != 0:
@@ -1312,6 +1585,9 @@ def run_compression_methods_for_rdf(
                 {
                     "exit_code": 0,
                     "wall_seconds": 0.0,
+                    "user_seconds": 0.0,
+                    "sys_seconds": 0.0,
+                    "max_rss_kb": 0,
                     "output_path": str(hdt_path),
                     "output_size_bytes": int(file_size_bytes(hdt_path) or 0),
                 },
@@ -1431,6 +1707,7 @@ def run_full_mode(
     run_id: str,
     timestamp: str,
     wrapper_log_path: Path,
+    run_tracker: RunTracker | None = None,
 ):
     """Execute full pipeline: per-input TSV -> RDF -> compression -> metrics."""
     print("Step 3/5: Processing per-input pipeline (TSV -> RDF -> compression)")
@@ -1445,16 +1722,50 @@ def run_full_mode(
     if generated_rules_dir.exists():
         shutil.rmtree(generated_rules_dir, ignore_errors=True)
     ensure_dir(generated_rules_dir)
+    if run_tracker is not None:
+        run_tracker.track_intermediate(tsv_dir)
+        run_tracker.track_intermediate(generated_rules_dir)
+        run_tracker.mark("Full pipeline started")
 
     total_triples_produced = 0
     saw_triple_counts = False
+    input_failures: list[dict] = []
 
     total_inputs = len(container_inputs)
     for idx, (container_input, expected_prefix) in enumerate(
         zip(container_inputs, expected_prefixes),
         start=1,
     ):
-        print(f"  - Input {idx}/{total_inputs}: {Path(container_input).name}")
+        input_name = Path(container_input).name
+        try:
+            container_rel = Path(container_input).relative_to("/data/in")
+            input_vcf = str((input_mount_dir / container_rel).resolve())
+        except ValueError:
+            input_vcf = container_input
+        input_failed = False
+
+        def fail_current(stage: str, message: str):
+            nonlocal input_failed
+            input_failed = True
+            compact = " ".join(str(message).split())
+            eprint(f"    ! Input {idx}/{total_inputs} ({input_name}) failed at {stage}: {compact}")
+            input_failures.append(
+                {
+                    "input_index": idx,
+                    "input_vcf": input_vcf,
+                    "expected_prefix": expected_prefix,
+                    "stage": stage,
+                    "error": compact,
+                }
+            )
+            if run_tracker is not None:
+                run_tracker.mark(
+                    f"Input {idx}/{total_inputs} failed at {stage} for {expected_prefix}: {compact}"
+                )
+
+        print(f"  - Input {idx}/{total_inputs}: {input_name}")
+        if run_tracker is not None:
+            run_tracker.mark(f"Input {idx}/{total_inputs} started: {expected_prefix}")
 
         # Pre-flight write checks for expected TSV outputs to fail fast on
         # permission/mount problems before starting container work.
@@ -1466,9 +1777,13 @@ def run_full_mode(
                 image_ref=image_ref,
                 wrapper_log_path=wrapper_log_path,
             ):
-                eprint(f"Error: cannot write expected TSV output '{expected_tsv_output}'.")
-                eprint(f"See log for details: {wrapper_log_path}")
-                return 1
+                fail_current(
+                    "preflight-write-check",
+                    f"cannot write expected TSV output '{expected_tsv_output}'. See log: {wrapper_log_path}",
+                )
+                break
+        if input_failed:
+            continue
 
         tsv_cmd = [
             *docker_run_base(),
@@ -1483,26 +1798,28 @@ def run_full_mode(
             "/data/tsv",
         ]
         if run(tsv_cmd) != 0:
-            eprint(f"Error: TSV conversion failed. See log: {wrapper_log_path}")
-            return 1
+            fail_current("tsv-conversion", f"TSV conversion failed. See log: {wrapper_log_path}")
+            continue
         print(f"    * TSV conversion {success_symbol()}")
+        if run_tracker is not None:
+            run_tracker.mark(f"Input {idx}: TSV conversion completed for {expected_prefix}")
 
         # Discover and lock the exact triplet generated for this input; this
         # guards against stale TSV files from previous runs.
         try:
             tsv_triplets = discover_tsv_triplets(tsv_dir)
         except ValueError as exc:
-            eprint(f"Error: {exc}")
-            eprint(f"See log for details: {wrapper_log_path}")
-            return 1
+            fail_current("tsv-discovery", f"{exc}. See log: {wrapper_log_path}")
+            continue
 
         triplets_by_prefix = {triplet["prefix"]: triplet for triplet in tsv_triplets}
         if expected_prefix not in triplets_by_prefix:
-            eprint(
-                f"Error: TSV conversion did not produce the expected triplet for '{expected_prefix}'."
+            fail_current(
+                "tsv-validation",
+                f"TSV conversion did not produce the expected triplet for '{expected_prefix}'. "
+                f"See log: {wrapper_log_path}",
             )
-            eprint(f"See log for details: {wrapper_log_path}")
-            return 1
+            continue
 
         triplet = triplets_by_prefix[expected_prefix]
         prefix = triplet["prefix"]
@@ -1524,9 +1841,11 @@ def run_full_mode(
             image_ref=image_ref,
             wrapper_log_path=wrapper_log_path,
         ):
-            eprint(f"Error: cannot write output directory '{output_sample_dir}'.")
-            eprint(f"See log for details: {wrapper_log_path}")
-            return 1
+            fail_current(
+                "output-write-check",
+                f"cannot write output directory '{output_sample_dir}'. See log: {wrapper_log_path}",
+            )
+            continue
         container_generated_rules = f"/data/rules/{generated_rules.name}"
 
         run_cmd = [
@@ -1564,9 +1883,14 @@ def run_full_mode(
             "/opt/vcf-rdfizer/run_conversion.sh",
         ]
         if run(run_cmd) != 0:
-            eprint(f"Error: RMLStreamer step failed for '{prefix}'. See log: {wrapper_log_path}")
-            return 1
+            fail_current(
+                "rdf-conversion",
+                f"RMLStreamer step failed for '{prefix}'. See log: {wrapper_log_path}",
+            )
+            continue
         print(f"    * RDF conversion {success_symbol()}")
+        if run_tracker is not None:
+            run_tracker.mark(f"Input {idx}: RDF conversion completed for {prefix}")
 
         triples_produced = read_conversion_total_triples(metrics_dir, output_name, run_id)
         if triples_produced is not None:
@@ -1585,12 +1909,16 @@ def run_full_mode(
             # Batch mode keeps each RMLStreamer part as its own RDF artifact.
             raw_rdf_files = sorted((out_dir / output_name).glob("*.nt"))
             if not raw_rdf_files:
-                eprint(
-                    f"Error: no RDF part files produced in batch mode for '{output_name}'. "
-                    f"Expected .nt files in {out_dir / output_name}."
+                fail_current(
+                    "rdf-discovery",
+                    f"no RDF part files produced in batch mode for '{output_name}'. "
+                    f"Expected .nt files in {out_dir / output_name}. See log: {wrapper_log_path}",
                 )
-                eprint(f"See log for details: {wrapper_log_path}")
-                return 1
+                continue
+
+        if run_tracker is not None:
+            for raw_rdf_path in raw_rdf_files:
+                run_tracker.track_raw_rdf(raw_rdf_path)
 
         method_results_by_file: dict[str, dict[str, dict]] = {}
         if selected_methods:
@@ -1606,9 +1934,17 @@ def run_full_mode(
                     status_indent=None,
                 )
                 if not ok:
-                    return 1
+                    fail_current(
+                        "compression",
+                        f"compression failed for '{raw_rdf_path.name}'. See log: {wrapper_log_path}",
+                    )
+                    break
                 method_results_by_file[raw_rdf_path.name] = method_results
+        if input_failed:
+            continue
         print(f"    * Compression {success_symbol()}")
+        if run_tracker is not None:
+            run_tracker.mark(f"Input {idx}: compression completed for {output_name}")
 
         raw_size_before_cleanup_by_file = {
             raw_rdf_path.name: int(file_size_bytes(raw_rdf_path) or 0) for raw_rdf_path in raw_rdf_files
@@ -1678,6 +2014,7 @@ def run_full_mode(
         if not keep_rdf and selected_methods:
             # Cleanup raw RDF only after every selected compression method has
             # completed successfully for that specific RDF artifact.
+            cleanup_failed = False
             for raw_rdf_path in raw_rdf_files:
                 method_results = method_results_by_file.get(raw_rdf_path.name, {})
                 missing_or_failed = []
@@ -1686,13 +2023,15 @@ def run_full_mode(
                     if result is None or int(result.get("exit_code", 1)) != 0:
                         missing_or_failed.append(method)
                 if missing_or_failed:
-                    eprint(
-                        "Error: refusing to remove raw RDF before all selected compression "
-                        f"methods completed successfully for '{raw_rdf_path.name}'. "
-                        f"Pending/failed: {', '.join(missing_or_failed)}"
+                    fail_current(
+                        "rdf-cleanup-validation",
+                        "refusing to remove raw RDF before all selected compression methods "
+                        f"completed successfully for '{raw_rdf_path.name}'. "
+                        f"Pending/failed: {', '.join(missing_or_failed)}. "
+                        f"See log: {wrapper_log_path}",
                     )
-                    eprint(f"See log for details: {wrapper_log_path}")
-                    return 1
+                    cleanup_failed = True
+                    break
 
                 if raw_rdf_path.exists():
                     if not remove_file_with_docker_fallback(
@@ -1702,7 +2041,14 @@ def run_full_mode(
                         image_ref=image_ref,
                         wrapper_log_path=wrapper_log_path,
                     ):
-                        return 1
+                        fail_current(
+                            "rdf-cleanup",
+                            f"failed to remove raw RDF '{raw_rdf_path.name}'. See log: {wrapper_log_path}",
+                        )
+                        cleanup_failed = True
+                        break
+            if cleanup_failed:
+                continue
 
         if rdf_layout == "batch" and raw_rdf_files:
             output_root = out_dir / output_name
@@ -1771,6 +2117,7 @@ def run_full_mode(
 
         if not keep_tsv:
             # Cleanup only the triplet generated for this input iteration.
+            tsv_cleanup_failed = False
             for tsv_path in (triplet["records"], triplet["headers"], triplet["metadata"]):
                 if tsv_path.exists():
                     if not remove_file_with_docker_fallback(
@@ -1780,7 +2127,17 @@ def run_full_mode(
                         image_ref=image_ref,
                         wrapper_log_path=wrapper_log_path,
                     ):
-                        return 1
+                        fail_current(
+                            "tsv-cleanup",
+                            f"failed to remove intermediate TSV '{tsv_path.name}'. See log: {wrapper_log_path}",
+                        )
+                        tsv_cleanup_failed = True
+                        break
+            if tsv_cleanup_failed:
+                continue
+
+        if run_tracker is not None:
+            run_tracker.mark(f"Input {idx}/{total_inputs} completed: {output_name}")
 
     if not keep_tsv:
         if not tsv_existed:
@@ -1791,7 +2148,23 @@ def run_full_mode(
     if saw_triple_counts:
         print(f"Total triples produced (full run): {total_triples_produced:,}")
 
+    if input_failures:
+        report_path = write_failed_inputs_report(metrics_dir=metrics_dir, failures=input_failures)
+        eprint(
+            f"Completed with failures for {len(input_failures)}/{total_inputs} input(s). "
+            f"Failure report: {report_path}"
+        )
+        print("Conversion process completed with failures.")
+        if run_tracker is not None:
+            run_tracker.mark(
+                f"Full pipeline completed with failures ({len(input_failures)}/{total_inputs}). "
+                f"Report: {report_path}"
+            )
+        return 1
+
     print("Conversion process finished.")
+    if run_tracker is not None:
+        run_tracker.mark("Full pipeline finished successfully")
     return 0
 
 
@@ -2144,26 +2517,38 @@ def main():
             )
 
     wrapper_log_path = metrics_dir / "wrapper_logs" / f"{run_id}.log"
+    progress_log_path = metrics_dir / "progress.log"
     execution_started = time.perf_counter()
     global _COMMAND_LOGGER
     _COMMAND_LOGGER = CommandLogger(wrapper_log_path)
+    run_tracker = RunTracker(progress_log_path)
+    run_tracker.mark(f"Run started (mode={mode})")
     print(f"  Detailed logs: {wrapper_log_path}")
+    print(f"  Progress log: {progress_log_path}")
 
     result_code = 1
     total_triples = None
+    resolved_image_ref = None
 
     def execute_mode():
+        nonlocal resolved_image_ref
         # Shared preflight for all modes: Docker availability + image strategy.
+        run_tracker.mark("Checking Docker availability")
         if not check_docker():
+            run_tracker.mark("Docker availability check failed")
             eprint(f"See log for details: {wrapper_log_path}")
             return 2
+        run_tracker.mark("Docker availability check passed")
 
         try:
             image_ref, version_requested = resolve_image_ref(args.image, args.image_version)
+            resolved_image_ref = image_ref
         except ValueError as exc:
+            run_tracker.mark(f"Image resolution failed: {exc}")
             eprint(f"Error: {exc}")
             return 2
 
+        run_tracker.mark(f"Ensuring image available: {image_ref}")
         image_code = ensure_image_available(
             image_ref,
             step_label="Step 2/5" if mode == "full" else "Step 2/3",
@@ -2174,7 +2559,9 @@ def main():
             wrapper_log_path=wrapper_log_path,
         )
         if image_code != 0:
+            run_tracker.mark(f"Image availability failed (code={image_code})")
             return image_code
+        run_tracker.mark("Image ready")
 
         if mode == "full":
             tsv_write_target = tsv_dir if tsv_dir.exists() else tsv_dir.parent
@@ -2213,12 +2600,14 @@ def main():
                 image_ref=image_ref,
                 wrapper_log_path=wrapper_log_path,
             ):
+                run_tracker.mark(f"Writeability check failed for {target}")
                 eprint(f"Error: cannot write to '{target}'.")
                 eprint(
                     "Try fixing ownership once with: "
                     f"sudo chown -R $USER:$USER {shlex.quote(str(target if is_dir else target.parent))}"
                 )
                 return 1
+        run_tracker.mark("Writeability checks passed")
 
         if mode == "full":
             # Full-mode orchestrates conversion + compression pipeline.
@@ -2240,6 +2629,7 @@ def main():
                 run_id=run_id,
                 timestamp=timestamp,
                 wrapper_log_path=wrapper_log_path,
+                run_tracker=run_tracker,
             )
         if mode == "compress":
             # Compression-only mode.
@@ -2258,9 +2648,36 @@ def main():
             wrapper_log_path=wrapper_log_path,
         )
 
+    def _interrupt_handler(_signum, _frame):
+        raise KeyboardInterrupt()
+
+    original_sigterm = None
+    if hasattr(signal, "SIGTERM"):
+        original_sigterm = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, _interrupt_handler)
+
     try:
         result_code = execute_mode()
+    except KeyboardInterrupt:
+        result_code = 130
+        eprint("Run interrupted by user signal; starting best-effort cleanup.")
+        run_tracker.mark("Run interrupted by user signal")
+        if mode == "full":
+            removed, failed = cleanup_interrupted_full_run(
+                run_tracker=run_tracker,
+                out_root=out_root,
+                image_ref=resolved_image_ref,
+                keep_rdf=args.keep_rdf,
+                wrapper_log_path=wrapper_log_path,
+            )
+            eprint(
+                "Interrupt cleanup summary: "
+                f"removed={removed}, failed={failed}, keep_rdf={str(args.keep_rdf).lower()}"
+            )
+        eprint(f"Progress log: {progress_log_path}")
     finally:
+        if hasattr(signal, "SIGTERM") and original_sigterm is not None:
+            signal.signal(signal.SIGTERM, original_sigterm)
         # Always report/record wrapper runtime, even on failure paths.
         elapsed_seconds = time.perf_counter() - execution_started
         if mode == "full" and result_code == 0:
@@ -2284,6 +2701,9 @@ def main():
         if _COMMAND_LOGGER is not None:
             _COMMAND_LOGGER.close()
             _COMMAND_LOGGER = None
+        if run_tracker is not None:
+            run_tracker.mark(f"Run finished (exit_code={result_code})")
+            run_tracker.close()
 
     return result_code
 

@@ -60,6 +60,10 @@ inside this directory.
 - `compress`: compress an existing `.nt`
 - `decompress`: decompress `.nt.gz`, `.nt.br`, or `.hdt`
 
+In `full` mode with multiple VCF inputs, failures are isolated per input:
+- the run continues with remaining files
+- failed inputs are summarized in `run_metrics/<RUN_ID>/failed_inputs.csv`
+
 ## Main Flags (Most Used)
 
 - `-m, --mode {full,compress,decompress}`
@@ -165,6 +169,21 @@ Given `--out ./results`:
 Intermediates are hidden by default.
 Raw `.nt` files are removed after compression unless `--keep-rdf` is provided.
 
+## Metrics
+
+For each run, VCF-RDFizer writes:
+
+- `run_metrics/<RUN_ID>/metrics.csv`
+- `run_metrics/<RUN_ID>/wrapper_execution_times.csv`
+- `run_metrics/<RUN_ID>/progress.log`
+
+Compression metrics now include per-method:
+
+- `wall_seconds_*`
+- `user_seconds_*`
+- `sys_seconds_*`
+- `max_rss_kb_*`
+
 ## Rules
 
 - default rules file: `rules/default_rules.ttl`
@@ -175,6 +194,14 @@ Raw `.nt` files are removed after compression unless `--keep-rdf` is provided.
 If Docker permission issues occur, rerun with a Docker-allowed user (or configure Docker group/sudo access on your system).
 
 If HDT compression fails on very large `.nt` files, use batch layout and/or non-HDT compression methods.
+
+Safe termination:
+
+- Press `Ctrl+C` to interrupt a run.
+- The wrapper exits with code `130`, writes progress to `run_metrics/<RUN_ID>/progress.log`, and performs best-effort cleanup of tracked intermediates.
+- Raw RDF cleanup on interrupt follows `--keep-rdf`:
+  - with `--keep-rdf`, raw `.nt` files are preserved
+  - without `--keep-rdf`, tracked raw `.nt` files are removed during interrupt cleanup
 
 ## Citation
 
