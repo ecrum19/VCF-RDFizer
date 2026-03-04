@@ -202,7 +202,12 @@ if [[ -n "$SPARK_PARTITIONS" ]]; then
   fi
 fi
 
-JAVA_CMD=(java "${JAVA_SPARK_OPTS[@]}" -jar "$JAR" toFile -m "$IN" -o "$OUT_DIR/$OUT_NAME")
+# Build Java command in a macOS Bash-3-compatible way:
+# with `set -u`, expanding an empty array (`"${arr[@]}"`) raises "unbound variable".
+JAVA_CMD=(java -jar "$JAR" toFile -m "$IN" -o "$OUT_DIR/$OUT_NAME")
+if (( ${#JAVA_SPARK_OPTS[@]} > 0 )); then
+  JAVA_CMD=(java "${JAVA_SPARK_OPTS[@]}" -jar "$JAR" toFile -m "$IN" -o "$OUT_DIR/$OUT_NAME")
+fi
 
 # Ensure repeated runs with the same OUT_NAME do not accumulate old artifacts.
 if [[ -d "$OUT_DIR/$OUT_NAME" ]]; then
