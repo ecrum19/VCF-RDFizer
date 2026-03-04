@@ -4,7 +4,7 @@ set -euo pipefail
 # ------------------------------------------------------------------------------
 # VCF -> TSV splitter
 # ------------------------------------------------------------------------------
-# For each input VCF, generate three TSV files:
+# For each input VCF, generate TSV files:
 #   <sample>.records.tsv
 #   <sample>.header_lines.tsv
 #   <sample>.file_metadata.tsv
@@ -72,7 +72,7 @@ for infile in "${files[@]}"; do
   # Remove stale outputs first so root-owned leftovers from prior runs do not block rewrite.
   rm -f "$records_out" "$headers_out" "$metadata_out"
 
-  printf "SOURCE_FILE\tROW_ID\tCHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLES\n" > "$records_out"
+  : > "$records_out"
   printf "SOURCE_FILE\tHEADER_INDEX\tHEADER_KEY\tHEADER_VALUE\tRAW_LINE\n" > "$headers_out"
   printf "SOURCE_FILE\tFILE_FORMAT\tFILE_DATE\tSOURCE_SOFTWARE\tREFERENCE_GENOME\tHEADER_COUNT\tRECORD_COUNT\n" > "$metadata_out"
 
@@ -82,6 +82,25 @@ for infile in "${files[@]}"; do
     function trim_cr(s) {
       sub(/\r$/, "", s)
       return s
+    }
+
+    function normalize_ws(s) {
+      gsub(/[[:space:]]+/, " ", s)
+      sub(/^ /, "", s)
+      sub(/ $/, "", s)
+      return s
+    }
+
+    function write_records_header(sample_col) {
+      if (records_header_written) {
+        return
+      }
+      sample_column_name = sample_col
+      if (sample_column_name == "") {
+        sample_column_name = "SAMPLES"
+      }
+      print "SOURCE_FILE", "ROW_ID", "CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER", "INFO", "FORMAT", sample_column_name >> records_out
+      records_header_written = 1
     }
 
     BEGIN { FS = OFS = "\t" }
@@ -115,7 +134,16 @@ for infile in "${files[@]}"; do
       }
       sub(/^#/, "", $1)
       header_index++
-      print source_file, header_index, "CHROM_HEADER", $0, $0 >> headers_out
+
+      sample_column_name = ""
+      if (NF >= 10) {
+        sample_column_name = $10
+        for (i = 11; i <= NF; i++) {
+          sample_column_name = sample_column_name " " $i
+        }
+        sample_column_name = normalize_ws(sample_column_name)
+      }
+      write_records_header(sample_column_name)
       next
     }
     /^[^#]/ {
@@ -137,14 +165,16 @@ for infile in "${files[@]}"; do
       if (NF >= 10) {
         samples = $10
         for (i = 11; i <= NF; i++) {
-          samples = samples "|" $i
+          samples = samples " " $i
         }
+        samples = normalize_ws(samples)
       }
-
+      write_records_header(sample_column_name)
       print source_file, row_id, chrom, pos, rec_id, ref, alt, qual, filter, info, format, samples >> records_out
       next
     }
     END {
+      write_records_header(sample_column_name)
       print source_file, file_format, file_date, source_software, reference_genome, header_index + 0, row_id + 0 >> metadata_out
     }
   ' source_file="$source_file" \

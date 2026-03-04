@@ -47,14 +47,17 @@ class VcfAsTsvUnitTests(VerboseTestCase):
             self.assertIn("must end with .vcf or .vcf.gz", result.stdout)
 
     def test_vcf_as_tsv_directory_mode(self):
-        """Directory input: writes per-VCF records/header/metadata TSVs."""
+        """Directory input: records.tsv uses dynamic sample column header and sample payload."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             input_dir = tmp_path / "in"
             input_dir.mkdir()
             output_dir = tmp_path / "tsv"
             (input_dir / "sample.vcf").write_text(
-                "##fileformat=VCFv4.2\n##source=test\n#CHROM\tPOS\tID\n1\t10\trs1\n"
+                "##fileformat=VCFv4.2\n"
+                "##source=test\n"
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tHG002\n"
+                "1\t10\trs1\tA\tG\t50\tPASS\t.\tGT:DP\t0/1:42\n"
             )
 
             result = subprocess.run(
@@ -73,6 +76,42 @@ class VcfAsTsvUnitTests(VerboseTestCase):
             self.assertIn("sample.vcf", records_all.read_text())
             self.assertIn("fileformat", headers_all.read_text().lower())
             self.assertIn("sample.vcf", metadata_all.read_text())
+            self.assertNotIn("CHROM_HEADER", headers_all.read_text())
+            records_text = records_all.read_text()
+            self.assertIn(
+                "SOURCE_FILE\tROW_ID\tCHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tHG002",
+                records_text.splitlines()[0],
+            )
+            self.assertIn("\tGT:DP\t0/1:42", records_text)
+
+    def test_vcf_as_tsv_collapses_multi_sample_header_and_values_to_single_column(self):
+        """Multi-sample VCF: records.tsv keeps one dynamic sample header and one normalized sample payload column."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_file = tmp_path / "multi.vcf"
+            output_dir = tmp_path / "tsv"
+            input_file.write_text(
+                "##fileformat=VCFv4.2\n"
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE_A\tSAMPLE_B\n"
+                "1\t10\trs1\tA\tG\t50\tPASS\t.\tGT:DP\t0/1:42\t0/0:18\n"
+            )
+
+            result = subprocess.run(
+                ["bash", str(SCRIPT), str(input_file), str(output_dir)],
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            records_text = (output_dir / "multi.records.tsv").read_text().splitlines()
+            self.assertEqual(
+                records_text[0],
+                "SOURCE_FILE\tROW_ID\tCHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE_A SAMPLE_B",
+            )
+            self.assertEqual(
+                records_text[1],
+                "multi.vcf\t1\t1\t10\trs1\tA\tG\t50\tPASS\t.\tGT:DP\t0/1:42 0/0:18",
+            )
 
     def test_vcf_as_tsv_single_gz_file_mode(self):
         """Single .vcf.gz input: decompresses and writes per-VCF split TSV outputs."""

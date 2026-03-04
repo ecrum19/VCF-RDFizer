@@ -72,6 +72,42 @@ stat_size() {
     fi
     return
   fi
+
+  echo 0
+}
+
+# Report comparable input VCF bytes.
+# - .vcf    -> on-disk bytes
+# - .vcf.gz -> decompressed bytes
+# - dir     -> sum of normalized sizes for contained .vcf/.vcf.gz files
+normalized_vcf_size() {
+  local path="$1"
+  local total=0
+
+  if [[ -f "$path" ]]; then
+    if [[ "$path" == *.vcf.gz ]]; then
+      gzip -dc "$path" | wc -c | tr -d ' '
+      return
+    fi
+    stat_size "$path"
+    return
+  fi
+
+  if [[ -d "$path" ]]; then
+    shopt -s nullglob
+    for file in "$path"/*.vcf "$path"/*.vcf.gz; do
+      if [[ ! -f "$file" ]]; then
+        continue
+      fi
+      size=$(normalized_vcf_size "$file")
+      total=$((total + size))
+    done
+    shopt -u nullglob
+    echo "$total"
+    return
+  fi
+
+  echo 0
 }
 
 have_gnu_time() { [[ -x /usr/bin/time ]] && /usr/bin/time --version >/dev/null 2>&1; }
@@ -140,7 +176,22 @@ JAVA_VERSION=$(java -version 2>&1 | head -n1 | sed 's/"/\\"/g')
 # or for Java 8: GC_OPTS="-Xloggc:$LOGDIR/gc-$RUN_ID.log -XX:+PrintGCDetails -XX:+PrintGCDateStamps"
 GC_OPTS=${GC_OPTS:-}
 
-JAVA_CMD=(java -jar "$JAR" toFile -m "$IN" -o "$OUT_DIR/$OUT_NAME")
+# Optional low-cost Spark partition hint for RMLStreamer execution.
+# When set, this caps Spark default parallelism and shuffle partitions to
+# reduce tiny output-part overproduction without introducing expensive
+# repartition/shuffle stages in the pipeline.
+SPARK_PARTITIONS=${SPARK_PARTITIONS:-}
+JAVA_SPARK_OPTS=()
+if [[ -n "$SPARK_PARTITIONS" ]]; then
+  if [[ "$SPARK_PARTITIONS" =~ ^[1-9][0-9]*$ ]]; then
+    JAVA_SPARK_OPTS+=("-Dspark.default.parallelism=$SPARK_PARTITIONS")
+    JAVA_SPARK_OPTS+=("-Dspark.sql.shuffle.partitions=$SPARK_PARTITIONS")
+  else
+    echo "WARNING: ignoring invalid SPARK_PARTITIONS='$SPARK_PARTITIONS' (expected positive integer)." >&2
+  fi
+fi
+
+JAVA_CMD=(java "${JAVA_SPARK_OPTS[@]}" -jar "$JAR" toFile -m "$IN" -o "$OUT_DIR/$OUT_NAME")
 
 # Ensure repeated runs with the same OUT_NAME do not accumulate old artifacts.
 if [[ -d "$OUT_DIR/$OUT_NAME" ]]; then
@@ -149,7 +200,7 @@ fi
 
 # ---------- Pre-run ----------
 IN_SIZE=$(stat_size "$IN")
-VCF_SIZE=$(stat_size "$IN_VCF")
+VCF_SIZE=$(normalized_vcf_size "$IN_VCF")
 
 # ---------- Run RMLStreamer with timing ----------
 EXIT_CODE=0

@@ -1,4 +1,5 @@
 import csv
+import gzip
 import subprocess
 import tempfile
 import unittest
@@ -80,6 +81,63 @@ printf '<s> <p> <o> .\\n' > "$out/part-000"
             self.assertEqual(row["run_id"], "run123")
             self.assertEqual(row["output_name"], "rdf")
             self.assertEqual(row["exit_code_java"], "0")
+
+    def test_run_conversion_records_normalized_size_for_gz_input_vcf(self):
+        """input_vcf_size_bytes uses decompressed size for .vcf.gz inputs."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            fake_bin = tmp_path / "bin"
+            fake_bin.mkdir()
+            make_executable(
+                fake_bin / "java",
+                """#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "-version" ]]; then
+  echo 'openjdk version "11.0.0"' >&2
+  exit 0
+fi
+out=""
+while [[ $# -gt 0 ]]; do
+  if [[ "$1" == "-o" ]]; then
+    out="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+mkdir -p "$out"
+printf '<s> <p> <o> .\\n' > "$out/part-000"
+""",
+            )
+
+            out_dir = tmp_path / "out"
+            metrics_dir = tmp_path / "metrics"
+            rules = tmp_path / "rules.ttl"
+            rules.write_text("@prefix ex: <http://example.org/> .\n")
+            vcf_gz = tmp_path / "input.vcf.gz"
+            raw_vcf = b"##fileformat=VCFv4.2\n#CHROM\tPOS\n1\t5\n"
+            with gzip.open(vcf_gz, "wb") as handle:
+                handle.write(raw_vcf)
+
+            env = env_with_path(fake_bin)
+            env.update(
+                {
+                    "JAR": "fake.jar",
+                    "IN": str(rules),
+                    "IN_VCF": str(vcf_gz),
+                    "OUT_DIR": str(out_dir),
+                    "OUT_NAME": "rdf",
+                    "LOGDIR": str(metrics_dir),
+                    "RUN_ID": "run-gz-size",
+                    "TIMESTAMP": "2026-01-01T00:00:00",
+                }
+            )
+
+            result = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            with (metrics_dir / "metrics.csv").open() as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(int(row["input_vcf_size_bytes"]), len(raw_vcf))
 
     def test_run_conversion_exits_non_zero_when_java_fails(self):
         """Conversion script returns non-zero and records exit_code_java when Java command fails."""
@@ -238,6 +296,65 @@ printf '# only comments\\n' > "$out/comments-only.nt"
             with (metrics_dir / "metrics.csv").open() as f:
                 rows = list(csv.DictReader(f))
             self.assertEqual(rows[0]["output_triples"], "0")
+
+    def test_run_conversion_applies_spark_partition_hint_when_set(self):
+        """SPARK_PARTITIONS adds Spark parallelism/shuffle Java options."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            fake_bin = tmp_path / "bin"
+            fake_bin.mkdir()
+            args_file = tmp_path / "java.args"
+            make_executable(
+                fake_bin / "java",
+                """#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "-version" ]]; then
+  echo 'openjdk version "11.0.0"' >&2
+  exit 0
+fi
+printf '%s\n' "$*" > "${ARGS_FILE:?}"
+out=""
+while [[ $# -gt 0 ]]; do
+  if [[ "$1" == "-o" ]]; then
+    out="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+mkdir -p "$out"
+printf '<s> <p> <o> .\\n' > "$out/part-000"
+""",
+            )
+
+            out_dir = tmp_path / "out"
+            metrics_dir = tmp_path / "metrics"
+            rules = tmp_path / "rules.ttl"
+            rules.write_text("@prefix ex: <http://example.org/> .\n")
+            vcf = tmp_path / "input.vcf"
+            vcf.write_text("##fileformat=VCFv4.2\n#CHROM\tPOS\n1\t5\n")
+
+            env = env_with_path(fake_bin)
+            env.update(
+                {
+                    "JAR": "fake.jar",
+                    "IN": str(rules),
+                    "IN_VCF": str(vcf),
+                    "OUT_DIR": str(out_dir),
+                    "OUT_NAME": "rdf",
+                    "LOGDIR": str(metrics_dir),
+                    "RUN_ID": "run-spark",
+                    "TIMESTAMP": "2026-01-01T00:00:00",
+                    "SPARK_PARTITIONS": "3",
+                    "ARGS_FILE": str(args_file),
+                }
+            )
+
+            result = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            java_args = args_file.read_text(encoding="utf-8")
+            self.assertIn("-Dspark.default.parallelism=3", java_args)
+            self.assertIn("-Dspark.sql.shuffle.partitions=3", java_args)
 
     def test_run_conversion_normalizes_legacy_and_writes_merged_nt(self):
         """Normalization + merge writes rdf.nt with combined converted content."""

@@ -197,6 +197,98 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertEqual(parsed["sys_seconds"], 0.45)
             self.assertEqual(parsed["max_rss_kb"], 12345)
 
+    def test_build_sample_support_tsvs_expands_per_sample_and_per_format_rows(self):
+        """records.tsv is expanded into helper tables for sample calls and format key/value pairs."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            records_tsv = tmp_path / "sample.records.tsv"
+            records_tsv.write_text(
+                "SOURCE_FILE\tROW_ID\tCHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE1 SAMPLE2\n"
+                "sample.vcf\t1\t1\t100\t.\tA\tG\t50\tPASS\t.\tGT:DP:AD\t0/1:42:30,12 0/0:18:18,0\n"
+            )
+            sample_calls_tsv = tmp_path / "sample.sample_calls.tsv"
+            sample_format_tsv = tmp_path / "sample.sample_format_values.tsv"
+
+            vcf_rdfizer.build_sample_support_tsvs(
+                records_tsv=records_tsv,
+                sample_calls_tsv=sample_calls_tsv,
+                sample_format_tsv=sample_format_tsv,
+            )
+
+            sample_calls_rows = sample_calls_tsv.read_text().splitlines()
+            sample_format_rows = sample_format_tsv.read_text().splitlines()
+
+            self.assertEqual(len(sample_calls_rows), 3)  # header + 2 samples
+            self.assertEqual(
+                sample_calls_rows[1],
+                "sample.vcf\t1\t1\tSAMPLE1\tSAMPLE1\t0/1:42:30,12",
+            )
+            self.assertEqual(
+                sample_calls_rows[2],
+                "sample.vcf\t1\t2\tSAMPLE2\tSAMPLE2\t0/0:18:18,0",
+            )
+
+            self.assertEqual(len(sample_format_rows), 7)  # header + (2 samples * 3 FORMAT keys)
+            self.assertIn("sample.vcf\t1\t1\tSAMPLE1\tSAMPLE1\t1\tGT\t0/1", sample_format_rows)
+            self.assertIn("sample.vcf\t1\t1\tSAMPLE1\tSAMPLE1\t2\tDP\t42", sample_format_rows)
+            self.assertIn("sample.vcf\t1\t1\tSAMPLE1\tSAMPLE1\t3\tAD\t30,12", sample_format_rows)
+            self.assertIn("sample.vcf\t1\t2\tSAMPLE2\tSAMPLE2\t1\tGT\t0/0", sample_format_rows)
+            self.assertIn("sample.vcf\t1\t2\tSAMPLE2\tSAMPLE2\t2\tDP\t18", sample_format_rows)
+            self.assertIn("sample.vcf\t1\t2\tSAMPLE2\tSAMPLE2\t3\tAD\t18,0", sample_format_rows)
+
+    def test_build_sample_support_tsvs_sanitizes_sample_id_for_uri_paths(self):
+        """Sample URI IDs are sanitized so sample names can be used in RDF resource paths."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            records_tsv = tmp_path / "sample.records.tsv"
+            records_tsv.write_text(
+                "SOURCE_FILE\tROW_ID\tCHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE-A SAMPLE/B\n"
+                "sample.vcf\t2\t1\t100\t.\tA\tG\t50\tPASS\t.\tGT:DP\t0/1:42 0/0:18\n"
+            )
+            sample_calls_tsv = tmp_path / "sample.sample_calls.tsv"
+            sample_format_tsv = tmp_path / "sample.sample_format_values.tsv"
+
+            vcf_rdfizer.build_sample_support_tsvs(
+                records_tsv=records_tsv,
+                sample_calls_tsv=sample_calls_tsv,
+                sample_format_tsv=sample_format_tsv,
+            )
+
+            sample_calls_rows = sample_calls_tsv.read_text().splitlines()
+            self.assertIn("sample.vcf\t2\t1\tSAMPLE-A\tSAMPLE-A\t0/1:42", sample_calls_rows)
+            self.assertIn("sample.vcf\t2\t2\tSAMPLE/B\tSAMPLE_B\t0/0:18", sample_calls_rows)
+
+    def test_render_rules_for_triplet_rewrites_helper_tsv_placeholders(self):
+        """Rule rendering rewrites records/header/metadata and helper TSV placeholders."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            template = tmp_path / "rules.ttl"
+            template.write_text(
+                'r1 csvw:url "/data/tsv/records.tsv" .\n'
+                'r2 csvw:url "/data/tsv/header_lines.tsv" .\n'
+                'r3 csvw:url "/data/tsv/file_metadata.tsv" .\n'
+                'r4 csvw:url "/data/tsv/sample_calls.tsv" .\n'
+                'r5 csvw:url "/data/tsv/sample_format_values.tsv" .\n'
+            )
+            rendered = tmp_path / "rendered.ttl"
+
+            vcf_rdfizer.render_rules_for_triplet(
+                template_rules=template,
+                output_rules=rendered,
+                records_name="sample.records.tsv",
+                headers_name="sample.header_lines.tsv",
+                metadata_name="sample.file_metadata.tsv",
+                sample_calls_name="sample.sample_calls.tsv",
+                sample_format_name="sample.sample_format_values.tsv",
+            )
+
+            text = rendered.read_text()
+            self.assertIn('/data/tsv/sample.records.tsv', text)
+            self.assertIn('/data/tsv/sample.header_lines.tsv', text)
+            self.assertIn('/data/tsv/sample.file_metadata.tsv', text)
+            self.assertIn('/data/tsv/sample.sample_calls.tsv', text)
+            self.assertIn('/data/tsv/sample.sample_format_values.tsv', text)
+
     def test_cleanup_interrupted_full_run_removes_intermediates(self):
         """Interrupt cleanup removes tracked intermediate and raw RDF files."""
         with tempfile.TemporaryDirectory() as td:
@@ -645,6 +737,64 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertEqual(rows[-1]["status"], "success")
             self.assertEqual(rows[-1]["total_triples"], "17")
 
+    def test_main_full_mode_no_compression_counts_triples_from_nt_when_metrics_missing(self):
+        """No-compression runs still report triples by counting generated .nt when metrics JSON is absent."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+            out_dir = tmp_path / "out"
+
+            def fake_run(cmd, cwd=None, env=None):
+                if "/opt/vcf-rdfizer/run_conversion.sh" in cmd:
+                    out_name = next(
+                        (part.split("=", 1)[1] for part in cmd if isinstance(part, str) and part.startswith("OUT_NAME=")),
+                        "sample",
+                    )
+                    sample_dir = out_dir / out_name
+                    sample_dir.mkdir(parents=True, exist_ok=True)
+                    (sample_dir / f"{out_name}.nt").write_text(
+                        "<s1> <p> <o> .\n<s2> <p> <o> .\n",
+                        encoding="utf-8",
+                    )
+                return 0
+
+            out_buf = StringIO()
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch.object(
+                    vcf_rdfizer, "check_docker", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "docker_image_exists", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "discover_tsv_triplets", return_value=mocked_triplets()
+                ), redirect_stdout(out_buf):
+                    rc = invoke_main(
+                        [
+                            "--mode",
+                            "full",
+                            "--input",
+                            str(input_dir),
+                            "--rules",
+                            str(rules_path),
+                            "--rdf-layout",
+                            "aggregate",
+                            "--compression",
+                            "none",
+                            "--out",
+                            str(out_dir),
+                            "--keep-tsv",
+                            "--keep-rdf",
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 0)
+            output = out_buf.getvalue()
+            self.assertIn("Triples produced: 2", output)
+            self.assertIn("Total triples produced (full run): 2", output)
+
     def test_main_compress_mode_accepts_nt_and_preserves_extension(self):
         """Compression mode accepts .nt input and emits extension-aware output names."""
         with tempfile.TemporaryDirectory() as td:
@@ -688,6 +838,14 @@ class WrapperUnitTests(VerboseTestCase):
     def test_main_compress_mode_requires_rdf_argument(self):
         """Compression mode fails validation when --rdf is missing."""
         rc = invoke_main(["--mode", "compress"])
+        self.assertEqual(rc, 2)
+
+    def test_main_rejects_spark_partitions_outside_full_mode(self):
+        """--spark-partitions is rejected for non-full modes."""
+        rc = invoke_main(
+            ["--mode", "compress", "--spark-partitions", "4", "--rdf", "missing.nt"],
+            auto_layout=False,
+        )
         self.assertEqual(rc, 2)
 
     def test_main_compress_mode_rejects_non_rdf_input(self):
@@ -1088,6 +1246,48 @@ class WrapperUnitTests(VerboseTestCase):
 
             self.assertEqual(rc, 0)
             self.assertIn("AGGREGATE_RDF=1", commands[1])
+
+    def test_main_full_mode_passes_spark_partition_hint_to_conversion(self):
+        """Full mode forwards --spark-partitions to run_conversion as SPARK_PARTITIONS."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+            commands = []
+
+            def fake_run(cmd, cwd=None, env=None):
+                commands.append(cmd)
+                return 0
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch.object(
+                    vcf_rdfizer, "check_docker", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "docker_image_exists", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "discover_tsv_triplets", return_value=mocked_triplets()
+                ):
+                    rc = invoke_main(
+                        [
+                            "--input",
+                            str(input_dir),
+                            "--rules",
+                            str(rules_path),
+                            "--rdf-layout",
+                            "aggregate",
+                            "--compression",
+                            "none",
+                            "--spark-partitions",
+                            "4",
+                            "--keep-tsv",
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 0)
+            self.assertIn("SPARK_PARTITIONS=4", commands[1])
 
     def test_main_multiple_triplets_run_multiple_conversions_and_compress_all_outputs(self):
         """Multiple input triplets trigger per-sample conversion runs and all-output compression."""

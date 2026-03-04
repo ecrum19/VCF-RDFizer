@@ -81,6 +81,8 @@ In `full` mode with multiple VCF inputs, failures are isolated per input:
 - `-r, --rules` mapping rules file (`.ttl`)
   - default: `rules/default_rules.ttl`
 - `-l, --rdf-layout {aggregate,batch}` required in full mode
+- `-P, --spark-partitions` optional Spark partition hint (positive integer)
+  - low-cost way to reduce output part count by setting `spark.default.parallelism` and `spark.sql.shuffle.partitions`
 - `-k, --keep-tsv` keep hidden TSV intermediates
 - `-R, --keep-rdf` keep raw `.nt` after compression
 - `-e, --estimate-size` preflight size estimate
@@ -121,6 +123,18 @@ vcf-rdfizer \
   --rdf-layout batch \
   --compression hdt \
   --out ./results
+
+Full pipeline with low-cost partition cap (helps avoid too many tiny batch files):
+
+```bash
+vcf-rdfizer \
+  --mode full \
+  --input ./vcf_files \
+  --rdf-layout batch \
+  --spark-partitions 8 \
+  --compression hdt \
+  --out ./results
+```
 ```
 
 Full pipeline with custom rules + keep RDF:

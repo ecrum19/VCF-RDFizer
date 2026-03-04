@@ -556,6 +556,25 @@ def file_size_bytes(path: Path):
     return path.stat().st_size
 
 
+def count_triples_in_nt_files(paths: list[Path]) -> int | None:
+    """Count triples in RDF line-oriented files as a fallback when metrics are missing."""
+    total = 0
+    matched_any = False
+    pattern = re.compile(r"^\s*[^#].*\.\s*$")
+    for path in paths:
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    if pattern.match(line):
+                        total += 1
+                        matched_any = True
+        except OSError:
+            return None
+    return total if matched_any else 0
+
+
 def _as_int(value):
     """Loss-tolerant integer coercion for metrics values."""
     if isinstance(value, bool):
@@ -583,18 +602,32 @@ def read_conversion_total_triples(metrics_dir: Path, output_name: str, run_id: s
         metrics_dir / f"conversion-metrics-{safe_name}-{run_id}.json",
     ]
     metrics_json = next((path for path in candidates if path.exists()), None)
-    if metrics_json is None:
+    if metrics_json is not None:
+        try:
+            payload = json.loads(metrics_json.read_text(encoding="utf-8"))
+            artifacts = payload.get("artifacts", {})
+            triples = artifacts.get("output_triples")
+            if isinstance(triples, dict):
+                value = _as_int(triples.get("TOTAL"))
+            else:
+                value = _as_int(triples)
+            if value is not None:
+                return value
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    # Fallback to conversion CSV if JSON metric is unavailable.
+    metrics_csv = metrics_dir / "metrics.csv"
+    if not metrics_csv.exists():
         return None
     try:
-        payload = json.loads(metrics_json.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        with metrics_csv.open(newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                if row.get("run_id") == run_id and row.get("output_name") == output_name:
+                    return _as_int(row.get("output_triples"))
+    except OSError:
         return None
-
-    artifacts = payload.get("artifacts", {})
-    triples = artifacts.get("output_triples")
-    if isinstance(triples, dict):
-        return _as_int(triples.get("TOTAL"))
-    return _as_int(triples)
+    return None
 
 
 def collect_full_mode_total_triples(metrics_dir: Path, run_id: str):
@@ -1034,12 +1067,155 @@ def discover_tsv_triplets(tsv_dir: Path):
     )
 
 
-def render_rules_for_triplet(template_rules: Path, output_rules: Path, records_name: str, headers_name: str, metadata_name: str):
+def build_sample_support_tsvs(records_tsv: Path, sample_calls_tsv: Path, sample_format_tsv: Path):
+    """Materialize per-sample helper TSVs from records.tsv.
+
+    These helper tables keep records.tsv user-facing and simple while providing
+    deterministic row-wise inputs for rules that map:
+    - one `SampleCall` per sample/record
+    - one `FormatFieldValue` per sample/record/FORMAT key
+    """
+    sample_calls_tsv.parent.mkdir(parents=True, exist_ok=True)
+    sample_format_tsv.parent.mkdir(parents=True, exist_ok=True)
+
+    def sample_id_to_uri_id(sample_id: str, fallback_index: int) -> str:
+        candidate = re.sub(r"[^A-Za-z0-9._~-]+", "_", sample_id).strip("_")
+        if not candidate:
+            candidate = f"sample_{fallback_index}"
+        return candidate
+
+    with sample_calls_tsv.open("w", newline="", encoding="utf-8") as sample_calls_handle, \
+        sample_format_tsv.open("w", newline="", encoding="utf-8") as sample_format_handle:
+        sample_calls_writer = csv.writer(sample_calls_handle, delimiter="\t")
+        sample_format_writer = csv.writer(sample_format_handle, delimiter="\t")
+
+        sample_calls_writer.writerow(
+            [
+                "SOURCE_FILE",
+                "ROW_ID",
+                "SAMPLE_INDEX",
+                "SAMPLE_ID",
+                "SAMPLE_URI_ID",
+                "SAMPLE_PAYLOAD",
+            ]
+        )
+        sample_format_writer.writerow(
+            [
+                "SOURCE_FILE",
+                "ROW_ID",
+                "SAMPLE_INDEX",
+                "SAMPLE_ID",
+                "SAMPLE_URI_ID",
+                "FORMAT_INDEX",
+                "FORMAT_KEY",
+                "FORMAT_VALUE",
+            ]
+        )
+
+        if not records_tsv.exists():
+            return
+
+        with records_tsv.open(newline="", encoding="utf-8") as records_handle:
+            reader = csv.reader(records_handle, delimiter="\t")
+            header = next(reader, None)
+            if not header:
+                return
+
+            sample_header = header[-1].strip() if len(header) >= 12 else ""
+            declared_sample_ids = [token for token in sample_header.split() if token]
+
+            for row in reader:
+                if not row:
+                    continue
+                if len(row) < len(header):
+                    row = row + [""] * (len(header) - len(row))
+
+                source_file = row[0] if len(row) > 0 else ""
+                row_id = row[1] if len(row) > 1 else ""
+                format_raw = row[10] if len(row) > 10 else ""
+                samples_raw = row[-1] if len(row) >= 12 else ""
+
+                format_keys = [token for token in format_raw.split(":")] if format_raw else []
+                sample_payloads = [token for token in samples_raw.split()] if samples_raw else []
+
+                total_samples = max(len(declared_sample_ids), len(sample_payloads))
+                if total_samples == 0:
+                    continue
+
+                sample_uri_seen: dict[str, int] = {}
+                for sample_idx in range(total_samples):
+                    sample_id = (
+                        declared_sample_ids[sample_idx]
+                        if sample_idx < len(declared_sample_ids)
+                        else f"SAMPLE_{sample_idx + 1}"
+                    )
+                    sample_payload = (
+                        sample_payloads[sample_idx]
+                        if sample_idx < len(sample_payloads)
+                        else ""
+                    )
+                    sample_index_value = str(sample_idx + 1)
+                    sample_uri_id_base = sample_id_to_uri_id(sample_id, sample_idx + 1)
+                    sample_uri_seen[sample_uri_id_base] = sample_uri_seen.get(sample_uri_id_base, 0) + 1
+                    if sample_uri_seen[sample_uri_id_base] > 1:
+                        sample_uri_id = f"{sample_uri_id_base}_{sample_uri_seen[sample_uri_id_base]}"
+                    else:
+                        sample_uri_id = sample_uri_id_base
+
+                    sample_calls_writer.writerow(
+                        [
+                            source_file,
+                            row_id,
+                            sample_index_value,
+                            sample_id,
+                            sample_uri_id,
+                            sample_payload,
+                        ]
+                    )
+
+                    value_tokens = sample_payload.split(":") if sample_payload else []
+                    total_fields = max(len(format_keys), len(value_tokens))
+                    for format_idx in range(total_fields):
+                        format_key = (
+                            format_keys[format_idx]
+                            if format_idx < len(format_keys) and format_keys[format_idx]
+                            else f"FIELD_{format_idx + 1}"
+                        )
+                        format_value = (
+                            value_tokens[format_idx]
+                            if format_idx < len(value_tokens)
+                            else ""
+                        )
+                        sample_format_writer.writerow(
+                            [
+                                source_file,
+                                row_id,
+                                sample_index_value,
+                                sample_id,
+                                sample_uri_id,
+                                str(format_idx + 1),
+                                format_key,
+                                format_value,
+                            ]
+                        )
+
+
+def render_rules_for_triplet(
+    template_rules: Path,
+    output_rules: Path,
+    records_name: str,
+    headers_name: str,
+    metadata_name: str,
+    sample_calls_name: str,
+    sample_format_name: str,
+):
     """Render per-input mapping rules by substituting TSV placeholders."""
     text = template_rules.read_text()
     text = text.replace('/data/tsv/records.tsv', f'/data/tsv/{records_name}')
     text = text.replace('/data/tsv/header_lines.tsv', f'/data/tsv/{headers_name}')
     text = text.replace('/data/tsv/file_metadata.tsv', f'/data/tsv/{metadata_name}')
+    text = text.replace('/data/tsv/sample_calls.tsv', f'/data/tsv/{sample_calls_name}')
+    text = text.replace('/data/tsv/sample_format_values.tsv', f'/data/tsv/{sample_format_name}')
     output_rules.write_text(text)
 
 
@@ -1115,6 +1291,17 @@ def parse_compression_methods(raw: str):
         if method not in methods:
             methods.append(method)
     return methods
+
+
+def parse_positive_int(value: str, *, name: str) -> int:
+    """Parse a strictly positive integer CLI value."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a positive integer.") from exc
+    if parsed <= 0:
+        raise ValueError(f"{name} must be a positive integer.")
+    return parsed
 
 
 def safe_metrics_name(value: str) -> str:
@@ -1752,6 +1939,7 @@ def run_full_mode(
     out_name: str,
     rdf_layout: str,
     compression: str,
+    spark_partitions: int | None,
     keep_tsv: bool,
     keep_rdf: bool,
     run_id: str,
@@ -1761,6 +1949,8 @@ def run_full_mode(
 ):
     """Execute full pipeline: per-input TSV -> RDF -> compression -> metrics."""
     print("Step 3/5: Processing per-input pipeline (TSV -> RDF -> compression)")
+    if spark_partitions is not None:
+        print(f"  Spark partition hint: {spark_partitions}")
     intermediate_dir = tsv_dir.parent
     ensure_dir(tsv_dir)
     ensure_dir(out_dir)
@@ -1820,7 +2010,13 @@ def run_full_mode(
 
         # Pre-flight write checks for expected TSV outputs to fail fast on
         # permission/mount problems before starting container work.
-        for suffix in ("records.tsv", "header_lines.tsv", "file_metadata.tsv"):
+        for suffix in (
+            "records.tsv",
+            "header_lines.tsv",
+            "file_metadata.tsv",
+            "sample_calls.tsv",
+            "sample_format_values.tsv",
+        ):
             expected_tsv_output = tsv_dir / f"{expected_prefix}.{suffix}"
             if not ensure_writable_path_or_fix(
                 target_path=expected_tsv_output,
@@ -1874,6 +2070,24 @@ def run_full_mode(
 
         triplet = triplets_by_prefix[expected_prefix]
         prefix = triplet["prefix"]
+        sample_calls_tsv = tsv_dir / f"{prefix}.sample_calls.tsv"
+        sample_format_tsv = tsv_dir / f"{prefix}.sample_format_values.tsv"
+        try:
+            build_sample_support_tsvs(
+                records_tsv=triplet["records"],
+                sample_calls_tsv=sample_calls_tsv,
+                sample_format_tsv=sample_format_tsv,
+            )
+        except Exception as exc:
+            fail_current(
+                "tsv-derivation",
+                f"failed generating sample helper TSVs for '{prefix}': {exc}. "
+                f"See log: {wrapper_log_path}",
+            )
+            continue
+
+        triplet["sample_calls"] = sample_calls_tsv
+        triplet["sample_format_values"] = sample_format_tsv
         safe_prefix = slugify(prefix)
         generated_rules = generated_rules_dir / f"{safe_prefix}.rules.ttl"
         render_rules_for_triplet(
@@ -1882,6 +2096,8 @@ def run_full_mode(
             triplet["records"].name,
             triplet["headers"].name,
             triplet["metadata"].name,
+            triplet["sample_calls"].name,
+            triplet["sample_format_values"].name,
         )
 
         output_name = safe_prefix or slugify(out_name)
@@ -1922,11 +2138,13 @@ def run_full_mode(
             "-e",
             f"AGGREGATE_RDF={'1' if rdf_layout == 'aggregate' else '0'}",
             "-e",
+            f"SPARK_PARTITIONS={spark_partitions or ''}",
+            "-e",
             f"RUN_ID={run_id}",
             "-e",
             f"TIMESTAMP={timestamp}",
             "-e",
-            f"IN_VCF={input_metrics_target}",
+            f"IN_VCF={container_input}",
             "-e",
             "LOGDIR=/data/metrics",
             image_ref,
@@ -1944,10 +2162,6 @@ def run_full_mode(
             run_tracker.mark(f"Input {idx}: RDF conversion completed for {prefix}")
 
         triples_produced = read_conversion_total_triples(metrics_dir, output_name, run_id)
-        if triples_produced is not None:
-            saw_triple_counts = True
-            total_triples_produced += triples_produced
-            print(f"    * Triples produced: {triples_produced:,}")
 
         if rdf_layout == "aggregate":
             # Aggregate mode yields one merged RDF artifact per sample.
@@ -1966,6 +2180,13 @@ def run_full_mode(
                     f"Expected .nt files in {out_dir / output_name}. See log: {wrapper_log_path}",
                 )
                 continue
+
+        if triples_produced is None:
+            triples_produced = count_triples_in_nt_files(raw_rdf_files)
+        if triples_produced is not None:
+            saw_triple_counts = True
+            total_triples_produced += triples_produced
+            print(f"    * Triples produced: {triples_produced:,}")
 
         if run_tracker is not None:
             for raw_rdf_path in raw_rdf_files:
@@ -2173,7 +2394,15 @@ def run_full_mode(
         if not keep_tsv:
             # Cleanup only the triplet generated for this input iteration.
             tsv_cleanup_failed = False
-            for tsv_path in (triplet["records"], triplet["headers"], triplet["metadata"]):
+            for tsv_path in (
+                triplet["records"],
+                triplet["headers"],
+                triplet["metadata"],
+                triplet.get("sample_calls"),
+                triplet.get("sample_format_values"),
+            ):
+                if tsv_path is None:
+                    continue
                 if tsv_path.exists():
                     if not remove_file_with_docker_fallback(
                         path=tsv_path,
@@ -2385,6 +2614,8 @@ def main():
             "    vcf_rdfizer.py -m full -i ./vcf_files --rdf-layout aggregate -o ./results\n"
             "  Full pipeline (batch RDF outputs, compress each part):\n"
             "    vcf_rdfizer.py -m full -i ./vcf_files --rdf-layout batch -c hdt -o ./results\n"
+            "  Full pipeline with partition hint:\n"
+            "    vcf_rdfizer.py -m full -i ./vcf_files --rdf-layout batch -P 8 -c hdt -o ./results\n"
             "  Compression-only:\n"
             "    vcf_rdfizer.py -m compress -q ./results/out/sample/sample.nt -c gzip,hdt_gzip -o ./results\n"
             "  Decompression-only:\n"
@@ -2436,6 +2667,16 @@ def main():
         choices=["aggregate", "batch"],
         default=None,
         help="Full mode required: aggregate merges RML output parts into one .nt; batch keeps part files separate",
+    )
+    parser.add_argument(
+        "-P",
+        "--spark-partitions",
+        default=None,
+        help=(
+            "Optional full-mode Spark partition hint (positive integer). "
+            "Sets spark.default.parallelism and spark.sql.shuffle.partitions "
+            "inside RMLStreamer."
+        ),
     )
     parser.add_argument(
         "-o",
@@ -2498,6 +2739,7 @@ def main():
     timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     metrics_dir = metrics_root / run_id
     mode = args.mode
+    spark_partitions = None
 
     step1_label = "Step 1/5" if mode == "full" else "Step 1/3"
 
@@ -2523,7 +2765,13 @@ def main():
                 raise ValueError(f"rules file not found: {rules_path}")
             validate_mode_dirs([out_root, out_dir, tsv_dir, metrics_root])
             parse_compression_methods(args.compression)
+            if args.spark_partitions is not None:
+                spark_partitions = parse_positive_int(
+                    args.spark_partitions, name="--spark-partitions"
+                )
         elif mode == "compress":
+            if args.spark_partitions is not None:
+                raise ValueError("--spark-partitions is only valid in --mode full")
             if not args.rdf:
                 raise ValueError("--rdf is required in --mode compress")
             rdf_path = Path(args.rdf).expanduser().resolve()
@@ -2534,6 +2782,8 @@ def main():
             methods = parse_compression_methods(args.compression)
             validate_mode_dirs([out_root, out_dir, metrics_root])
         else:
+            if args.spark_partitions is not None:
+                raise ValueError("--spark-partitions is only valid in --mode full")
             if not args.compressed_input:
                 raise ValueError("--compressed-input is required in --mode decompress")
             compressed_path = Path(args.compressed_input).expanduser().resolve()
@@ -2690,6 +2940,7 @@ def main():
                 out_name=args.out_name,
                 rdf_layout=args.rdf_layout,
                 compression=args.compression,
+                spark_partitions=spark_partitions,
                 keep_tsv=args.keep_tsv,
                 keep_rdf=args.keep_rdf,
                 run_id=run_id,
