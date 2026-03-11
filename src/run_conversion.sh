@@ -35,7 +35,14 @@ mkdir -p "$TIME_LOG_DIR" "$METRICS_JSON_DIR"
 TIME_LOG="$TIME_LOG_DIR/${RUN_ID}.txt"
 METRICS_JSON="$METRICS_JSON_DIR/${RUN_ID}.json"
 METRICS_CSV="$LOGDIR/metrics.csv"
-METRICS_HEADER="run_id,timestamp,output_name,output_dir,exit_code_java,wall_seconds_java,user_seconds_java,sys_seconds_java,max_rss_kb_java,input_mapping_size_bytes,input_vcf_size_bytes,output_dir_size_bytes,output_triples,jar,mapping_file,output_path"
+TSV_EXIT_CODE=${TSV_EXIT_CODE:-0}
+TSV_WALL_SECONDS=${TSV_WALL_SECONDS:-null}
+TSV_USER_SECONDS=${TSV_USER_SECONDS:-null}
+TSV_SYS_SECONDS=${TSV_SYS_SECONDS:-null}
+TSV_MAX_RSS_KB=${TSV_MAX_RSS_KB:-null}
+TSV_OUTPUT_SIZE_BYTES=${TSV_OUTPUT_SIZE_BYTES:-0}
+TSV_OUTPUT_PATH=${TSV_OUTPUT_PATH:-}
+METRICS_HEADER="run_id,timestamp,output_name,output_dir,exit_code_java,wall_seconds_java,user_seconds_java,sys_seconds_java,max_rss_kb_java,input_mapping_size_bytes,input_vcf_size_bytes,output_dir_size_bytes,output_triples,jar,mapping_file,output_path,exit_code_tsv,wall_seconds_tsv,user_seconds_tsv,sys_seconds_tsv,max_rss_kb_tsv,tsv_output_size_bytes,tsv_output_path"
 
 
 # Return byte size for file or directory (GNU + BSD compatible).
@@ -337,6 +344,17 @@ cat > "$METRICS_JSON" <<EOF
     "output_size_bytes": $OUT_SIZE,
     "output_triples": $TRIPLES_JSON
   },
+  "tsv_generation": {
+    "exit_code": ${TSV_EXIT_CODE},
+    "timing": {
+      "wall_seconds": ${TSV_WALL_SECONDS},
+      "user_seconds": ${TSV_USER_SECONDS},
+      "sys_seconds": ${TSV_SYS_SECONDS},
+      "max_rss_kb": ${TSV_MAX_RSS_KB}
+    },
+    "output_size_bytes": ${TSV_OUTPUT_SIZE_BYTES},
+    "output_path": "$TSV_OUTPUT_PATH"
+  },
   "java": {
     "version_header": "$JAVA_VERSION"
   }
@@ -375,6 +393,13 @@ csv_fields=(
   "$JAR"
   "$IN"
   "$OUTPUT_PATH"
+  "$TSV_EXIT_CODE"
+  "$TSV_WALL_SECONDS"
+  "$TSV_USER_SECONDS"
+  "$TSV_SYS_SECONDS"
+  "$TSV_MAX_RSS_KB"
+  "$TSV_OUTPUT_SIZE_BYTES"
+  "$TSV_OUTPUT_PATH"
 )
 ( IFS=,; echo "${csv_fields[*]}" ) >> "$METRICS_CSV"
 

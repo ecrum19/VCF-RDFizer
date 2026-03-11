@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Script: update_rules.sh
-# Usage: ./update_rules.sh RECORDS_TSV [HEADERS_TSV] [METADATA_TSV] [RULES_FILE]
+# Usage: ./update_rules.sh [RECORDS_TSV] [HEADERS_TSV] [METADATA_TSV] [RULES_FILE]
 # Example: ./update_rules.sh /data/tsv/records.tsv /data/tsv/header_lines.tsv /data/tsv/file_metadata.tsv rules/default_rules.ttl
 
 RULES_FILE=${RULES_FILE:-rules/default_rules.ttl}

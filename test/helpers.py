@@ -73,6 +73,13 @@ CONVERSION_METRICS_HEADER = [
     "jar",
     "mapping_file",
     "output_path",
+    "exit_code_tsv",
+    "wall_seconds_tsv",
+    "user_seconds_tsv",
+    "sys_seconds_tsv",
+    "max_rss_kb_tsv",
+    "tsv_output_size_bytes",
+    "tsv_output_path",
 ]
 
 

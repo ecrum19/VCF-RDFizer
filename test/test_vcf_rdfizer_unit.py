@@ -197,6 +197,248 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertEqual(parsed["sys_seconds"], 0.45)
             self.assertEqual(parsed["max_rss_kb"], 12345)
 
+    def test_run_compression_methods_persists_raw_metrics_and_time_logs(self):
+        """Per-file compression timing/metrics are retained under raw_metrics."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            out_dir = tmp_path / "out" / "sample"
+            metrics_dir = tmp_path / "metrics"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            rdf_path = out_dir / "sample.nt"
+            rdf_path.write_text("<s> <p> <o> .\n")
+
+            def fake_run(cmd, cwd=None, env=None):
+                script = str(cmd[-1]) if cmd else ""
+                time_match = re.search(r"-o\s+(/data/out/[^\s;]+)", script)
+                if time_match:
+                    rel = time_match.group(1).replace("/data/out/", "", 1)
+                    time_log = out_dir / rel
+                    time_log.parent.mkdir(parents=True, exist_ok=True)
+                    time_log.write_text(
+                        "User time (seconds): 0.12\n"
+                        "System time (seconds): 0.03\n"
+                        "Elapsed (wall clock) time (h:mm:ss or m:ss): 0:00.20\n"
+                        "Maximum resident set size (kbytes): 1234\n"
+                    )
+
+                if "gzip -c" in script:
+                    (out_dir / "sample.nt.gz").write_text("gz\n")
+                if 'HDT_BIN="${RDF2HDT_BIN' in script:
+                    (out_dir / "sample.hdt").write_text("hdt\n")
+                return 0
+
+            with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run):
+                ok, method_results = vcf_rdfizer.run_compression_methods_for_rdf(
+                    rdf_path=rdf_path,
+                    out_dir=out_dir,
+                    image_ref="example/vcf-rdfizer:latest",
+                    methods=["hdt", "gzip"],
+                    wrapper_log_path=tmp_path / "wrapper.log",
+                    status_indent=None,
+                    metrics_dir=metrics_dir,
+                    run_id="run-1",
+                    timestamp="2026-03-11T10:00:00",
+                    output_name="sample",
+                )
+
+            self.assertTrue(ok)
+            self.assertIn("hdt", method_results)
+            self.assertIn("gzip", method_results)
+
+            safe_output = vcf_rdfizer.safe_metrics_name("sample")
+            safe_rdf = vcf_rdfizer.safe_metrics_name("sample.nt")
+            hdt_time = (
+                metrics_dir
+                / "raw_metrics"
+                / "compression_time"
+                / safe_output
+                / safe_rdf
+                / "hdt"
+                / "run-1.txt"
+            )
+            gzip_time = (
+                metrics_dir
+                / "raw_metrics"
+                / "compression_time"
+                / safe_output
+                / safe_rdf
+                / "gzip"
+                / "run-1.txt"
+            )
+            raw_json = (
+                metrics_dir
+                / "raw_metrics"
+                / "compression_metrics"
+                / safe_output
+                / safe_rdf
+                / "run-1.json"
+            )
+
+            self.assertTrue(hdt_time.exists())
+            self.assertTrue(gzip_time.exists())
+            self.assertTrue(raw_json.exists())
+
+            payload = json.loads(raw_json.read_text())
+            self.assertEqual(payload["rdf_name"], "sample.nt")
+            self.assertEqual(payload["methods"]["hdt"]["exit_code"], 0)
+            self.assertEqual(payload["methods"]["gzip"]["exit_code"], 0)
+
+    def test_run_compression_methods_records_implicit_hdt_in_raw_metrics(self):
+        """Compound HDT methods include the implicit HDT stage in raw metrics JSON."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            out_dir = tmp_path / "out" / "sample"
+            metrics_dir = tmp_path / "metrics"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            rdf_path = out_dir / "sample.nt"
+            rdf_path.write_text("<s> <p> <o> .\n")
+
+            def fake_run(cmd, cwd=None, env=None):
+                script = str(cmd[-1]) if cmd else ""
+                time_match = re.search(r"-o\s+(/data/out/[^\s;]+)", script)
+                if time_match:
+                    rel = time_match.group(1).replace("/data/out/", "", 1)
+                    time_log = out_dir / rel
+                    time_log.parent.mkdir(parents=True, exist_ok=True)
+                    time_log.write_text(
+                        "User time (seconds): 0.08\n"
+                        "System time (seconds): 0.02\n"
+                        "Elapsed (wall clock) time (h:mm:ss or m:ss): 0:00.14\n"
+                        "Maximum resident set size (kbytes): 1111\n"
+                    )
+
+                if 'HDT_BIN="${RDF2HDT_BIN' in script:
+                    (out_dir / "sample.hdt").write_text("hdt\n")
+                if "gzip -c /data/out/sample.hdt" in script:
+                    (out_dir / "sample.hdt.gz").write_text("gz\n")
+                return 0
+
+            with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run):
+                ok, method_results = vcf_rdfizer.run_compression_methods_for_rdf(
+                    rdf_path=rdf_path,
+                    out_dir=out_dir,
+                    image_ref="example/vcf-rdfizer:latest",
+                    methods=["hdt_gzip"],
+                    wrapper_log_path=tmp_path / "wrapper.log",
+                    status_indent=None,
+                    metrics_dir=metrics_dir,
+                    run_id="run-2",
+                    timestamp="2026-03-11T10:00:00",
+                    output_name="sample",
+                )
+
+            self.assertTrue(ok)
+            self.assertIn("hdt", method_results)
+            self.assertIn("hdt_gzip", method_results)
+
+            safe_output = vcf_rdfizer.safe_metrics_name("sample")
+            safe_rdf = vcf_rdfizer.safe_metrics_name("sample.nt")
+            raw_json = (
+                metrics_dir
+                / "raw_metrics"
+                / "compression_metrics"
+                / safe_output
+                / safe_rdf
+                / "run-2.json"
+            )
+            self.assertTrue(raw_json.exists())
+
+            payload = json.loads(raw_json.read_text())
+            self.assertIn("hdt", payload["methods"])
+            self.assertIn("hdt_gzip", payload["methods"])
+
+    def test_main_full_mode_records_tsv_metrics_and_raw_artifacts(self):
+        """Full mode stores TSV timing/metrics artifacts and writes TSV fields into metrics.csv."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+            out_dir = tmp_path / "out"
+
+            def fake_run(cmd, cwd=None, env=None):
+                rendered = " ".join(map(str, cmd))
+
+                if "/opt/vcf-rdfizer/vcf_as_tsv.sh" in rendered:
+                    tsv_dir = out_dir / ".intermediate" / "tsv"
+                    tsv_dir.mkdir(parents=True, exist_ok=True)
+                    (tsv_dir / "sample.records.tsv").write_text("SOURCE_FILE\tROW_ID\nsample.vcf\t1\n")
+                    (tsv_dir / "sample.header_lines.tsv").write_text("SOURCE_FILE\tLINE\nsample.vcf\t##x\n")
+                    (tsv_dir / "sample.file_metadata.tsv").write_text("SOURCE_FILE\tKEY\tVALUE\nsample.vcf\tk\tv\n")
+
+                    metrics_mount = next(
+                        (part.split(":", 1)[0] for part in cmd if isinstance(part, str) and part.endswith(":/data/metrics")),
+                        None,
+                    )
+                    script = str(cmd[-1]) if cmd else ""
+                    time_match = re.search(
+                        r"-o\s+(/data/metrics/raw_metrics/tsv_time/[^\s;]+)",
+                        script,
+                    )
+                    if metrics_mount and time_match:
+                        rel = time_match.group(1).replace("/data/metrics/", "", 1)
+                        time_log = Path(metrics_mount) / rel
+                        time_log.parent.mkdir(parents=True, exist_ok=True)
+                        time_log.write_text(
+                            "User time (seconds): 0.11\n"
+                            "System time (seconds): 0.02\n"
+                            "Elapsed (wall clock) time (h:mm:ss or m:ss): 0:00.19\n"
+                            "Maximum resident set size (kbytes): 987\n"
+                        )
+                    return 0
+
+                if "/opt/vcf-rdfizer/run_conversion.sh" in cmd:
+                    sample_dir = out_dir / "sample"
+                    sample_dir.mkdir(parents=True, exist_ok=True)
+                    (sample_dir / "sample.nt").write_text("<s> <p> <o> .\n")
+                    return 0
+
+                return 0
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch.object(
+                    vcf_rdfizer, "check_docker", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "docker_image_exists", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "discover_tsv_triplets", return_value=mocked_triplets()
+                ):
+                    rc = invoke_main(
+                        [
+                            "--input",
+                            str(input_dir),
+                            "--rules",
+                            str(rules_path),
+                            "--rdf-layout",
+                            "aggregate",
+                            "--compression",
+                            "none",
+                            "--out",
+                            str(out_dir),
+                            "--keep-tsv",
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 0)
+            run_metrics_dir = latest_metrics_run_dir(out_dir / "run_metrics")
+            run_id = run_metrics_dir.name
+
+            tsv_time = run_metrics_dir / "raw_metrics" / "tsv_time" / "sample" / f"{run_id}.txt"
+            tsv_json = run_metrics_dir / "raw_metrics" / "tsv_metrics" / "sample" / f"{run_id}.json"
+            self.assertTrue(tsv_time.exists())
+            self.assertTrue(tsv_json.exists())
+
+            metrics_csv = run_metrics_dir / "metrics.csv"
+            with metrics_csv.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertTrue(rows)
+            row = next((r for r in rows if r.get("output_name") == "sample"), rows[0])
+            self.assertEqual(row.get("exit_code_tsv"), "0")
+            self.assertIn("wall_seconds_tsv", row)
+            self.assertNotEqual(row.get("tsv_output_size_bytes", ""), "")
+
     def test_build_sample_support_tsvs_expands_per_sample_and_per_format_rows(self):
         """records.tsv is expanded into helper tables for sample calls and format key/value pairs."""
         with tempfile.TemporaryDirectory() as td:
@@ -363,7 +605,7 @@ class WrapperUnitTests(VerboseTestCase):
         self.assertEqual(exc.exception.code, 0)
         text = out_buf.getvalue()
         self.assertIn("Examples:", text)
-        self.assertIn("-m {full,compress,decompress}", text)
+        self.assertIn("-m {full,compress,decompress,tsv}", text)
         self.assertIn("-i INPUT", text)
 
     def test_estimate_pipeline_sizes_handles_plain_and_gz_inputs(self):
@@ -470,6 +712,93 @@ class WrapperUnitTests(VerboseTestCase):
 
             self.assertEqual(rc, 0)
             self.assertEqual(len(commands), 2)
+
+    def test_main_tsv_mode_runs_conversion_and_writes_benchmark_metrics(self):
+        """TSV mode runs only TSV conversion and persists benchmark metrics artifacts."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, _rules_path = prepare_inputs(tmp_path)
+            out_dir = tmp_path / "out"
+            commands = []
+
+            def fake_run(cmd, cwd=None, env=None):
+                commands.append(cmd)
+                rendered = " ".join(map(str, cmd))
+                if "/opt/vcf-rdfizer/vcf_as_tsv.sh" in rendered:
+                    tsv_dir = out_dir / ".intermediate" / "tsv"
+                    tsv_dir.mkdir(parents=True, exist_ok=True)
+                    (tsv_dir / "sample.records.tsv").write_text("SOURCE_FILE\tROW_ID\nsample.vcf\t1\n")
+                    (tsv_dir / "sample.header_lines.tsv").write_text("SOURCE_FILE\tLINE\nsample.vcf\t##x\n")
+                    (tsv_dir / "sample.file_metadata.tsv").write_text("SOURCE_FILE\tKEY\tVALUE\nsample.vcf\tk\tv\n")
+
+                    metrics_mount = next(
+                        (part.split(":", 1)[0] for part in cmd if isinstance(part, str) and part.endswith(":/data/metrics")),
+                        None,
+                    )
+                    script = str(cmd[-1]) if cmd else ""
+                    time_match = re.search(
+                        r"-o\s+(/data/metrics/raw_metrics/tsv_time/[^\s;]+)",
+                        script,
+                    )
+                    if metrics_mount and time_match:
+                        rel = time_match.group(1).replace("/data/metrics/", "", 1)
+                        time_log = Path(metrics_mount) / rel
+                        time_log.parent.mkdir(parents=True, exist_ok=True)
+                        time_log.write_text(
+                            "User time (seconds): 0.10\n"
+                            "System time (seconds): 0.02\n"
+                            "Elapsed (wall clock) time (h:mm:ss or m:ss): 0:00.17\n"
+                            "Maximum resident set size (kbytes): 654\n"
+                        )
+                    return 0
+                return 0
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch.object(
+                    vcf_rdfizer, "check_docker", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "docker_image_exists", return_value=True
+                ):
+                    rc = invoke_main(
+                        [
+                            "--mode",
+                            "tsv",
+                            "--input",
+                            str(input_dir),
+                            "--out",
+                            str(out_dir),
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(commands), 1)
+            self.assertIn("/opt/vcf-rdfizer/vcf_as_tsv.sh", " ".join(map(str, commands[0])))
+            self.assertNotIn("/opt/vcf-rdfizer/run_conversion.sh", " ".join(map(str, commands[0])))
+
+            run_metrics_dir = latest_metrics_run_dir(out_dir / "run_metrics")
+            run_id = run_metrics_dir.name
+            tsv_time = run_metrics_dir / "raw_metrics" / "tsv_time" / "sample" / f"{run_id}.txt"
+            tsv_json = run_metrics_dir / "raw_metrics" / "tsv_metrics" / "sample" / f"{run_id}.json"
+            self.assertTrue(tsv_time.exists())
+            self.assertTrue(tsv_json.exists())
+
+            benchmark_csv = run_metrics_dir / "tsv_metrics.csv"
+            with benchmark_csv.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(len(rows), 1)
+            row = rows[0]
+            self.assertEqual(row["prefix"], "sample")
+            self.assertEqual(row["exit_code_tsv"], "0")
+            self.assertNotEqual(row["tsv_output_size_bytes"], "0")
+
+    def test_main_tsv_mode_requires_input_argument(self):
+        """TSV mode fails validation when --input is not provided."""
+        rc = invoke_main(["--mode", "tsv"])
+        self.assertEqual(rc, 2)
 
     def test_main_compress_mode_runs_selected_methods(self):
         """Compression mode runs only requested methods for a designated .nt input."""
@@ -1098,7 +1427,7 @@ class WrapperUnitTests(VerboseTestCase):
 
             self.assertEqual(rc, 0)
             self.assertEqual(len(commands), 2)
-            self.assertIn("/opt/vcf-rdfizer/vcf_as_tsv.sh", commands[0])
+            self.assertIn("/opt/vcf-rdfizer/vcf_as_tsv.sh", " ".join(map(str, commands[0])))
             self.assertIn("/opt/vcf-rdfizer/run_conversion.sh", commands[1])
             self.assertTrue(any(str(arg).endswith(":/data/in:ro") for arg in commands[1]))
             self.assertTrue(any(str(arg).startswith("IN_VCF=/data/in/") for arg in commands[1]))
@@ -1338,13 +1667,13 @@ class WrapperUnitTests(VerboseTestCase):
 
             self.assertEqual(rc, 0)
             self.assertEqual(len(commands), 10)
-            self.assertIn("/opt/vcf-rdfizer/vcf_as_tsv.sh", commands[0])
-            self.assertIn("/data/in/sample_a.vcf", commands[0])
+            self.assertIn("/opt/vcf-rdfizer/vcf_as_tsv.sh", " ".join(map(str, commands[0])))
+            self.assertIn("/data/in/sample_a.vcf", " ".join(map(str, commands[0])))
             self.assertIn("OUT_NAME=sample_a", commands[1])
             self.assertIn("rdf2hdt", commands[4][-1])
             self.assertIn("/data/out/sample_a.hdt", commands[4][-1])
-            self.assertIn("/opt/vcf-rdfizer/vcf_as_tsv.sh", commands[5])
-            self.assertIn("/data/in/sample_b.vcf", commands[5])
+            self.assertIn("/opt/vcf-rdfizer/vcf_as_tsv.sh", " ".join(map(str, commands[5])))
+            self.assertIn("/data/in/sample_b.vcf", " ".join(map(str, commands[5])))
             self.assertIn("OUT_NAME=sample_b", commands[6])
             self.assertIn("rdf2hdt", commands[9][-1])
             self.assertIn("/data/out/sample_b.hdt", commands[9][-1])
@@ -1542,7 +1871,17 @@ class WrapperUnitTests(VerboseTestCase):
                 return 0
 
             # Simulate partial compression bookkeeping: gzip recorded, brotli missing.
-            def fake_compress(*, rdf_path, out_dir, target_out_dir, image_ref, methods, wrapper_log_path, status_indent):
+            def fake_compress(
+                *,
+                rdf_path,
+                out_dir,
+                target_out_dir,
+                image_ref,
+                methods,
+                wrapper_log_path,
+                status_indent,
+                **_extra,
+            ):
                 return True, {
                     "gzip": {
                         "exit_code": 0,

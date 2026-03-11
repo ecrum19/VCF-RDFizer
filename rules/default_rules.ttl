@@ -33,12 +33,12 @@
     rml:referenceFormulation ql:CSV
   ] ;
   rr:subjectMap [
-    rr:template "https://w3id.org/vcf-rdfizer/vcf/{SOURCE_FILE}" ;
+    rr:template "file://{SOURCE_FILE}" ;
     rr:class vcfr:VCFFile
   ] ;
   rr:predicateObjectMap [
     rr:predicate vcfr:hasHeader ;
-    rr:objectMap [ rr:template "https://w3id.org/vcf-rdfizer/vcf/{SOURCE_FILE}/header" ]
+    rr:objectMap [ rr:template "file://{SOURCE_FILE}#header" ]
   ] ;
   rr:predicateObjectMap [
     rr:predicate vcfr:fileFormat ;
@@ -68,7 +68,7 @@
     rml:referenceFormulation ql:CSV
   ] ;
   rr:subjectMap [
-    rr:template "https://w3id.org/vcf-rdfizer/vcf/{SOURCE_FILE}/header" ;
+    rr:template "file://{SOURCE_FILE}#header" ;
     rr:class vcfr:VCFHeader
   ] ;
   .
@@ -91,12 +91,12 @@
     rml:referenceFormulation ql:CSV
   ] ;
   rr:subjectMap [
-    rr:template "https://w3id.org/vcf-rdfizer/vcf/{SOURCE_FILE}"
+    rr:template "file://{SOURCE_FILE}"
   ] ;
   rr:predicateObjectMap [
     rr:predicate vcfr:hasRecord ;
     rr:objectMap [
-      rr:template "https://w3id.org/vcf-rdfizer/vcf/{SOURCE_FILE}/record/var{ROW_ID}"
+      rr:template "file://{SOURCE_FILE}#record/{ROW_ID}"
     ]
   ] .
 
@@ -115,12 +115,12 @@
     rml:referenceFormulation ql:CSV
   ] ;
   rr:subjectMap [
-    rr:template "https://w3id.org/vcf-rdfizer/vcf/{SOURCE_FILE}/header"
+    rr:template "file://{SOURCE_FILE}#header"
   ] ;
   rr:predicateObjectMap [
     rr:predicate vcfr:hasHeaderLine ;
     rr:objectMap [
-      rr:template "https://w3id.org/vcf-rdfizer/vcf/{SOURCE_FILE}/header/line/{HEADER_INDEX}"
+      rr:template "file://{SOURCE_FILE}#header/line/{HEADER_INDEX}"
     ]
   ] .
 
@@ -139,7 +139,7 @@
     rml:referenceFormulation ql:CSV
   ] ;
   rr:subjectMap [
-    rr:template "https://w3id.org/vcf-rdfizer/vcf/{SOURCE_FILE}/header/line/{HEADER_INDEX}" ;
+    rr:template "file://{SOURCE_FILE}#header/line/{HEADER_INDEX}" ;
     rr:class vcfr:HeaderLine
   ] ;
   rr:predicateObjectMap [
@@ -166,7 +166,7 @@
     rml:referenceFormulation ql:CSV
   ] ;
   rr:subjectMap [
-    rr:template "https://w3id.org/vcf-rdfizer/vcf/{SOURCE_FILE}/record/var{ROW_ID}" ;
+    rr:template "file://{SOURCE_FILE}#record/{ROW_ID}" ;
     rr:class vcfr:VCFRecord
   ] ;
   rr:predicateObjectMap [
@@ -191,7 +191,7 @@
   ] ;
   rr:predicateObjectMap [
     rr:predicate vcfr:hasCall ;
-    rr:objectMap [ rr:template "https://w3id.org/vcf-rdfizer/vcf/{SOURCE_FILE}/call/var{ROW_ID}" ]
+    rr:objectMap [ rr:template "file://{SOURCE_FILE}#call/{ROW_ID}" ]
   ] .
 
 <#VariantCallMap>
@@ -209,7 +209,7 @@
     rml:referenceFormulation ql:CSV
   ] ;
   rr:subjectMap [
-    rr:template "https://w3id.org/vcf-rdfizer/vcf/{SOURCE_FILE}/call/var{ROW_ID}" ;
+    rr:template "file://{SOURCE_FILE}#call/{ROW_ID}" ;
     rr:class vcfr:VariantCall
   ] ;
   rr:predicateObjectMap [
@@ -240,12 +240,12 @@
     rml:referenceFormulation ql:CSV
   ] ;
   rr:subjectMap [
-    rr:template "https://w3id.org/vcf-rdfizer/vcf/{SOURCE_FILE}/call/var{ROW_ID}"
+    rr:template "file://{SOURCE_FILE}#call/{ROW_ID}"
   ] ;
   rr:predicateObjectMap [
     rr:predicate vcfr:hasSampleCall ;
     rr:objectMap [
-      rr:template "https://w3id.org/vcf-rdfizer/vcf/{SOURCE_FILE}/sample/var{ROW_ID}/{SAMPLE_URI_ID}"
+      rr:template "file://{SOURCE_FILE}#sample/{ROW_ID}/{SAMPLE_URI_ID}"
     ]
   ] .
 
@@ -264,7 +264,7 @@
     rml:referenceFormulation ql:CSV
   ] ;
   rr:subjectMap [
-    rr:template "https://w3id.org/vcf-rdfizer/vcf/{SOURCE_FILE}/sample/var{ROW_ID}/{SAMPLE_URI_ID}" ;
+    rr:template "file://{SOURCE_FILE}#sample/{ROW_ID}/{SAMPLE_URI_ID}" ;
     rr:class vcfr:SampleCall
   ] ;
   rr:predicateObjectMap [
@@ -287,12 +287,12 @@
     rml:referenceFormulation ql:CSV
   ] ;
   rr:subjectMap [
-    rr:template "https://w3id.org/vcf-rdfizer/vcf/{SOURCE_FILE}/sample/var{ROW_ID}/{SAMPLE_URI_ID}"
+    rr:template "file://{SOURCE_FILE}#sample/{ROW_ID}/{SAMPLE_URI_ID}"
   ] ;
   rr:predicateObjectMap [
     rr:predicate vcfr:hasFormatValue ;
     rr:objectMap [
-      rr:template "https://w3id.org/vcf-rdfizer/vcf/{SOURCE_FILE}/sample/var{ROW_ID}/{SAMPLE_URI_ID}/fmt/{FORMAT_KEY}"
+      rr:template "file://{SOURCE_FILE}#sample/{ROW_ID}/{SAMPLE_URI_ID}/fmt/{FORMAT_KEY}"
     ]
   ] .
 
@@ -311,7 +311,7 @@
     rml:referenceFormulation ql:CSV
   ] ;
   rr:subjectMap [
-    rr:template "https://w3id.org/vcf-rdfizer/vcf/{SOURCE_FILE}/sample/var{ROW_ID}/{SAMPLE_URI_ID}/fmt/{FORMAT_KEY}" ;
+    rr:template "file://{SOURCE_FILE}#sample/{ROW_ID}/{SAMPLE_URI_ID}/fmt/{FORMAT_KEY}" ;
     rr:class vcfr:FormatFieldValue
   ] ;
   rr:predicateObjectMap [

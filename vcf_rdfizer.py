@@ -57,6 +57,28 @@ CONVERSION_METRICS_HEADER = [
     "jar",
     "mapping_file",
     "output_path",
+    "exit_code_tsv",
+    "wall_seconds_tsv",
+    "user_seconds_tsv",
+    "sys_seconds_tsv",
+    "max_rss_kb_tsv",
+    "tsv_output_size_bytes",
+    "tsv_output_path",
+]
+
+TSV_BENCHMARK_HEADER = [
+    "run_id",
+    "timestamp",
+    "input_vcf",
+    "prefix",
+    "exit_code_tsv",
+    "wall_seconds_tsv",
+    "user_seconds_tsv",
+    "sys_seconds_tsv",
+    "max_rss_kb_tsv",
+    "tsv_output_size_bytes",
+    "tsv_output_path",
+    "tsv_time_log_path",
 ]
 
 COMPRESSION_COMMON_COLUMNS = ["combined_rdf_size_bytes", "compression_methods"]
@@ -706,7 +728,7 @@ def append_wrapper_timing_log(
 
 
 def write_failed_inputs_report(*, metrics_dir: Path, failures: list[dict]):
-    """Write per-input failure summary for full-mode partial runs."""
+    """Write per-input failure summary for multi-input modes."""
     ensure_dir(metrics_dir)
     report_path = metrics_dir / "failed_inputs.csv"
     header = [
@@ -1348,6 +1370,7 @@ def update_metrics_csv_with_compression(
     combined_size_bytes: int,
     selected_methods: list[str],
     method_results: dict[str, dict],
+    tsv_metrics: dict | None = None,
 ):
     """Upsert compression-related columns in `metrics.csv` for one output artifact.
 
@@ -1395,6 +1418,13 @@ def update_metrics_csv_with_compression(
         row["compression_methods"] = "|".join(selected_methods) if selected_methods else "none"
 
     defaults = {
+        "exit_code_tsv": "0",
+        "wall_seconds_tsv": "null",
+        "user_seconds_tsv": "null",
+        "sys_seconds_tsv": "null",
+        "max_rss_kb_tsv": "null",
+        "tsv_output_size_bytes": "0",
+        "tsv_output_path": "",
         "gzip_size_bytes": "0",
         "brotli_size_bytes": "0",
         "hdt_size_bytes": "0",
@@ -1430,6 +1460,27 @@ def update_metrics_csv_with_compression(
     for key, value in defaults.items():
         if key in row:
             row[key] = value
+
+    if tsv_metrics is not None:
+        if "exit_code_tsv" in row:
+            row["exit_code_tsv"] = str(int(tsv_metrics.get("exit_code") or 0))
+        if "wall_seconds_tsv" in row:
+            wall = tsv_metrics.get("wall_seconds")
+            row["wall_seconds_tsv"] = "null" if wall is None else f"{float(wall):.6f}"
+        if "user_seconds_tsv" in row:
+            user = tsv_metrics.get("user_seconds")
+            row["user_seconds_tsv"] = "null" if user is None else f"{float(user):.6f}"
+        if "sys_seconds_tsv" in row:
+            sys_val = tsv_metrics.get("sys_seconds")
+            row["sys_seconds_tsv"] = "null" if sys_val is None else f"{float(sys_val):.6f}"
+        if "max_rss_kb_tsv" in row:
+            rss = tsv_metrics.get("max_rss_kb")
+            row["max_rss_kb_tsv"] = "null" if rss is None else str(int(rss))
+        if "tsv_output_size_bytes" in row:
+            row["tsv_output_size_bytes"] = str(int(tsv_metrics.get("output_size_bytes") or 0))
+        if "tsv_output_path" in row:
+            paths = tsv_metrics.get("output_paths") or []
+            row["tsv_output_path"] = "|".join(str(path) for path in paths)
 
     def assign_timing(prefix: str, result: dict):
         wall_val = result.get("wall_seconds")
@@ -1580,6 +1631,49 @@ def write_compression_metrics_artifacts(
     metrics_json.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
+def write_raw_compression_metrics_artifact(
+    *,
+    metrics_dir: Path,
+    run_id: str,
+    timestamp: str,
+    output_name: str,
+    rdf_name: str,
+    source_rdf_path: Path,
+    selected_methods: list[str],
+    method_results: dict[str, dict],
+):
+    """Persist per-RDF-file compression metrics under `raw_metrics/`."""
+    safe_output = safe_metrics_name(output_name)
+    safe_rdf = safe_metrics_name(rdf_name)
+    raw_json_dir = metrics_dir / "raw_metrics" / "compression_metrics" / safe_output / safe_rdf
+    raw_json_dir.mkdir(parents=True, exist_ok=True)
+
+    payload = {
+        "run_id": run_id,
+        "timestamp": timestamp,
+        "output_name": output_name,
+        "rdf_name": rdf_name,
+        "source_rdf_path": str(source_rdf_path),
+        "compression_methods": ",".join(selected_methods) if selected_methods else "none",
+        "methods": {},
+    }
+
+    for method, result in method_results.items():
+        payload["methods"][method] = {
+            "exit_code": int(result.get("exit_code") or 0),
+            "wall_seconds": result.get("wall_seconds"),
+            "user_seconds": result.get("user_seconds"),
+            "sys_seconds": result.get("sys_seconds"),
+            "max_rss_kb": result.get("max_rss_kb"),
+            "output_path": result.get("output_path", ""),
+            "output_size_bytes": int(result.get("output_size_bytes") or 0),
+            "source": result.get("source"),
+        }
+
+    raw_json = raw_json_dir / f"{run_id}.json"
+    raw_json.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
 def aggregate_method_results_across_files(method_results_by_file: dict[str, dict[str, dict]]):
     """Aggregate per-file compression results into one per-method summary.
 
@@ -1658,8 +1752,297 @@ def validate_mode_dirs(paths):
             raise ValueError(f"expected a directory path but found a file: {p}")
 
 
+def tsv_output_paths_for_prefix(tsv_dir: Path, prefix: str) -> list[Path]:
+    """Return expected TSV outputs produced by `vcf_as_tsv.sh` for one input prefix."""
+    return [
+        tsv_dir / f"{prefix}.records.tsv",
+        tsv_dir / f"{prefix}.header_lines.tsv",
+        tsv_dir / f"{prefix}.file_metadata.tsv",
+    ]
+
+
+def summarize_tsv_outputs(tsv_dir: Path, prefix: str):
+    """Summarize TSV output paths and total bytes for one prefix."""
+    output_paths = tsv_output_paths_for_prefix(tsv_dir, prefix)
+    existing = [path for path in output_paths if path.exists()]
+    total_size = sum(int(file_size_bytes(path) or 0) for path in existing)
+    return existing, total_size
+
+
+def write_tsv_metrics_artifacts(
+    *,
+    metrics_dir: Path,
+    run_id: str,
+    timestamp: str,
+    prefix: str,
+    input_path: str,
+    exit_code: int,
+    timing: dict,
+    output_paths: list[Path],
+    output_size_bytes: int,
+):
+    """Persist raw TSV-step metrics under `raw_metrics/`."""
+    safe_prefix = safe_metrics_name(prefix)
+    json_dir = metrics_dir / "raw_metrics" / "tsv_metrics" / safe_prefix
+    json_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "run_id": run_id,
+        "timestamp": timestamp,
+        "prefix": prefix,
+        "input_path": input_path,
+        "exit_code": int(exit_code),
+        "timing": {
+            "wall_seconds": timing.get("wall_seconds"),
+            "user_seconds": timing.get("user_seconds"),
+            "sys_seconds": timing.get("sys_seconds"),
+            "max_rss_kb": timing.get("max_rss_kb"),
+        },
+        "artifacts": {
+            "output_paths": [str(path) for path in output_paths],
+            "output_size_bytes": int(output_size_bytes),
+        },
+    }
+    (json_dir / f"{run_id}.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def run_tsv_conversion_with_metrics(
+    *,
+    input_mount_dir: Path,
+    container_input: str,
+    tsv_dir: Path,
+    metrics_dir: Path,
+    image_ref: str,
+    run_id: str,
+    timestamp: str,
+    prefix: str,
+):
+    """Run VCF->TSV conversion and collect per-input timing/resource metrics."""
+    safe_prefix = safe_metrics_name(prefix)
+    raw_time_dir = metrics_dir / "raw_metrics" / "tsv_time" / safe_prefix
+    raw_time_dir.mkdir(parents=True, exist_ok=True)
+    time_log_host = raw_time_dir / f"{run_id}.txt"
+    time_log_container = f"/data/metrics/raw_metrics/tsv_time/{safe_prefix}/{run_id}.txt"
+
+    wrapped_command = (
+        "set -euo pipefail; "
+        f"rm -f {shlex.quote(time_log_container)}; "
+        'if [[ -x /usr/bin/time ]] && /usr/bin/time --version >/dev/null 2>&1; then '
+        f"/usr/bin/time -v -o {shlex.quote(time_log_container)} -- "
+        f"bash /opt/vcf-rdfizer/vcf_as_tsv.sh {shlex.quote(container_input)} /data/tsv; "
+        "else "
+        f"{{ time -p bash /opt/vcf-rdfizer/vcf_as_tsv.sh {shlex.quote(container_input)} /data/tsv; }} "
+        f"> {shlex.quote(time_log_container)} 2>&1; "
+        "fi"
+    )
+    cmd = [
+        *docker_run_base(),
+        "-v",
+        f"{str(input_mount_dir)}:/data/in:ro",
+        "-v",
+        f"{str(tsv_dir)}:/data/tsv",
+        "-v",
+        f"{str(metrics_dir)}:/data/metrics",
+        image_ref,
+        "bash",
+        "-lc",
+        wrapped_command,
+    ]
+
+    started = time.perf_counter()
+    exit_code = run(cmd)
+    elapsed = time.perf_counter() - started
+
+    timing = parse_time_log_metrics(time_log_host)
+    if timing.get("wall_seconds") is None:
+        timing["wall_seconds"] = elapsed
+
+    output_paths, output_size_bytes = summarize_tsv_outputs(tsv_dir, prefix)
+    write_tsv_metrics_artifacts(
+        metrics_dir=metrics_dir,
+        run_id=run_id,
+        timestamp=timestamp,
+        prefix=prefix,
+        input_path=container_input,
+        exit_code=exit_code,
+        timing=timing,
+        output_paths=output_paths,
+        output_size_bytes=output_size_bytes,
+    )
+
+    return {
+        "exit_code": exit_code,
+        "wall_seconds": timing.get("wall_seconds"),
+        "user_seconds": timing.get("user_seconds"),
+        "sys_seconds": timing.get("sys_seconds"),
+        "max_rss_kb": timing.get("max_rss_kb"),
+        "output_size_bytes": int(output_size_bytes),
+        "output_paths": [str(path) for path in output_paths],
+        "time_log_path": str(time_log_host),
+    }
+
+
+def write_tsv_benchmark_metrics_csv(*, metrics_dir: Path, rows: list[dict]):
+    """Write TSV-only benchmark metrics summary."""
+    ensure_dir(metrics_dir)
+    csv_path = metrics_dir / "tsv_metrics.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=TSV_BENCHMARK_HEADER)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({name: row.get(name, "") for name in TSV_BENCHMARK_HEADER})
+    return csv_path
+
+
+def run_tsv_mode(
+    *,
+    input_mount_dir: Path,
+    container_inputs: list[str],
+    expected_prefixes: list[str],
+    tsv_dir: Path,
+    metrics_dir: Path,
+    image_ref: str,
+    run_id: str,
+    timestamp: str,
+    wrapper_log_path: Path,
+    run_tracker: RunTracker | None = None,
+):
+    """Execute TSV-only benchmarking mode."""
+    print("Step 3/3: Processing TSV-only benchmark")
+    ensure_dir(tsv_dir)
+    ensure_dir(metrics_dir)
+
+    benchmark_rows: list[dict] = []
+    input_failures: list[dict] = []
+    total_inputs = len(container_inputs)
+
+    for idx, (container_input, expected_prefix) in enumerate(
+        zip(container_inputs, expected_prefixes),
+        start=1,
+    ):
+        input_name = Path(container_input).name
+        try:
+            container_rel = Path(container_input).relative_to("/data/in")
+            input_vcf = str((input_mount_dir / container_rel).resolve())
+        except ValueError:
+            input_vcf = container_input
+        input_failed = False
+
+        def fail_current(stage: str, message: str):
+            nonlocal input_failed
+            input_failed = True
+            compact = " ".join(str(message).split())
+            eprint(f"    ! Input {idx}/{total_inputs} ({input_name}) failed at {stage}: {compact}")
+            input_failures.append(
+                {
+                    "input_index": idx,
+                    "input_vcf": input_vcf,
+                    "expected_prefix": expected_prefix,
+                    "stage": stage,
+                    "error": compact,
+                }
+            )
+            if run_tracker is not None:
+                run_tracker.mark(
+                    f"Input {idx}/{total_inputs} failed at {stage} for {expected_prefix}: {compact}"
+                )
+
+        print(f"  - Input {idx}/{total_inputs}: {input_name}")
+        if run_tracker is not None:
+            run_tracker.mark(f"TSV input {idx}/{total_inputs} started: {expected_prefix}")
+
+        for expected_tsv_output in tsv_output_paths_for_prefix(tsv_dir, expected_prefix):
+            if not ensure_writable_path_or_fix(
+                target_path=expected_tsv_output,
+                is_dir=False,
+                image_ref=image_ref,
+                wrapper_log_path=wrapper_log_path,
+            ):
+                fail_current(
+                    "preflight-write-check",
+                    f"cannot write expected TSV output '{expected_tsv_output}'. See log: {wrapper_log_path}",
+                )
+                break
+        if input_failed:
+            continue
+
+        tsv_metrics = run_tsv_conversion_with_metrics(
+            input_mount_dir=input_mount_dir,
+            container_input=container_input,
+            tsv_dir=tsv_dir,
+            metrics_dir=metrics_dir,
+            image_ref=image_ref,
+            run_id=run_id,
+            timestamp=timestamp,
+            prefix=expected_prefix,
+        )
+        tsv_exit_code = int(tsv_metrics.get("exit_code") or 0)
+        if tsv_exit_code != 0:
+            fail_current("tsv-conversion", f"TSV conversion failed. See log: {wrapper_log_path}")
+            continue
+
+        expected_outputs = tsv_output_paths_for_prefix(tsv_dir, expected_prefix)
+        missing_outputs = [path for path in expected_outputs if not path.exists()]
+        if missing_outputs:
+            missing_list = ", ".join(path.name for path in missing_outputs)
+            fail_current(
+                "tsv-validation",
+                (
+                    f"TSV conversion did not produce expected outputs for '{expected_prefix}': "
+                    f"{missing_list}. See log: {wrapper_log_path}"
+                ),
+            )
+            continue
+
+        print(f"    * TSV conversion {success_symbol()}")
+        if run_tracker is not None:
+            run_tracker.mark(f"TSV input {idx}: conversion completed for {expected_prefix}")
+
+        wall_seconds = tsv_metrics.get("wall_seconds")
+        user_seconds = tsv_metrics.get("user_seconds")
+        sys_seconds = tsv_metrics.get("sys_seconds")
+        max_rss_kb = tsv_metrics.get("max_rss_kb")
+        benchmark_rows.append(
+            {
+                "run_id": run_id,
+                "timestamp": timestamp,
+                "input_vcf": input_vcf,
+                "prefix": expected_prefix,
+                "exit_code_tsv": str(tsv_exit_code),
+                "wall_seconds_tsv": "null" if wall_seconds is None else f"{float(wall_seconds):.6f}",
+                "user_seconds_tsv": "null" if user_seconds is None else f"{float(user_seconds):.6f}",
+                "sys_seconds_tsv": "null" if sys_seconds is None else f"{float(sys_seconds):.6f}",
+                "max_rss_kb_tsv": "null" if max_rss_kb is None else str(int(max_rss_kb)),
+                "tsv_output_size_bytes": str(int(tsv_metrics.get("output_size_bytes") or 0)),
+                "tsv_output_path": "|".join(str(path) for path in expected_outputs),
+                "tsv_time_log_path": str(tsv_metrics.get("time_log_path") or ""),
+            }
+        )
+
+    benchmark_csv = write_tsv_benchmark_metrics_csv(metrics_dir=metrics_dir, rows=benchmark_rows)
+    print(f"TSV benchmark metrics: {benchmark_csv}")
+
+    if input_failures:
+        report_path = write_failed_inputs_report(metrics_dir=metrics_dir, failures=input_failures)
+        eprint(
+            f"Completed with failures for {len(input_failures)}/{total_inputs} input(s). "
+            f"Failure report: {report_path}"
+        )
+        print("TSV benchmarking completed with failures.")
+        if run_tracker is not None:
+            run_tracker.mark(
+                f"TSV benchmark completed with failures ({len(input_failures)}/{total_inputs}). "
+                f"Report: {report_path}"
+            )
+        return 1
+
+    print("TSV benchmarking finished.")
+    if run_tracker is not None:
+        run_tracker.mark("TSV benchmark finished successfully")
+    return 0
+
+
 # ---------------------------------------------------------------------------
-# Mode runners (full/compress/decompress)
+# Mode runners (full/tsv/compress/decompress)
 # ---------------------------------------------------------------------------
 def ensure_image_available(
     image_ref: str,
@@ -1716,6 +2099,10 @@ def run_compression_methods_for_rdf(
     methods: list[str],
     wrapper_log_path: Path,
     status_indent: str | None,
+    metrics_dir: Path | None = None,
+    run_id: str | None = None,
+    timestamp: str | None = None,
+    output_name: str | None = None,
 ):
     """Run selected compression methods for a single RDF file.
 
@@ -1755,8 +2142,11 @@ def run_compression_methods_for_rdf(
     hdt_container = f"{target_out_container}/{hdt_name}"
     hdt_is_ready = False
     hdt_source = "generated"
+    metrics_output_name = output_name or target_out_dir.name
+    safe_output_name = safe_metrics_name(metrics_output_name)
+    safe_rdf_name = safe_metrics_name(rdf_path.name)
 
-    def run_container_command(*, method: str, output_name: str, command: str):
+    def run_container_command(*, method: str, artifact_name: str, command: str):
         """Execute one compression command in Docker and capture timing/size."""
         timing_name = f".{input_stem}.{method}.time"
         timing_container = f"{target_out_container}/{timing_name}"
@@ -1785,7 +2175,7 @@ def run_compression_methods_for_rdf(
         exit_code = run(cmd)
         elapsed = time.perf_counter() - started
         timing = parse_time_log_metrics(timing_host)
-        output_path = target_out_dir / output_name
+        output_path = target_out_dir / artifact_name
         method_results[method] = {
             "exit_code": exit_code,
             "wall_seconds": timing.get("wall_seconds")
@@ -1797,6 +2187,21 @@ def run_compression_methods_for_rdf(
             "output_path": str(output_path),
             "output_size_bytes": int(file_size_bytes(output_path) or 0),
         }
+        if metrics_dir is not None and run_id is not None and timing_host.exists():
+            raw_time_dir = (
+                metrics_dir
+                / "raw_metrics"
+                / "compression_time"
+                / safe_output_name
+                / safe_rdf_name
+                / method
+            )
+            raw_time_dir.mkdir(parents=True, exist_ok=True)
+            raw_time_path = raw_time_dir / f"{run_id}.txt"
+            try:
+                shutil.copyfile(timing_host, raw_time_path)
+            except OSError:
+                pass
         if timing_host.exists():
             try:
                 timing_host.unlink()
@@ -1845,7 +2250,7 @@ def run_compression_methods_for_rdf(
             '"$HDT_BIN" '
             f"{shlex.quote(input_container)} {shlex.quote(hdt_container)}"
         )
-        if not run_container_command(method="hdt", output_name=hdt_name, command=hdt_command):
+        if not run_container_command(method="hdt", artifact_name=hdt_name, command=hdt_command):
             return False
         hdt_is_ready = True
         hdt_source = "generated"
@@ -1853,31 +2258,31 @@ def run_compression_methods_for_rdf(
 
     for method in methods:
         if method == "gzip":
-            output_name = f"{input_stem}.{input_ext}.gz"
-            out_container = f"{target_out_container}/{output_name}"
+            artifact_name = f"{input_stem}.{input_ext}.gz"
+            out_container = f"{target_out_container}/{artifact_name}"
             command = (
                 "set -euo pipefail; "
                 f"rm -f {shlex.quote(out_container)}; "
                 f"gzip -c {shlex.quote(input_container)} > {shlex.quote(out_container)}"
             )
-            if not run_container_command(method=method, output_name=output_name, command=command):
+            if not run_container_command(method=method, artifact_name=artifact_name, command=command):
                 return False, method_results
             if status_indent is not None:
-                print(f"{status_indent}- {method}: {output_name} {success_symbol()}")
+                print(f"{status_indent}- {method}: {artifact_name} {success_symbol()}")
             continue
 
         if method == "brotli":
-            output_name = f"{input_stem}.{input_ext}.br"
-            out_container = f"{target_out_container}/{output_name}"
+            artifact_name = f"{input_stem}.{input_ext}.br"
+            out_container = f"{target_out_container}/{artifact_name}"
             command = (
                 "set -euo pipefail; "
                 f"rm -f {shlex.quote(out_container)}; "
                 f"brotli -q 7 -c {shlex.quote(input_container)} > {shlex.quote(out_container)}"
             )
-            if not run_container_command(method=method, output_name=output_name, command=command):
+            if not run_container_command(method=method, artifact_name=artifact_name, command=command):
                 return False, method_results
             if status_indent is not None:
-                print(f"{status_indent}- {method}: {output_name} {success_symbol()}")
+                print(f"{status_indent}- {method}: {artifact_name} {success_symbol()}")
             continue
 
         if method == "hdt":
@@ -1891,36 +2296,48 @@ def run_compression_methods_for_rdf(
         if method == "hdt_gzip":
             if not ensure_hdt_available():
                 return False, method_results
-            output_name = f"{input_stem}.hdt.gz"
-            out_container = f"{target_out_container}/{output_name}"
+            artifact_name = f"{input_stem}.hdt.gz"
+            out_container = f"{target_out_container}/{artifact_name}"
             command = (
                 "set -euo pipefail; "
                 f"rm -f {shlex.quote(out_container)}; "
                 f"gzip -c {shlex.quote(hdt_container)} > {shlex.quote(out_container)}"
             )
-            if not run_container_command(method=method, output_name=output_name, command=command):
+            if not run_container_command(method=method, artifact_name=artifact_name, command=command):
                 return False, method_results
             if status_indent is not None:
                 suffix = " (using existing HDT)" if hdt_source == "existing" else ""
-                print(f"{status_indent}- {method}: {output_name} {success_symbol()}{suffix}")
+                print(f"{status_indent}- {method}: {artifact_name} {success_symbol()}{suffix}")
             continue
 
         if method == "hdt_brotli":
             if not ensure_hdt_available():
                 return False, method_results
-            output_name = f"{input_stem}.hdt.br"
-            out_container = f"{target_out_container}/{output_name}"
+            artifact_name = f"{input_stem}.hdt.br"
+            out_container = f"{target_out_container}/{artifact_name}"
             command = (
                 "set -euo pipefail; "
                 f"rm -f {shlex.quote(out_container)}; "
                 f"brotli -q 7 -c {shlex.quote(hdt_container)} > {shlex.quote(out_container)}"
             )
-            if not run_container_command(method=method, output_name=output_name, command=command):
+            if not run_container_command(method=method, artifact_name=artifact_name, command=command):
                 return False, method_results
             if status_indent is not None:
                 suffix = " (using existing HDT)" if hdt_source == "existing" else ""
-                print(f"{status_indent}- {method}: {output_name} {success_symbol()}{suffix}")
+                print(f"{status_indent}- {method}: {artifact_name} {success_symbol()}{suffix}")
             continue
+
+    if metrics_dir is not None and run_id is not None and timestamp is not None:
+        write_raw_compression_metrics_artifact(
+            metrics_dir=metrics_dir,
+            run_id=run_id,
+            timestamp=timestamp,
+            output_name=metrics_output_name,
+            rdf_name=rdf_path.name,
+            source_rdf_path=rdf_path,
+            selected_methods=methods,
+            method_results=method_results,
+        )
 
     return True, method_results
 
@@ -2032,19 +2449,18 @@ def run_full_mode(
         if input_failed:
             continue
 
-        tsv_cmd = [
-            *docker_run_base(),
-            "-v",
-            f"{str(input_mount_dir)}:/data/in:ro",
-            "-v",
-            f"{str(tsv_dir)}:/data/tsv",
-            image_ref,
-            "bash",
-            "/opt/vcf-rdfizer/vcf_as_tsv.sh",
-            container_input,
-            "/data/tsv",
-        ]
-        if run(tsv_cmd) != 0:
+        tsv_metrics = run_tsv_conversion_with_metrics(
+            input_mount_dir=input_mount_dir,
+            container_input=container_input,
+            tsv_dir=tsv_dir,
+            metrics_dir=metrics_dir,
+            image_ref=image_ref,
+            run_id=run_id,
+            timestamp=timestamp,
+            prefix=expected_prefix,
+        )
+        tsv_exit_code = tsv_metrics.get("exit_code")
+        if int(0 if tsv_exit_code is None else tsv_exit_code) != 0:
             fail_current("tsv-conversion", f"TSV conversion failed. See log: {wrapper_log_path}")
             continue
         print(f"    * TSV conversion {success_symbol()}")
@@ -2146,6 +2562,57 @@ def run_full_mode(
             "-e",
             f"TIMESTAMP={timestamp}",
             "-e",
+            f"TSV_EXIT_CODE={int(tsv_metrics.get('exit_code') or 0)}",
+            "-e",
+            (
+                "TSV_WALL_SECONDS="
+                + (
+                    "null"
+                    if tsv_metrics.get("wall_seconds") is None
+                    else f"{float(tsv_metrics.get('wall_seconds')):.6f}"
+                )
+            ),
+            "-e",
+            (
+                "TSV_USER_SECONDS="
+                + (
+                    "null"
+                    if tsv_metrics.get("user_seconds") is None
+                    else f"{float(tsv_metrics.get('user_seconds')):.6f}"
+                )
+            ),
+            "-e",
+            (
+                "TSV_SYS_SECONDS="
+                + (
+                    "null"
+                    if tsv_metrics.get("sys_seconds") is None
+                    else f"{float(tsv_metrics.get('sys_seconds')):.6f}"
+                )
+            ),
+            "-e",
+            (
+                "TSV_MAX_RSS_KB="
+                + (
+                    "null"
+                    if tsv_metrics.get("max_rss_kb") is None
+                    else str(int(tsv_metrics.get("max_rss_kb")))
+                )
+            ),
+            "-e",
+            f"TSV_OUTPUT_SIZE_BYTES={int(tsv_metrics.get('output_size_bytes') or 0)}",
+            "-e",
+            (
+                "TSV_OUTPUT_PATH="
+                + "|".join(
+                    [
+                        f"/data/tsv/{expected_prefix}.records.tsv",
+                        f"/data/tsv/{expected_prefix}.header_lines.tsv",
+                        f"/data/tsv/{expected_prefix}.file_metadata.tsv",
+                    ]
+                )
+            ),
+            "-e",
             f"IN_VCF={container_input}",
             "-e",
             "LOGDIR=/data/metrics",
@@ -2206,6 +2673,10 @@ def run_full_mode(
                     methods=selected_methods,
                     wrapper_log_path=wrapper_log_path,
                     status_indent=None,
+                    metrics_dir=metrics_dir,
+                    run_id=run_id,
+                    timestamp=timestamp,
+                    output_name=output_name,
                 )
                 if not ok:
                     fail_current(
@@ -2250,6 +2721,7 @@ def run_full_mode(
                     combined_size_bytes=combined_size_before_cleanup,
                     selected_methods=selected_methods,
                     method_results=aggregated_results,
+                    tsv_metrics=tsv_metrics,
                 )
             else:
                 for raw_rdf_path in raw_rdf_files:
@@ -2274,6 +2746,7 @@ def run_full_mode(
                         combined_size_bytes=source_size_before_cleanup,
                         selected_methods=selected_methods,
                         method_results=method_results,
+                        tsv_metrics=tsv_metrics,
                     )
         except PermissionError as exc:
             blocked_path = exc.filename or str(metrics_dir)
@@ -2469,6 +2942,9 @@ def run_compress_mode(
     *,
     rdf_path: Path,
     out_dir: Path,
+    metrics_dir: Path,
+    run_id: str,
+    timestamp: str,
     image_ref: str,
     methods: list[str],
     wrapper_log_path: Path,
@@ -2488,6 +2964,7 @@ def run_compress_mode(
             )
 
     ensure_dir(out_dir)
+    input_stem = rdf_path.stem
     ok, method_results = run_compression_methods_for_rdf(
         rdf_path=rdf_path,
         out_dir=out_dir,
@@ -2495,11 +2972,14 @@ def run_compress_mode(
         methods=methods,
         wrapper_log_path=wrapper_log_path,
         status_indent="  ",
+        metrics_dir=metrics_dir,
+        run_id=run_id,
+        timestamp=timestamp,
+        output_name=input_stem,
     )
     if not ok:
         return 1
 
-    input_stem = rdf_path.stem
     target_out_dir = out_dir / input_stem
     hdt_path = target_out_dir / f"{input_stem}.hdt"
     print_nt_hdt_summary(
@@ -2618,6 +3098,8 @@ def main():
             "    vcf_rdfizer.py -m full -i ./vcf_files --rdf-layout batch -c hdt -o ./results\n"
             "  Full pipeline with partition hint:\n"
             "    vcf_rdfizer.py -m full -i ./vcf_files --rdf-layout batch -P 8 -c hdt -o ./results\n"
+            "  TSV-only benchmark:\n"
+            "    vcf_rdfizer.py -m tsv -i ./vcf_files -o ./results\n"
             "  Compression-only:\n"
             "    vcf_rdfizer.py -m compress -q ./results/out/sample/sample.nt -c gzip,hdt_gzip -o ./results\n"
             "  Decompression-only:\n"
@@ -2627,15 +3109,15 @@ def main():
     parser.add_argument(
         "-m",
         "--mode",
-        choices=["full", "compress", "decompress"],
+        choices=["full", "compress", "decompress", "tsv"],
         default="full",
-        help="Run mode: full VCF->RDF pipeline, compression-only, or decompression-only",
+        help="Run mode: full VCF->RDF pipeline, TSV-only benchmark, compression-only, or decompression-only",
     )
     parser.add_argument(
         "-i",
         "--input",
         default=None,
-        help="VCF file or directory (required for --mode full)",
+        help="VCF file or directory (required for --mode full and --mode tsv)",
     )
     parser.add_argument(
         "-q",
@@ -2771,6 +3253,19 @@ def main():
                 spark_partitions = parse_positive_int(
                     args.spark_partitions, name="--spark-partitions"
                 )
+        elif mode == "tsv":
+            if args.spark_partitions is not None:
+                raise ValueError("--spark-partitions is only valid in --mode full")
+            if args.input is None:
+                raise ValueError("--input is required in --mode tsv")
+            input_path = Path(args.input).expanduser().resolve()
+            (
+                input_mount_dir,
+                container_inputs,
+                _input_metrics_target,
+                expected_prefixes,
+            ) = resolve_input_snapshot(input_path)
+            validate_mode_dirs([out_root, out_dir, tsv_dir, metrics_root])
         elif mode == "compress":
             if args.spark_partitions is not None:
                 raise ValueError("--spark-partitions is only valid in --mode full")
@@ -2891,6 +3386,14 @@ def main():
                 (metrics_write_target, True),
                 (metrics_dir / "metrics.csv", False),
             ]
+        elif mode == "tsv":
+            tsv_write_target = tsv_dir if tsv_dir.exists() else tsv_dir.parent
+            metrics_write_target = metrics_dir if metrics_dir.exists() else metrics_dir.parent
+            writable_targets = [
+                (tsv_write_target, True),
+                (metrics_write_target, True),
+                (metrics_dir / "tsv_metrics.csv", False),
+            ]
         elif mode == "compress":
             out_write_target = out_dir if out_dir.exists() else out_dir.parent
             metrics_write_target = metrics_dir if metrics_dir.exists() else metrics_dir.parent
@@ -2950,11 +3453,28 @@ def main():
                 wrapper_log_path=wrapper_log_path,
                 run_tracker=run_tracker,
             )
+        if mode == "tsv":
+            # TSV-only benchmark mode.
+            return run_tsv_mode(
+                input_mount_dir=input_mount_dir,
+                container_inputs=container_inputs,
+                expected_prefixes=expected_prefixes,
+                tsv_dir=tsv_dir,
+                metrics_dir=metrics_dir,
+                image_ref=image_ref,
+                run_id=run_id,
+                timestamp=timestamp,
+                wrapper_log_path=wrapper_log_path,
+                run_tracker=run_tracker,
+            )
         if mode == "compress":
             # Compression-only mode.
             return run_compress_mode(
                 rdf_path=rdf_path,
                 out_dir=out_dir,
+                metrics_dir=metrics_dir,
+                run_id=run_id,
+                timestamp=timestamp,
                 image_ref=image_ref,
                 methods=methods,
                 wrapper_log_path=wrapper_log_path,

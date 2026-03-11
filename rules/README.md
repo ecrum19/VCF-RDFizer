@@ -28,7 +28,7 @@ This directory contains RML mappings used by the conversion pipeline.
 1. Copy `default_rules.ttl` to a new file (for example `my_rules.ttl`).
 2. Keep TSV source expectations aligned with `src/vcf_as_tsv.sh` unless you also customize that script.
 3. Add new `rr:TriplesMap` blocks for additional properties/classes.
-4. Preserve stable subjects (`vcf-file/{SOURCE_FILE}`, `record/{SOURCE_FILE}/{ROW_ID}`) if you want joins to keep working.
+4. Preserve stable subjects (`file://{SOURCE_FILE}`, `file://{SOURCE_FILE}#record/{ROW_ID}`) if you want joins to keep working.
 5. Run the wrapper with your custom mapping:
 
 ```bash

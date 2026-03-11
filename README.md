@@ -57,6 +57,7 @@ inside this directory.
 ## Modes
 
 - `full`: VCF -> TSV -> RDF -> compression
+- `tsv`: VCF -> TSV only (benchmarking)
 - `compress`: compress an existing `.nt`
 - `decompress`: decompress `.nt.gz`, `.nt.br`, or `.hdt`
 
@@ -66,7 +67,7 @@ In `full` mode with multiple VCF inputs, failures are isolated per input:
 
 ## Main Flags (Most Used)
 
-- `-m, --mode {full,compress,decompress}`
+- `-m, --mode {full,compress,decompress,tsv}`
 - `-o, --out` required output root directory
 - `-c, --compression` methods: `gzip,brotli,hdt,hdt_gzip,hdt_brotli,none`
 - `-I, --image` Docker image repo (default `ecrum19/vcf-rdfizer`)
@@ -86,6 +87,12 @@ In `full` mode with multiple VCF inputs, failures are isolated per input:
 - `-k, --keep-tsv` keep hidden TSV intermediates
 - `-R, --keep-rdf` keep raw `.nt` after compression
 - `-e, --estimate-size` preflight size estimate
+
+## TSV Mode Flags
+
+- `-i, --input` required VCF file or directory
+- Outputs per-run benchmark summary in `run_metrics/<RUN_ID>/tsv_metrics.csv`
+- Raw TSV timing + artifact JSON per input in `run_metrics/<RUN_ID>/raw_metrics/tsv_*`
 
 ## Compression Mode Flags
 
@@ -123,6 +130,7 @@ vcf-rdfizer \
   --rdf-layout batch \
   --compression hdt \
   --out ./results
+```
 
 Full pipeline with low-cost partition cap (helps avoid too many tiny batch files):
 
@@ -135,7 +143,6 @@ vcf-rdfizer \
   --compression hdt \
   --out ./results
 ```
-```
 
 Full pipeline with custom rules + keep RDF:
 
@@ -147,6 +154,15 @@ vcf-rdfizer \
   --rdf-layout aggregate \
   --compression hdt,brotli \
   --keep-rdf \
+  --out ./results
+```
+
+TSV-only benchmark:
+
+```bash
+vcf-rdfizer \
+  --mode tsv \
+  --input ./vcf_files \
   --out ./results
 ```
 
