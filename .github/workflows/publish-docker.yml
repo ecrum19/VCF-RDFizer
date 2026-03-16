@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       docker_tag:
-        description: "Optional explicit Docker tag (example: v1.0.6)"
+        description: "Optional explicit Docker tag (example: v1.1.1)"
         required: false
         type: string
 
@@ -71,7 +71,7 @@ jobs:
           ref_name = os.environ.get("GITHUB_REF_NAME", "")
           head_message = os.environ.get("HEAD_COMMIT_MESSAGE", "")
           manual_tag = os.environ.get("INPUT_DOCKER_TAG", "").strip()
-          pattern = re.compile(r"^v1\.0\.(\d+)$")
+          pattern = re.compile(r"^v1\.1\.(\d+)$")
           major_release_pattern = re.compile(r"^v\d+\.0\.0$")
           explicit_from_commit = re.search(r"\[(?:publish-docker|docker)=([A-Za-z0-9_.-]+)\]", head_message)
 
@@ -102,7 +102,7 @@ jobs:
               except Exception:
                   tags = subprocess.check_output(["git", "tag"], text=True).splitlines()
                   max_n = max(max_n, parse_max(tags))
-              resolved_tag = f"v1.0.{max_n + 1}"
+              resolved_tag = f"v1.1.{max_n + 1}"
 
           if not re.match(r"^[A-Za-z0-9_.-]+$", resolved_tag):
               raise SystemExit(f"Invalid Docker tag: {resolved_tag}")

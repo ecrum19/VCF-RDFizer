@@ -45,8 +45,8 @@ class WrapperCrossPlatformUnitTests(VerboseTestCase):
 
     def test_resolve_image_ref_with_version(self):
         """Image repository + explicit version resolves to a tagged image."""
-        image, requested = vcf_rdfizer.resolve_image_ref("ecrum19/vcf-rdfizer", "1.0.0")
-        self.assertEqual(image, "ecrum19/vcf-rdfizer:1.0.0")
+        image, requested = vcf_rdfizer.resolve_image_ref("ecrum19/vcf-rdfizer", "1.1.0")
+        self.assertEqual(image, "ecrum19/vcf-rdfizer:1.1.0")
         self.assertTrue(requested)
 
     def test_success_symbol_falls_back_for_cp1252_console(self):

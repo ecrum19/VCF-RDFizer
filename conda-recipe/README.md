@@ -4,11 +4,11 @@ This directory contains a starter `meta.yaml` for publishing `vcf-rdfizer` on co
 
 ## Before submitting to conda-forge
 
-1. Create a GitHub release/tag (for example `v1.0.0`).
+1. Create a GitHub release/tag (for example `v1.1.0`).
 2. Download the source tarball and compute sha256:
    ```bash
    curl -L -o vcf-rdfizer.tar.gz \
-     https://github.com/ecrum19/VCF-RDFizer/archive/refs/tags/v1.0.0.tar.gz
+     https://github.com/ecrum19/VCF-RDFizer/archive/refs/tags/v1.1.0.tar.gz
    shasum -a 256 vcf-rdfizer.tar.gz
    ```
 3. Replace `version` and `sha256` in `meta.yaml`.
