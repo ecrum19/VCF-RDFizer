@@ -1853,8 +1853,10 @@ def run_tsv_conversion_with_metrics(
     elapsed = time.perf_counter() - started
 
     timing = parse_time_log_metrics(time_log_host)
-    if timing.get("wall_seconds") is None:
-        timing["wall_seconds"] = elapsed
+    # Use the wrapper-observed docker runtime as the authoritative wall clock.
+    # GNU `time` remains useful for CPU/RSS, but its elapsed field has proven
+    # unreliable for long-running conversion/compression workloads.
+    timing["wall_seconds"] = elapsed
 
     output_paths, output_size_bytes = summarize_tsv_outputs(tsv_dir, prefix)
     write_tsv_metrics_artifacts(
@@ -2178,9 +2180,9 @@ def run_compression_methods_for_rdf(
         output_path = target_out_dir / artifact_name
         method_results[method] = {
             "exit_code": exit_code,
-            "wall_seconds": timing.get("wall_seconds")
-            if timing.get("wall_seconds") is not None
-            else elapsed,
+            # Prefer the wrapper-observed docker runtime over the inner
+            # `/usr/bin/time` elapsed field for long-running jobs.
+            "wall_seconds": elapsed,
             "user_seconds": timing.get("user_seconds"),
             "sys_seconds": timing.get("sys_seconds"),
             "max_rss_kb": timing.get("max_rss_kb"),

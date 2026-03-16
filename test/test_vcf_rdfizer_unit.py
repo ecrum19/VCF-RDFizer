@@ -197,6 +197,76 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertEqual(parsed["sys_seconds"], 0.45)
             self.assertEqual(parsed["max_rss_kb"], 12345)
 
+    def test_run_tsv_conversion_uses_wrapper_elapsed_for_wall_seconds(self):
+        """TSV metrics use wrapper-observed wall time even if the inner time log disagrees."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_mount_dir = tmp_path / "input"
+            tsv_dir = tmp_path / "tsv"
+            metrics_dir = tmp_path / "metrics"
+            input_mount_dir.mkdir(parents=True, exist_ok=True)
+            tsv_dir.mkdir(parents=True, exist_ok=True)
+            metrics_dir.mkdir(parents=True, exist_ok=True)
+            (input_mount_dir / "sample.vcf").write_text("##fileformat=VCFv4.2\n")
+
+            def fake_run(cmd, cwd=None, env=None):
+                metrics_mount = next(
+                    (
+                        part.split(":", 1)[0]
+                        for part in cmd
+                        if isinstance(part, str) and part.endswith(":/data/metrics")
+                    ),
+                    None,
+                )
+                tsv_mount = next(
+                    (
+                        part.split(":", 1)[0]
+                        for part in cmd
+                        if isinstance(part, str) and part.endswith(":/data/tsv")
+                    ),
+                    None,
+                )
+                script = str(cmd[-1]) if cmd else ""
+                time_match = re.search(r"-o\s+(/data/metrics/raw_metrics/tsv_time/[^\s;]+)", script)
+                if metrics_mount and time_match:
+                    time_log = Path(metrics_mount) / time_match.group(1).replace("/data/metrics/", "", 1)
+                    time_log.parent.mkdir(parents=True, exist_ok=True)
+                    time_log.write_text(
+                        "User time (seconds): 11.00\n"
+                        "System time (seconds): 1.50\n"
+                        "Elapsed (wall clock) time (h:mm:ss or m:ss): 0:00.19\n"
+                        "Maximum resident set size (kbytes): 2048\n"
+                    )
+                if tsv_mount:
+                    tsv_root = Path(tsv_mount)
+                    (tsv_root / "sample.records.tsv").write_text("SOURCE_FILE\tROW_ID\nsample.vcf\t1\n")
+                    (tsv_root / "sample.header_lines.tsv").write_text("SOURCE_FILE\tLINE\nsample.vcf\t##x\n")
+                    (tsv_root / "sample.file_metadata.tsv").write_text("SOURCE_FILE\tKEY\tVALUE\nsample.vcf\tk\tv\n")
+                return 0
+
+            with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch(
+                "vcf_rdfizer.time.perf_counter", side_effect=[100.0, 460.0]
+            ):
+                metrics = vcf_rdfizer.run_tsv_conversion_with_metrics(
+                    input_mount_dir=input_mount_dir,
+                    container_input="/data/in/sample.vcf",
+                    tsv_dir=tsv_dir,
+                    metrics_dir=metrics_dir,
+                    image_ref="example/vcf-rdfizer:latest",
+                    run_id="run-tsv-elapsed",
+                    timestamp="2026-03-16T10:00:00",
+                    prefix="sample",
+                )
+
+            self.assertEqual(metrics["wall_seconds"], 360.0)
+            self.assertEqual(metrics["user_seconds"], 11.0)
+            self.assertEqual(metrics["sys_seconds"], 1.5)
+            self.assertEqual(metrics["max_rss_kb"], 2048)
+
+            raw_json = metrics_dir / "raw_metrics" / "tsv_metrics" / "sample" / "run-tsv-elapsed.json"
+            payload = json.loads(raw_json.read_text())
+            self.assertEqual(payload["timing"]["wall_seconds"], 360.0)
+
     def test_run_compression_methods_persists_raw_metrics_and_time_logs(self):
         """Per-file compression timing/metrics are retained under raw_metrics."""
         with tempfile.TemporaryDirectory() as td:
@@ -282,6 +352,49 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertEqual(payload["rdf_name"], "sample.nt")
             self.assertEqual(payload["methods"]["hdt"]["exit_code"], 0)
             self.assertEqual(payload["methods"]["gzip"]["exit_code"], 0)
+
+    def test_run_compression_methods_use_wrapper_elapsed_for_wall_seconds(self):
+        """Compression metrics use wrapper-observed wall time even if the inner time log disagrees."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            out_dir = tmp_path / "out" / "sample"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            rdf_path = out_dir / "sample.nt"
+            rdf_path.write_text("<s> <p> <o> .\n")
+
+            def fake_run(cmd, cwd=None, env=None):
+                script = str(cmd[-1]) if cmd else ""
+                time_match = re.search(r"-o\s+(/data/out/[^\s;]+)", script)
+                if time_match:
+                    time_log = out_dir / time_match.group(1).replace("/data/out/", "", 1)
+                    time_log.parent.mkdir(parents=True, exist_ok=True)
+                    time_log.write_text(
+                        "User time (seconds): 123.00\n"
+                        "System time (seconds): 4.50\n"
+                        "Elapsed (wall clock) time (h:mm:ss or m:ss): 0:05.06\n"
+                        "Maximum resident set size (kbytes): 8192\n"
+                    )
+                if 'HDT_BIN="${RDF2HDT_BIN' in script:
+                    (out_dir / "sample.hdt").write_text("hdt\n")
+                return 0
+
+            with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch(
+                "vcf_rdfizer.time.perf_counter", side_effect=[1000.0, 3700.0]
+            ):
+                ok, method_results = vcf_rdfizer.run_compression_methods_for_rdf(
+                    rdf_path=rdf_path,
+                    out_dir=out_dir,
+                    image_ref="example/vcf-rdfizer:latest",
+                    methods=["hdt"],
+                    wrapper_log_path=tmp_path / "wrapper.log",
+                    status_indent=None,
+                )
+
+            self.assertTrue(ok)
+            self.assertEqual(method_results["hdt"]["wall_seconds"], 2700.0)
+            self.assertEqual(method_results["hdt"]["user_seconds"], 123.0)
+            self.assertEqual(method_results["hdt"]["sys_seconds"], 4.5)
+            self.assertEqual(method_results["hdt"]["max_rss_kb"], 8192)
 
     def test_run_compression_methods_records_implicit_hdt_in_raw_metrics(self):
         """Compound HDT methods include the implicit HDT stage in raw metrics JSON."""
