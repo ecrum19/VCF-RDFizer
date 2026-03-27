@@ -16,6 +16,8 @@ VCF-RDFizer is a Docker-first CLI wrapper for:
 1. VCF -> RDF (N-Triples) with RMLStreamer
 2. Optional RDF compression/decompression
 
+The VCF-RDFizer vocabulary is available at [https://w3id.org/vcf-rdfizer/vocab#](https://w3id.org/vcf-rdfizer/vocab#).
+
 ## Requirements
 
 - Python 3.10+
