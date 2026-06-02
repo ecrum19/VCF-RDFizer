@@ -1283,6 +1283,12 @@ def docker_pull_image(image: str):
     return run([*docker_cmd_prefix(), "pull", image])
 
 
+def repo_has_dockerfile(repo_root: Path) -> bool:
+    """Return whether a local checkout includes a buildable Dockerfile."""
+    dockerfile = repo_root / "Dockerfile"
+    return dockerfile.exists() and dockerfile.is_file()
+
+
 def resolve_image_ref(image: str, image_version: str | None):
     """Resolve image + optional tag into a concrete Docker reference."""
     if ":" in image:
@@ -2057,7 +2063,15 @@ def ensure_image_available(
     wrapper_log_path: Path,
 ):
     """Resolve image availability policy (build/pull/reuse) with clear status codes."""
+    has_local_dockerfile = repo_has_dockerfile(repo_root)
+
     if build:
+        if not has_local_dockerfile:
+            eprint(
+                "Error: --build requested but no local Dockerfile is available. "
+                "Install from a source checkout or use a published image tag."
+            )
+            return 2
         print(f"{step_label}: Ensuring Docker image is available")
         print("  - Building Docker image")
         if docker_build_image(image_ref, repo_root) != 0:
@@ -2084,10 +2098,16 @@ def ensure_image_available(
         return 2
 
     print(f"{step_label}: Ensuring Docker image is available")
-    print("  - Image missing locally, building")
-    if docker_build_image(image_ref, repo_root) != 0:
-        eprint(f"Error: docker build failed. See log: {wrapper_log_path}")
-        return 1
+    if has_local_dockerfile:
+        print("  - Image missing locally, building")
+        if docker_build_image(image_ref, repo_root) != 0:
+            eprint(f"Error: docker build failed. See log: {wrapper_log_path}")
+            return 1
+    else:
+        print(f"  - Image missing locally, pulling: {image_ref}")
+        if docker_pull_image(image_ref) != 0:
+            eprint(f"Error: image '{image_ref}' could not be pulled. See log: {wrapper_log_path}")
+            return 2
     print(f"{step_label}: Ensuring Docker image is available {success_symbol()}")
     return 0
 

@@ -2471,6 +2471,43 @@ class WrapperUnitTests(VerboseTestCase):
 
             self.assertEqual(rc, 2)
 
+    def test_main_pulls_latest_image_when_installed_package_has_no_dockerfile(self):
+        """Wrapper pulls latest instead of building when running from an installed package layout."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "check_docker", return_value=True), mock.patch.object(
+                    vcf_rdfizer, "docker_image_exists", return_value=False
+                ), mock.patch.object(
+                    vcf_rdfizer, "docker_pull_image", return_value=0
+                ) as mocked_pull, mock.patch.object(
+                    vcf_rdfizer, "docker_build_image"
+                ) as mocked_build, mock.patch.object(
+                    vcf_rdfizer, "repo_has_dockerfile", return_value=False
+                ), mock.patch.object(
+                    vcf_rdfizer, "run", return_value=0
+                ), mock.patch.object(
+                    vcf_rdfizer, "discover_tsv_triplets", return_value=mocked_triplets()
+                ):
+                    rc = invoke_main(
+                        [
+                            "--input",
+                            str(input_dir),
+                            "--rules",
+                            str(rules_path),
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 0)
+            mocked_pull.assert_called_once_with("ecrum19/vcf-rdfizer:latest")
+            mocked_build.assert_not_called()
+
     def test_main_no_build_fails_if_local_image_missing(self):
         """Wrapper fails fast with --no-build when no local image is available."""
         with tempfile.TemporaryDirectory() as td:
