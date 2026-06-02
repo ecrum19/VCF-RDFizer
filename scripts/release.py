@@ -133,6 +133,10 @@ def main() -> int:
     print(f"  git tag -a {tag} -m \"VCF-RDFizer {tag}\"")
     print("  git push origin main")
     print(f"  git push origin {tag}")
+    print("  # Before building locally for upload, clean old artifacts:")
+    print("  rm -rf dist build *.egg-info")
+    print("  python -m build")
+    print("  python -m twine check dist/*")
 
     return 0
 

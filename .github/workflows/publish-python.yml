@@ -22,8 +22,44 @@ jobs:
       - name: Build package
         run: |
           python -m pip install --upgrade pip build twine
+          rm -rf dist build *.egg-info
           python -m build
           python -m twine check dist/*
+
+      - name: Verify built artifact versions
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import tomllib
+
+          version = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+          dist = sorted(Path("dist").glob("*"))
+          if not dist:
+              raise SystemExit("No build artifacts found in dist/")
+
+          names = [path.name for path in dist]
+          expected = {
+              f"vcf_rdfizer-{version}.tar.gz",
+              f"vcf_rdfizer-{version}-py3-none-any.whl",
+          }
+          missing = sorted(expected.difference(names))
+          if missing:
+              raise SystemExit(
+                  f"Built artifacts do not match project version {version}; missing: {', '.join(missing)}"
+              )
+
+          unexpected = sorted(
+              name for name in names if name.startswith("vcf_rdfizer-") and f"vcf_rdfizer-{version}" not in name
+          )
+          if unexpected:
+              raise SystemExit(
+                  f"Found stale artifacts in dist/: {', '.join(unexpected)}"
+              )
+
+          print("Verified build artifacts:")
+          for name in names:
+              print(f"  {name}")
+          PY
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
