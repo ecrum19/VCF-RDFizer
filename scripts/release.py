@@ -2,12 +2,16 @@
 """Bump repository release metadata from a single semantic version.
 
 Usage:
-    python3 scripts/release.py 1.2.0
+    python3 scripts/release.py 1.2.3
 
 The script updates the project version markers, README citation text, the conda
 recipe version, and a few release-oriented examples. It can also fetch the
 GitHub source tarball SHA256 for the conda recipe when network access is
 available.
+
+In workflow mode, pass a Git tag via ``--tag v1.2.3`` together with
+``--workflow`` to sync release metadata in CI without touching the conda recipe
+SHA256.
 """
 
 from __future__ import annotations
@@ -46,9 +50,26 @@ def sha256_for_url(url: str) -> str:
     return digest.hexdigest()
 
 
+def version_from_tag(tag: str) -> str:
+    match = re.fullmatch(r"v(\d+\.\d+\.\d+)", tag.strip())
+    if not match:
+        raise SystemExit("tag must match vMAJOR.MINOR.PATCH, for example v1.2.3")
+    return match.group(1)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Bump VCF-RDFizer release metadata.")
-    parser.add_argument("version", help="Target semantic version, for example 1.2.0")
+    parser.add_argument("version", nargs="?", help="Target semantic version, for example 1.2.3")
+    parser.add_argument(
+        "--tag",
+        default=None,
+        help="Git tag to use as the version source, for example v1.2.3",
+    )
+    parser.add_argument(
+        "--workflow",
+        action="store_true",
+        help="Sync build metadata from a tag in CI and skip conda recipe sha256 updates.",
+    )
     parser.add_argument(
         "--conda-sha256",
         default=None,
@@ -56,9 +77,20 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    version = args.version.strip()
-    if not re.fullmatch(r"\d+\.\d+\.\d+", version):
-        raise SystemExit("version must match MAJOR.MINOR.PATCH, for example 1.2.0")
+    version_arg = args.version.strip() if args.version else None
+    tag_arg = args.tag.strip() if args.tag else None
+    if tag_arg:
+        version = version_from_tag(tag_arg)
+        if version_arg and version_arg != version:
+            raise SystemExit(
+                f"version argument {version_arg!r} does not match tag-derived version {version!r}"
+            )
+    elif version_arg:
+        version = version_arg
+        if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+            raise SystemExit("version must match MAJOR.MINOR.PATCH, for example 1.2.3")
+    else:
+        raise SystemExit("provide either a semantic version argument or --tag vMAJOR.MINOR.PATCH")
 
     tag = f"v{version}"
 
@@ -93,38 +125,39 @@ def main() -> int:
                 text = replace_once(text, pattern, replacement, file=path)
         write_text(path, text)
 
-    meta_path = ROOT / "conda-recipe" / "meta.yaml"
-    meta_text = read_text(meta_path)
-    meta_text = replace_once(
-        meta_text,
-        r'^\{% set version = "\d+\.\d+\.\d+" %\}$',
-        f'{{% set version = "{version}" %}}',
-        file=meta_path,
-    )
+    if not args.workflow:
+        meta_path = ROOT / "conda-recipe" / "meta.yaml"
+        meta_text = read_text(meta_path)
+        meta_text = replace_once(
+            meta_text,
+            r'^\{% set version = "\d+\.\d+\.\d+" %\}$',
+            f'{{% set version = "{version}" %}}',
+            file=meta_path,
+        )
 
-    sha256 = args.conda_sha256
-    if sha256 is None:
-        url = f"https://github.com/ecrum19/VCF-RDFizer/archive/refs/tags/{tag}.tar.gz"
-        try:
-            sha256 = sha256_for_url(url)
-        except Exception as exc:
-            sha256 = "REPLACE_WITH_GITHUB_TARBALL_SHA256"
-            print(
-                f"Warning: could not fetch {url} to compute sha256 automatically ({exc}).",
-                file=sys.stderr,
-            )
-            print(
-                "Use the tarball URL above to compute the sha256 before opening the conda-forge PR.",
-                file=sys.stderr,
-            )
+        sha256 = args.conda_sha256
+        if sha256 is None:
+            url = f"https://github.com/ecrum19/VCF-RDFizer/archive/refs/tags/{tag}.tar.gz"
+            try:
+                sha256 = sha256_for_url(url)
+            except Exception as exc:
+                sha256 = "REPLACE_WITH_GITHUB_TARBALL_SHA256"
+                print(
+                    f"Warning: could not fetch {url} to compute sha256 automatically ({exc}).",
+                    file=sys.stderr,
+                )
+                print(
+                    "Use the tarball URL above to compute the sha256 before opening the conda-forge PR.",
+                    file=sys.stderr,
+                )
 
-    meta_text = replace_once(
-        meta_text,
-        r'^\s*sha256:\s*.*$',
-        f"  sha256: {sha256}",
-        file=meta_path,
-    )
-    write_text(meta_path, meta_text)
+        meta_text = replace_once(
+            meta_text,
+            r'^\s*sha256:\s*.*$',
+            f"  sha256: {sha256}",
+            file=meta_path,
+        )
+        write_text(meta_path, meta_text)
 
     print(f"Updated release metadata to {version}")
     print(f"Next steps:")

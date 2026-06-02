@@ -5,6 +5,11 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Optional Git tag to sync from, for example v1.2.3"
+        required: false
+        type: string
 
 jobs:
   build:
@@ -19,6 +24,12 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Sync release metadata from tag
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.release_tag || github.ref_name }}
+        run: |
+          python scripts/release.py --tag "${RELEASE_TAG}" --workflow
+
       - name: Build package
         run: |
           python -m pip install --upgrade pip build twine
@@ -27,12 +38,25 @@ jobs:
           python -m twine check dist/*
 
       - name: Verify built artifact versions
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.release_tag || github.ref_name }}
         run: |
           python - <<'PY'
           from pathlib import Path
+          import os
           import tomllib
 
-          version = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+          tag = os.environ["RELEASE_TAG"].strip()
+          if not tag.startswith("v"):
+              raise SystemExit(f"Release tag must start with 'v': {tag}")
+
+          version = tag[1:]
+          pyproject_version = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+          if pyproject_version != version:
+              raise SystemExit(
+                  f"pyproject.toml version {pyproject_version} does not match release tag version {version}"
+              )
+
           dist = sorted(Path("dist").glob("*"))
           if not dist:
               raise SystemExit("No build artifacts found in dist/")
