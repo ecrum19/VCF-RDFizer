@@ -74,6 +74,7 @@ In `full` mode with multiple VCF inputs, failures are isolated per input:
 - `-m, --mode {full,compress,decompress,tsv}`
 - `-o, --out` required output root directory
 - `-c, --compression` methods: `gzip,brotli,hdt,hdt_gzip,hdt_brotli,none`
+- `--hdt-strategy {auto,partitioned,single}` HDT generation policy
 - `-I, --image` Docker image repo (default `ecrum19/vcf-rdfizer`)
 - `-v, --image-version` Docker tag/version
 - `-b, --build` force Docker build
@@ -86,6 +87,13 @@ In `full` mode with multiple VCF inputs, failures are isolated per input:
 - `-r, --rules` mapping rules file (`.ttl`)
   - default: `rules/default_rules.ttl`
 - `-l, --rdf-layout {aggregate,batch}` required in full mode
+- `--hdt-strategy {auto,partitioned,single}`
+  - `auto`: in batch RDF layout, build smaller HDT chunks and merge them with `HDTCat`
+  - `partitioned`: always use chunked HDT generation for HDT-based methods
+  - `single`: always use one `rdf2hdt` run per RDF input
+- `--hdt-target-chunk-bytes` target chunk size for partitioned HDT generation
+- `--hdt-min-chunk-bytes` minimum size to accumulate before flushing a chunk group
+- `--hdt-max-chunk-bytes` maximum size allowed before line-preserving re-splitting
 - `-P, --spark-partitions` optional Spark partition hint (positive integer)
   - low-cost way to reduce output part count by setting `spark.default.parallelism` and `spark.sql.shuffle.partitions`
 - `-k, --keep-tsv` keep hidden TSV intermediates
@@ -133,6 +141,21 @@ vcf-rdfizer \
   --input ./vcf_files \
   --rdf-layout batch \
   --compression hdt \
+  --out ./results
+```
+
+Full pipeline (batch RDF parts, chunked HDT + HDTCat merge):
+
+```bash
+vcf-rdfizer \
+  --mode full \
+  --input ./vcf_files \
+  --rdf-layout batch \
+  --compression hdt \
+  --hdt-strategy partitioned \
+  --hdt-target-chunk-bytes 536870912 \
+  --hdt-min-chunk-bytes 134217728 \
+  --hdt-max-chunk-bytes 1073741824 \
   --out ./results
 ```
 
@@ -218,6 +241,20 @@ Compression metrics now include per-method:
 - `sys_seconds_*`
 - `max_rss_kb_*`
 
+For partitioned HDT runs, the final HDT metric still reports one end-to-end
+HDT conversion result per sample/output, while raw metrics also include a
+sample-scoped `__partitioned_hdt__` artifact describing the merged HDT build.
+
+## HDT Optimization
+
+When HDT-based compression is selected in `full` mode with `--rdf-layout batch`,
+the default `--hdt-strategy auto` uses the existing RDF part files as split
+boundaries, builds smaller HDT chunks, merges them with `HDTCat`, and
+pre-generates the final `.hdt.index` file for query-ready output.
+
+This is usually faster and more robust than converting one very large merged
+`.nt` file in a single `rdf2hdt` run.
+
 ## Rules
 
 - default rules file: `rules/default_rules.ttl`
@@ -227,7 +264,8 @@ Compression metrics now include per-method:
 
 If Docker permission issues occur, rerun with a Docker-allowed user (or configure Docker group/sudo access on your system).
 
-If HDT compression fails on very large `.nt` files, use batch layout and/or non-HDT compression methods.
+If HDT compression fails on very large `.nt` files, switch to `--rdf-layout batch`
+and keep `--hdt-strategy auto` or set `--hdt-strategy partitioned` explicitly.
 
 Safe termination:
 

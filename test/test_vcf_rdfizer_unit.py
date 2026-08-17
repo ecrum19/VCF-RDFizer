@@ -460,6 +460,118 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertIn("hdt", payload["methods"])
             self.assertIn("hdt_gzip", payload["methods"])
 
+    def test_plan_partitioned_hdt_chunks_groups_small_inputs_and_splits_large_ones(self):
+        """Partition planning coalesces small RDF parts and line-splits oversized ones."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            rdf_dir = tmp_path / "rdf"
+            chunk_dir = tmp_path / "chunks"
+            rdf_dir.mkdir()
+
+            small_a = rdf_dir / "part-a.nt"
+            small_b = rdf_dir / "part-b.nt"
+            large = rdf_dir / "part-c.nt"
+            small_a.write_text("<a> <p> <o> .\n")
+            small_b.write_text("<b> <p> <o> .\n")
+            large.write_text((" <c> <p> <o> .\n".lstrip()) * 8)
+
+            chunk_inputs, plan = vcf_rdfizer.plan_partitioned_hdt_chunks(
+                [small_a, small_b, large],
+                chunk_dir,
+                target_bytes=40,
+                min_bytes=10,
+                max_bytes=60,
+            )
+
+            self.assertGreaterEqual(len(chunk_inputs), 2)
+            self.assertEqual(plan["source_file_count"], 3)
+            self.assertEqual(plan["chunk_count"], len(chunk_inputs))
+            self.assertTrue(all(path.exists() for path in chunk_inputs))
+            first_chunk_text = chunk_inputs[0].read_text()
+            self.assertIn("<a> <p> <o> .", first_chunk_text)
+            self.assertIn("<b> <p> <o> .", first_chunk_text)
+
+    def test_run_partitioned_hdt_methods_merges_chunks_and_generates_index(self):
+        """Partitioned HDT pipeline builds chunk HDTs, merges them, and writes a final index."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            out_dir = tmp_path / "out" / "sample"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            rdf_paths = []
+            for index in range(3):
+                rdf_path = out_dir / f"part-{index:05d}.nt"
+                rdf_path.write_text("<s> <p> <o> .\n" * 4)
+                rdf_paths.append(rdf_path)
+
+            def fake_run(cmd, cwd=None, env=None):
+                script = str(cmd[-1]) if cmd else ""
+                work_mount = next(
+                    (part.split(":", 1)[0] for part in cmd if isinstance(part, str) and part.endswith(":/data/work")),
+                    None,
+                )
+                out_mount = next(
+                    (part.split(":", 1)[0] for part in cmd if isinstance(part, str) and part.endswith(":/data/out")),
+                    None,
+                )
+                time_match = re.search(r"-o\s+(/data/work/[^\s;]+)", script)
+                if work_mount and time_match:
+                    time_log = Path(work_mount) / time_match.group(1).replace("/data/work/", "", 1)
+                    time_log.parent.mkdir(parents=True, exist_ok=True)
+                    time_log.write_text(
+                        "User time (seconds): 0.20\n"
+                        "System time (seconds): 0.05\n"
+                        "Elapsed (wall clock) time (h:mm:ss or m:ss): 0:00.10\n"
+                        "Maximum resident set size (kbytes): 4096\n"
+                    )
+
+                if work_mount and '"$HDT_BIN"' in script:
+                    outputs = re.findall(r"(/data/work/[^\s;]+\.hdt)", script)
+                    if outputs:
+                        output_path = Path(work_mount) / outputs[-1].replace("/data/work/", "", 1)
+                        output_path.parent.mkdir(parents=True, exist_ok=True)
+                        output_path.write_text("chunk-hdt\n")
+
+                if work_mount and '"$HDTCAT_BIN"' in script:
+                    outputs = re.findall(r"(/data/work/[^\s;]+\.hdt)", script)
+                    if outputs:
+                        output_path = Path(work_mount) / outputs[-1].replace("/data/work/", "", 1)
+                        output_path.parent.mkdir(parents=True, exist_ok=True)
+                        output_path.write_text("merged-hdt\n")
+
+                if out_mount and '"$HDT_INDEX_BIN"' in script:
+                    index_match = re.search(r'"\$HDT_INDEX_BIN"\s+(/data/out/[^\s;]+\.hdt)', script)
+                    if index_match:
+                        index_path = Path(out_mount) / index_match.group(1).replace("/data/out/", "", 1)
+                        Path(str(index_path) + ".index").write_text("index\n")
+
+                if out_mount and "gzip -c /data/out/sample.hdt" in script:
+                    (Path(out_mount) / "sample.hdt.gz").write_text("gz\n")
+                return 0
+
+            with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run):
+                ok, method_results = vcf_rdfizer.run_partitioned_hdt_methods_for_rdf_files(
+                    rdf_paths=rdf_paths,
+                    out_dir=out_dir,
+                    image_ref="example/vcf-rdfizer:latest",
+                    methods=["hdt", "hdt_gzip"],
+                    wrapper_log_path=tmp_path / "wrapper.log",
+                    metrics_dir=tmp_path / "metrics",
+                    run_id="run-partitioned",
+                    timestamp="2026-08-04T10:00:00",
+                    output_name="sample",
+                    target_chunk_bytes=40,
+                    min_chunk_bytes=10,
+                    max_chunk_bytes=60,
+                )
+
+            self.assertTrue(ok)
+            self.assertEqual(method_results["hdt"]["source"], "partitioned_generated")
+            self.assertTrue((out_dir / "sample.hdt").exists())
+            self.assertTrue((out_dir / "sample.hdt.index").exists())
+            self.assertTrue((out_dir / "sample.hdt.gz").exists())
+            self.assertGreaterEqual(method_results["hdt"]["details"]["chunk_count"], 2)
+            self.assertGreaterEqual(method_results["hdt"]["details"]["merge_rounds"], 1)
+
     def test_main_full_mode_records_tsv_metrics_and_raw_artifacts(self):
         """Full mode stores TSV timing/metrics artifacts and writes TSV fields into metrics.csv."""
         with tempfile.TemporaryDirectory() as td:
@@ -1650,6 +1762,103 @@ class WrapperUnitTests(VerboseTestCase):
 
             self.assertEqual(rc, 0)
             self.assertEqual(seen_output_names, ["sample"])
+
+    def test_main_full_mode_batch_hdt_uses_partitioned_merge_pipeline(self):
+        """Batch HDT in auto mode uses chunk-local rdf2hdt plus HDTCat merge and final indexing."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+            out_dir = tmp_path / "out"
+            commands = []
+
+            def fake_run(cmd, cwd=None, env=None):
+                commands.append(cmd)
+                rendered = str(cmd[-1]) if cmd else ""
+                if "/opt/vcf-rdfizer/run_conversion.sh" in cmd:
+                    sample_dir = out_dir / "sample"
+                    sample_dir.mkdir(parents=True, exist_ok=True)
+                    (sample_dir / "part-00000.nt").write_text("<s1> <p> <o> .\n" * 4)
+                    (sample_dir / "part-00001.nt").write_text("<s2> <p> <o> .\n" * 4)
+                    return 0
+
+                work_mount = next(
+                    (part.split(":", 1)[0] for part in cmd if isinstance(part, str) and part.endswith(":/data/work")),
+                    None,
+                )
+                out_mount = next(
+                    (part.split(":", 1)[0] for part in cmd if isinstance(part, str) and part.endswith(":/data/out")),
+                    None,
+                )
+                time_match = re.search(r"-o\s+(/data/work/[^\s;]+)", rendered)
+                if work_mount and time_match:
+                    time_log = Path(work_mount) / time_match.group(1).replace("/data/work/", "", 1)
+                    time_log.parent.mkdir(parents=True, exist_ok=True)
+                    time_log.write_text(
+                        "User time (seconds): 0.10\n"
+                        "System time (seconds): 0.02\n"
+                        "Elapsed (wall clock) time (h:mm:ss or m:ss): 0:00.05\n"
+                        "Maximum resident set size (kbytes): 1024\n"
+                    )
+
+                if work_mount and '"$HDT_BIN"' in rendered:
+                    outputs = re.findall(r"(/data/work/[^\s;]+\.hdt)", rendered)
+                    if outputs:
+                        output_path = Path(work_mount) / outputs[-1].replace("/data/work/", "", 1)
+                        output_path.parent.mkdir(parents=True, exist_ok=True)
+                        output_path.write_text("chunk-hdt\n")
+
+                if work_mount and '"$HDTCAT_BIN"' in rendered:
+                    outputs = re.findall(r"(/data/work/[^\s;]+\.hdt)", rendered)
+                    if outputs:
+                        output_path = Path(work_mount) / outputs[-1].replace("/data/work/", "", 1)
+                        output_path.parent.mkdir(parents=True, exist_ok=True)
+                        output_path.write_text("merged-hdt\n")
+
+                if out_mount and '"$HDT_INDEX_BIN"' in rendered:
+                    index_match = re.search(r'"\$HDT_INDEX_BIN"\s+(/data/out/[^\s;]+\.hdt)', rendered)
+                    if index_match:
+                        hdt_path = Path(out_mount) / index_match.group(1).replace("/data/out/", "", 1)
+                        Path(str(hdt_path) + ".index").write_text("index\n")
+                return 0
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch.object(
+                    vcf_rdfizer, "check_docker", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "docker_image_exists", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "discover_tsv_triplets", return_value=mocked_triplets()
+                ):
+                    rc = invoke_main(
+                        [
+                            "--input",
+                            str(input_dir),
+                            "--rules",
+                            str(rules_path),
+                            "--rdf-layout",
+                            "batch",
+                            "--compression",
+                            "hdt",
+                            "--hdt-target-chunk-bytes",
+                            "40",
+                            "--hdt-min-chunk-bytes",
+                            "10",
+                            "--hdt-max-chunk-bytes",
+                            "60",
+                            "--out",
+                            str(out_dir),
+                            "--keep-tsv",
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 0)
+            self.assertTrue(any('"$HDTCAT_BIN"' in str(cmd[-1]) for cmd in commands if isinstance(cmd, list) and cmd))
+            self.assertTrue(any('"$HDT_INDEX_BIN"' in str(cmd[-1]) for cmd in commands if isinstance(cmd, list) and cmd))
+            self.assertTrue((out_dir / "sample" / "sample.hdt").exists())
 
     def test_main_full_mode_aggregate_layout_sets_merge_flag(self):
         """Aggregate layout passes AGGREGATE_RDF=1 to conversion step."""
