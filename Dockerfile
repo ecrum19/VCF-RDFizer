@@ -52,8 +52,13 @@ RUN apt-get update \
     gzip \
     libserd-0-0 \
     nodejs \
+    python3 \
+    python3-venv \
     time \
   && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m venv /opt/pycottas-venv \
+  && /opt/pycottas-venv/bin/pip install --no-cache-dir pycottas
 
 RUN mkdir -p /opt/rmlstreamer \
   && curl -fsSL \
@@ -74,6 +79,7 @@ COPY --from=build-hdt-cpp /usr/local/lib/libhdt* /usr/local/lib/
 COPY --from=build-hdt-cpp /opt/third_party_licenses/ /usr/share/licenses/vcf-rdfizer/
 COPY THIRD_PARTY_NOTICES.md /usr/share/licenses/vcf-rdfizer/THIRD_PARTY_NOTICES.md
 COPY src/*.sh /opt/vcf-rdfizer/
+COPY src/*.py /opt/vcf-rdfizer/
 
 RUN chmod +x /opt/vcf-rdfizer/*.sh \
   && find /opt/hdt-java/bin -type f -exec chmod +x {} \; \
@@ -85,6 +91,7 @@ ENV JAR=/opt/rmlstreamer/RMLStreamer-v${RMLSTREAMER_VERSION}-standalone.jar
 ENV HDT_JAVA_HOME=/opt/hdt-java
 ENV RDF2HDT_BIN=/usr/local/bin/rdf2hdt
 ENV HDT2RDF_BIN=/usr/local/bin/hdt2rdf
+ENV COTTAS_PYTHON_BIN=/opt/pycottas-venv/bin/python
 ENV LD_LIBRARY_PATH=/usr/local/lib
 
 WORKDIR /work

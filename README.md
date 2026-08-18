@@ -62,7 +62,7 @@ inside this directory.
 
 - `full`: VCF -> TSV -> RDF -> compression
 - `tsv`: VCF -> TSV only (benchmarking)
-- `compress`: compress an existing `.nt`
+- `compress`: compress an existing `.nt` or `.nt.gz`
 - `decompress`: decompress `.nt.gz`, `.nt.br`, or `.hdt`
 
 In `full` mode with multiple VCF inputs, failures are isolated per input:
@@ -73,8 +73,9 @@ In `full` mode with multiple VCF inputs, failures are isolated per input:
 
 - `-m, --mode {full,compress,decompress,tsv}`
 - `-o, --out` required output root directory
-- `-c, --compression` methods: `gzip,brotli,hdt,hdt_gzip,hdt_brotli,none`
+- `-c, --compression` methods: `gzip,brotli,hdt,hdt_gzip,hdt_brotli,cottas,none`
 - `--hdt-strategy {auto,partitioned,single}` HDT generation policy
+- `--chunk-target-bytes`, `--chunk-min-bytes`, `--chunk-max-bytes` shared record-safe chunk sizing
 - `-I, --image` Docker image repo (default `ecrum19/vcf-rdfizer`)
 - `-v, --image-version` Docker tag/version
 - `-b, --build` force Docker build
@@ -86,14 +87,18 @@ In `full` mode with multiple VCF inputs, failures are isolated per input:
 - `-i, --input` required VCF file or directory
 - `-r, --rules` mapping rules file (`.ttl`)
   - default: `rules/default_rules.ttl`
-- `-l, --rdf-layout {aggregate,batch}` required in full mode
+- `-l, --rdf-layout {aggregate,batch}` legacy full-mode RDF layout
+- `--rdf-storage-mode {plain,space-optimized}` full-mode aggregate storage policy
+  - `plain`: merge RMLStreamer parts into one uncompressed `.nt`
+  - `space-optimized`: gzip each part into one `.nt.gz` aggregate and delete the source part immediately
 - `--hdt-strategy {auto,partitioned,single}`
-  - `auto`: in batch RDF layout, build smaller HDT chunks and merge them with `HDTCat`
+  - `auto`: in batch RDF layout or a storage mode, build smaller HDT chunks and merge them with `HDTCat`
   - `partitioned`: always use chunked HDT generation for HDT-based methods
   - `single`: always use one `rdf2hdt` run per RDF input
-- `--hdt-target-chunk-bytes` target chunk size for partitioned HDT generation
-- `--hdt-min-chunk-bytes` minimum size to accumulate before flushing a chunk group
-- `--hdt-max-chunk-bytes` maximum size allowed before line-preserving re-splitting
+  - with `space-optimized`, use `auto` or `partitioned`; `single` cannot consume the gzip stream without expanding it
+- `--chunk-target-bytes` target uncompressed bytes per HDT/COTTAS chunk
+- `--chunk-min-bytes` minimum uncompressed bytes before flushing a chunk group
+- `--chunk-max-bytes` maximum uncompressed bytes in a chunk; boundaries remain on complete NT lines
 - `-P, --spark-partitions` optional Spark partition hint (positive integer)
   - low-cost way to reduce output part count by setting `spark.default.parallelism` and `spark.sql.shuffle.partitions`
 - `-k, --keep-tsv` keep hidden TSV intermediates
@@ -153,9 +158,23 @@ vcf-rdfizer \
   --rdf-layout batch \
   --compression hdt \
   --hdt-strategy partitioned \
-  --hdt-target-chunk-bytes 536870912 \
-  --hdt-min-chunk-bytes 134217728 \
-  --hdt-max-chunk-bytes 1073741824 \
+  --chunk-target-bytes 536870912 \
+  --chunk-min-bytes 134217728 \
+  --chunk-max-bytes 1073741824 \
+  --out ./results
+```
+
+Full pipeline (space-optimized aggregate with shared HDT and COTTAS chunks):
+
+```bash
+vcf-rdfizer \
+  --mode full \
+  --input ./vcf_files \
+  --rdf-storage-mode space-optimized \
+  --compression hdt,cottas \
+  --chunk-target-bytes 536870912 \
+  --chunk-min-bytes 134217728 \
+  --chunk-max-bytes 1073741824 \
   --out ./results
 ```
 
@@ -203,6 +222,17 @@ vcf-rdfizer \
   --out ./results
 ```
 
+Compression-only from a space-optimized aggregate:
+
+```bash
+vcf-rdfizer \
+  --mode compress \
+  --rdf ./results/sample/sample.nt.gz \
+  --compression hdt,cottas \
+  --chunk-target-bytes 536870912 \
+  --out ./results
+```
+
 Decompression-only:
 
 ```bash
@@ -224,7 +254,9 @@ Given `--out ./results`:
   - `./results/.intermediate/tsv/`
 
 Intermediates are hidden by default.
-Raw `.nt` files are removed after compression unless `--keep-rdf` is provided.
+Raw RDF files are removed after compression unless `--keep-rdf` is provided.
+The space-optimized mode retains the `.nt.gz` aggregate when `gzip` is selected
+because that file is the gzip artifact itself.
 
 ## Metrics
 
@@ -241,19 +273,33 @@ Compression metrics now include per-method:
 - `sys_seconds_*`
 - `max_rss_kb_*`
 
-For partitioned HDT runs, the final HDT metric still reports one end-to-end
-HDT conversion result per sample/output, while raw metrics also include a
-sample-scoped `__partitioned_hdt__` artifact describing the merged HDT build.
+For partitioned HDT/COTTAS runs, the final method metric reports one
+sample-level result, while raw metrics also include a sample-scoped
+`__partitioned_compression__` artifact describing chunk conversion, merge
+rounds, and the generated chunk guide.
 
-## HDT Optimization
+## Chunked Compression
 
-When HDT-based compression is selected in `full` mode with `--rdf-layout batch`,
-the default `--hdt-strategy auto` uses the existing RDF part files as split
-boundaries, builds smaller HDT chunks, merges them with `HDTCat`, and
-pre-generates the final `.hdt.index` file for query-ready output.
+The new storage modes are mutually exclusive with the legacy `--rdf-layout`
+option. Both modes create one logical N-Triples aggregate. The space-optimized
+mode streams each RMLStreamer part through gzip and deletes that part before
+processing the next one, so it avoids retaining both the part files and a full
+uncompressed aggregate.
 
-This is usually faster and more robust than converting one very large merged
-`.nt` file in a single `rdf2hdt` run.
+When HDT or COTTAS is selected, the aggregate is read sequentially and split
+into complete N-Triples records. The chunk guide is generated during that same
+pass, and the same temporary chunks are consumed by both converters before
+cleanup. HDT chunks are merged with `HDTCat`, the final HDT index is generated
+after merging, and COTTAS chunks are merged with `pycottas.cat`, which rebuilds
+the query indexes for the merged representation.
+
+Successful aggregate partitioned runs retain `<sample>.chunks.json` beside the
+final compression artifacts. It records the record-safe chunk boundaries and
+uncompressed byte ranges; temporary RDF chunks and merge intermediates are
+removed after successful conversion.
+
+See [`COMPRESSION_CHANGELOG.md`](COMPRESSION_CHANGELOG.md) for the detailed
+implementation approach and operational constraints.
 
 ## Rules
 
@@ -264,8 +310,10 @@ This is usually faster and more robust than converting one very large merged
 
 If Docker permission issues occur, rerun with a Docker-allowed user (or configure Docker group/sudo access on your system).
 
-If HDT compression fails on very large `.nt` files, switch to `--rdf-layout batch`
-and keep `--hdt-strategy auto` or set `--hdt-strategy partitioned` explicitly.
+If HDT compression fails on very large RDF files, use
+`--rdf-storage-mode space-optimized` or `--rdf-storage-mode plain` with
+`--hdt-strategy partitioned`, then lower `--chunk-target-bytes` and
+`--chunk-max-bytes` to reduce each converter's working set.
 
 Safe termination:
 

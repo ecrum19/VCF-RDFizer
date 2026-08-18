@@ -20,6 +20,14 @@ OUT_NAME=${OUT_NAME:-rdf}
 OUT_DIR=${OUT_DIR:-run_output}
 OUT="$OUT_DIR/$OUT_NAME"
 AGGREGATE_RDF=${AGGREGATE_RDF:-1}
+# Full-mode storage policy. `plain` keeps a normal aggregate N-Triples file;
+# `space-optimized` appends gzip members and removes each source part after it
+# has been compressed. Empty means legacy AGGREGATE_RDF behavior.
+RDF_STORAGE_MODE=${RDF_STORAGE_MODE:-}
+if [[ -n "$RDF_STORAGE_MODE" && "$RDF_STORAGE_MODE" != "plain" && "$RDF_STORAGE_MODE" != "space-optimized" ]]; then
+  echo "ERROR: invalid RDF_STORAGE_MODE='$RDF_STORAGE_MODE' (expected plain or space-optimized)." >&2
+  exit 2
+fi
 LOGDIR=${LOGDIR:-run_metrics}
 mkdir -p "$LOGDIR" "$OUT_DIR"
 
@@ -141,7 +149,11 @@ count_triples_json() {
 
   if [[ -f "$path" ]]; then
     local count
-    count=$( (grep -E '^[[:space:]]*[^#].*\.[[:space:]]*$' "$path" || true) | wc -l | tr -d ' ' )
+    if [[ "$path" == *.gz ]]; then
+      count=$(gzip -dc "$path" | awk '/^[[:space:]]*[^#].*\.[[:space:]]*$/ { count++ } END { print count + 0 }')
+    else
+      count=$( (grep -E '^[[:space:]]*[^#].*\.[[:space:]]*$' "$path" || true) | wc -l | tr -d ' ' )
+    fi
     echo "{"
     printf "  \"%s\": %s,\n" "$path" "$count"
     printf "  \"TOTAL\": %s\n" "$count"
@@ -236,7 +248,9 @@ fi
 # ---------- Post-run normalization ----------
 mkdir -p "$OUT_DIR/$OUT_NAME"
 
-# Normalize output files to .nt for downstream compression/HDT conversion.
+# Normalize output files to .nt for downstream line-oriented processing. The
+# wrapper does not infer or rewrite RDF syntax beyond preserving the part as a
+# line-oriented file; callers must validate whether the stream is NT or NQ.
 for RDF_FILE in "$OUT_DIR/$OUT_NAME"/*; do
   if [[ ! -f "$RDF_FILE" ]]; then
     continue
@@ -254,7 +268,39 @@ if [[ "$AGGREGATE_RDF" == "1" ]]; then
   MERGED_NT="$OUT_DIR/$OUT_NAME/$OUT_NAME.nt"
   shopt -s nullglob
   PART_FILES=("$OUT_DIR/$OUT_NAME"/*.nt)
-  if (( ${#PART_FILES[@]} > 0 )); then
+  if [[ "$RDF_STORAGE_MODE" == "space-optimized" ]]; then
+    MERGED_RDF="${MERGED_NT}.gz"
+    MERGED_TMP="${MERGED_RDF}.partial"
+    # Keep duplicate-part protection in the compressed path as well. Hashing
+    # each part is linear in the bytes already being read and avoids retaining
+    # an uncompressed duplicate just to compare it later.
+    SEEN_HASH_FILE="$OUT_DIR/$OUT_NAME/.seen_part_hashes.$$"
+    SEEN_MAP_FILE="$OUT_DIR/$OUT_NAME/.seen_part_hash_map.$$"
+    : > "$SEEN_HASH_FILE"
+    : > "$SEEN_MAP_FILE"
+    rm -f "$MERGED_TMP" "$MERGED_RDF"
+    # Feed an empty stream on stdin for GNU and BSD gzip compatibility.
+    gzip -c < /dev/null > "$MERGED_TMP"
+    for PART_NT in "${PART_FILES[@]}"; do
+      PART_HASH=$(hash_file_sha256 "$PART_NT")
+      if grep -Fqx "$PART_HASH" "$SEEN_HASH_FILE"; then
+        FIRST_SEEN=$(awk -F'\t' -v hash="$PART_HASH" '$1 == hash { print $2; exit }' "$SEEN_MAP_FILE")
+        echo "WARNING: skipping duplicate RDF part '$PART_NT' (same content as '$FIRST_SEEN')." >&2
+        rm -f "$PART_NT"
+        continue
+      fi
+      printf "%s\n" "$PART_HASH" >> "$SEEN_HASH_FILE"
+      printf "%s\t%s\n" "$PART_HASH" "$PART_NT" >> "$SEEN_MAP_FILE"
+      annotate_null_literals_nt "$PART_NT"
+      # Concatenated gzip members form one valid sequential gzip stream while
+      # allowing each completed RMLStreamer part to be deleted immediately.
+      gzip -c "$PART_NT" >> "$MERGED_TMP"
+      rm -f "$PART_NT"
+    done
+    rm -f "$SEEN_HASH_FILE" "$SEEN_MAP_FILE"
+    mv "$MERGED_TMP" "$MERGED_RDF"
+    OUTPUT_PATH="$MERGED_RDF"
+  elif (( ${#PART_FILES[@]} > 0 )); then
     : > "$MERGED_NT"
     # Defensive dedupe: some Spark/RMLStreamer runs can emit identical part
     # files for the same dataset. Skip exact duplicate part payloads to avoid
@@ -282,15 +328,18 @@ if [[ "$AGGREGATE_RDF" == "1" ]]; then
     rm -f "$SEEN_HASH_FILE" "$SEEN_MAP_FILE"
   else
     : > "$MERGED_NT"
+    OUTPUT_PATH="$MERGED_NT"
   fi
   shopt -u nullglob
-  OUTPUT_PATH="$MERGED_NT"
+  if [[ "$RDF_STORAGE_MODE" != "space-optimized" ]]; then
+    OUTPUT_PATH="$MERGED_NT"
+  fi
 else
   OUTPUT_PATH="$OUT_DIR/$OUT_NAME"
 fi
 
 # Apply ontology-compliant null datatype annotation to produced RDF files.
-if [[ -f "$OUTPUT_PATH" ]]; then
+if [[ -f "$OUTPUT_PATH" && "$OUTPUT_PATH" != *.gz ]]; then
   annotate_null_literals_nt "$OUTPUT_PATH"
 elif [[ -d "$OUTPUT_PATH" ]]; then
   shopt -s nullglob
@@ -343,6 +392,11 @@ cat > "$METRICS_JSON" <<EOF
     "output_path": "$OUTPUT_PATH",
     "output_size_bytes": $OUT_SIZE,
     "output_triples": $TRIPLES_JSON
+  },
+  "rdf_storage": {
+    "mode": "${RDF_STORAGE_MODE:-legacy}",
+    "compressed": $( [[ "$OUTPUT_PATH" == *.gz ]] && echo true || echo false ),
+    "serialization": "ntriples"
   },
   "tsv_generation": {
     "exit_code": ${TSV_EXIT_CODE},

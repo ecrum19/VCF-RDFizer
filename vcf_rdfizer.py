@@ -14,6 +14,7 @@ diagnosed at a specific stage and future workflow changes stay localized.
 
 import argparse
 import csv
+import gzip
 import importlib.resources as importlib_resources
 import json
 import os
@@ -124,16 +125,26 @@ COMPRESSION_METHOD_COLUMNS = {
         "sys_seconds_brotli_on_hdt",
         "max_rss_kb_brotli_on_hdt",
     ],
+    "cottas": [
+        "cottas_size_bytes",
+        "exit_code_cottas",
+        "wall_seconds_cottas",
+        "user_seconds_cottas",
+        "sys_seconds_cottas",
+        "max_rss_kb_cottas",
+    ],
 }
 
 HDT_SOURCE_COLUMN = "hdt_source"
-VALID_COMPRESSION_METHODS = {"gzip", "brotli", "hdt", "hdt_gzip", "hdt_brotli"}
+VALID_COMPRESSION_METHODS = {"gzip", "brotli", "hdt", "hdt_gzip", "hdt_brotli", "cottas"}
 HDT_COMPRESSION_METHODS = {"hdt", "hdt_gzip", "hdt_brotli"}
+PARTITIONED_COMPRESSION_METHODS = HDT_COMPRESSION_METHODS | {"cottas"}
 HDT_STRATEGY_CHOICES = {"auto", "single", "partitioned"}
 DEFAULT_HDT_STRATEGY = "auto"
-DEFAULT_HDT_TARGET_CHUNK_BYTES = 512 * 1024 * 1024
-DEFAULT_HDT_MIN_CHUNK_BYTES = 128 * 1024 * 1024
-DEFAULT_HDT_MAX_CHUNK_BYTES = 1024 * 1024 * 1024
+RDF_STORAGE_MODES = {"space-optimized", "plain"}
+DEFAULT_CHUNK_TARGET_BYTES = 512 * 1024 * 1024
+DEFAULT_CHUNK_MIN_BYTES = 128 * 1024 * 1024
+DEFAULT_CHUNK_MAX_BYTES = 1024 * 1024 * 1024
 HDTCAT_CANDIDATES = [
     "hdtCat",
     "hdtCat.sh",
@@ -662,6 +673,124 @@ def split_nt_file_for_hdt(
     return chunk_paths or [source_path]
 
 
+def iter_rdf_binary_lines(path: Path):
+    """Yield RDF records from plain or gzip-compressed line-oriented RDF."""
+    opener = gzip.open if path.name.endswith(".gz") else Path.open
+    with opener(path, "rb") as handle:
+        for line in handle:
+            yield line
+
+
+def plan_record_safe_rdf_chunks(
+    source_paths: list[Path],
+    chunk_dir: Path,
+    *,
+    target_bytes: int,
+    min_bytes: int,
+    max_bytes: int,
+    guide_path: Path | None = None,
+) -> tuple[list[Path], dict]:
+    """Create bounded RDF chunks without splitting a line-level statement.
+
+    The guide is written as boundaries are discovered during this single
+    sequential pass. A separate pre-scan would read/decompress the complete
+    aggregate twice, so the guide and chunk files are produced together.
+    Logical offsets are uncompressed offsets and therefore work for both plain
+    and gzip-backed aggregate sources.
+    """
+    if not source_paths:
+        return [], {"source_file_count": 0, "chunk_count": 0, "chunk_input_bytes": 0}
+    if target_bytes <= 0 or min_bytes <= 0 or max_bytes <= 0:
+        raise ValueError("RDF chunk sizes must be positive.")
+    if min_bytes > target_bytes or target_bytes > max_bytes:
+        raise ValueError("RDF chunk sizes must satisfy min <= target <= max.")
+
+    ensure_dir(chunk_dir)
+    chunk_paths: list[Path] = []
+    guide_chunks: list[dict] = []
+    chunk_handle = None
+    chunk_path = None
+    chunk_size = 0
+    chunk_start_offset = 0
+    chunk_start_record = 0
+    logical_offset = 0
+    record_count = 0
+    total_bytes = 0
+    chunk_index = 0
+
+    def close_chunk():
+        nonlocal chunk_handle, chunk_path, chunk_size
+        if chunk_handle is None or chunk_path is None:
+            return
+        chunk_handle.close()
+        chunk_paths.append(chunk_path)
+        guide_chunks.append(
+            {
+                "chunk_id": len(guide_chunks),
+                "path": str(chunk_path),
+                "start_record": chunk_start_record,
+                "end_record": record_count,
+                "start_uncompressed_byte": chunk_start_offset,
+                "end_uncompressed_byte": logical_offset,
+                "record_count": record_count - chunk_start_record,
+                "payload_bytes": chunk_size,
+            }
+        )
+        chunk_handle = None
+        chunk_path = None
+        chunk_size = 0
+
+    try:
+        for source_path in source_paths:
+            for line in iter_rdf_binary_lines(source_path):
+                if not line.endswith(b"\n"):
+                    raise ValueError(
+                        f"RDF source contains a non-line-terminated record: {source_path}"
+                    )
+                line_size = len(line)
+                if chunk_handle is None:
+                    chunk_path = chunk_dir / f"chunk-{chunk_index:05d}.nt"
+                    chunk_index += 1
+                    chunk_handle = chunk_path.open("wb")
+                    chunk_start_offset = logical_offset
+                    chunk_start_record = record_count
+                elif chunk_size > 0 and (
+                    (chunk_size >= target_bytes and chunk_size >= min_bytes)
+                    or chunk_size + line_size > max_bytes
+                ):
+                    close_chunk()
+                    chunk_path = chunk_dir / f"chunk-{chunk_index:05d}.nt"
+                    chunk_index += 1
+                    chunk_handle = chunk_path.open("wb")
+                    chunk_start_offset = logical_offset
+                    chunk_start_record = record_count
+
+                chunk_handle.write(line)
+                chunk_size += line_size
+                logical_offset += line_size
+                total_bytes += line_size
+                record_count += 1
+    finally:
+        close_chunk()
+
+    plan = {
+        "source_file_count": len(source_paths),
+        "source_paths": [str(path) for path in source_paths],
+        "chunk_count": len(chunk_paths),
+        "chunk_input_bytes": total_bytes,
+        "record_count": record_count,
+        "target_chunk_bytes": target_bytes,
+        "min_chunk_bytes": min_bytes,
+        "max_chunk_bytes": max_bytes,
+        "chunks": guide_chunks,
+    }
+    if guide_path is not None:
+        ensure_dir(guide_path.parent)
+        plan["guide_path"] = str(guide_path)
+        guide_path.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
+    return chunk_paths, plan
+
+
 def plan_partitioned_hdt_chunks(
     rdf_paths: list[Path],
     chunk_dir: Path,
@@ -757,7 +886,8 @@ def count_triples_in_nt_files(paths: list[Path]) -> int | None:
         if not path.exists() or not path.is_file():
             continue
         try:
-            with path.open("r", encoding="utf-8", errors="replace") as handle:
+            opener = gzip.open if path.name.endswith(".gz") else Path.open
+            with opener(path, "rt", encoding="utf-8", errors="replace") as handle:
                 for line in handle:
                     if pattern.match(line):
                         total += 1
@@ -996,8 +1126,12 @@ def rdf_label_for_path(path: Path) -> str:
 
 def compression_artifact_name_for_method(path: Path, method: str) -> str:
     """Compute expected compressed artifact filename for a method."""
-    stem = path.stem
-    ext = path.suffix.lstrip(".") or "nt"
+    if path.name.endswith(".nt.gz"):
+        stem = path.name[: -len(".nt.gz")]
+        ext = "nt"
+    else:
+        stem = path.stem
+        ext = path.suffix.lstrip(".") or "nt"
     if method == "gzip":
         return f"{stem}.{ext}.gz"
     if method == "brotli":
@@ -1008,18 +1142,23 @@ def compression_artifact_name_for_method(path: Path, method: str) -> str:
         return f"{stem}.hdt.gz"
     if method == "hdt_brotli":
         return f"{stem}.hdt.br"
+    if method == "cottas":
+        return f"{stem}.cottas"
     return f"{stem}.{method}"
 
 
 def compression_method_label_for_path(path: Path, method: str) -> str:
     """Return human-readable compression method label for a path."""
     ext = path.suffix.lstrip(".") or "nt"
+    if path.name.endswith(".nt.gz"):
+        ext = "nt"
     labels = {
         "gzip": f"gzip (.{ext}.gz)",
         "brotli": f"brotli (.{ext}.br)",
         "hdt": "HDT (.hdt)",
         "hdt_gzip": "gzip-on-HDT (.hdt.gz)",
         "hdt_brotli": "brotli-on-HDT (.hdt.br)",
+        "cottas": "COTTAS (.cottas)",
     }
     return labels.get(method, method)
 
@@ -1484,7 +1623,7 @@ def parse_compression_methods(raw: str):
         if method not in VALID_COMPRESSION_METHODS:
             raise ValueError(
                 "Unsupported compression method "
-                f"'{method}'. Use gzip,brotli,hdt,hdt_gzip,hdt_brotli, or none."
+                f"'{method}'. Use gzip,brotli,hdt,hdt_gzip,hdt_brotli,cottas, or none."
             )
         if method not in methods:
             methods.append(method)
@@ -1502,12 +1641,24 @@ def parse_positive_int(value: str, *, name: str) -> int:
     return parsed
 
 
+def compression_uses_partitioning(methods: list[str]) -> bool:
+    """Return whether selected methods need bounded RDF chunks."""
+    return any(method in PARTITIONED_COMPRESSION_METHODS for method in methods)
+
+
 def compression_uses_hdt(methods: list[str]) -> bool:
     """Return whether any selected compression step depends on HDT generation."""
     return any(method in HDT_COMPRESSION_METHODS for method in methods)
 
 
-def should_use_partitioned_hdt(*, mode: str, rdf_layout: str | None, methods: list[str], hdt_strategy: str) -> bool:
+def should_use_partitioned_hdt(
+    *,
+    mode: str,
+    rdf_layout: str | None,
+    methods: list[str],
+    hdt_strategy: str,
+    rdf_storage_mode: str | None = None,
+) -> bool:
     """Resolve whether the HDT pipeline should use chunked generation + HDTCat."""
     if not compression_uses_hdt(methods):
         return False
@@ -1518,7 +1669,7 @@ def should_use_partitioned_hdt(*, mode: str, rdf_layout: str | None, methods: li
     # `auto` keeps aggregate/full and ordinary RDF compression behavior stable,
     # while enabling the chunked HDT path where this project already has
     # natural RDF part boundaries to exploit.
-    return mode == "full" and rdf_layout == "batch"
+    return mode == "full" and (rdf_layout == "batch" or rdf_storage_mode in RDF_STORAGE_MODES)
 
 
 def safe_metrics_name(value: str) -> str:
@@ -1539,6 +1690,9 @@ def metrics_header_for_methods(selected_methods: list[str]) -> list[str]:
         header.extend(COMPRESSION_METHOD_COLUMNS["gzip"])
     if "brotli" in methods:
         header.extend(COMPRESSION_METHOD_COLUMNS["brotli"])
+
+    if "cottas" in methods:
+        header.extend(COMPRESSION_METHOD_COLUMNS["cottas"])
 
     uses_hdt = any(method in HDT_COMPRESSION_METHODS for method in methods)
     if uses_hdt:
@@ -1696,7 +1850,7 @@ def update_metrics_csv_with_compression(
         if rss_col in row:
             row[rss_col] = "null" if rss_val is None else str(int(rss_val))
 
-    for method in ("gzip", "brotli", "hdt"):
+    for method in ("gzip", "brotli", "hdt", "cottas"):
         result = method_results.get(method)
         if result is None:
             continue
@@ -1770,6 +1924,7 @@ def write_compression_metrics_artifacts(
     hdt_result = method_results.get("hdt", {})
     hdt_gzip_result = method_results.get("hdt_gzip", {})
     hdt_brotli_result = method_results.get("hdt_brotli", {})
+    cottas_result = method_results.get("cottas", {})
 
     def timing_payload(result: dict):
         return {
@@ -1799,6 +1954,12 @@ def write_compression_metrics_artifacts(
             "output_brotli_size_bytes": int(brotli_result.get("output_size_bytes") or 0),
             "exit_code": int(brotli_result.get("exit_code") or 0),
             "timing": timing_payload(brotli_result),
+        },
+        "cottas_conversion": {
+            "output_cottas_path": cottas_result.get("output_path", ""),
+            "output_cottas_size_bytes": int(cottas_result.get("output_size_bytes") or 0),
+            "exit_code": int(cottas_result.get("exit_code") or 0),
+            "timing": timing_payload(cottas_result),
         },
         "hdt_conversion": {
             "output_hdt_path": hdt_result.get("output_path", ""),
@@ -1863,6 +2024,7 @@ def write_raw_compression_metrics_artifact(
             "output_path": result.get("output_path", ""),
             "output_size_bytes": int(result.get("output_size_bytes") or 0),
             "source": result.get("source"),
+            "details": result.get("details", {}),
         }
 
     raw_json = raw_json_dir / f"{run_id}.json"
@@ -2323,8 +2485,12 @@ def run_compression_methods_for_rdf(
     """
     in_dir = rdf_path.parent
     input_container = f"/data/in/{rdf_path.name}"
-    input_stem = rdf_path.stem
-    input_ext = rdf_path.suffix.lstrip(".") or "nt"
+    if rdf_path.name.endswith(".nt.gz"):
+        input_stem = rdf_path.name[: -len(".nt.gz")]
+        input_ext = "nt"
+    else:
+        input_stem = rdf_path.stem
+        input_ext = rdf_path.suffix.lstrip(".") or "nt"
     if target_out_dir is None:
         target_out_dir = out_dir / input_stem
     ensure_dir(target_out_dir)
@@ -2471,6 +2637,25 @@ def run_compression_methods_for_rdf(
         if method == "gzip":
             artifact_name = f"{input_stem}.{input_ext}.gz"
             out_container = f"{target_out_container}/{artifact_name}"
+            if rdf_path.name.endswith(".gz"):
+                # The space-optimized aggregate is already gzip-compressed.
+                # Keep it as the selected gzip artifact rather than producing
+                # a redundant second gzip layer.
+                if rdf_path.resolve() != (target_out_dir / artifact_name).resolve():
+                    shutil.copyfile(rdf_path, target_out_dir / artifact_name)
+                method_results[method] = {
+                    "exit_code": 0,
+                    "wall_seconds": 0.0,
+                    "user_seconds": 0.0,
+                    "sys_seconds": 0.0,
+                    "max_rss_kb": 0,
+                    "output_path": str(target_out_dir / artifact_name),
+                    "output_size_bytes": int(file_size_bytes(target_out_dir / artifact_name) or 0),
+                    "source": "already_compressed",
+                }
+                if status_indent is not None:
+                    print(f"{status_indent}- {method}: {artifact_name} {success_symbol()} (already compressed)")
+                continue
             command = (
                 "set -euo pipefail; "
                 f"rm -f {shlex.quote(out_container)}; "
@@ -2485,10 +2670,33 @@ def run_compression_methods_for_rdf(
         if method == "brotli":
             artifact_name = f"{input_stem}.{input_ext}.br"
             out_container = f"{target_out_container}/{artifact_name}"
+            input_command = (
+                f"gzip -dc {shlex.quote(input_container)}"
+                if rdf_path.name.endswith(".gz")
+                else f"cat {shlex.quote(input_container)}"
+            )
             command = (
                 "set -euo pipefail; "
                 f"rm -f {shlex.quote(out_container)}; "
-                f"brotli -q 7 -c {shlex.quote(input_container)} > {shlex.quote(out_container)}"
+                f"{input_command} | brotli -q 7 -c > {shlex.quote(out_container)}"
+            )
+            if not run_container_command(method=method, artifact_name=artifact_name, command=command):
+                return False, method_results
+            if status_indent is not None:
+                print(f"{status_indent}- {method}: {artifact_name} {success_symbol()}")
+            continue
+
+        if method == "cottas":
+            artifact_name = f"{input_stem}.cottas"
+            out_container = f"{target_out_container}/{artifact_name}"
+            command = (
+                "set -euo pipefail; "
+                f"rm -f {shlex.quote(out_container)}; "
+                'PYTHON_BIN="${COTTAS_PYTHON_BIN:-$(command -v python3 || true)}"; '
+                'if [[ -z "$PYTHON_BIN" || ! -x "$PYTHON_BIN" ]]; then '
+                'echo "Missing pycottas Python executable in container" >&2; exit 127; fi; '
+                f'"$PYTHON_BIN" /opt/vcf-rdfizer/cottas_tool.py convert '
+                f"{shlex.quote(input_container)} {shlex.quote(out_container)} spo"
             )
             if not run_container_command(method=method, artifact_name=artifact_name, command=command):
                 return False, method_results
@@ -2556,6 +2764,7 @@ def run_compression_methods_for_rdf(
 def run_partitioned_hdt_methods_for_rdf_files(
     *,
     rdf_paths: list[Path],
+    source_rdf_path: Path | None = None,
     out_dir: Path,
     image_ref: str,
     methods: list[str],
@@ -2568,31 +2777,58 @@ def run_partitioned_hdt_methods_for_rdf_files(
     min_chunk_bytes: int,
     max_chunk_bytes: int,
 ):
-    """Generate one HDT artifact from many RDF inputs via chunking + HDTCat.
+    """Generate HDT and/or COTTAS artifacts from bounded RDF chunks.
 
-    The batch RDF layout already gives us natural, line-oriented N-Triples
-    boundaries. This helper exploits those boundaries to keep individual
-    `rdf2hdt` conversions small, then merges the resulting HDTs in a balanced
-    binary tree so the final artifact still represents the whole VCF dataset.
+    When ``source_rdf_path`` is supplied, it may be a plain or gzip-compressed
+    aggregate. The source is read once into record-safe temporary chunks. The
+    same chunks are consumed by all selected methods before being deleted.
+    ``rdf_paths`` retains the legacy batch-part path for compatibility.
     """
-    if not rdf_paths:
+    if not rdf_paths and source_rdf_path is None:
         return True, {}
 
     ensure_dir(out_dir)
-    work_dir = out_dir / ".hdt_partitioned"
+    work_dir = out_dir / ".compression_partitioned"
     if work_dir.exists():
         shutil.rmtree(work_dir, ignore_errors=True)
     ensure_dir(work_dir)
 
-    chunk_inputs, plan = plan_partitioned_hdt_chunks(
-        rdf_paths,
-        work_dir / "nt_chunks",
-        target_bytes=target_chunk_bytes,
-        min_bytes=min_chunk_bytes,
-        max_bytes=max_chunk_bytes,
-    )
-
     output_stem = output_name
+    try:
+        if source_rdf_path is not None:
+            chunk_inputs, plan = plan_record_safe_rdf_chunks(
+                [source_rdf_path],
+                work_dir / "nt_chunks",
+                target_bytes=target_chunk_bytes,
+                min_bytes=min_chunk_bytes,
+                max_bytes=max_chunk_bytes,
+                guide_path=work_dir / "chunks.json",
+            )
+        else:
+            chunk_inputs, plan = plan_partitioned_hdt_chunks(
+                rdf_paths,
+                work_dir / "nt_chunks",
+                target_bytes=target_chunk_bytes,
+                min_bytes=min_chunk_bytes,
+                max_bytes=max_chunk_bytes,
+            )
+    except (OSError, ValueError) as exc:
+        eprint(f"Error: unable to prepare record-safe RDF chunks: {exc}. See log: {wrapper_log_path}")
+        shutil.rmtree(work_dir, ignore_errors=True)
+        return False, {}
+
+    # Keep the small boundary guide as a user-visible artifact. The temporary
+    # chunks and converter outputs are removed later, but the guide remains
+    # useful for benchmarking, auditing, and reproducing a chunk layout.
+    if source_rdf_path is not None:
+        temporary_guide = work_dir / "chunks.json"
+        if temporary_guide.exists():
+            persistent_guide = out_dir / f"{output_stem}.chunks.json"
+            plan["guide_path"] = str(persistent_guide)
+            # Rewrite the small guide with its durable path before temporary
+            # conversion files are removed at the end of this function.
+            persistent_guide.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
+
     final_hdt_path = out_dir / f"{output_stem}.hdt"
     final_index_path = Path(str(final_hdt_path) + ".index")
     method_results: dict[str, dict] = {}
@@ -2700,6 +2936,13 @@ def run_partitioned_hdt_methods_for_rdf_files(
         HDT_INDEX_CANDIDATES,
         "Missing hdtGenerateIndex binary in container",
     )
+    cottas_python_resolve = (
+        'PYTHON_BIN="${COTTAS_PYTHON_BIN:-$(command -v python3 || true)}"; '
+        'if [[ -z "$PYTHON_BIN" || ! -x "$PYTHON_BIN" ]]; then '
+        'echo "Missing Python runtime for COTTAS" >&2; exit 127; '
+        "fi; "
+    )
+    cottas_tool_container = "/opt/vcf-rdfizer/cottas_tool.py"
 
     hdt_totals = {
         "exit_code": 0,
@@ -2708,111 +2951,210 @@ def run_partitioned_hdt_methods_for_rdf_files(
         "sys_seconds": 0.0,
         "max_rss_kb": 0,
     }
+    cottas_totals = {
+        "exit_code": 0,
+        "wall_seconds": 0.0,
+        "user_seconds": 0.0,
+        "sys_seconds": 0.0,
+        "max_rss_kb": 0,
+    }
     chunk_hdts: list[Path] = []
+    chunk_cottas: list[Path] = []
 
     for chunk_index, chunk_input in enumerate(chunk_inputs):
-        chunk_hdt = work_dir / f"chunk-{chunk_index:05d}.hdt"
-        command = (
-            "set -euo pipefail; "
-            f"rm -f {shlex.quote(container_path_for_host(chunk_hdt))}; "
-            f"{rdf2hdt_resolve}"
-            '"$HDT_BIN" '
-            f"{shlex.quote(container_path_for_host(chunk_input))} "
-            f"{shlex.quote(container_path_for_host(chunk_hdt))}"
-        )
-        result = run_stage(stage_name=f"hdt-build-{chunk_index:05d}", command=command, output_path=chunk_hdt)
-        add_stage_totals(hdt_totals, result)
-        if int(result.get("exit_code") or 0) != 0:
-            eprint(f"Error: partitioned HDT chunk conversion failed. See log: {wrapper_log_path}")
-            return False, method_results
-        chunk_hdts.append(chunk_hdt)
-
-    merge_rounds = 0
-    current_hdts = list(chunk_hdts)
-    while len(current_hdts) > 1:
-        merge_rounds += 1
-        next_hdts: list[Path] = []
-        for pair_index in range(0, len(current_hdts), 2):
-            left = current_hdts[pair_index]
-            if pair_index + 1 >= len(current_hdts):
-                next_hdts.append(left)
-                continue
-            right = current_hdts[pair_index + 1]
-            merged = work_dir / f"merge-r{merge_rounds:02d}-{pair_index // 2:05d}.hdt"
+        if "hdt" in methods or "hdt_gzip" in methods or "hdt_brotli" in methods:
+            chunk_hdt = work_dir / f"chunk-{chunk_index:05d}.hdt"
             command = (
                 "set -euo pipefail; "
-                f"rm -f {shlex.quote(container_path_for_host(merged))}; "
-                f"{hdtcat_resolve}"
-                '"$HDTCAT_BIN" '
-                f"{shlex.quote(container_path_for_host(left))} "
-                f"{shlex.quote(container_path_for_host(right))} "
-                f"{shlex.quote(container_path_for_host(merged))}"
+                f"rm -f {shlex.quote(container_path_for_host(chunk_hdt))}; "
+                f"{rdf2hdt_resolve}"
+                '"$HDT_BIN" '
+                f"{shlex.quote(container_path_for_host(chunk_input))} "
+                f"{shlex.quote(container_path_for_host(chunk_hdt))}"
             )
             result = run_stage(
-                stage_name=f"hdt-merge-r{merge_rounds:02d}-{pair_index // 2:05d}",
+                stage_name=f"hdt-build-{chunk_index:05d}",
                 command=command,
-                output_path=merged,
+                output_path=chunk_hdt,
             )
             add_stage_totals(hdt_totals, result)
             if int(result.get("exit_code") or 0) != 0:
-                eprint(f"Error: HDTCat merge failed. See log: {wrapper_log_path}")
+                eprint(f"Error: partitioned HDT chunk conversion failed. See log: {wrapper_log_path}")
                 return False, method_results
-            next_hdts.append(merged)
-        current_hdts = next_hdts
+            chunk_hdts.append(chunk_hdt)
 
-    final_work_hdt = current_hdts[0]
-    if final_work_hdt.resolve() != final_hdt_path.resolve():
-        shutil.copyfile(final_work_hdt, final_hdt_path)
-
-    index_command = (
-        "set -euo pipefail; "
-        f"{hdt_index_resolve}"
-        '"$HDT_INDEX_BIN" '
-        f"{shlex.quote(container_path_for_host(final_hdt_path))}"
-    )
-    index_result = run_stage(stage_name="hdt-index", command=index_command, output_path=final_index_path)
-    add_stage_totals(hdt_totals, index_result)
-    if int(index_result.get("exit_code") or 0) != 0:
-        eprint(f"Error: final HDT index generation failed. See log: {wrapper_log_path}")
-        return False, method_results
-
-    hdt_result = finalize_stage_totals(hdt_totals)
-    hdt_result["output_path"] = str(final_hdt_path)
-    hdt_result["output_size_bytes"] = int(file_size_bytes(final_hdt_path) or 0)
-    hdt_result["source"] = "partitioned_generated"
-    hdt_result["details"] = {
-        **plan,
-        "merge_rounds": merge_rounds,
-        "index_path": str(final_index_path),
-        "index_size_bytes": int(file_size_bytes(final_index_path) or 0),
-    }
-    method_results["hdt"] = hdt_result
-
-    final_hdt_container = container_path_for_host(final_hdt_path)
-    for method in methods:
-        if method == "hdt":
-            continue
-        if method == "hdt_gzip":
-            artifact_path = out_dir / f"{output_stem}.hdt.gz"
+        if "cottas" in methods:
+            chunk_cottas_path = work_dir / f"chunk-{chunk_index:05d}.cottas"
             command = (
                 "set -euo pipefail; "
-                f"rm -f {shlex.quote(container_path_for_host(artifact_path))}; "
-                f"gzip -c {shlex.quote(final_hdt_container)} > {shlex.quote(container_path_for_host(artifact_path))}"
+                f"rm -f {shlex.quote(container_path_for_host(chunk_cottas_path))}; "
+                f"{cottas_python_resolve}"
+                f'"$PYTHON_BIN" {shlex.quote(cottas_tool_container)} convert '
+                f"{shlex.quote(container_path_for_host(chunk_input))} "
+                f"{shlex.quote(container_path_for_host(chunk_cottas_path))} spo"
             )
-        elif method == "hdt_brotli":
-            artifact_path = out_dir / f"{output_stem}.hdt.br"
-            command = (
-                "set -euo pipefail; "
-                f"rm -f {shlex.quote(container_path_for_host(artifact_path))}; "
-                f"brotli -q 7 -c {shlex.quote(final_hdt_container)} > {shlex.quote(container_path_for_host(artifact_path))}"
+            result = run_stage(
+                stage_name=f"cottas-build-{chunk_index:05d}",
+                command=command,
+                output_path=chunk_cottas_path,
             )
-        else:
-            continue
-        result = run_stage(stage_name=method, command=command, output_path=artifact_path)
-        if int(result.get("exit_code") or 0) != 0:
-            eprint(f"Error: {method} compression failed. See log: {wrapper_log_path}")
+            add_stage_totals(cottas_totals, result)
+            if int(result.get("exit_code") or 0) != 0:
+                eprint(f"Error: COTTAS chunk conversion failed. See log: {wrapper_log_path}")
+                return False, method_results
+            chunk_cottas.append(chunk_cottas_path)
+
+        # The chunk is shared by all selected compressors and is safe to
+        # remove only after every selected chunk conversion succeeded.
+        try:
+            chunk_input.unlink()
+        except OSError:
+            pass
+
+    if chunk_hdts:
+        merge_rounds = 0
+        current_hdts = list(chunk_hdts)
+        while len(current_hdts) > 1:
+            merge_rounds += 1
+            next_hdts: list[Path] = []
+            for pair_index in range(0, len(current_hdts), 2):
+                left = current_hdts[pair_index]
+                if pair_index + 1 >= len(current_hdts):
+                    next_hdts.append(left)
+                    continue
+                right = current_hdts[pair_index + 1]
+                merged = work_dir / f"merge-r{merge_rounds:02d}-{pair_index // 2:05d}.hdt"
+                command = (
+                    "set -euo pipefail; "
+                    f"rm -f {shlex.quote(container_path_for_host(merged))}; "
+                    f"{hdtcat_resolve}"
+                    '"$HDTCAT_BIN" '
+                    f"{shlex.quote(container_path_for_host(left))} "
+                    f"{shlex.quote(container_path_for_host(right))} "
+                    f"{shlex.quote(container_path_for_host(merged))}"
+                )
+                result = run_stage(
+                    stage_name=f"hdt-merge-r{merge_rounds:02d}-{pair_index // 2:05d}",
+                    command=command,
+                    output_path=merged,
+                )
+                add_stage_totals(hdt_totals, result)
+                if int(result.get("exit_code") or 0) != 0:
+                    eprint(f"Error: HDTCat merge failed. See log: {wrapper_log_path}")
+                    return False, method_results
+                for consumed in (left, right):
+                    try:
+                        consumed.unlink()
+                    except OSError:
+                        pass
+                next_hdts.append(merged)
+            current_hdts = next_hdts
+
+        final_work_hdt = current_hdts[0]
+        if final_work_hdt.resolve() != final_hdt_path.resolve():
+            shutil.copyfile(final_work_hdt, final_hdt_path)
+
+        index_command = (
+            "set -euo pipefail; "
+            f"{hdt_index_resolve}"
+            '"$HDT_INDEX_BIN" '
+            f"{shlex.quote(container_path_for_host(final_hdt_path))}"
+        )
+        index_result = run_stage(stage_name="hdt-index", command=index_command, output_path=final_index_path)
+        add_stage_totals(hdt_totals, index_result)
+        if int(index_result.get("exit_code") or 0) != 0:
+            eprint(f"Error: final HDT index generation failed. See log: {wrapper_log_path}")
             return False, method_results
-        method_results[method] = result
+
+        hdt_result = finalize_stage_totals(hdt_totals)
+        hdt_result["output_path"] = str(final_hdt_path)
+        hdt_result["output_size_bytes"] = int(file_size_bytes(final_hdt_path) or 0)
+        hdt_result["source"] = "partitioned_generated"
+        hdt_result["details"] = {
+            **plan,
+            "merge_rounds": merge_rounds,
+            "index_path": str(final_index_path),
+            "index_size_bytes": int(file_size_bytes(final_index_path) or 0),
+        }
+        method_results["hdt"] = hdt_result
+
+    if "cottas" in methods:
+        merge_rounds = 0
+        current_cottas = list(chunk_cottas)
+        while len(current_cottas) > 1:
+            merge_rounds += 1
+            next_cottas: list[Path] = []
+            for pair_index in range(0, len(current_cottas), 2):
+                left = current_cottas[pair_index]
+                if pair_index + 1 >= len(current_cottas):
+                    next_cottas.append(left)
+                    continue
+                right = current_cottas[pair_index + 1]
+                merged = work_dir / f"cottas-merge-r{merge_rounds:02d}-{pair_index // 2:05d}.cottas"
+                command = (
+                    "set -euo pipefail; "
+                    f"rm -f {shlex.quote(container_path_for_host(merged))}; "
+                    f"{cottas_python_resolve}"
+                    f'"$PYTHON_BIN" {shlex.quote(cottas_tool_container)} merge '
+                    f"{shlex.quote(container_path_for_host(left))} "
+                    f"{shlex.quote(container_path_for_host(right))} "
+                    f"{shlex.quote(container_path_for_host(merged))} spo"
+                )
+                result = run_stage(
+                    stage_name=f"cottas-merge-r{merge_rounds:02d}-{pair_index // 2:05d}",
+                    command=command,
+                    output_path=merged,
+                )
+                add_stage_totals(cottas_totals, result)
+                if int(result.get("exit_code") or 0) != 0:
+                    eprint(f"Error: COTTAS merge failed. See log: {wrapper_log_path}")
+                    return False, method_results
+                next_cottas.append(merged)
+            current_cottas = next_cottas
+
+        final_cottas_path = out_dir / f"{output_stem}.cottas"
+        if current_cottas:
+            final_work_cottas = current_cottas[0]
+            if final_work_cottas.resolve() != final_cottas_path.resolve():
+                shutil.copyfile(final_work_cottas, final_cottas_path)
+        cottas_result = finalize_stage_totals(cottas_totals)
+        cottas_result["output_path"] = str(final_cottas_path)
+        cottas_result["output_size_bytes"] = int(file_size_bytes(final_cottas_path) or 0)
+        cottas_result["source"] = "partitioned_generated"
+        cottas_result["details"] = {
+            **plan,
+            "chunk_count": len(chunk_cottas),
+            "merge_rounds": merge_rounds,
+            "index": "spo",
+        }
+        method_results["cottas"] = cottas_result
+
+    if chunk_hdts:
+        final_hdt_container = container_path_for_host(final_hdt_path)
+        for method in methods:
+            if method == "hdt":
+                continue
+            if method == "hdt_gzip":
+                artifact_path = out_dir / f"{output_stem}.hdt.gz"
+                command = (
+                    "set -euo pipefail; "
+                    f"rm -f {shlex.quote(container_path_for_host(artifact_path))}; "
+                    f"gzip -c {shlex.quote(final_hdt_container)} > {shlex.quote(container_path_for_host(artifact_path))}"
+                )
+            elif method == "hdt_brotli":
+                artifact_path = out_dir / f"{output_stem}.hdt.br"
+                command = (
+                    "set -euo pipefail; "
+                    f"rm -f {shlex.quote(container_path_for_host(artifact_path))}; "
+                    f"brotli -q 7 -c {shlex.quote(final_hdt_container)} > {shlex.quote(container_path_for_host(artifact_path))}"
+                )
+            else:
+                continue
+            result = run_stage(stage_name=method, command=command, output_path=artifact_path)
+            if int(result.get("exit_code") or 0) != 0:
+                eprint(f"Error: {method} compression failed. See log: {wrapper_log_path}")
+                return False, method_results
+            method_results[method] = result
 
     if metrics_dir is not None and run_id is not None and timestamp is not None:
         write_raw_compression_metrics_artifact(
@@ -2820,7 +3162,7 @@ def run_partitioned_hdt_methods_for_rdf_files(
             run_id=run_id,
             timestamp=timestamp,
             output_name=output_name,
-            rdf_name="__partitioned_hdt__",
+            rdf_name="__partitioned_compression__",
             source_rdf_path=out_dir,
             selected_methods=methods,
             method_results=method_results,
@@ -2843,11 +3185,12 @@ def run_full_mode(
     image_ref: str,
     out_name: str,
     rdf_layout: str,
+    rdf_storage_mode: str | None,
     compression: str,
     hdt_strategy: str,
-    hdt_target_chunk_bytes: int,
-    hdt_min_chunk_bytes: int,
-    hdt_max_chunk_bytes: int,
+    chunk_target_bytes: int,
+    chunk_min_bytes: int,
+    chunk_max_bytes: int,
     spark_partitions: int | None,
     keep_tsv: bool,
     keep_rdf: bool,
@@ -2871,9 +3214,21 @@ def run_full_mode(
         rdf_layout=rdf_layout,
         methods=selected_methods,
         hdt_strategy=hdt_strategy,
+        rdf_storage_mode=rdf_storage_mode,
     )
-    hdt_methods = [method for method in selected_methods if method in HDT_COMPRESSION_METHODS]
-    non_hdt_methods = [method for method in selected_methods if method not in HDT_COMPRESSION_METHODS]
+    partitioned_methods = [
+        method for method in selected_methods if method in PARTITIONED_COMPRESSION_METHODS
+    ]
+    non_partitioned_methods = [
+        method for method in selected_methods if method not in PARTITIONED_COMPRESSION_METHODS
+    ]
+    use_partitioned_compression = (
+        use_partitioned_hdt
+        or (
+            (rdf_layout == "batch" or rdf_storage_mode in RDF_STORAGE_MODES)
+            and compression_uses_partitioning(selected_methods)
+        )
+    )
 
     generated_rules_dir = metrics_dir / "_generated_rules"
     if generated_rules_dir.exists():
@@ -3054,7 +3409,9 @@ def run_full_mode(
             "-e",
             f"OUT_NAME={output_name}",
             "-e",
-            f"AGGREGATE_RDF={'1' if rdf_layout == 'aggregate' else '0'}",
+            f"AGGREGATE_RDF={'1' if rdf_storage_mode or rdf_layout == 'aggregate' else '0'}",
+            "-e",
+            f"RDF_STORAGE_MODE={rdf_storage_mode or ''}",
             "-e",
             f"SPARK_PARTITIONS={spark_partitions or ''}",
             "-e",
@@ -3132,13 +3489,13 @@ def run_full_mode(
 
         triples_produced = read_conversion_total_triples(metrics_dir, output_name, run_id)
 
-        if rdf_layout == "aggregate":
+        if rdf_storage_mode == "space-optimized":
+            # The optimized mode leaves one gzip stream assembled from the
+            # RMLStreamer parts; chunk planning will decompress it incrementally.
+            raw_rdf_files = [out_dir / output_name / f"{output_name}.nt.gz"]
+        elif rdf_storage_mode == "plain" or rdf_layout == "aggregate":
             # Aggregate mode yields one merged RDF artifact per sample.
-            nt_path = out_dir / output_name / f"{output_name}.nt"
-            if nt_path.exists():
-                raw_rdf_files = [nt_path]
-            else:
-                raw_rdf_files = [nt_path]
+            raw_rdf_files = [out_dir / output_name / f"{output_name}.nt"]
         else:
             # Batch mode keeps each RMLStreamer part as its own RDF artifact.
             raw_rdf_files = sorted((out_dir / output_name).glob("*.nt"))
@@ -3149,6 +3506,16 @@ def run_full_mode(
                     f"Expected .nt files in {out_dir / output_name}. See log: {wrapper_log_path}",
                 )
                 continue
+
+        missing_raw_rdf = [path for path in raw_rdf_files if not path.is_file()]
+        if rdf_storage_mode is not None and missing_raw_rdf:
+            fail_current(
+                "rdf-discovery",
+                "expected RDF output was not produced: "
+                + ", ".join(str(path) for path in missing_raw_rdf)
+                + f". See log: {wrapper_log_path}",
+            )
+            continue
 
         if triples_produced is None:
             triples_produced = count_triples_in_nt_files(raw_rdf_files)
@@ -3164,12 +3531,11 @@ def run_full_mode(
         method_results_by_file: dict[str, dict[str, dict]] = {}
         partitioned_hdt_results: dict[str, dict] = {}
         if selected_methods:
-            # Non-HDT methods stay per-RDF-file in batch mode. HDT methods can
-            # instead use the chunked HDT+HDTCat pipeline to build one final
-            # HDT artifact for the whole sample.
+            # Ordinary methods remain per source file. HDT and COTTAS consume
+            # one shared, record-safe chunk stream when partitioning is active.
             per_file_methods = selected_methods
-            if rdf_layout == "batch" and use_partitioned_hdt:
-                per_file_methods = non_hdt_methods
+            if use_partitioned_compression:
+                per_file_methods = non_partitioned_methods
 
             for raw_rdf_path in raw_rdf_files:
                 if not per_file_methods:
@@ -3196,25 +3562,26 @@ def run_full_mode(
                     break
                 method_results_by_file[raw_rdf_path.name] = method_results
 
-            if not input_failed and rdf_layout == "batch" and use_partitioned_hdt and hdt_methods:
+            if not input_failed and use_partitioned_compression and partitioned_methods:
                 ok, partitioned_hdt_results = run_partitioned_hdt_methods_for_rdf_files(
-                    rdf_paths=raw_rdf_files,
+                    rdf_paths=raw_rdf_files if rdf_storage_mode is None else [],
+                    source_rdf_path=(raw_rdf_files[0] if rdf_storage_mode is not None else None),
                     out_dir=out_dir / output_name,
                     image_ref=image_ref,
-                    methods=hdt_methods,
+                    methods=partitioned_methods,
                     wrapper_log_path=wrapper_log_path,
                     metrics_dir=metrics_dir,
                     run_id=run_id,
                     timestamp=timestamp,
                     output_name=output_name,
-                    target_chunk_bytes=hdt_target_chunk_bytes,
-                    min_chunk_bytes=hdt_min_chunk_bytes,
-                    max_chunk_bytes=hdt_max_chunk_bytes,
+                    target_chunk_bytes=chunk_target_bytes,
+                    min_chunk_bytes=chunk_min_bytes,
+                    max_chunk_bytes=chunk_max_bytes,
                 )
                 if not ok:
                     fail_current(
                         "compression",
-                        f"partitioned HDT compression failed for '{output_name}'. See log: {wrapper_log_path}",
+                        f"partitioned compression failed for '{output_name}'. See log: {wrapper_log_path}",
                     )
         if input_failed:
             continue
@@ -3227,7 +3594,7 @@ def run_full_mode(
         }
         try:
             # Persist machine-readable metrics after compression succeeds.
-            if rdf_layout == "batch":
+            if rdf_layout == "batch" or rdf_storage_mode is not None:
                 # Batch mode produces many RDF parts for a single sample. Keep
                 # one metrics row per sample by aggregating per-part compression
                 # outputs and timings.
@@ -3239,7 +3606,11 @@ def run_full_mode(
                     run_id=run_id,
                     timestamp=timestamp,
                     output_name=output_name,
-                    source_rdf_path=out_dir / output_name,
+                    source_rdf_path=(
+                        raw_rdf_files[0]
+                        if rdf_storage_mode is not None
+                        else out_dir / output_name
+                    ),
                     combined_size_bytes=combined_size_before_cleanup,
                     selected_methods=selected_methods,
                     method_results=aggregated_results,
@@ -3294,16 +3665,16 @@ def run_full_mode(
             # Cleanup raw RDF only after every selected compression method has
             # completed successfully for that specific RDF artifact.
             cleanup_failed = False
-            if rdf_layout == "batch" and use_partitioned_hdt:
+            if use_partitioned_compression:
                 missing_or_failed_hdt = []
-                for method in hdt_methods:
+                for method in partitioned_methods:
                     result = partitioned_hdt_results.get(method)
                     if result is None or int(result.get("exit_code", 1)) != 0:
                         missing_or_failed_hdt.append(method)
                 if missing_or_failed_hdt:
                     fail_current(
                         "rdf-cleanup-validation",
-                        "refusing to remove raw RDF before the final merged HDT pipeline "
+                        "refusing to remove raw RDF before the final merged compression pipeline "
                         f"completed successfully for '{output_name}'. Pending/failed: "
                         f"{', '.join(missing_or_failed_hdt)}. See log: {wrapper_log_path}",
                     )
@@ -3313,8 +3684,8 @@ def run_full_mode(
                     break
                 method_results = method_results_by_file.get(raw_rdf_path.name, {})
                 methods_to_validate = selected_methods
-                if rdf_layout == "batch" and use_partitioned_hdt:
-                    methods_to_validate = non_hdt_methods
+                if use_partitioned_compression:
+                    methods_to_validate = non_partitioned_methods
                 missing_or_failed = []
                 for method in methods_to_validate:
                     result = method_results.get(method)
@@ -3331,6 +3702,13 @@ def run_full_mode(
                     cleanup_failed = True
                     break
 
+                # In space-optimized mode the aggregate `.nt.gz` is itself
+                # the gzip artifact. Do not remove it when gzip was selected.
+                if (
+                    rdf_storage_mode == "space-optimized"
+                    and method_results.get("gzip", {}).get("output_path") == str(raw_rdf_path)
+                ):
+                    continue
                 if raw_rdf_path.exists():
                     if not remove_file_with_docker_fallback(
                         path=raw_rdf_path,
@@ -3348,7 +3726,7 @@ def run_full_mode(
             if cleanup_failed:
                 continue
 
-        if rdf_layout == "batch" and raw_rdf_files:
+        if (rdf_layout == "batch" or rdf_storage_mode is not None) and raw_rdf_files:
             output_root = out_dir / output_name
             part_count = len(raw_rdf_files)
             raw_total_size = sum(raw_size_before_cleanup_by_file.values())
@@ -3371,7 +3749,7 @@ def run_full_mode(
 
             if selected_methods:
                 for method in selected_methods:
-                    if use_partitioned_hdt and method in HDT_COMPRESSION_METHODS:
+                    if use_partitioned_compression and method in PARTITIONED_COMPRESSION_METHODS:
                         result = partitioned_hdt_results.get(method)
                         label = compression_method_label_for_path(first_path, method)
                         if not result or int(result.get("exit_code", 1)) != 0:
@@ -3510,9 +3888,9 @@ def run_compress_mode(
     image_ref: str,
     methods: list[str],
     hdt_strategy: str,
-    hdt_target_chunk_bytes: int,
-    hdt_min_chunk_bytes: int,
-    hdt_max_chunk_bytes: int,
+    chunk_target_bytes: int,
+    chunk_min_bytes: int,
+    chunk_max_bytes: int,
     wrapper_log_path: Path,
 ):
     """Execute compression-only mode for a designated RDF file."""
@@ -3520,6 +3898,13 @@ def run_compress_mode(
     if not methods:
         print("No compression methods selected (`none`). Nothing to do.")
         return 0
+
+    if rdf_path.name.endswith(".gz") and compression_uses_hdt(methods) and hdt_strategy == "single":
+        eprint(
+            "Error: --hdt-strategy single cannot read a gzip aggregate without materializing "
+            "an uncompressed RDF file; use --hdt-strategy partitioned."
+        )
+        return 2
 
     if any(method in HDT_COMPRESSION_METHODS for method in methods):
         file_size = file_size_bytes(rdf_path) or 0
@@ -3531,14 +3916,18 @@ def run_compress_mode(
 
     ensure_dir(out_dir)
     input_stem = rdf_path.stem
-    if should_use_partitioned_hdt(
-        mode="compress",
-        rdf_layout=None,
-        methods=methods,
-        hdt_strategy=hdt_strategy,
-    ):
-        raw_methods = [method for method in methods if method not in HDT_COMPRESSION_METHODS]
-        hdt_methods = [method for method in methods if method in HDT_COMPRESSION_METHODS]
+    use_partitioned_compression = compression_uses_partitioning(methods) and (
+        "cottas" in methods
+        or should_use_partitioned_hdt(
+            mode="compress",
+            rdf_layout=None,
+            methods=methods,
+            hdt_strategy=hdt_strategy,
+        )
+    )
+    if use_partitioned_compression:
+        raw_methods = [method for method in methods if method not in PARTITIONED_COMPRESSION_METHODS]
+        partitioned_methods = [method for method in methods if method in PARTITIONED_COMPRESSION_METHODS]
         method_results = {}
         if raw_methods:
             ok, raw_method_results = run_compression_methods_for_rdf(
@@ -3557,18 +3946,19 @@ def run_compress_mode(
                 return 1
             method_results.update(raw_method_results)
         ok, partitioned_results = run_partitioned_hdt_methods_for_rdf_files(
-            rdf_paths=[rdf_path],
+            rdf_paths=[] if rdf_path.name.endswith(".gz") else [rdf_path],
+            source_rdf_path=rdf_path if rdf_path.name.endswith(".gz") else None,
             out_dir=out_dir / input_stem,
             image_ref=image_ref,
-            methods=hdt_methods,
+            methods=partitioned_methods,
             wrapper_log_path=wrapper_log_path,
             metrics_dir=metrics_dir,
             run_id=run_id,
             timestamp=timestamp,
             output_name=input_stem,
-            target_chunk_bytes=hdt_target_chunk_bytes,
-            min_chunk_bytes=hdt_min_chunk_bytes,
-            max_chunk_bytes=hdt_max_chunk_bytes,
+            target_chunk_bytes=chunk_target_bytes,
+            min_chunk_bytes=chunk_min_bytes,
+            max_chunk_bytes=chunk_max_bytes,
         )
         if not ok:
             return 1
@@ -3707,9 +4097,9 @@ def main():
             "    vcf_rdfizer.py -m full -i ./vcf_files --rdf-layout batch -c hdt -o ./results\n"
             "  Full pipeline with partition hint:\n"
             "    vcf_rdfizer.py -m full -i ./vcf_files --rdf-layout batch -P 8 -c hdt -o ./results\n"
-            "  Full pipeline with explicit HDT chunk sizing:\n"
-            "    vcf_rdfizer.py -m full -i ./vcf_files --rdf-layout batch -c hdt "
-            "--hdt-strategy partitioned --hdt-target-chunk-bytes 536870912 -o ./results\n"
+            "  Space-optimized full pipeline with shared HDT/COTTAS chunks:\n"
+            "    vcf_rdfizer.py -m full -i ./vcf_files --rdf-storage-mode space-optimized "
+            "-c hdt,cottas --chunk-target-bytes 536870912 -o ./results\n"
             "  TSV-only benchmark:\n"
             "    vcf_rdfizer.py -m tsv -i ./vcf_files -o ./results\n"
             "  Compression-only:\n"
@@ -3737,7 +4127,7 @@ def main():
         "--nt",
         dest="rdf",
         default=None,
-        help="Input RDF file (.nt) for --mode compress",
+        help="Input RDF file (.nt or .nt.gz) for --mode compress",
     )
     parser.add_argument(
         "-C",
@@ -3762,7 +4152,16 @@ def main():
         "--rdf-layout",
         choices=["aggregate", "batch"],
         default=None,
-        help="Full mode required: aggregate merges RML output parts into one .nt; batch keeps part files separate",
+        help="Legacy full-mode layout: aggregate merges parts into .nt; batch keeps parts separate",
+    )
+    parser.add_argument(
+        "--rdf-storage-mode",
+        choices=sorted(RDF_STORAGE_MODES),
+        default=None,
+        help=(
+            "Full-mode aggregate storage: plain keeps one .nt; space-optimized builds one .nt.gz "
+            "from RMLStreamer parts before record-safe HDT/COTTAS chunking"
+        ),
     )
     parser.add_argument(
         "-P",
@@ -3804,31 +4203,31 @@ def main():
         "-c",
         "--compression",
         default="gzip,brotli,hdt",
-        help="Compression methods (gzip,brotli,hdt,hdt_gzip,hdt_brotli,none)",
+        help="Compression methods (gzip,brotli,hdt,hdt_gzip,hdt_brotli,cottas,none)",
     )
     parser.add_argument(
         "--hdt-strategy",
         choices=sorted(HDT_STRATEGY_CHOICES),
         default=DEFAULT_HDT_STRATEGY,
         help=(
-            "HDT generation strategy: auto uses partitioned HDT+HDTCat in full-mode batch RDF layout, "
-            "single always uses one rdf2hdt run, partitioned forces chunked HDT generation"
+            "HDT generation strategy: auto uses partitioned HDT+HDTCat for batch or aggregate storage, "
+            "single uses one rdf2hdt run, partitioned forces chunked HDT generation"
         ),
     )
     parser.add_argument(
-        "--hdt-target-chunk-bytes",
-        default=str(DEFAULT_HDT_TARGET_CHUNK_BYTES),
-        help="Target uncompressed RDF bytes per partitioned HDT chunk (default: 536870912)",
+        "--chunk-target-bytes",
+        default=str(DEFAULT_CHUNK_TARGET_BYTES),
+        help="Target uncompressed RDF bytes per HDT/COTTAS chunk (default: 536870912)",
     )
     parser.add_argument(
-        "--hdt-min-chunk-bytes",
-        default=str(DEFAULT_HDT_MIN_CHUNK_BYTES),
-        help="Minimum uncompressed RDF bytes to accumulate before flushing a chunk group (default: 134217728)",
+        "--chunk-min-bytes",
+        default=str(DEFAULT_CHUNK_MIN_BYTES),
+        help="Minimum uncompressed RDF bytes before flushing a chunk group (default: 134217728)",
     )
     parser.add_argument(
-        "--hdt-max-chunk-bytes",
-        default=str(DEFAULT_HDT_MAX_CHUNK_BYTES),
-        help="Maximum uncompressed RDF bytes allowed in one chunk before line-preserving re-splitting (default: 1073741824)",
+        "--chunk-max-bytes",
+        default=str(DEFAULT_CHUNK_MAX_BYTES),
+        help="Maximum uncompressed RDF bytes allowed in one chunk (default: 1073741824)",
     )
     parser.add_argument("-k", "--keep-tsv", action="store_true", help="Keep TSV intermediates")
     parser.add_argument(
@@ -3860,33 +4259,37 @@ def main():
     metrics_dir = metrics_root / run_id
     mode = args.mode
     spark_partitions = None
-    hdt_target_chunk_bytes = DEFAULT_HDT_TARGET_CHUNK_BYTES
-    hdt_min_chunk_bytes = DEFAULT_HDT_MIN_CHUNK_BYTES
-    hdt_max_chunk_bytes = DEFAULT_HDT_MAX_CHUNK_BYTES
+    chunk_target_bytes = DEFAULT_CHUNK_TARGET_BYTES
+    chunk_min_bytes = DEFAULT_CHUNK_MIN_BYTES
+    chunk_max_bytes = DEFAULT_CHUNK_MAX_BYTES
 
     step1_label = "Step 1/5" if mode == "full" else "Step 1/3"
 
     try:
-        hdt_target_chunk_bytes = parse_positive_int(
-            args.hdt_target_chunk_bytes, name="--hdt-target-chunk-bytes"
+        chunk_target_bytes = parse_positive_int(
+            args.chunk_target_bytes, name="--chunk-target-bytes"
         )
-        hdt_min_chunk_bytes = parse_positive_int(
-            args.hdt_min_chunk_bytes, name="--hdt-min-chunk-bytes"
+        chunk_min_bytes = parse_positive_int(
+            args.chunk_min_bytes, name="--chunk-min-bytes"
         )
-        hdt_max_chunk_bytes = parse_positive_int(
-            args.hdt_max_chunk_bytes, name="--hdt-max-chunk-bytes"
+        chunk_max_bytes = parse_positive_int(
+            args.chunk_max_bytes, name="--chunk-max-bytes"
         )
-        if hdt_min_chunk_bytes > hdt_target_chunk_bytes:
-            raise ValueError("--hdt-min-chunk-bytes must be <= --hdt-target-chunk-bytes")
-        if hdt_target_chunk_bytes > hdt_max_chunk_bytes:
-            raise ValueError("--hdt-target-chunk-bytes must be <= --hdt-max-chunk-bytes")
+        if chunk_min_bytes > chunk_target_bytes:
+            raise ValueError("--chunk-min-bytes must be <= --chunk-target-bytes")
+        if chunk_target_bytes > chunk_max_bytes:
+            raise ValueError("--chunk-target-bytes must be <= --chunk-max-bytes")
 
         # Mode-specific argument validation and canonical path resolution.
         if mode == "full":
             if args.input is None:
                 raise ValueError("--input is required in --mode full")
-            if args.rdf_layout is None:
-                raise ValueError("--rdf-layout is required in --mode full (aggregate|batch)")
+            if args.rdf_storage_mode is not None and args.rdf_layout is not None:
+                raise ValueError("--rdf-storage-mode and --rdf-layout are mutually exclusive")
+            if args.rdf_storage_mode is None and args.rdf_layout is None:
+                raise ValueError(
+                    "one of --rdf-storage-mode or --rdf-layout is required in --mode full"
+                )
             input_path = Path(args.input).expanduser().resolve()
             (
                 input_mount_dir,
@@ -3901,7 +4304,16 @@ def main():
             if not rules_path.exists() or not rules_path.is_file():
                 raise ValueError(f"rules file not found: {rules_path}")
             validate_mode_dirs([out_root, out_dir, tsv_dir, metrics_root])
-            parse_compression_methods(args.compression)
+            full_methods = parse_compression_methods(args.compression)
+            if (
+                args.rdf_storage_mode == "space-optimized"
+                and args.hdt_strategy == "single"
+                and compression_uses_hdt(full_methods)
+            ):
+                raise ValueError(
+                    "--hdt-strategy single cannot be used with space-optimized HDT input; "
+                    "use --hdt-strategy partitioned"
+                )
             if args.spark_partitions is not None:
                 spark_partitions = parse_positive_int(
                     args.spark_partitions, name="--spark-partitions"
@@ -3927,9 +4339,18 @@ def main():
             rdf_path = Path(args.rdf).expanduser().resolve()
             if not rdf_path.exists() or not rdf_path.is_file():
                 raise ValueError(f"RDF input file not found: {rdf_path}")
-            if rdf_path.suffix != ".nt":
-                raise ValueError("Compression input must be a .nt file")
+            if rdf_path.suffix != ".nt" and not rdf_path.name.endswith(".nt.gz"):
+                raise ValueError("Compression input must be a .nt or .nt.gz file")
             methods = parse_compression_methods(args.compression)
+            if (
+                rdf_path.name.endswith(".gz")
+                and args.hdt_strategy == "single"
+                and compression_uses_hdt(methods)
+            ):
+                raise ValueError(
+                    "--hdt-strategy single cannot be used with a .nt.gz HDT input; "
+                    "use --hdt-strategy partitioned"
+                )
             validate_mode_dirs([out_root, out_dir, metrics_root])
         else:
             if args.spark_partitions is not None:
@@ -4096,12 +4517,13 @@ def main():
                 metrics_dir=metrics_dir,
                 image_ref=image_ref,
                 out_name=args.out_name,
-                rdf_layout=args.rdf_layout,
+                rdf_layout=args.rdf_layout or "aggregate",
+                rdf_storage_mode=args.rdf_storage_mode,
                 compression=args.compression,
                 hdt_strategy=args.hdt_strategy,
-                hdt_target_chunk_bytes=hdt_target_chunk_bytes,
-                hdt_min_chunk_bytes=hdt_min_chunk_bytes,
-                hdt_max_chunk_bytes=hdt_max_chunk_bytes,
+                chunk_target_bytes=chunk_target_bytes,
+                chunk_min_bytes=chunk_min_bytes,
+                chunk_max_bytes=chunk_max_bytes,
                 spark_partitions=spark_partitions,
                 keep_tsv=args.keep_tsv,
                 keep_rdf=args.keep_rdf,
@@ -4135,9 +4557,9 @@ def main():
                 image_ref=image_ref,
                 methods=methods,
                 hdt_strategy=args.hdt_strategy,
-                hdt_target_chunk_bytes=hdt_target_chunk_bytes,
-                hdt_min_chunk_bytes=hdt_min_chunk_bytes,
-                hdt_max_chunk_bytes=hdt_max_chunk_bytes,
+                chunk_target_bytes=chunk_target_bytes,
+                chunk_min_bytes=chunk_min_bytes,
+                chunk_max_bytes=chunk_max_bytes,
                 wrapper_log_path=wrapper_log_path,
             )
         # Decompression-only mode.

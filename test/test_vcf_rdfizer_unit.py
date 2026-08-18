@@ -39,7 +39,12 @@ def invoke_main(argv, *, auto_layout=True):
             if token in {"--mode", "-m"} and index + 1 < len(args):
                 mode = args[index + 1]
                 break
-        if mode == "full" and "--rdf-layout" not in args and "-l" not in args:
+        if (
+            mode == "full"
+            and "--rdf-layout" not in args
+            and "-l" not in args
+            and "--rdf-storage-mode" not in args
+        ):
             args.extend(["--rdf-layout", "aggregate"])
     if "--out" not in args and "-o" not in args:
         args.extend(["--out", "./out"])
@@ -490,6 +495,39 @@ class WrapperUnitTests(VerboseTestCase):
             first_chunk_text = chunk_inputs[0].read_text()
             self.assertIn("<a> <p> <o> .", first_chunk_text)
             self.assertIn("<b> <p> <o> .", first_chunk_text)
+
+    def test_record_safe_chunk_planner_reads_gzip_and_writes_boundary_guide(self):
+        """Gzip-backed chunking preserves complete records and records exact ranges."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            source = tmp_path / "aggregate.nt.gz"
+            source_payload = (
+                b"<s1> <p> <o1> .\n"
+                b"<s2> <p> <o2> .\n"
+                b"<s3> <p> <o3> .\n"
+            )
+            import gzip
+
+            with gzip.open(source, "wb") as handle:
+                handle.write(source_payload)
+
+            chunk_dir = tmp_path / "chunks"
+            guide = tmp_path / "chunks.json"
+            chunk_paths, plan = vcf_rdfizer.plan_record_safe_rdf_chunks(
+                [source],
+                chunk_dir,
+                target_bytes=20,
+                min_bytes=10,
+                max_bytes=30,
+                guide_path=guide,
+            )
+
+            self.assertTrue(guide.exists())
+            self.assertEqual(plan["record_count"], 3)
+            self.assertEqual(plan["chunk_count"], len(chunk_paths))
+            self.assertEqual(b"".join(path.read_bytes() for path in chunk_paths), source_payload)
+            self.assertTrue(all(path.read_bytes().endswith(b"\n") for path in chunk_paths))
+            self.assertEqual(json.loads(guide.read_text())["chunks"], plan["chunks"])
 
     def test_run_partitioned_hdt_methods_merges_chunks_and_generates_index(self):
         """Partitioned HDT pipeline builds chunk HDTs, merges them, and writes a final index."""
@@ -1841,11 +1879,11 @@ class WrapperUnitTests(VerboseTestCase):
                             "batch",
                             "--compression",
                             "hdt",
-                            "--hdt-target-chunk-bytes",
+                            "--chunk-target-bytes",
                             "40",
-                            "--hdt-min-chunk-bytes",
+                            "--chunk-min-bytes",
                             "10",
-                            "--hdt-max-chunk-bytes",
+                            "--chunk-max-bytes",
                             "60",
                             "--out",
                             str(out_dir),
