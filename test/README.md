@@ -7,7 +7,7 @@ This repository uses `unittest` (Python standard library) to isolate orchestrati
 - `test/test_vcf_rdfizer_unit.py`
   - Verifies wrapper control flow for the 5-step pipeline.
   - Verifies image/version resolution behavior and error handling.
-  - Verifies CLI compression option propagation into `compression.sh`.
+  - Verifies the separate RDF-compression, representation, and artifact-packaging plan.
 
 - `test/test_vcf_rdfizer_cross_platform_unit.py`
   - Runs a Windows/macOS/Linux-safe subset of wrapper tests.
@@ -25,9 +25,9 @@ This repository uses `unittest` (Python standard library) to isolate orchestrati
   - Verifies unified metrics CSV row creation and schema consistency.
 
 - `test/test_compression_unit.py`
-  - Replaces `gzip`, `brotli`, and `rdf2hdt` with fake executables.
-  - Verifies compression artifact generation and metrics row update.
-  - Verifies `-m none` behavior (no compression outputs, metrics still updated).
+  - Replaces `gzip`, `brotli`, and `rdf2hdt` with fake executables for the standalone helper.
+  - Verifies helper compression artifact generation and metrics row update.
+  - Verifies no-op behavior (no compression outputs, metrics still updated).
 
 ## CI matrix behavior
 

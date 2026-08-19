@@ -3,6 +3,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -15,7 +16,7 @@ import vcf_rdfizer
 from test.helpers import VerboseTestCase
 
 
-def invoke_main(argv, *, auto_layout=True):
+def invoke_main(argv, *, auto_storage=True):
     args = list(argv)
     normalized = []
     skip_next = False
@@ -33,7 +34,7 @@ def invoke_main(argv, *, auto_layout=True):
         normalized.append(token)
     args = normalized
 
-    if auto_layout:
+    if auto_storage:
         mode = "full"
         for index, token in enumerate(args):
             if token in {"--mode", "-m"} and index + 1 < len(args):
@@ -41,15 +42,74 @@ def invoke_main(argv, *, auto_layout=True):
                 break
         if (
             mode == "full"
-            and "--rdf-layout" not in args
-            and "-l" not in args
             and "--rdf-storage-mode" not in args
         ):
-            args.extend(["--rdf-layout", "aggregate"])
+            args.extend(["--rdf-storage-mode", "plain"])
     if "--out" not in args and "-o" not in args:
         args.extend(["--out", "./out"])
 
-    with mock.patch.object(sys, "argv", ["vcf_rdfizer.py", *args]):
+    original_run = vcf_rdfizer.run
+
+    def run_with_default_aggregate(cmd, cwd=None, env=None):
+        """Make successful mocked RMLStreamer calls produce the new aggregate artifact."""
+        result = original_run(cmd, cwd=cwd, env=env)
+        if result == 0 and "/opt/vcf-rdfizer/run_conversion.sh" in cmd:
+            out_mount = next(
+                (
+                    Path(part.split(":", 1)[0])
+                    for part in cmd
+                    if isinstance(part, str) and part.endswith(":/data/out")
+                ),
+                None,
+            )
+            output_name = next(
+                (
+                    part.split("=", 1)[1]
+                    for part in cmd
+                    if isinstance(part, str) and part.startswith("OUT_NAME=")
+                ),
+                "rdf",
+            )
+            if out_mount is not None:
+                output_dir = out_mount / output_name
+                output_dir.mkdir(parents=True, exist_ok=True)
+                if not any(output_dir.glob("*.nt")) and not any(output_dir.glob("*.nt.gz")):
+                    (output_dir / f"{output_name}.nt").write_text("<s> <p> <o> .\n")
+        if result == 0:
+            rendered = str(cmd[-1]) if cmd else ""
+            work_mount = next(
+                (
+                    Path(part.split(":", 1)[0])
+                    for part in cmd
+                    if isinstance(part, str) and part.endswith(":/data/work")
+                ),
+                None,
+            )
+            if work_mount and ('"$HDT_BIN"' in rendered or '"$HDTCAT_BIN"' in rendered):
+                hdt_paths = re.findall(r"(/data/work/[^\s;]+\.hdt)", rendered)
+                if hdt_paths:
+                    hdt_output = work_mount / hdt_paths[-1].replace("/data/work/", "", 1)
+                    hdt_output.parent.mkdir(parents=True, exist_ok=True)
+                    hdt_output.write_text("mock-hdt\n")
+            out_mount = next(
+                (
+                    Path(part.split(":", 1)[0])
+                    for part in cmd
+                    if isinstance(part, str) and part.endswith(":/data/out")
+                ),
+                None,
+            )
+            if out_mount and "ensure_hdt_index.sh" in rendered:
+                index_paths = re.findall(r"(/data/out/[^\s;]+\.hdt)", rendered)
+                if index_paths:
+                    hdt_output = out_mount / index_paths[-1].replace("/data/out/", "", 1)
+                    hdt_output.parent.mkdir(parents=True, exist_ok=True)
+                    Path(str(hdt_output) + ".index").write_text("mock-index\n")
+        return result
+
+    with mock.patch.object(sys, "argv", ["vcf_rdfizer.py", *args]), mock.patch.object(
+        vcf_rdfizer, "run", side_effect=run_with_default_aggregate
+    ):
         return vcf_rdfizer.main()
 
 
@@ -465,6 +525,76 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertIn("hdt", payload["methods"])
             self.assertIn("hdt_gzip", payload["methods"])
 
+    def test_run_compression_methods_packages_cottas(self):
+        """COTTAS packaging reuses one generated COTTAS artifact for gzip and Brotli."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir = tmp_path / "input"
+            out_dir = tmp_path / "out"
+            target_dir = out_dir / "sample"
+            metrics_dir = tmp_path / "metrics"
+            input_dir.mkdir()
+            target_dir.mkdir(parents=True)
+            rdf_path = input_dir / "sample.nt"
+            rdf_path.write_text("<s> <p> <o> .\n")
+
+            def fake_run(cmd, cwd=None, env=None):
+                script = str(cmd[-1]) if cmd else ""
+                time_match = re.search(r"-o\s+(/data/out/[^\s;]+)", script)
+                if time_match:
+                    time_log = out_dir / time_match.group(1).replace("/data/out/", "", 1)
+                    time_log.parent.mkdir(parents=True, exist_ok=True)
+                    time_log.write_text(
+                        "User time (seconds): 0.08\n"
+                        "System time (seconds): 0.02\n"
+                        "Elapsed (wall clock) time (h:mm:ss or m:ss): 0:00.14\n"
+                        "Maximum resident set size (kbytes): 1111\n"
+                    )
+
+                if "cottas_tool.py convert" in script:
+                    (target_dir / "sample.cottas").write_text("cottas\n")
+                if "gzip -c /data/out/sample/sample.cottas" in script:
+                    (target_dir / "sample.cottas.gz").write_text("gz\n")
+                if "brotli -q 7 -c /data/out/sample/sample.cottas" in script:
+                    (target_dir / "sample.cottas.br").write_text("br\n")
+                return 0
+
+            with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run):
+                ok, method_results = vcf_rdfizer.run_compression_methods_for_rdf(
+                    rdf_path=rdf_path,
+                    out_dir=out_dir,
+                    target_out_dir=target_dir,
+                    image_ref="example/vcf-rdfizer:latest",
+                    methods=["cottas", "cottas_gzip", "cottas_brotli"],
+                    wrapper_log_path=tmp_path / "wrapper.log",
+                    status_indent=None,
+                    metrics_dir=metrics_dir,
+                    run_id="run-cottas-package",
+                    timestamp="2026-03-11T10:00:00",
+                    output_name="sample",
+                )
+
+            self.assertTrue(ok)
+            self.assertEqual(method_results["cottas"]["exit_code"], 0)
+            self.assertEqual(method_results["cottas_gzip"]["exit_code"], 0)
+            self.assertEqual(method_results["cottas_brotli"]["exit_code"], 0)
+            self.assertTrue((target_dir / "sample.cottas").exists())
+            self.assertTrue((target_dir / "sample.cottas.gz").exists())
+            self.assertTrue((target_dir / "sample.cottas.br").exists())
+
+            raw_json = (
+                metrics_dir
+                / "raw_metrics"
+                / "compression_metrics"
+                / "sample"
+                / "sample.nt"
+                / "run-cottas-package.json"
+            )
+            self.assertTrue(raw_json.exists())
+            payload = json.loads(raw_json.read_text())
+            self.assertIn("cottas_gzip", payload["methods"])
+            self.assertIn("cottas_brotli", payload["methods"])
+
     def test_plan_partitioned_hdt_chunks_groups_small_inputs_and_splits_large_ones(self):
         """Partition planning coalesces small RDF parts and line-splits oversized ones."""
         with tempfile.TemporaryDirectory() as td:
@@ -530,7 +660,7 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertEqual(json.loads(guide.read_text())["chunks"], plan["chunks"])
 
     def test_run_partitioned_hdt_methods_merges_chunks_and_generates_index(self):
-        """Partitioned HDT pipeline builds chunk HDTs, merges them, and writes a final index."""
+        """Partitioned HDT/COTTAS pipelines share chunks and write final artifacts."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             out_dir = tmp_path / "out" / "sample"
@@ -576,22 +706,31 @@ class WrapperUnitTests(VerboseTestCase):
                         output_path.parent.mkdir(parents=True, exist_ok=True)
                         output_path.write_text("merged-hdt\n")
 
-                if out_mount and '"$HDT_INDEX_BIN"' in script:
-                    index_match = re.search(r'"\$HDT_INDEX_BIN"\s+(/data/out/[^\s;]+\.hdt)', script)
+                if work_mount and "cottas_tool.py" in script:
+                    outputs = re.findall(r"(/data/work/[^\s;]+\.cottas)", script)
+                    if outputs:
+                        output_path = Path(work_mount) / outputs[-1].replace("/data/work/", "", 1)
+                        output_path.parent.mkdir(parents=True, exist_ok=True)
+                        output_path.write_text("cottas\n")
+
+                if out_mount and "ensure_hdt_index.sh" in script:
+                    index_match = re.search(r"ensure_hdt_index\.sh\s+(/data/out/[^\s;]+\.hdt)", script)
                     if index_match:
                         index_path = Path(out_mount) / index_match.group(1).replace("/data/out/", "", 1)
                         Path(str(index_path) + ".index").write_text("index\n")
 
                 if out_mount and "gzip -c /data/out/sample.hdt" in script:
                     (Path(out_mount) / "sample.hdt.gz").write_text("gz\n")
+                if out_mount and "gzip -c /data/out/sample.cottas" in script:
+                    (Path(out_mount) / "sample.cottas.gz").write_text("gz\n")
                 return 0
 
             with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run):
-                ok, method_results = vcf_rdfizer.run_partitioned_hdt_methods_for_rdf_files(
+                ok, method_results = vcf_rdfizer.run_partitioned_representation_methods_for_rdf_files(
                     rdf_paths=rdf_paths,
                     out_dir=out_dir,
                     image_ref="example/vcf-rdfizer:latest",
-                    methods=["hdt", "hdt_gzip"],
+                    methods=["hdt", "hdt_gzip", "cottas", "cottas_gzip"],
                     wrapper_log_path=tmp_path / "wrapper.log",
                     metrics_dir=tmp_path / "metrics",
                     run_id="run-partitioned",
@@ -607,6 +746,8 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertTrue((out_dir / "sample.hdt").exists())
             self.assertTrue((out_dir / "sample.hdt.index").exists())
             self.assertTrue((out_dir / "sample.hdt.gz").exists())
+            self.assertTrue((out_dir / "sample.cottas").exists())
+            self.assertTrue((out_dir / "sample.cottas.gz").exists())
             self.assertGreaterEqual(method_results["hdt"]["details"]["chunk_count"], 2)
             self.assertGreaterEqual(method_results["hdt"]["details"]["merge_rounds"], 1)
 
@@ -672,8 +813,8 @@ class WrapperUnitTests(VerboseTestCase):
                             str(input_dir),
                             "--rules",
                             str(rules_path),
-                            "--rdf-layout",
-                            "aggregate",
+                            "--rdf-storage-mode",
+                            "plain",
                             "--compression",
                             "none",
                             "--out",
@@ -814,7 +955,7 @@ class WrapperUnitTests(VerboseTestCase):
                 run_tracker=tracker,
                 out_root=out_root,
                 image_ref=None,
-                keep_rdf=False,
+                keep_rmlstreamer_rdf_output=False,
                 wrapper_log_path=metrics_dir / "wrapper.log",
             )
             tracker.close()
@@ -823,40 +964,6 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertEqual(failed, 0)
             self.assertFalse(tsv_file.parent.exists())
             self.assertFalse(raw_rdf.exists())
-
-    def test_aggregate_method_results_includes_all_timing_types(self):
-        """Batch aggregation keeps wall/user/sys and max_rss metrics for each method."""
-        aggregated = vcf_rdfizer.aggregate_method_results_across_files(
-            {
-                "part1.nt": {
-                    "gzip": {
-                        "exit_code": 0,
-                        "wall_seconds": 1.0,
-                        "user_seconds": 0.7,
-                        "sys_seconds": 0.1,
-                        "max_rss_kb": 100,
-                        "output_size_bytes": 10,
-                    }
-                },
-                "part2.nt": {
-                    "gzip": {
-                        "exit_code": 0,
-                        "wall_seconds": 2.0,
-                        "user_seconds": 1.2,
-                        "sys_seconds": 0.2,
-                        "max_rss_kb": 150,
-                        "output_size_bytes": 20,
-                    }
-                },
-            }
-        )
-
-        gzip = aggregated["gzip"]
-        self.assertEqual(gzip["wall_seconds"], 3.0)
-        self.assertAlmostEqual(gzip["user_seconds"], 1.9, places=6)
-        self.assertAlmostEqual(gzip["sys_seconds"], 0.3, places=6)
-        self.assertEqual(gzip["max_rss_kb"], 150)
-        self.assertEqual(gzip["output_size_bytes"], 30)
 
     def test_help_flag_prints_usage_guide(self):
         """Help flag exits cleanly and prints mode usage examples."""
@@ -868,8 +975,15 @@ class WrapperUnitTests(VerboseTestCase):
         self.assertEqual(exc.exception.code, 0)
         text = out_buf.getvalue()
         self.assertIn("Examples:", text)
-        self.assertIn("-m {full,compress,decompress,tsv}", text)
+        self.assertIn("-m {full,compress,decompress,tsv,index}", text)
         self.assertIn("-i INPUT", text)
+        self.assertIn("--keep-rmlstreamer-rdf-output", text)
+        self.assertIn("--remove-rdf-storage-output", text)
+        self.assertIn("--rdf-compression", text)
+        self.assertIn("--representations", text)
+        self.assertIn("--artifact-compression", text)
+        self.assertNotIn("--keep-rdf", text)
+        self.assertNotIn("--compression", text)
 
     def test_estimate_pipeline_sizes_handles_plain_and_gz_inputs(self):
         """Size estimation scales gzipped inputs and reports free disk bytes."""
@@ -895,6 +1009,7 @@ class WrapperUnitTests(VerboseTestCase):
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             input_dir, rules_path = prepare_inputs(tmp_path)
+            out_dir = tmp_path / "out"
             commands = []
 
             def fake_run(cmd, cwd=None, env=None):
@@ -924,6 +1039,8 @@ class WrapperUnitTests(VerboseTestCase):
                             "--rules",
                             str(rules_path),
                             "--estimate-size",
+                            "--hdt-strategy",
+                            "single",
                             "--keep-tsv",
                         ]
                     )
@@ -1297,8 +1414,8 @@ class WrapperUnitTests(VerboseTestCase):
                             str(input_dir),
                             "--rules",
                             str(rules_path),
-                            "--rdf-layout",
-                            "aggregate",
+                            "--rdf-storage-mode",
+                            "plain",
                             "--compression",
                             "none",
                             "--out",
@@ -1306,7 +1423,7 @@ class WrapperUnitTests(VerboseTestCase):
                             "--metrics",
                             str(metrics_dir),
                             "--keep-tsv",
-                            "--keep-rdf",
+                            "--keep-rmlstreamer-rdf-output",
                         ]
                     )
             finally:
@@ -1369,14 +1486,14 @@ class WrapperUnitTests(VerboseTestCase):
                             str(input_dir),
                             "--rules",
                             str(rules_path),
-                            "--rdf-layout",
-                            "aggregate",
+                            "--rdf-storage-mode",
+                            "plain",
                             "--compression",
                             "none",
                             "--out",
                             str(out_dir),
                             "--keep-tsv",
-                            "--keep-rdf",
+                            "--keep-rmlstreamer-rdf-output",
                         ]
                     )
             finally:
@@ -1436,7 +1553,7 @@ class WrapperUnitTests(VerboseTestCase):
         """--spark-partitions is rejected for non-full modes."""
         rc = invoke_main(
             ["--mode", "compress", "--spark-partitions", "4", "--rdf", "missing.nt"],
-            auto_layout=False,
+            auto_storage=False,
         )
         self.assertEqual(rc, 2)
 
@@ -1454,16 +1571,56 @@ class WrapperUnitTests(VerboseTestCase):
         rc = invoke_main(["--mode", "full"])
         self.assertEqual(rc, 2)
 
-    def test_main_full_mode_requires_rdf_layout_argument(self):
-        """Full mode fails validation when --rdf-layout is omitted."""
+    def test_main_full_mode_requires_storage_mode_argument(self):
+        """Full mode fails validation when --rdf-storage-mode is omitted."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             input_dir, rules_path = prepare_inputs(tmp_path)
             rc = invoke_main(
                 ["--mode", "full", "--input", str(input_dir), "--rules", str(rules_path)],
-                auto_layout=False,
+                auto_storage=False,
             )
             self.assertEqual(rc, 2)
+
+    def test_removed_legacy_cli_options_are_rejected(self):
+        """Removed layout and compatibility aliases are not accepted by the CLI."""
+        for legacy_args in (
+            ["--rdf-layout", "batch"],
+            ["--nt", "sample.nt"],
+            ["--keep_rdf"],
+            ["--keep-rdf"],
+        ):
+            with self.subTest(args=legacy_args), redirect_stderr(StringIO()):
+                with mock.patch.object(
+                    sys,
+                    "argv",
+                    ["vcf_rdfizer.py", "--mode", "compress", *legacy_args, "--out", "./out"],
+                ), self.assertRaises(SystemExit) as exc:
+                    vcf_rdfizer.main()
+            self.assertEqual(exc.exception.code, 2)
+
+    def test_rdf_output_retention_and_removal_flags_are_mutually_exclusive(self):
+        """RDF output retention and removal cannot be requested together."""
+        with redirect_stderr(StringIO()):
+            with mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "vcf_rdfizer.py",
+                    "--mode",
+                    "full",
+                    "--input",
+                    "sample.vcf",
+                    "--rdf-storage-mode",
+                    "plain",
+                    "--keep-rmlstreamer-rdf-output",
+                    "--remove-rdf-storage-output",
+                    "--out",
+                    "./out",
+                ],
+            ), self.assertRaises(SystemExit) as exc:
+                vcf_rdfizer.main()
+        self.assertEqual(exc.exception.code, 2)
 
     def test_main_full_mode_keyboard_interrupt_returns_130_and_writes_progress_log(self):
         """Keyboard interrupt exits with 130 and records interruption in progress log."""
@@ -1488,8 +1645,8 @@ class WrapperUnitTests(VerboseTestCase):
                             str(input_dir),
                             "--rules",
                             str(rules_path),
-                            "--rdf-layout",
-                            "aggregate",
+                            "--rdf-storage-mode",
+                            "plain",
                             "--out",
                             str(out_dir),
                         ]
@@ -1616,6 +1773,81 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertTrue(any(arg.endswith("/out/sample:/data/out") for arg in commands[0]))
             self.assertIn("/data/out/sample.nt", commands[0][-1])
 
+    def test_main_index_mode_initializes_existing_hdt(self):
+        """Index mode runs the container helper and records the sidecar artifact."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            hdt_path = tmp_path / "sample.hdt"
+            hdt_path.write_bytes(b"fake-hdt")
+            out_dir = tmp_path / "out"
+            commands = []
+
+            def fake_run(cmd, cwd=None, env=None):
+                commands.append(cmd)
+                rendered = str(cmd[-1])
+                if "ensure_hdt_index.sh" in rendered:
+                    Path(str(hdt_path) + ".index").write_text("index\n")
+                return 0
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch.object(
+                    vcf_rdfizer, "check_docker", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "docker_image_exists", return_value=True
+                ):
+                    rc = invoke_main(
+                        [
+                            "--mode",
+                            "index",
+                            "--hdt",
+                            str(hdt_path),
+                            "--out",
+                            str(out_dir),
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 0)
+            self.assertTrue((tmp_path / "sample.hdt.index").exists())
+            self.assertEqual(len(commands), 1)
+            self.assertIn("ensure_hdt_index.sh", commands[0][-1])
+            self.assertTrue(any(arg.endswith(":/data/hdt") for arg in commands[0]))
+            metrics = latest_metrics_run_dir(out_dir / "run_metrics") / "hdt_index_metrics.json"
+            self.assertEqual(json.loads(metrics.read_text())["index_status"], "generated")
+
+    def test_hdt_index_helper_uses_exit_only_and_verifies_sidecar(self):
+        """The Docker-side helper initializes the index without issuing a query."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            java_home = tmp_path / "java-home"
+            bin_dir = java_home / "bin"
+            bin_dir.mkdir(parents=True)
+            search = bin_dir / "hdtSearch.sh"
+            search.write_text(
+                "#!/usr/bin/env bash\n"
+                "read -r command\n"
+                "[[ \"$command\" == \"exit\" ]] || exit 3\n"
+                "printf 'index\\n' > \"${1}.index\"\n",
+                encoding="utf-8",
+            )
+            search.chmod(0o755)
+            hdt_path = tmp_path / "sample.hdt"
+            hdt_path.write_bytes(b"fake-hdt")
+            helper = Path(__file__).parents[1] / "src" / "ensure_hdt_index.sh"
+
+            result = subprocess.run(
+                ["bash", str(helper), str(hdt_path)],
+                env={**os.environ, "HDT_JAVA_HOME": str(java_home)},
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertTrue(Path(str(hdt_path) + ".index").exists())
+
     def test_main_decompress_mode_rejects_unknown_extension(self):
         """Decompression mode rejects unsupported compressed RDF extensions."""
         with tempfile.TemporaryDirectory() as td:
@@ -1695,114 +1927,8 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertTrue(any(str(arg).endswith(":/data/in:ro") for arg in commands[1]))
             self.assertTrue(any(str(arg).startswith("IN_VCF=/data/in/") for arg in commands[1]))
 
-    def test_main_full_mode_batch_layout_compresses_each_rml_part(self):
-        """Batch layout compresses each part and prints one consolidated size summary."""
-        with tempfile.TemporaryDirectory() as td:
-            tmp_path = Path(td)
-            input_dir, rules_path = prepare_inputs(tmp_path)
-            out_dir = tmp_path / "out"
-            commands = []
-            out_buf = StringIO()
-
-            def fake_run(cmd, cwd=None, env=None):
-                commands.append(cmd)
-                if "/opt/vcf-rdfizer/run_conversion.sh" in cmd:
-                    sample_dir = out_dir / "sample"
-                    sample_dir.mkdir(parents=True, exist_ok=True)
-                    (sample_dir / "part-00000.nt").write_text("<s1> <p> <o> .\n")
-                    (sample_dir / "part-00001.nt").write_text("<s2> <p> <o> .\n")
-                return 0
-
-            old_cwd = os.getcwd()
-            os.chdir(tmp_path)
-            try:
-                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch.object(
-                    vcf_rdfizer, "check_docker", return_value=True
-                ), mock.patch.object(
-                    vcf_rdfizer, "docker_image_exists", return_value=True
-                ), mock.patch.object(
-                    vcf_rdfizer, "discover_tsv_triplets", return_value=mocked_triplets()
-                ), redirect_stdout(out_buf):
-                    rc = invoke_main(
-                        [
-                            "--input",
-                            str(input_dir),
-                            "--rules",
-                            str(rules_path),
-                            "--rdf-layout",
-                            "batch",
-                            "--compression",
-                            "gzip",
-                            "--out",
-                            str(out_dir),
-                            "--keep-tsv",
-                        ]
-                    )
-            finally:
-                os.chdir(old_cwd)
-
-            self.assertEqual(rc, 0)
-            self.assertIn("AGGREGATE_RDF=0", commands[1])
-            gzip_cmds = [cmd for cmd in commands if isinstance(cmd, list) and cmd and "gzip -c" in cmd[-1]]
-            self.assertEqual(len(gzip_cmds), 2)
-            self.assertIn("/data/in/part-00000.nt", gzip_cmds[0][-1])
-            self.assertIn("/data/in/part-00001.nt", gzip_cmds[1][-1])
-            self.assertEqual(out_buf.getvalue().count("* Output directory:"), 1)
-
-    def test_main_full_mode_batch_metrics_upsert_is_sample_scoped(self):
-        """Batch layout writes compression CSV metrics once per sample, not once per RDF part."""
-        with tempfile.TemporaryDirectory() as td:
-            tmp_path = Path(td)
-            input_dir, rules_path = prepare_inputs(tmp_path)
-            out_dir = tmp_path / "out"
-            seen_output_names = []
-
-            def fake_run(cmd, cwd=None, env=None):
-                if "/opt/vcf-rdfizer/run_conversion.sh" in cmd:
-                    sample_dir = out_dir / "sample"
-                    sample_dir.mkdir(parents=True, exist_ok=True)
-                    (sample_dir / "part-00000.nt").write_text("<s1> <p> <o> .\n")
-                    (sample_dir / "part-00001.nt").write_text("<s2> <p> <o> .\n")
-                return 0
-
-            def fake_update_metrics_csv_with_compression(**kwargs):
-                seen_output_names.append(kwargs["output_name"])
-
-            old_cwd = os.getcwd()
-            os.chdir(tmp_path)
-            try:
-                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch.object(
-                    vcf_rdfizer, "check_docker", return_value=True
-                ), mock.patch.object(
-                    vcf_rdfizer, "docker_image_exists", return_value=True
-                ), mock.patch.object(
-                    vcf_rdfizer, "discover_tsv_triplets", return_value=mocked_triplets()
-                ), mock.patch.object(
-                    vcf_rdfizer, "update_metrics_csv_with_compression", side_effect=fake_update_metrics_csv_with_compression
-                ):
-                    rc = invoke_main(
-                        [
-                            "--input",
-                            str(input_dir),
-                            "--rules",
-                            str(rules_path),
-                            "--rdf-layout",
-                            "batch",
-                            "--compression",
-                            "gzip",
-                            "--out",
-                            str(out_dir),
-                            "--keep-tsv",
-                        ]
-                    )
-            finally:
-                os.chdir(old_cwd)
-
-            self.assertEqual(rc, 0)
-            self.assertEqual(seen_output_names, ["sample"])
-
-    def test_main_full_mode_batch_hdt_uses_partitioned_merge_pipeline(self):
-        """Batch HDT in auto mode uses chunk-local rdf2hdt plus HDTCat merge and final indexing."""
+    def test_main_full_mode_plain_hdt_uses_partitioned_merge_pipeline(self):
+        """Plain aggregate HDT uses chunk-local rdf2hdt plus HDTCat and indexing."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             input_dir, rules_path = prepare_inputs(tmp_path)
@@ -1815,8 +1941,9 @@ class WrapperUnitTests(VerboseTestCase):
                 if "/opt/vcf-rdfizer/run_conversion.sh" in cmd:
                     sample_dir = out_dir / "sample"
                     sample_dir.mkdir(parents=True, exist_ok=True)
-                    (sample_dir / "part-00000.nt").write_text("<s1> <p> <o> .\n" * 4)
-                    (sample_dir / "part-00001.nt").write_text("<s2> <p> <o> .\n" * 4)
+                    (sample_dir / "sample.nt").write_text(
+                        "<s1> <p> <o> .\n" * 4 + "<s2> <p> <o> .\n" * 4
+                    )
                     return 0
 
                 work_mount = next(
@@ -1852,8 +1979,8 @@ class WrapperUnitTests(VerboseTestCase):
                         output_path.parent.mkdir(parents=True, exist_ok=True)
                         output_path.write_text("merged-hdt\n")
 
-                if out_mount and '"$HDT_INDEX_BIN"' in rendered:
-                    index_match = re.search(r'"\$HDT_INDEX_BIN"\s+(/data/out/[^\s;]+\.hdt)', rendered)
+                if out_mount and "ensure_hdt_index.sh" in rendered:
+                    index_match = re.search(r"ensure_hdt_index\.sh\s+(/data/out/[^\s;]+\.hdt)", rendered)
                     if index_match:
                         hdt_path = Path(out_mount) / index_match.group(1).replace("/data/out/", "", 1)
                         Path(str(hdt_path) + ".index").write_text("index\n")
@@ -1875,8 +2002,8 @@ class WrapperUnitTests(VerboseTestCase):
                             str(input_dir),
                             "--rules",
                             str(rules_path),
-                            "--rdf-layout",
-                            "batch",
+                            "--rdf-storage-mode",
+                            "plain",
                             "--compression",
                             "hdt",
                             "--chunk-target-bytes",
@@ -1895,18 +2022,23 @@ class WrapperUnitTests(VerboseTestCase):
 
             self.assertEqual(rc, 0)
             self.assertTrue(any('"$HDTCAT_BIN"' in str(cmd[-1]) for cmd in commands if isinstance(cmd, list) and cmd))
-            self.assertTrue(any('"$HDT_INDEX_BIN"' in str(cmd[-1]) for cmd in commands if isinstance(cmd, list) and cmd))
+            self.assertTrue(any("ensure_hdt_index.sh" in str(cmd[-1]) for cmd in commands if isinstance(cmd, list) and cmd))
             self.assertTrue((out_dir / "sample" / "sample.hdt").exists())
 
-    def test_main_full_mode_aggregate_layout_sets_merge_flag(self):
-        """Aggregate layout passes AGGREGATE_RDF=1 to conversion step."""
+    def test_main_full_mode_plain_storage_sets_storage_mode(self):
+        """Plain storage passes the canonical storage mode to conversion."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             input_dir, rules_path = prepare_inputs(tmp_path)
+            out_dir = tmp_path / "out"
             commands = []
 
             def fake_run(cmd, cwd=None, env=None):
                 commands.append(cmd)
+                if "/opt/vcf-rdfizer/run_conversion.sh" in cmd:
+                    sample_dir = out_dir / "sample"
+                    sample_dir.mkdir(parents=True, exist_ok=True)
+                    (sample_dir / "sample.nt").write_text("<s> <p> <o> .\n")
                 return 0
 
             old_cwd = os.getcwd()
@@ -1925,8 +2057,8 @@ class WrapperUnitTests(VerboseTestCase):
                             str(input_dir),
                             "--rules",
                             str(rules_path),
-                            "--rdf-layout",
-                            "aggregate",
+                            "--rdf-storage-mode",
+                            "plain",
                             "--compression",
                             "none",
                             "--keep-tsv",
@@ -1936,7 +2068,7 @@ class WrapperUnitTests(VerboseTestCase):
                 os.chdir(old_cwd)
 
             self.assertEqual(rc, 0)
-            self.assertIn("AGGREGATE_RDF=1", commands[1])
+            self.assertIn("RDF_STORAGE_MODE=plain", commands[1])
 
     def test_main_full_mode_passes_spark_partition_hint_to_conversion(self):
         """Full mode forwards --spark-partitions to run_conversion as SPARK_PARTITIONS."""
@@ -1965,8 +2097,8 @@ class WrapperUnitTests(VerboseTestCase):
                             str(input_dir),
                             "--rules",
                             str(rules_path),
-                            "--rdf-layout",
-                            "aggregate",
+                            "--rdf-storage-mode",
+                            "plain",
                             "--compression",
                             "none",
                             "--spark-partitions",
@@ -2021,7 +2153,17 @@ class WrapperUnitTests(VerboseTestCase):
                 ), mock.patch.object(
                     vcf_rdfizer, "discover_tsv_triplets", return_value=multi_triplets
                 ):
-                    rc = invoke_main(["--input", str(input_dir), "--rules", str(rules_path), "--keep-tsv"])
+                    rc = invoke_main(
+                        [
+                            "--input",
+                            str(input_dir),
+                            "--rules",
+                            str(rules_path),
+                            "--hdt-strategy",
+                            "single",
+                            "--keep-tsv",
+                        ]
+                    )
             finally:
                 os.chdir(old_cwd)
 
@@ -2118,8 +2260,8 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertIn("sample_a", report_text)
             self.assertIn("rdf-conversion", report_text)
 
-    def test_main_full_mode_deletes_nt_after_compression_by_default(self):
-        """Full mode removes merged .nt outputs after successful compression unless --keep-rdf is set."""
+    def test_main_full_mode_remove_rdf_storage_output_deletes_nt(self):
+        """The explicit RDF storage cleanup flag removes the aggregate after compression."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             input_dir, rules_path = prepare_inputs(tmp_path)
@@ -2157,6 +2299,7 @@ class WrapperUnitTests(VerboseTestCase):
                             "--out",
                             str(out_dir),
                             "--keep-tsv",
+                            "--remove-rdf-storage-output",
                         ]
                     )
             finally:
@@ -2166,8 +2309,8 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertFalse((out_dir / "sample" / "sample.nt").exists())
             self.assertTrue((out_dir / "sample" / "sample.hdt").exists())
 
-    def test_main_full_mode_keep_rdf_preserves_nt_after_compression(self):
-        """Full mode keeps merged .nt outputs when --keep-rdf is provided."""
+    def test_main_full_mode_keep_rmlstreamer_rdf_output_preserves_nt_after_compression(self):
+        """Full mode keeps merged .nt outputs with the RMLStreamer retention flag."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             input_dir, rules_path = prepare_inputs(tmp_path)
@@ -2205,7 +2348,7 @@ class WrapperUnitTests(VerboseTestCase):
                             "--out",
                             str(out_dir),
                             "--keep-tsv",
-                            "--keep-rdf",
+                            "--keep-rmlstreamer-rdf-output",
                         ]
                     )
             finally:
@@ -2326,7 +2469,7 @@ class WrapperUnitTests(VerboseTestCase):
                             "--compression",
                             "hdt",
                             "--keep-tsv",
-                            "--keep-rdf",
+                            "--keep-rmlstreamer-rdf-output",
                         ]
                     )
             finally:
@@ -2493,7 +2636,17 @@ class WrapperUnitTests(VerboseTestCase):
                 ), mock.patch.object(
                     vcf_rdfizer, "discover_tsv_triplets", return_value=triplets
                 ):
-                    rc = invoke_main(["--input", str(input_dir), "--rules", str(rules_path), "--keep-tsv"])
+                    rc = invoke_main(
+                        [
+                            "--input",
+                            str(input_dir),
+                            "--rules",
+                            str(rules_path),
+                            "--hdt-strategy",
+                            "single",
+                            "--keep-tsv",
+                        ]
+                    )
             finally:
                 os.chdir(old_cwd)
 

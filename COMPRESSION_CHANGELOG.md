@@ -24,6 +24,31 @@ stream, so standard gzip readers expose the same logical N-Triples sequence.
 Exact duplicate part payloads are skipped in both modes. This protects against
 duplicate Spark output without requiring a second full aggregate comparison.
 
+## Public Compression Plan
+
+The CLI separates staging, primary representation, and packaging:
+
+| Option | Values | Purpose |
+| --- | --- | --- |
+| `--rdf-storage-mode` | `plain`, `space-optimized` | Controls the temporary RDF aggregate used by the chunk planner |
+| `--rdf-compression` | `gzip`, `brotli`, `none` | Creates final raw RDF artifacts |
+| `--representations` | `hdt`, `cottas`, `none` | Selects queryable indexed outputs |
+| `--artifact-compression` | `gzip`, `brotli`, `none` | Packages each selected HDT/COTTAS representation |
+
+For example, `--representations hdt --artifact-compression gzip` produces both
+the queryable `sample.hdt` and the packaged `sample.hdt.gz`. The same plan can
+package COTTAS as `sample.cottas.gz` or `sample.cottas.br`. Packaged artifacts
+must be decompressed before querying; the unwrapped indexed artifact should be
+retained for direct queries.
+
+All three selectors accept comma-separated values. `none` is a standalone
+no-op value, and artifact packaging is rejected unless a base representation is
+selected.
+
+The gzip stream created by `--rdf-storage-mode space-optimized` is an
+intermediate aggregate. It is not a final raw RDF artifact unless
+`--rdf-compression gzip` is selected or the aggregate is retained explicitly.
+
 The storage mode is passed to `src/run_conversion.sh` through
 `RDF_STORAGE_MODE`. The conversion metrics JSON records the selected mode,
 serialization, compressed state, logical output path, and triple count.
@@ -54,7 +79,7 @@ all selected conversions complete.
 
 ## Shared HDT/COTTAS Pipeline
 
-When multiple partitioned methods are selected, the temporary `.nt` chunks are
+When multiple partitioned representations are selected, the temporary `.nt` chunks are
 shared:
 
 ```text
@@ -77,7 +102,7 @@ record-safe temporary .nt chunks + chunks.json
         |                         |
         v                         v
  final HDT + generated       final COTTAS + rebuilt indexes
- .hdt.index
+ .hdt.index                  + optional gzip/Brotli packaging
 ```
 
 Each selected converter consumes a chunk before that chunk is deleted. This
@@ -89,9 +114,20 @@ silently treated as successfully compressed output.
 
 Each chunk is converted with `rdf2hdt`. Intermediate HDTs are merged pairwise
 in a balanced tree using HDTCat. Unpaired files are carried into the next
-round. After the final HDT is produced, `hdtGenerateIndex` runs on that final
-file. Intermediate indexes are intentionally not copied: the final dictionary
-and triple layout are the authoritative query representation.
+round. After the final HDT is produced, the bundled HDT Java `hdtSearch.sh`
+launcher is fed only `exit`. This invokes `mapIndexedHDT()`, eagerly creating
+the final sibling `.hdt.index` without executing a potentially large query.
+Intermediate indexes are intentionally not copied: the final dictionary and
+triple layout are the authoritative query representation.
+
+The same operation is available independently as:
+
+```text
+vcf-rdfizer --mode index --hdt path/to/sample.hdt --out results
+```
+
+The standalone mode records its result in
+`run_metrics/<RUN_ID>/hdt_index_metrics.json`.
 
 ### COTTAS
 
@@ -115,14 +151,15 @@ details.
 
 Raw RDF is removed only after all selected methods report success. The exception
 is the space-optimized `.nt.gz` source when `gzip` is selected: that file is
-already the requested gzip artifact and is retained. `--keep-rdf` retains the
-raw aggregate regardless of the selected compression methods.
+already the requested gzip artifact and is retained. Cleanup is enabled by
+default; `--remove-rdf-storage-output` makes aggregate removal explicit, while
+`--keep-rmlstreamer-rdf-output` retains the aggregate produced by RMLStreamer.
+The two flags are mutually exclusive.
 
 ## Compatibility and Limits
 
-The legacy `--rdf-layout aggregate|batch` options remain available. The new
-`--rdf-storage-mode` options replace the layout choice for the optimized
-pipeline and cannot be combined with `--rdf-layout`. The old
+Full mode requires `--rdf-storage-mode plain` or
+`--rdf-storage-mode space-optimized`; both produce one logical RDF aggregate.
 HDT-specific chunk option names were removed; chunk sizing is deliberately
 shared by HDT and COTTAS. `--hdt-strategy single` is not allowed for a gzip
 aggregate because it would require materializing the full uncompressed RDF

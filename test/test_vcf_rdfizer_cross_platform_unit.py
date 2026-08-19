@@ -64,6 +64,33 @@ class WrapperCrossPlatformUnitTests(VerboseTestCase):
         with self.assertRaises(ValueError):
             vcf_rdfizer.parse_compression_methods("gzip,unknown")
 
+    def test_build_compression_methods_separates_representation_packaging(self):
+        """Public plan options expand into shared base and packaging stages."""
+        self.assertEqual(
+            vcf_rdfizer.build_compression_methods(
+                rdf_compression="none",
+                representations="hdt,cottas",
+                artifact_compression="gzip,brotli",
+            ),
+            [
+                "hdt",
+                "hdt_gzip",
+                "hdt_brotli",
+                "cottas",
+                "cottas_gzip",
+                "cottas_brotli",
+            ],
+        )
+
+    def test_build_compression_methods_rejects_packaging_without_representation(self):
+        """Packaging cannot be requested without a base representation."""
+        with self.assertRaises(ValueError):
+            vcf_rdfizer.build_compression_methods(
+                rdf_compression="none",
+                representations="none",
+                artifact_compression="gzip",
+            )
+
     def test_detect_compressed_format(self):
         """Compressed format detection works by extension."""
         self.assertEqual(vcf_rdfizer.detect_compressed_format(Path("sample.nt.gz")), "gzip")
@@ -98,7 +125,7 @@ class WrapperCrossPlatformUnitTests(VerboseTestCase):
                             "compress",
                             "--rdf",
                             str(nt_path),
-                            "--compression",
+                            "--rdf-compression",
                             "gzip",
                             "--out",
                             str(out_dir),

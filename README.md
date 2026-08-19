@@ -64,6 +64,7 @@ inside this directory.
 - `tsv`: VCF -> TSV only (benchmarking)
 - `compress`: compress an existing `.nt` or `.nt.gz`
 - `decompress`: decompress `.nt.gz`, `.nt.br`, or `.hdt`
+- `index`: eagerly initialize the `.hdt.index` sidecar for an existing `.hdt`
 
 In `full` mode with multiple VCF inputs, failures are isolated per input:
 - the run continues with remaining files
@@ -71,9 +72,11 @@ In `full` mode with multiple VCF inputs, failures are isolated per input:
 
 ## Main Flags (Most Used)
 
-- `-m, --mode {full,compress,decompress,tsv}`
+- `-m, --mode {full,compress,decompress,tsv,index}`
 - `-o, --out` required output root directory
-- `-c, --compression` methods: `gzip,brotli,hdt,hdt_gzip,hdt_brotli,cottas,none`
+- `--rdf-compression` final raw RDF codecs: `gzip`, `brotli`, or `none`
+- `--representations` queryable RDF outputs: `hdt`, `cottas`, or `none`
+- `--artifact-compression` packaging codecs for selected representations: `gzip`, `brotli`, or `none`
 - `--hdt-strategy {auto,partitioned,single}` HDT generation policy
 - `--chunk-target-bytes`, `--chunk-min-bytes`, `--chunk-max-bytes` shared record-safe chunk sizing
 - `-I, --image` Docker image repo (default `ecrum19/vcf-rdfizer`)
@@ -82,17 +85,50 @@ In `full` mode with multiple VCF inputs, failures are isolated per input:
 - `-B, --no-build` fail if image not found
 - `-h, --help` show full usage
 
+## Compression Plan
+
+Compression is configured as three independent decisions:
+
+1. **RDF staging**: `--rdf-storage-mode` controls how RMLStreamer output is
+   assembled before chunking. `plain` creates one `.nt` aggregate;
+   `space-optimized` streams the parts into one `.nt.gz` aggregate and removes
+   each source part immediately.
+2. **Raw RDF artifacts**: `--rdf-compression gzip,brotli` creates compressed
+   copies of the RDF aggregate. Use `--rdf-compression none` when RDF is only a
+   temporary input to HDT/COTTAS.
+3. **Queryable representations and packaging**: `--representations hdt,cottas`
+   creates the selected indexed formats. `--artifact-compression gzip,brotli`
+   packages each selected representation, producing `.hdt.gz`, `.hdt.br`,
+   `.cottas.gz`, or `.cottas.br` in addition to the queryable base artifact.
+
+Each selector accepts comma-separated values. Use `none` by itself to disable
+that stage; do not combine `none` with another value. `--artifact-compression`
+requires at least one selected value in `--representations`.
+
+The gzip used by `--rdf-storage-mode space-optimized` is staging storage; it is
+not automatically a final raw RDF artifact. The default plan preserves the
+historical outputs: `--rdf-compression gzip,brotli` and
+`--representations hdt`. For the smallest final output, select
+`--rdf-compression none`, one representation, and
+`--remove-rdf-storage-output`.
+
+Packaged `.hdt.gz`, `.hdt.br`, `.cottas.gz`, and `.cottas.br` files are archives,
+not directly queryable indexed files. Keep the unwrapped `.hdt`/`.cottas` file
+when queries must run without a decompression step.
+
 ## Full Mode Flags
 
 - `-i, --input` required VCF file or directory
 - `-r, --rules` mapping rules file (`.ttl`)
   - default: `rules/default_rules.ttl`
-- `-l, --rdf-layout {aggregate,batch}` legacy full-mode RDF layout
-- `--rdf-storage-mode {plain,space-optimized}` full-mode aggregate storage policy
+- `--rdf-storage-mode {plain,space-optimized}` required full-mode aggregate storage policy
   - `plain`: merge RMLStreamer parts into one uncompressed `.nt`
   - `space-optimized`: gzip each part into one `.nt.gz` aggregate and delete the source part immediately
+- `--rdf-compression {gzip,brotli,none}` raw RDF artifacts to retain
+- `--representations {hdt,cottas,none}` queryable primary representations
+- `--artifact-compression {gzip,brotli,none}` optional packaging applied to each selected representation
 - `--hdt-strategy {auto,partitioned,single}`
-  - `auto`: in batch RDF layout or a storage mode, build smaller HDT chunks and merge them with `HDTCat`
+  - `auto`: in full mode, build smaller HDT chunks and merge them with `HDTCat`
   - `partitioned`: always use chunked HDT generation for HDT-based methods
   - `single`: always use one `rdf2hdt` run per RDF input
   - with `space-optimized`, use `auto` or `partitioned`; `single` cannot consume the gzip stream without expanding it
@@ -100,9 +136,10 @@ In `full` mode with multiple VCF inputs, failures are isolated per input:
 - `--chunk-min-bytes` minimum uncompressed bytes before flushing a chunk group
 - `--chunk-max-bytes` maximum uncompressed bytes in a chunk; boundaries remain on complete NT lines
 - `-P, --spark-partitions` optional Spark partition hint (positive integer)
-  - low-cost way to reduce output part count by setting `spark.default.parallelism` and `spark.sql.shuffle.partitions`
+  - low-cost way to tune RMLStreamer parallelism while the wrapper still produces one aggregate RDF output
 - `-k, --keep-tsv` keep hidden TSV intermediates
-- `-R, --keep-rdf` keep raw `.nt` after compression
+- `-R, --keep-rmlstreamer-rdf-output` keep the aggregate RDF output produced by RMLStreamer
+- `--remove-rdf-storage-output` explicitly remove the aggregate `.nt`/`.nt.gz` after successful compression
 - `-e, --estimate-size` preflight size estimate
 
 ## TSV Mode Flags
@@ -113,12 +150,18 @@ In `full` mode with multiple VCF inputs, failures are isolated per input:
 
 ## Compression Mode Flags
 
-- `-q, --rdf, --nt` required input `.nt` file
+- `--rdf` required input `.nt` or `.nt.gz` file
 
 ## Decompression Mode Flags
 
 - `-C, --compressed-input` required `.nt.gz`, `.nt.br`, or `.hdt`
 - `-d, --decompress-out` optional explicit output `.nt` path (must be inside `--out`)
+
+## HDT Index Mode Flags
+
+- `-H, --hdt` required existing `.hdt` file
+- The generated `.hdt.index` is written beside the input HDT.
+- The operation is also run automatically after each partitioned HDT merge.
 
 ## Quick Start
 
@@ -128,35 +171,27 @@ Show help:
 vcf-rdfizer --help
 ```
 
-Full pipeline (aggregate RDF):
+Full pipeline (plain aggregate RDF):
 
 ```bash
 vcf-rdfizer \
   --mode full \
   --input ./vcf_files \
-  --rdf-layout aggregate \
+  --rdf-storage-mode plain \
+  --rdf-compression none \
+  --representations none \
   --out ./results
 ```
 
-Full pipeline (batch RDF parts):
+Full pipeline (plain aggregate, chunked HDT + HDTCat merge):
 
 ```bash
 vcf-rdfizer \
   --mode full \
   --input ./vcf_files \
-  --rdf-layout batch \
-  --compression hdt \
-  --out ./results
-```
-
-Full pipeline (batch RDF parts, chunked HDT + HDTCat merge):
-
-```bash
-vcf-rdfizer \
-  --mode full \
-  --input ./vcf_files \
-  --rdf-layout batch \
-  --compression hdt \
+  --rdf-storage-mode plain \
+  --rdf-compression none \
+  --representations hdt \
   --hdt-strategy partitioned \
   --chunk-target-bytes 536870912 \
   --chunk-min-bytes 134217728 \
@@ -171,35 +206,65 @@ vcf-rdfizer \
   --mode full \
   --input ./vcf_files \
   --rdf-storage-mode space-optimized \
-  --compression hdt,cottas \
+  --rdf-compression none \
+  --representations hdt,cottas \
   --chunk-target-bytes 536870912 \
   --chunk-min-bytes 134217728 \
   --chunk-max-bytes 1073741824 \
   --out ./results
 ```
 
-Full pipeline with low-cost partition cap (helps avoid too many tiny batch files):
+Full pipeline with a Spark partition hint:
 
 ```bash
 vcf-rdfizer \
   --mode full \
   --input ./vcf_files \
-  --rdf-layout batch \
+  --rdf-storage-mode space-optimized \
   --spark-partitions 8 \
-  --compression hdt \
+  --rdf-compression none \
+  --representations hdt \
   --out ./results
 ```
 
-Full pipeline with custom rules + keep RDF:
+Full pipeline with custom rules + keep RMLStreamer RDF output:
 
 ```bash
 vcf-rdfizer \
   --mode full \
   --input ./vcf_files \
   --rules ./rules/my_rules.ttl \
-  --rdf-layout aggregate \
-  --compression hdt,brotli \
-  --keep-rdf \
+  --rdf-storage-mode plain \
+  --rdf-compression brotli \
+  --representations hdt \
+  --keep-rmlstreamer-rdf-output \
+  --out ./results
+```
+
+Ultra-small full pipeline:
+
+```bash
+vcf-rdfizer \
+  --mode full \
+  --input ./vcf_files \
+  --rdf-storage-mode space-optimized \
+  --rdf-compression none \
+  --representations hdt \
+  --hdt-strategy partitioned \
+  --remove-rdf-storage-output \
+  --out ./results
+```
+
+Queryable HDT and COTTAS plus gzip/Brotli packages:
+
+```bash
+vcf-rdfizer \
+  --mode full \
+  --input ./vcf_files \
+  --rdf-storage-mode space-optimized \
+  --rdf-compression none \
+  --representations hdt,cottas \
+  --artifact-compression gzip,brotli \
   --out ./results
 ```
 
@@ -218,7 +283,9 @@ Compression-only:
 vcf-rdfizer \
   --mode compress \
   --rdf ./results/sample/sample.nt \
-  --compression hdt_gzip \
+  --rdf-compression none \
+  --representations hdt \
+  --artifact-compression gzip \
   --out ./results
 ```
 
@@ -228,7 +295,8 @@ Compression-only from a space-optimized aggregate:
 vcf-rdfizer \
   --mode compress \
   --rdf ./results/sample/sample.nt.gz \
-  --compression hdt,cottas \
+  --rdf-compression none \
+  --representations hdt,cottas \
   --chunk-target-bytes 536870912 \
   --out ./results
 ```
@@ -239,6 +307,15 @@ Decompression-only:
 vcf-rdfizer \
   --mode decompress \
   --compressed-input ./results/sample/sample.hdt \
+  --out ./results
+```
+
+Initialize an index for an existing HDT:
+
+```bash
+vcf-rdfizer \
+  --mode index \
+  --hdt ./results/sample/sample.hdt \
   --out ./results
 ```
 
@@ -254,7 +331,9 @@ Given `--out ./results`:
   - `./results/.intermediate/tsv/`
 
 Intermediates are hidden by default.
-Raw RDF files are removed after compression unless `--keep-rdf` is provided.
+Raw RDF files are removed after successful compression by default. Use
+`--remove-rdf-storage-output` to make that cleanup explicit, or use
+`--keep-rmlstreamer-rdf-output` to retain the aggregate RDF output instead.
 The space-optimized mode retains the `.nt.gz` aggregate when `gzip` is selected
 because that file is the gzip artifact itself.
 
@@ -265,6 +344,7 @@ For each run, VCF-RDFizer writes:
 - `run_metrics/<RUN_ID>/metrics.csv`
 - `run_metrics/<RUN_ID>/wrapper_execution_times.csv`
 - `run_metrics/<RUN_ID>/progress.log`
+- `run_metrics/<RUN_ID>/hdt_index_metrics.json` for standalone HDT index mode
 
 Compression metrics now include per-method:
 
@@ -278,20 +358,29 @@ sample-level result, while raw metrics also include a sample-scoped
 `__partitioned_compression__` artifact describing chunk conversion, merge
 rounds, and the generated chunk guide.
 
+Metrics may use internal stage names such as `hdt_gzip` and `cottas_brotli`.
+These correspond to the public combination of `--representations` and
+`--artifact-compression`; users do not need to pass those compound names.
+
 ## Chunked Compression
 
-The new storage modes are mutually exclusive with the legacy `--rdf-layout`
-option. Both modes create one logical N-Triples aggregate. The space-optimized
-mode streams each RMLStreamer part through gzip and deletes that part before
-processing the next one, so it avoids retaining both the part files and a full
-uncompressed aggregate.
+Full mode always uses one of the two aggregate storage modes. Both modes create
+one logical N-Triples aggregate. The space-optimized mode streams each
+RMLStreamer part through gzip and deletes that part before processing the next
+one, so it avoids retaining both the part files and a full uncompressed
+aggregate.
 
 When HDT or COTTAS is selected, the aggregate is read sequentially and split
 into complete N-Triples records. The chunk guide is generated during that same
 pass, and the same temporary chunks are consumed by both converters before
 cleanup. HDT chunks are merged with `HDTCat`, the final HDT index is generated
-after merging, and COTTAS chunks are merged with `pycottas.cat`, which rebuilds
+after merging through HDT Java's indexed search loader, and COTTAS chunks are merged with `pycottas.cat`, which rebuilds
 the query indexes for the merged representation.
+
+HDT Java 3.0.10 does not provide a standalone `hdtGenerateIndex` executable.
+VCF-RDFizer sends an `exit` command to the supported `hdtSearch.sh` launcher;
+this opens the HDT through `mapIndexedHDT()` without executing a data query and
+creates the sibling `.hdt.index` sidecar before the run is marked successful.
 
 Successful aggregate partitioned runs retain `<sample>.chunks.json` beside the
 final compression artifacts. It records the record-safe chunk boundaries and
@@ -319,9 +408,9 @@ Safe termination:
 
 - Press `Ctrl+C` to interrupt a run.
 - The wrapper exits with code `130`, writes progress to `run_metrics/<RUN_ID>/progress.log`, and performs best-effort cleanup of tracked intermediates.
-- Raw RDF cleanup on interrupt follows `--keep-rdf`:
-  - with `--keep-rdf`, raw `.nt` files are preserved
-  - without `--keep-rdf`, tracked raw `.nt` files are removed during interrupt cleanup
+- Raw RDF cleanup on interrupt follows `--keep-rmlstreamer-rdf-output`:
+  - with `--keep-rmlstreamer-rdf-output`, raw RDF files are preserved
+  - without it, tracked raw RDF files are removed during interrupt cleanup
 
 ## Citation
 

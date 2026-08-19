@@ -7,7 +7,7 @@ set -euo pipefail
 # Responsibilities:
 # 1) run RMLStreamer with stable output naming
 # 2) normalize Spark part outputs to .nt
-# 3) optionally aggregate part files into a single <sample>.nt
+# 3) aggregate part files into a single <sample>.nt or <sample>.nt.gz
 # 4) collect conversion timing + output metrics
 # 5) upsert conversion row in run_metrics/metrics.csv
 # ------------------------------------------------------------------------------
@@ -19,12 +19,11 @@ IN_VCF=${IN_VCF:-input.vcf}
 OUT_NAME=${OUT_NAME:-rdf}
 OUT_DIR=${OUT_DIR:-run_output}
 OUT="$OUT_DIR/$OUT_NAME"
-AGGREGATE_RDF=${AGGREGATE_RDF:-1}
 # Full-mode storage policy. `plain` keeps a normal aggregate N-Triples file;
 # `space-optimized` appends gzip members and removes each source part after it
-# has been compressed. Empty means legacy AGGREGATE_RDF behavior.
-RDF_STORAGE_MODE=${RDF_STORAGE_MODE:-}
-if [[ -n "$RDF_STORAGE_MODE" && "$RDF_STORAGE_MODE" != "plain" && "$RDF_STORAGE_MODE" != "space-optimized" ]]; then
+# has been compressed. Plain storage is the default for direct script use.
+RDF_STORAGE_MODE=${RDF_STORAGE_MODE:-plain}
+if [[ "$RDF_STORAGE_MODE" != "plain" && "$RDF_STORAGE_MODE" != "space-optimized" ]]; then
   echo "ERROR: invalid RDF_STORAGE_MODE='$RDF_STORAGE_MODE' (expected plain or space-optimized)." >&2
   exit 2
 fi
@@ -261,14 +260,13 @@ for RDF_FILE in "$OUT_DIR/$OUT_NAME"/*; do
   mv "$RDF_FILE" "${RDF_FILE}.nt"
 done
 
-# Merge all RMLStreamer output parts into one N-Triples file named after output
-# basename when AGGREGATE_RDF=1. Stream merge + delete each part immediately to
-# avoid temporary 2x disk spikes.
-if [[ "$AGGREGATE_RDF" == "1" ]]; then
-  MERGED_NT="$OUT_DIR/$OUT_NAME/$OUT_NAME.nt"
-  shopt -s nullglob
-  PART_FILES=("$OUT_DIR/$OUT_NAME"/*.nt)
-  if [[ "$RDF_STORAGE_MODE" == "space-optimized" ]]; then
+# Merge all RMLStreamer output parts into one aggregate named after the output
+# basename. Stream merge + delete each part immediately to avoid temporary 2x
+# disk spikes.
+MERGED_NT="$OUT_DIR/$OUT_NAME/$OUT_NAME.nt"
+shopt -s nullglob
+PART_FILES=("$OUT_DIR/$OUT_NAME"/*.nt)
+if [[ "$RDF_STORAGE_MODE" == "space-optimized" ]]; then
     MERGED_RDF="${MERGED_NT}.gz"
     MERGED_TMP="${MERGED_RDF}.partial"
     # Keep duplicate-part protection in the compressed path as well. Hashing
@@ -329,14 +327,11 @@ if [[ "$AGGREGATE_RDF" == "1" ]]; then
   else
     : > "$MERGED_NT"
     OUTPUT_PATH="$MERGED_NT"
-  fi
+fi
   shopt -u nullglob
   if [[ "$RDF_STORAGE_MODE" != "space-optimized" ]]; then
     OUTPUT_PATH="$MERGED_NT"
   fi
-else
-  OUTPUT_PATH="$OUT_DIR/$OUT_NAME"
-fi
 
 # Apply ontology-compliant null datatype annotation to produced RDF files.
 if [[ -f "$OUTPUT_PATH" && "$OUTPUT_PATH" != *.gz ]]; then
@@ -394,7 +389,7 @@ cat > "$METRICS_JSON" <<EOF
     "output_triples": $TRIPLES_JSON
   },
   "rdf_storage": {
-    "mode": "${RDF_STORAGE_MODE:-legacy}",
+    "mode": "$RDF_STORAGE_MODE",
     "compressed": $( [[ "$OUTPUT_PATH" == *.gz ]] && echo true || echo false ),
     "serialization": "ntriples"
   },
