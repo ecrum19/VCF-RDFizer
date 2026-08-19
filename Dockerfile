@@ -94,4 +94,8 @@ ENV HDT2RDF_BIN=/usr/local/bin/hdt2rdf
 ENV COTTAS_PYTHON_BIN=/opt/pycottas-venv/bin/python
 ENV LD_LIBRARY_PATH=/usr/local/lib
 
+# COTTAS creates a temporary DuckDB database in the container working
+# directory. The wrapper runs containers as the host UID/GID, so this path
+# must be writable without requiring root or creating root-owned host files.
+RUN mkdir -p /work && chmod 1777 /work
 WORKDIR /work
