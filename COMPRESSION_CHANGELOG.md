@@ -69,18 +69,16 @@ into a second full `.nt` file. A chunk boundary is emitted only after a
 complete newline-terminated N-Triples record. The planner therefore cannot
 split a triple, even when a target or maximum falls in the middle of a line.
 
-During this same pass it writes `chunks.json`, containing source paths, record
-ranges, byte ranges, payload sizes, and chunk counts. This is both an audit
-trail and a reusable guide for diagnosing an unsuccessful conversion. The
-guide is generated during the read rather than by a second decompression pass.
-For a successful aggregate partitioned run, it is retained beside the final
-artifacts as `<sample>.chunks.json`; temporary chunk files are removed after
-all selected conversions complete.
+During this same pass it builds an in-workspace guide containing source paths,
+record ranges, byte ranges, payload sizes, and chunk counts. This avoids a
+second decompression pass. The guide is returned in the raw
+`__partitioned_compression__` metrics artifact for diagnostics, but is not
+retained as a host-side `<sample>.chunks.json` file.
 
 ## Shared HDT/COTTAS Pipeline
 
-When multiple partitioned representations are selected, the temporary `.nt` chunks are
-shared:
+When multiple partitioned representations are selected, the temporary `.nt`
+chunks are shared inside one ephemeral Docker-managed workspace:
 
 ```text
 RMLStreamer parts
@@ -89,7 +87,10 @@ RMLStreamer parts
 plain .nt or streamed .nt.gz aggregate
         |
         v
-record-safe temporary .nt chunks + chunks.json
+read-only source mount + Docker volume workspace
+        |
+        v
+record-safe temporary .nt chunks + in-volume guide
         |                         |
         v                         v
      rdf2hdt                 pycottas.rdf2cottas
@@ -105,10 +106,14 @@ record-safe temporary .nt chunks + chunks.json
  .hdt.index                  + optional gzip/Brotli packaging
 ```
 
-Each selected converter consumes a chunk before that chunk is deleted. This
-prevents the HDT conversion from forcing a second RDF materialization for
-COTTAS. If a conversion or merge fails, temporary files and raw RDF are not
-silently treated as successfully compressed output.
+The aggregate is always mounted read-only; final artifacts are written
+directly to the output mount. Each selected
+converter consumes a chunk before that chunk is deleted, preventing the HDT
+conversion from forcing a second RDF materialization for COTTAS. The same
+container owns DuckDB scratch data, converter outputs, merge intermediates,
+and packaging stages, so the host never accumulates the intermediate files.
+The volume is initialized for the mapped host user and removed in a `finally`
+cleanup path after success, failure, or interruption.
 
 ### HDT
 
@@ -143,11 +148,12 @@ the Docker workflow, not a dependency of the lightweight pip/conda wrapper.
 
 ## Metrics and Cleanup
 
-Every chunk conversion, merge, index-generation, and final HDT post-compression
-stage is timed separately. The sample-level result sums sequential wall, user,
-and system times and records the maximum resident set size. Raw metrics also
-include a `__partitioned_compression__` artifact with the chunk plan and merge
-details.
+Every chunk conversion, merge, index-generation, and final representation
+packaging stage is timed separately inside the container. The sample-level
+result sums sequential wall, user, and system times and records the maximum
+resident set size. Raw metrics also include a
+`__partitioned_compression__` artifact with the chunk plan, stage timings,
+merge details, and workspace cleanup status.
 
 Raw RDF is removed only after all selected methods report success. The exception
 is the space-optimized `.nt.gz` source when `gzip` is selected: that file is
@@ -167,13 +173,15 @@ file; use the partitioned strategy instead.
 
 The planner assumes line-oriented N-Triples input. Conversion and merge stages
 are sequential to constrain peak disk and memory usage. Temporary chunks and
-intermediate compressed files still require working space, although the
-space-optimized path avoids the largest duplicate uncompressed aggregate.
+intermediate compressed files still require Docker storage space, although the
+space-optimized path avoids the largest duplicate uncompressed aggregate and
+the host output filesystem does not carry those intermediates.
 
 ## Relevant Components
 
 - `vcf_rdfizer.py`: CLI, storage-mode dispatch, chunk planning, conversion, merge, and metrics
 - `src/run_conversion.sh`: RMLStreamer output aggregation and streamed gzip storage
 - `src/cottas_tool.py`: Docker-side pycottas conversion/merge adapter
+- `src/partitioned_compression.py`: one-container chunk, merge, index, packaging, and stage-metrics runner
 - `Dockerfile`: runtime dependencies and pycottas environment
 - `README.md`: user-facing CLI and workflow documentation

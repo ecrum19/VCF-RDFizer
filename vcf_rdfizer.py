@@ -177,17 +177,8 @@ RDF_STORAGE_MODES = {"space-optimized", "plain"}
 DEFAULT_CHUNK_TARGET_BYTES = 512 * 1024 * 1024
 DEFAULT_CHUNK_MIN_BYTES = 128 * 1024 * 1024
 DEFAULT_CHUNK_MAX_BYTES = 1024 * 1024 * 1024
-HDTCAT_CANDIDATES = [
-    "hdtCat",
-    "hdtCat.sh",
-    "HDTCat",
-    "HDTCat.sh",
-    "/opt/hdt-java/bin/hdtCat",
-    "/opt/hdt-java/bin/hdtCat.sh",
-    "/usr/local/bin/hdtCat",
-    "/usr/local/bin/hdtCat.sh",
-]
 HDT_INDEX_HELPER_CONTAINER = "/opt/vcf-rdfizer/ensure_hdt_index.sh"
+PARTITIONED_COMPRESSION_RUNNER_CONTAINER = "/opt/vcf-rdfizer/partitioned_compression.py"
 
 
 # ---------------------------------------------------------------------------
@@ -877,27 +868,6 @@ def plan_partitioned_hdt_chunks(
         "chunk_input_bytes": chunk_input_bytes,
     }
     return chunk_inputs, plan
-
-
-def shell_resolve_executable(var_name: str, candidates: list[str], error_message: str) -> str:
-    """Build a shell snippet that resolves one executable from several candidates."""
-    rendered_candidates = " ".join(shlex.quote(candidate) for candidate in candidates)
-    return (
-        f'{var_name}="${{{var_name}:-}}"; '
-        f'if [[ -z "${var_name}" ]]; then '
-        f"for candidate in {rendered_candidates}; do "
-        'if [[ "$candidate" == */* ]]; then '
-        f'[[ -x "$candidate" ]] && {var_name}="$candidate" && break; '
-        "else "
-        'resolved="$(command -v "$candidate" || true)"; '
-        f'[[ -n "$resolved" && -x "$resolved" ]] && {var_name}="$resolved" && break; '
-        "fi; "
-        "done; "
-        "fi; "
-        f'if [[ -z "${var_name}" || ! -x "${var_name}" ]]; then '
-        f"echo {shlex.quote(error_message)} >&2; exit 127; "
-        "fi; "
-    )
 
 
 def count_triples_in_nt_files(paths: list[Path]) -> int | None:
@@ -2885,6 +2855,174 @@ def run_compression_methods_for_rdf(
     return True, method_results
 
 
+def run_containerized_partitioned_representation_methods(
+    *,
+    source_rdf_path: Path,
+    out_dir: Path,
+    image_ref: str,
+    methods: list[str],
+    wrapper_log_path: Path,
+    metrics_dir: Path | None = None,
+    run_id: str | None = None,
+    timestamp: str | None = None,
+    output_name: str,
+    target_chunk_bytes: int,
+    min_chunk_bytes: int,
+    max_chunk_bytes: int,
+):
+    """Run partitioned compression in an ephemeral Docker-managed volume.
+
+    The source and final outputs are the only bind mounts. Chunks, DuckDB
+    scratch data, HDT/COTTAS merge intermediates, and stage timing files stay
+    in a named volume that is removed in ``finally`` on both success and
+    failure. A short JSON handoff carries the container-side metrics back to
+    the host without exposing the temporary workspace.
+    """
+    ensure_dir(out_dir)
+    if not source_rdf_path.is_file():
+        eprint(f"Error: RDF source file not found: {source_rdf_path}. See log: {wrapper_log_path}")
+        return False, {}
+
+    safe_output_name = safe_metrics_name(output_name)
+    volume_name = (
+        f"vcf-rdfizer-{safe_output_name[:40]}-{os.getpid()}-{time.time_ns()}"
+    )
+    result_path = out_dir / f".{safe_output_name}.partitioned-results.json"
+    method_results: dict[str, dict] = {}
+    volume_created = False
+
+    source_resolved = source_rdf_path.resolve()
+    out_resolved = out_dir.resolve()
+    try:
+        # Mount the source separately, even when it lives below the output
+        # directory. This keeps the aggregate read-only inside the runner.
+        source_mount = f"{source_resolved.parent}:/data/in:ro"
+        source_container = f"/data/in/{source_resolved.name}"
+
+        if run([*docker_cmd_prefix(), "volume", "create", volume_name]) != 0:
+            eprint(f"Error: unable to create temporary Docker volume '{volume_name}'. See log: {wrapper_log_path}")
+            return False, {}
+        volume_created = True
+
+        # A named volume is normally initialized by Docker as root. Make its
+        # workspace writable for the mapped host user before running COTTAS.
+        init_cmd = [
+            *docker_run_base(as_user=False),
+            "--mount",
+            f"type=volume,source={volume_name},target=/work",
+            image_ref,
+            "bash",
+            "-lc",
+            "chmod 1777 /work",
+        ]
+        if run(init_cmd) != 0:
+            eprint(f"Error: unable to initialize temporary Docker volume '{volume_name}'. See log: {wrapper_log_path}")
+            return False, {}
+
+        command = [
+            *docker_run_base(),
+            "--mount",
+            f"type=volume,source={volume_name},target=/work",
+        ]
+        if source_mount is not None:
+            command.extend(["-v", source_mount])
+        command.extend(
+            [
+                "-v",
+                f"{out_resolved}:/data/out",
+                image_ref,
+                "python3",
+                PARTITIONED_COMPRESSION_RUNNER_CONTAINER,
+                "--source",
+                source_container,
+                "--output-dir",
+                "/data/out",
+                "--output-name",
+                output_name,
+                "--methods",
+                ",".join(methods),
+                "--target-chunk-bytes",
+                str(target_chunk_bytes),
+                "--min-chunk-bytes",
+                str(min_chunk_bytes),
+                "--max-chunk-bytes",
+                str(max_chunk_bytes),
+                "--result-path",
+                f"/data/out/{result_path.name}",
+            ]
+        )
+        run_exit_code = run(command)
+        payload = None
+        if result_path.is_file():
+            try:
+                payload = json.loads(result_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                eprint(f"Error: invalid partitioned compression result: {exc}. See log: {wrapper_log_path}")
+
+        if payload is not None:
+            method_results = payload.get("methods", {})
+            for method, result in method_results.items():
+                artifact_path = out_dir / compression_artifact_name_for_method(
+                    Path(f"{output_name}.nt"), method
+                )
+                result["output_path"] = str(artifact_path)
+                result["output_size_bytes"] = int(file_size_bytes(artifact_path) or 0)
+                details = result.setdefault("details", {})
+                if method == "hdt":
+                    details["index_path"] = str(Path(str(artifact_path) + ".index"))
+                    details["index_size_bytes"] = int(
+                        file_size_bytes(Path(str(artifact_path) + ".index")) or 0
+                    )
+                if "source_paths" in details:
+                    details["source_paths"] = [str(source_rdf_path)]
+                for chunk in details.get("chunks", []):
+                    if isinstance(chunk, dict) and chunk.get("path"):
+                        chunk["path"] = Path(str(chunk["path"])).name
+                details["workspace"] = "docker-volume"
+                details["workspace_cleanup"] = "removed"
+
+        missing_methods = set(methods) - set(method_results)
+        if missing_methods and payload is not None and int(payload.get("exit_code", 1)) == 0:
+            eprint(
+                "Error: partitioned compression did not return results for: "
+                + ", ".join(sorted(missing_methods))
+                + f". See log: {wrapper_log_path}"
+            )
+            return False, method_results
+
+        if run_exit_code != 0 or payload is None or int(payload.get("exit_code", 1)) != 0:
+            error = payload.get("error") if payload else "container did not return a result"
+            eprint(f"Error: partitioned compression failed: {error}. See log: {wrapper_log_path}")
+            return False, method_results
+
+        if metrics_dir is not None and run_id is not None and timestamp is not None:
+            write_raw_compression_metrics_artifact(
+                metrics_dir=metrics_dir,
+                run_id=run_id,
+                timestamp=timestamp,
+                output_name=output_name,
+                rdf_name="__partitioned_compression__",
+                source_rdf_path=out_dir,
+                selected_methods=methods,
+                method_results=method_results,
+            )
+        return True, method_results
+    finally:
+        # The result handoff is not a user artifact; remove it before volume
+        # cleanup so only final compression outputs and normal metrics remain.
+        try:
+            result_path.unlink()
+        except OSError:
+            pass
+        if volume_created:
+            cleanup_exit_code = run([*docker_cmd_prefix(), "volume", "rm", "-f", volume_name])
+            if cleanup_exit_code != 0:
+                eprint(
+                    f"Warning: failed to remove temporary Docker volume '{volume_name}'. "
+                    f"See log: {wrapper_log_path}"
+                )
+
+
 def run_partitioned_representation_methods_for_rdf_files(
     *,
     rdf_paths: list[Path],
@@ -2901,428 +3039,36 @@ def run_partitioned_representation_methods_for_rdf_files(
     min_chunk_bytes: int,
     max_chunk_bytes: int,
 ):
-    """Generate HDT and/or COTTAS artifacts from bounded RDF chunks.
+    """Dispatch aggregate RDF to the ephemeral container pipeline.
 
-    When ``source_rdf_path`` is supplied, it may be a plain or gzip-compressed
-    aggregate. The source is read once into record-safe temporary chunks. The
-    same chunks are consumed by all selected methods before being deleted.
-    ``rdf_paths`` supports programmatic callers that already have multiple
-    plain RDF sources; the CLI supplies one aggregate source.
+    Partitioned compression intentionally accepts one logical aggregate. The
+    full and compression CLI modes create that aggregate before this call;
+    callers using this helper directly must provide exactly one source path.
+    This prevents a second host-side implementation from reintroducing large
+    intermediate files.
     """
-    if not rdf_paths and source_rdf_path is None:
-        return True, {}
-
-    ensure_dir(out_dir)
-    work_dir = out_dir / ".compression_partitioned"
-    if work_dir.exists():
-        shutil.rmtree(work_dir, ignore_errors=True)
-    ensure_dir(work_dir)
-
-    output_stem = output_name
-    try:
-        if source_rdf_path is not None:
-            chunk_inputs, plan = plan_record_safe_rdf_chunks(
-                [source_rdf_path],
-                work_dir / "nt_chunks",
-                target_bytes=target_chunk_bytes,
-                min_bytes=min_chunk_bytes,
-                max_bytes=max_chunk_bytes,
-                guide_path=work_dir / "chunks.json",
+    if source_rdf_path is None:
+        if len(rdf_paths) != 1:
+            eprint(
+                "Error: partitioned compression requires one aggregate RDF source; "
+                "combine RDF parts before calling this helper."
             )
-        else:
-            chunk_inputs, plan = plan_partitioned_hdt_chunks(
-                rdf_paths,
-                work_dir / "nt_chunks",
-                target_bytes=target_chunk_bytes,
-                min_bytes=min_chunk_bytes,
-                max_bytes=max_chunk_bytes,
-            )
-    except (OSError, ValueError) as exc:
-        eprint(f"Error: unable to prepare record-safe RDF chunks: {exc}. See log: {wrapper_log_path}")
-        shutil.rmtree(work_dir, ignore_errors=True)
-        return False, {}
-
-    # Keep the small boundary guide as a user-visible artifact. The temporary
-    # chunks and converter outputs are removed later, but the guide remains
-    # useful for benchmarking, auditing, and reproducing a chunk layout.
-    if source_rdf_path is not None:
-        temporary_guide = work_dir / "chunks.json"
-        if temporary_guide.exists():
-            persistent_guide = out_dir / f"{output_stem}.chunks.json"
-            plan["guide_path"] = str(persistent_guide)
-            # Rewrite the small guide with its durable path before temporary
-            # conversion files are removed at the end of this function.
-            persistent_guide.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
-
-    final_hdt_path = out_dir / f"{output_stem}.hdt"
-    final_index_path = Path(str(final_hdt_path) + ".index")
-    method_results: dict[str, dict] = {}
-
-    def container_path_for_host(path: Path) -> str:
-        resolved = path.resolve()
-        try:
-            rel = resolved.relative_to(work_dir.resolve())
-            return f"/data/work/{rel.as_posix()}"
-        except ValueError:
-            rel = resolved.relative_to(out_dir.resolve())
-            return f"/data/out/{rel.as_posix()}"
-
-    def run_stage(*, stage_name: str, command: str, output_path: Path | None = None) -> dict:
-        timing_host = work_dir / f".{stage_name}.time"
-        timing_container = f"/data/work/.{stage_name}.time"
-        wrapped_command = (
-            "set -euo pipefail; "
-            f"rm -f {shlex.quote(timing_container)}; "
-            'if [[ -x /usr/bin/time ]] && /usr/bin/time --version >/dev/null 2>&1; then '
-            f"/usr/bin/time -v -o {shlex.quote(timing_container)} -- bash -lc {shlex.quote(command)}; "
-            "else "
-            f"{{ time -p bash -lc {shlex.quote(command)}; }} > {shlex.quote(timing_container)} 2>&1; "
-            "fi"
-        )
-        cmd = [
-            *docker_run_base(),
-            "-v",
-            f"{str(work_dir)}:/data/work",
-            "-v",
-            f"{str(out_dir)}:/data/out",
-            image_ref,
-            "bash",
-            "-lc",
-            wrapped_command,
-        ]
-        started = time.perf_counter()
-        exit_code = run(cmd)
-        elapsed = time.perf_counter() - started
-        timing = parse_time_log_metrics(timing_host)
-        if timing_host.exists():
-            try:
-                timing_host.unlink()
-            except OSError:
-                pass
-        return {
-            "exit_code": exit_code,
-            "wall_seconds": elapsed,
-            "user_seconds": timing.get("user_seconds"),
-            "sys_seconds": timing.get("sys_seconds"),
-            "max_rss_kb": timing.get("max_rss_kb"),
-            "output_path": "" if output_path is None else str(output_path),
-            "output_size_bytes": 0 if output_path is None else int(file_size_bytes(output_path) or 0),
-        }
-
-    def add_stage_totals(acc: dict, result: dict):
-        acc["exit_code"] = max(int(acc.get("exit_code", 0)), int(result.get("exit_code") or 0))
-        wall = result.get("wall_seconds")
-        if wall is not None:
-            acc["wall_seconds"] = float(acc.get("wall_seconds", 0.0)) + float(wall)
-            acc["_seen_wall"] = True
-        user = result.get("user_seconds")
-        if user is not None:
-            acc["user_seconds"] = float(acc.get("user_seconds", 0.0)) + float(user)
-            acc["_seen_user"] = True
-        sys_seconds = result.get("sys_seconds")
-        if sys_seconds is not None:
-            acc["sys_seconds"] = float(acc.get("sys_seconds", 0.0)) + float(sys_seconds)
-            acc["_seen_sys"] = True
-        rss = result.get("max_rss_kb")
-        if rss is not None:
-            acc["max_rss_kb"] = max(int(acc.get("max_rss_kb", 0)), int(rss))
-            acc["_seen_rss"] = True
-
-    def finalize_stage_totals(acc: dict):
-        result = dict(acc)
-        if not result.pop("_seen_wall", False):
-            result["wall_seconds"] = None
-        if not result.pop("_seen_user", False):
-            result["user_seconds"] = None
-        if not result.pop("_seen_sys", False):
-            result["sys_seconds"] = None
-        if not result.pop("_seen_rss", False):
-            result["max_rss_kb"] = None
-        return result
-
-    rdf2hdt_resolve = (
-        'HDT_BIN="${RDF2HDT_BIN:-$(command -v rdf2hdt || true)}"; '
-        'if [[ -z "$HDT_BIN" ]]; then '
-        'for candidate in /usr/local/bin/rdf2hdt /opt/hdt-cpp/bin/rdf2hdt; do '
-        '[[ -x "$candidate" ]] && HDT_BIN="$candidate" && break; '
-        "done; "
-        "fi; "
-        'if [[ -z "$HDT_BIN" || ! -x "$HDT_BIN" ]]; then '
-        'echo "Missing rdf2hdt binary in container" >&2; exit 127; '
-        "fi; "
+            return False, {}
+        source_rdf_path = rdf_paths[0]
+    return run_containerized_partitioned_representation_methods(
+        source_rdf_path=source_rdf_path,
+        out_dir=out_dir,
+        image_ref=image_ref,
+        methods=methods,
+        wrapper_log_path=wrapper_log_path,
+        metrics_dir=metrics_dir,
+        run_id=run_id,
+        timestamp=timestamp,
+        output_name=output_name,
+        target_chunk_bytes=target_chunk_bytes,
+        min_chunk_bytes=min_chunk_bytes,
+        max_chunk_bytes=max_chunk_bytes,
     )
-    hdtcat_resolve = shell_resolve_executable(
-        "HDTCAT_BIN",
-        HDTCAT_CANDIDATES,
-        "Missing HDTCat binary in container",
-    )
-    cottas_python_resolve = (
-        'PYTHON_BIN="${COTTAS_PYTHON_BIN:-$(command -v python3 || true)}"; '
-        'if [[ -z "$PYTHON_BIN" || ! -x "$PYTHON_BIN" ]]; then '
-        'echo "Missing Python runtime for COTTAS" >&2; exit 127; '
-        "fi; "
-    )
-    cottas_tool_container = "/opt/vcf-rdfizer/cottas_tool.py"
-
-    hdt_totals = {
-        "exit_code": 0,
-        "wall_seconds": 0.0,
-        "user_seconds": 0.0,
-        "sys_seconds": 0.0,
-        "max_rss_kb": 0,
-    }
-    cottas_totals = {
-        "exit_code": 0,
-        "wall_seconds": 0.0,
-        "user_seconds": 0.0,
-        "sys_seconds": 0.0,
-        "max_rss_kb": 0,
-    }
-    chunk_hdts: list[Path] = []
-    chunk_cottas: list[Path] = []
-
-    for chunk_index, chunk_input in enumerate(chunk_inputs):
-        if compression_uses_hdt(methods):
-            chunk_hdt = work_dir / f"chunk-{chunk_index:05d}.hdt"
-            command = (
-                "set -euo pipefail; "
-                f"rm -f {shlex.quote(container_path_for_host(chunk_hdt))}; "
-                f"{rdf2hdt_resolve}"
-                '"$HDT_BIN" '
-                f"{shlex.quote(container_path_for_host(chunk_input))} "
-                f"{shlex.quote(container_path_for_host(chunk_hdt))}"
-            )
-            result = run_stage(
-                stage_name=f"hdt-build-{chunk_index:05d}",
-                command=command,
-                output_path=chunk_hdt,
-            )
-            add_stage_totals(hdt_totals, result)
-            if int(result.get("exit_code") or 0) != 0:
-                eprint(f"Error: partitioned HDT chunk conversion failed. See log: {wrapper_log_path}")
-                return False, method_results
-            chunk_hdts.append(chunk_hdt)
-
-        if any(method in COTTAS_COMPRESSION_METHODS for method in methods):
-            chunk_cottas_path = work_dir / f"chunk-{chunk_index:05d}.cottas"
-            command = (
-                "set -euo pipefail; "
-                f"rm -f {shlex.quote(container_path_for_host(chunk_cottas_path))}; "
-                f"{cottas_python_resolve}"
-                f'"$PYTHON_BIN" {shlex.quote(cottas_tool_container)} convert '
-                f"{shlex.quote(container_path_for_host(chunk_input))} "
-                f"{shlex.quote(container_path_for_host(chunk_cottas_path))} spo"
-            )
-            result = run_stage(
-                stage_name=f"cottas-build-{chunk_index:05d}",
-                command=command,
-                output_path=chunk_cottas_path,
-            )
-            add_stage_totals(cottas_totals, result)
-            if int(result.get("exit_code") or 0) != 0:
-                eprint(f"Error: COTTAS chunk conversion failed. See log: {wrapper_log_path}")
-                return False, method_results
-            chunk_cottas.append(chunk_cottas_path)
-
-        # The chunk is shared by all selected compressors and is safe to
-        # remove only after every selected chunk conversion succeeded.
-        try:
-            chunk_input.unlink()
-        except OSError:
-            pass
-
-    if chunk_hdts:
-        merge_rounds = 0
-        current_hdts = list(chunk_hdts)
-        while len(current_hdts) > 1:
-            merge_rounds += 1
-            next_hdts: list[Path] = []
-            for pair_index in range(0, len(current_hdts), 2):
-                left = current_hdts[pair_index]
-                if pair_index + 1 >= len(current_hdts):
-                    next_hdts.append(left)
-                    continue
-                right = current_hdts[pair_index + 1]
-                merged = work_dir / f"merge-r{merge_rounds:02d}-{pair_index // 2:05d}.hdt"
-                command = (
-                    "set -euo pipefail; "
-                    f"rm -f {shlex.quote(container_path_for_host(merged))}; "
-                    f"{hdtcat_resolve}"
-                    '"$HDTCAT_BIN" '
-                    f"{shlex.quote(container_path_for_host(left))} "
-                    f"{shlex.quote(container_path_for_host(right))} "
-                    f"{shlex.quote(container_path_for_host(merged))}"
-                )
-                result = run_stage(
-                    stage_name=f"hdt-merge-r{merge_rounds:02d}-{pair_index // 2:05d}",
-                    command=command,
-                    output_path=merged,
-                )
-                add_stage_totals(hdt_totals, result)
-                if int(result.get("exit_code") or 0) != 0:
-                    eprint(f"Error: HDTCat merge failed. See log: {wrapper_log_path}")
-                    return False, method_results
-                for consumed in (left, right):
-                    try:
-                        consumed.unlink()
-                    except OSError:
-                        pass
-                next_hdts.append(merged)
-            current_hdts = next_hdts
-
-        final_work_hdt = current_hdts[0]
-        if final_work_hdt.resolve() != final_hdt_path.resolve():
-            shutil.copyfile(final_work_hdt, final_hdt_path)
-
-        # HDT Java 3.0.10 does not ship a standalone hdtGenerateIndex binary.
-        # Its supported hdtSearch launcher calls mapIndexedHDT(), which creates
-        # the sibling .hdt.index sidecar when it is missing. The helper sends
-        # only `exit`, so no potentially huge query result is materialized.
-        index_command = (
-            "set -euo pipefail; "
-            f"{shlex.quote(HDT_INDEX_HELPER_CONTAINER)} "
-            f"{shlex.quote(container_path_for_host(final_hdt_path))}"
-        )
-        index_result = run_stage(stage_name="hdt-index", command=index_command, output_path=final_index_path)
-        add_stage_totals(hdt_totals, index_result)
-        if int(index_result.get("exit_code") or 0) != 0:
-            eprint(f"Error: final HDT index initialization failed. See log: {wrapper_log_path}")
-            return False, method_results
-
-        hdt_result = finalize_stage_totals(hdt_totals)
-        hdt_result["output_path"] = str(final_hdt_path)
-        hdt_result["output_size_bytes"] = int(file_size_bytes(final_hdt_path) or 0)
-        hdt_result["source"] = "partitioned_generated"
-        hdt_result["details"] = {
-            **plan,
-            "merge_rounds": merge_rounds,
-            "index_path": str(final_index_path),
-            "index_size_bytes": int(file_size_bytes(final_index_path) or 0),
-        }
-        method_results["hdt"] = hdt_result
-
-    if "cottas" in methods:
-        merge_rounds = 0
-        current_cottas = list(chunk_cottas)
-        while len(current_cottas) > 1:
-            merge_rounds += 1
-            next_cottas: list[Path] = []
-            for pair_index in range(0, len(current_cottas), 2):
-                left = current_cottas[pair_index]
-                if pair_index + 1 >= len(current_cottas):
-                    next_cottas.append(left)
-                    continue
-                right = current_cottas[pair_index + 1]
-                merged = work_dir / f"cottas-merge-r{merge_rounds:02d}-{pair_index // 2:05d}.cottas"
-                command = (
-                    "set -euo pipefail; "
-                    f"rm -f {shlex.quote(container_path_for_host(merged))}; "
-                    f"{cottas_python_resolve}"
-                    f'"$PYTHON_BIN" {shlex.quote(cottas_tool_container)} merge '
-                    f"{shlex.quote(container_path_for_host(left))} "
-                    f"{shlex.quote(container_path_for_host(right))} "
-                    f"{shlex.quote(container_path_for_host(merged))} spo"
-                )
-                result = run_stage(
-                    stage_name=f"cottas-merge-r{merge_rounds:02d}-{pair_index // 2:05d}",
-                    command=command,
-                    output_path=merged,
-                )
-                add_stage_totals(cottas_totals, result)
-                if int(result.get("exit_code") or 0) != 0:
-                    eprint(f"Error: COTTAS merge failed. See log: {wrapper_log_path}")
-                    return False, method_results
-                next_cottas.append(merged)
-            current_cottas = next_cottas
-
-        final_cottas_path = out_dir / f"{output_stem}.cottas"
-        if current_cottas:
-            final_work_cottas = current_cottas[0]
-            if final_work_cottas.resolve() != final_cottas_path.resolve():
-                shutil.copyfile(final_work_cottas, final_cottas_path)
-        cottas_result = finalize_stage_totals(cottas_totals)
-        cottas_result["output_path"] = str(final_cottas_path)
-        cottas_result["output_size_bytes"] = int(file_size_bytes(final_cottas_path) or 0)
-        cottas_result["source"] = "partitioned_generated"
-        cottas_result["details"] = {
-            **plan,
-            "chunk_count": len(chunk_cottas),
-            "merge_rounds": merge_rounds,
-            "index": "spo",
-        }
-        method_results["cottas"] = cottas_result
-
-    if chunk_hdts:
-        final_hdt_container = container_path_for_host(final_hdt_path)
-        for method in methods:
-            if method == "hdt":
-                continue
-            if method == "hdt_gzip":
-                artifact_path = out_dir / f"{output_stem}.hdt.gz"
-                command = (
-                    "set -euo pipefail; "
-                    f"rm -f {shlex.quote(container_path_for_host(artifact_path))}; "
-                    f"gzip -c {shlex.quote(final_hdt_container)} > {shlex.quote(container_path_for_host(artifact_path))}"
-                )
-            elif method == "hdt_brotli":
-                artifact_path = out_dir / f"{output_stem}.hdt.br"
-                command = (
-                    "set -euo pipefail; "
-                    f"rm -f {shlex.quote(container_path_for_host(artifact_path))}; "
-                    f"brotli -q 7 -c {shlex.quote(final_hdt_container)} > {shlex.quote(container_path_for_host(artifact_path))}"
-                )
-            else:
-                continue
-            result = run_stage(stage_name=method, command=command, output_path=artifact_path)
-            if int(result.get("exit_code") or 0) != 0:
-                eprint(f"Error: {method} compression failed. See log: {wrapper_log_path}")
-                return False, method_results
-            method_results[method] = result
-
-    if chunk_cottas:
-        final_cottas_path = out_dir / f"{output_stem}.cottas"
-        final_cottas_container = container_path_for_host(final_cottas_path)
-        for method in methods:
-            if method == "cottas":
-                continue
-            if method == "cottas_gzip":
-                artifact_path = out_dir / f"{output_stem}.cottas.gz"
-                command = (
-                    "set -euo pipefail; "
-                    f"rm -f {shlex.quote(container_path_for_host(artifact_path))}; "
-                    f"gzip -c {shlex.quote(final_cottas_container)} > "
-                    f"{shlex.quote(container_path_for_host(artifact_path))}"
-                )
-            elif method == "cottas_brotli":
-                artifact_path = out_dir / f"{output_stem}.cottas.br"
-                command = (
-                    "set -euo pipefail; "
-                    f"rm -f {shlex.quote(container_path_for_host(artifact_path))}; "
-                    f"brotli -q 7 -c {shlex.quote(final_cottas_container)} > "
-                    f"{shlex.quote(container_path_for_host(artifact_path))}"
-                )
-            else:
-                continue
-            result = run_stage(stage_name=method, command=command, output_path=artifact_path)
-            if int(result.get("exit_code") or 0) != 0:
-                eprint(f"Error: {method} compression failed. See log: {wrapper_log_path}")
-                return False, method_results
-            method_results[method] = result
-
-    if metrics_dir is not None and run_id is not None and timestamp is not None:
-        write_raw_compression_metrics_artifact(
-            metrics_dir=metrics_dir,
-            run_id=run_id,
-            timestamp=timestamp,
-            output_name=output_name,
-            rdf_name="__partitioned_compression__",
-            source_rdf_path=out_dir,
-            selected_methods=methods,
-            method_results=method_results,
-        )
-
-    shutil.rmtree(work_dir, ignore_errors=True)
-    return True, method_results
 
 
 def run_full_mode(
@@ -4063,8 +3809,8 @@ def run_compress_mode(
                 return 1
             method_results.update(raw_method_results)
         ok, partitioned_results = run_partitioned_representation_methods_for_rdf_files(
-            rdf_paths=[] if rdf_path.name.endswith(".gz") else [rdf_path],
-            source_rdf_path=rdf_path if rdf_path.name.endswith(".gz") else None,
+            rdf_paths=[],
+            source_rdf_path=rdf_path,
             out_dir=out_dir / input_stem,
             image_ref=image_ref,
             methods=partitioned_methods,

@@ -371,21 +371,26 @@ one, so it avoids retaining both the part files and a full uncompressed
 aggregate.
 
 When HDT or COTTAS is selected, the aggregate is read sequentially and split
-into complete N-Triples records. The chunk guide is generated during that same
-pass, and the same temporary chunks are consumed by both converters before
-cleanup. HDT chunks are merged with `HDTCat`, the final HDT index is generated
-after merging through HDT Java's indexed search loader, and COTTAS chunks are merged with `pycottas.cat`, which rebuilds
-the query indexes for the merged representation.
+into complete N-Triples records. The same temporary chunks are consumed by
+both converters before cleanup. HDT chunks are merged with `HDTCat`, the final
+HDT index is generated after merging through HDT Java's indexed search loader,
+and COTTAS chunks are merged with `pycottas.cat`, which rebuilds the query
+indexes for the merged representation.
+
+Partitioned HDT/COTTAS compression runs in an ephemeral Docker-managed
+workspace. Temporary RDF chunks, COTTAS/DuckDB scratch data, intermediate
+representations, and merge files are not written to the output directory.
+After a successful or failed run, the temporary workspace is removed; only
+the selected final artifacts and normal run metrics remain on the host.
 
 HDT Java 3.0.10 does not provide a standalone `hdtGenerateIndex` executable.
 VCF-RDFizer sends an `exit` command to the supported `hdtSearch.sh` launcher;
 this opens the HDT through `mapIndexedHDT()` without executing a data query and
 creates the sibling `.hdt.index` sidecar before the run is marked successful.
 
-Successful aggregate partitioned runs retain `<sample>.chunks.json` beside the
-final compression artifacts. It records the record-safe chunk boundaries and
-uncompressed byte ranges; temporary RDF chunks and merge intermediates are
-removed after successful conversion.
+The record-safe chunk plan and per-stage timings are retained in the raw
+partitioned-compression metrics JSON for diagnostics. The temporary chunk
+files and guide are not retained as host files.
 
 See [`COMPRESSION_CHANGELOG.md`](COMPRESSION_CHANGELOG.md) for the detailed
 implementation approach and operational constraints.

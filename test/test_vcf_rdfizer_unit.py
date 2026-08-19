@@ -16,6 +16,50 @@ import vcf_rdfizer
 from test.helpers import VerboseTestCase
 
 
+def emulate_partitioned_runner(cmd):
+    """Create deterministic final artifacts for the one-shot Docker runner."""
+    if vcf_rdfizer.PARTITIONED_COMPRESSION_RUNNER_CONTAINER not in cmd:
+        return False
+    out_mount = next(
+        (
+            Path(part.split(":", 1)[0])
+            for part in cmd
+            if isinstance(part, str) and part.endswith(":/data/out")
+        ),
+        None,
+    )
+    if out_mount is None:
+        return False
+    output_name = cmd[cmd.index("--output-name") + 1]
+    methods = cmd[cmd.index("--methods") + 1].split(",")
+    method_results = {}
+    for method in methods:
+        artifact_name = vcf_rdfizer.compression_artifact_name_for_method(
+            Path(f"{output_name}.nt"), method
+        )
+        artifact_path = out_mount / artifact_name
+        artifact_path.write_text(f"mock-{method}\n")
+        method_results[method] = {
+            "exit_code": 0,
+            "wall_seconds": 0.2,
+            "user_seconds": 0.1,
+            "sys_seconds": 0.05,
+            "max_rss_kb": 4096,
+            "output_path": f"/data/out/{artifact_name}",
+            "output_size_bytes": artifact_path.stat().st_size,
+            "source": "partitioned_generated",
+            "details": {"chunk_count": 2, "merge_rounds": 1},
+        }
+    if "hdt" in methods:
+        (out_mount / f"{output_name}.hdt.index").write_text("mock-index\n")
+    result_container_path = cmd[cmd.index("--result-path") + 1]
+    result_path = out_mount / result_container_path.replace("/data/out/", "", 1)
+    result_path.write_text(
+        json.dumps({"exit_code": 0, "methods": method_results, "stages": []})
+    )
+    return True
+
+
 def invoke_main(argv, *, auto_storage=True):
     args = list(argv)
     normalized = []
@@ -52,7 +96,11 @@ def invoke_main(argv, *, auto_storage=True):
 
     def run_with_default_aggregate(cmd, cwd=None, env=None):
         """Make successful mocked RMLStreamer calls produce the new aggregate artifact."""
+        if isinstance(cmd, list) and "volume" in cmd and "docker" in cmd:
+            return 0
         result = original_run(cmd, cwd=cwd, env=env)
+        if result == 0 and emulate_partitioned_runner(cmd):
+            return result
         if result == 0 and "/opt/vcf-rdfizer/run_conversion.sh" in cmd:
             out_mount = next(
                 (
@@ -660,74 +708,25 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertEqual(json.loads(guide.read_text())["chunks"], plan["chunks"])
 
     def test_run_partitioned_hdt_methods_merges_chunks_and_generates_index(self):
-        """Partitioned HDT/COTTAS pipelines share chunks and write final artifacts."""
+        """Partitioned HDT/COTTAS pipelines share chunks in one container."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             out_dir = tmp_path / "out" / "sample"
+            source = out_dir / "sample.nt"
             out_dir.mkdir(parents=True, exist_ok=True)
-            rdf_paths = []
-            for index in range(3):
-                rdf_path = out_dir / f"part-{index:05d}.nt"
-                rdf_path.write_text("<s> <p> <o> .\n" * 4)
-                rdf_paths.append(rdf_path)
+            source.write_text("<s> <p> <o> .\n" * 12)
+            commands = []
 
             def fake_run(cmd, cwd=None, env=None):
-                script = str(cmd[-1]) if cmd else ""
-                work_mount = next(
-                    (part.split(":", 1)[0] for part in cmd if isinstance(part, str) and part.endswith(":/data/work")),
-                    None,
-                )
-                out_mount = next(
-                    (part.split(":", 1)[0] for part in cmd if isinstance(part, str) and part.endswith(":/data/out")),
-                    None,
-                )
-                time_match = re.search(r"-o\s+(/data/work/[^\s;]+)", script)
-                if work_mount and time_match:
-                    time_log = Path(work_mount) / time_match.group(1).replace("/data/work/", "", 1)
-                    time_log.parent.mkdir(parents=True, exist_ok=True)
-                    time_log.write_text(
-                        "User time (seconds): 0.20\n"
-                        "System time (seconds): 0.05\n"
-                        "Elapsed (wall clock) time (h:mm:ss or m:ss): 0:00.10\n"
-                        "Maximum resident set size (kbytes): 4096\n"
-                    )
-
-                if work_mount and '"$HDT_BIN"' in script:
-                    outputs = re.findall(r"(/data/work/[^\s;]+\.hdt)", script)
-                    if outputs:
-                        output_path = Path(work_mount) / outputs[-1].replace("/data/work/", "", 1)
-                        output_path.parent.mkdir(parents=True, exist_ok=True)
-                        output_path.write_text("chunk-hdt\n")
-
-                if work_mount and '"$HDTCAT_BIN"' in script:
-                    outputs = re.findall(r"(/data/work/[^\s;]+\.hdt)", script)
-                    if outputs:
-                        output_path = Path(work_mount) / outputs[-1].replace("/data/work/", "", 1)
-                        output_path.parent.mkdir(parents=True, exist_ok=True)
-                        output_path.write_text("merged-hdt\n")
-
-                if work_mount and "cottas_tool.py" in script:
-                    outputs = re.findall(r"(/data/work/[^\s;]+\.cottas)", script)
-                    if outputs:
-                        output_path = Path(work_mount) / outputs[-1].replace("/data/work/", "", 1)
-                        output_path.parent.mkdir(parents=True, exist_ok=True)
-                        output_path.write_text("cottas\n")
-
-                if out_mount and "ensure_hdt_index.sh" in script:
-                    index_match = re.search(r"ensure_hdt_index\.sh\s+(/data/out/[^\s;]+\.hdt)", script)
-                    if index_match:
-                        index_path = Path(out_mount) / index_match.group(1).replace("/data/out/", "", 1)
-                        Path(str(index_path) + ".index").write_text("index\n")
-
-                if out_mount and "gzip -c /data/out/sample.hdt" in script:
-                    (Path(out_mount) / "sample.hdt.gz").write_text("gz\n")
-                if out_mount and "gzip -c /data/out/sample.cottas" in script:
-                    (Path(out_mount) / "sample.cottas.gz").write_text("gz\n")
+                commands.append(cmd)
+                if vcf_rdfizer.PARTITIONED_COMPRESSION_RUNNER_CONTAINER in cmd:
+                    self.assertTrue(emulate_partitioned_runner(cmd))
                 return 0
 
             with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run):
                 ok, method_results = vcf_rdfizer.run_partitioned_representation_methods_for_rdf_files(
-                    rdf_paths=rdf_paths,
+                    rdf_paths=[],
+                    source_rdf_path=source,
                     out_dir=out_dir,
                     image_ref="example/vcf-rdfizer:latest",
                     methods=["hdt", "hdt_gzip", "cottas", "cottas_gzip"],
@@ -748,8 +747,94 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertTrue((out_dir / "sample.hdt.gz").exists())
             self.assertTrue((out_dir / "sample.cottas").exists())
             self.assertTrue((out_dir / "sample.cottas.gz").exists())
+            self.assertTrue(any("target=/work" in " ".join(cmd) for cmd in commands))
             self.assertGreaterEqual(method_results["hdt"]["details"]["chunk_count"], 2)
             self.assertGreaterEqual(method_results["hdt"]["details"]["merge_rounds"], 1)
+
+    def test_containerized_partitioned_pipeline_cleans_ephemeral_volume(self):
+        """Source-based partitioning leaves only final artifacts on the host."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            source = tmp_path / "input.nt"
+            source.write_text("<s> <p> <o> .\n")
+            out_dir = tmp_path / "out" / "sample"
+            commands = []
+
+            def fake_run(cmd, cwd=None, env=None):
+                commands.append(cmd)
+                if vcf_rdfizer.PARTITIONED_COMPRESSION_RUNNER_CONTAINER in cmd:
+                    self.assertTrue(emulate_partitioned_runner(cmd))
+                return 0
+
+            with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run):
+                ok, method_results = vcf_rdfizer.run_partitioned_representation_methods_for_rdf_files(
+                    rdf_paths=[],
+                    source_rdf_path=source,
+                    out_dir=out_dir,
+                    image_ref="example/vcf-rdfizer:latest",
+                    methods=["hdt", "cottas"],
+                    wrapper_log_path=tmp_path / "wrapper.log",
+                    output_name="sample",
+                    target_chunk_bytes=40,
+                    min_chunk_bytes=10,
+                    max_chunk_bytes=60,
+                )
+
+            self.assertTrue(ok)
+            self.assertEqual(method_results["hdt"]["details"]["workspace"], "docker-volume")
+            self.assertEqual(method_results["cottas"]["details"]["workspace_cleanup"], "removed")
+            self.assertTrue((out_dir / "sample.hdt").exists())
+            self.assertTrue((out_dir / "sample.cottas").exists())
+            self.assertFalse((out_dir / ".compression_partitioned").exists())
+            self.assertTrue(any("volume" in cmd and "create" in cmd for cmd in commands))
+            self.assertTrue(any("volume" in cmd and "rm" in cmd for cmd in commands))
+            runner_command = next(
+                cmd for cmd in commands if vcf_rdfizer.PARTITIONED_COMPRESSION_RUNNER_CONTAINER in cmd
+            )
+            self.assertIn(f"{source.parent.resolve()}:/data/in:ro", runner_command)
+
+    def test_containerized_partitioned_pipeline_removes_volume_after_failure(self):
+        """A failed container run still removes its named workspace volume."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            source = tmp_path / "input.nt"
+            source.write_text("<s> <p> <o> .\n")
+            out_dir = tmp_path / "out"
+            commands = []
+
+            def fake_run(cmd, cwd=None, env=None):
+                commands.append(cmd)
+                if vcf_rdfizer.PARTITIONED_COMPRESSION_RUNNER_CONTAINER in cmd:
+                    out_mount = next(
+                        Path(part.split(":", 1)[0])
+                        for part in cmd
+                        if isinstance(part, str) and part.endswith(":/data/out")
+                    )
+                    result_path = out_mount / cmd[cmd.index("--result-path") + 1].replace(
+                        "/data/out/", "", 1
+                    )
+                    result_path.write_text(json.dumps({"exit_code": 1, "methods": {}}))
+                    return 1
+                return 0
+
+            with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run):
+                ok, method_results = vcf_rdfizer.run_partitioned_representation_methods_for_rdf_files(
+                    rdf_paths=[],
+                    source_rdf_path=source,
+                    out_dir=out_dir,
+                    image_ref="example/vcf-rdfizer:latest",
+                    methods=["cottas"],
+                    wrapper_log_path=tmp_path / "wrapper.log",
+                    output_name="sample",
+                    target_chunk_bytes=40,
+                    min_chunk_bytes=10,
+                    max_chunk_bytes=60,
+                )
+
+            self.assertFalse(ok)
+            self.assertEqual(method_results, {})
+            self.assertTrue(any("volume" in cmd and "rm" in cmd for cmd in commands))
+            self.assertFalse(any(path.name.startswith(".") for path in out_dir.glob("*")))
 
     def test_main_full_mode_records_tsv_metrics_and_raw_artifacts(self):
         """Full mode stores TSV timing/metrics artifacts and writes TSV fields into metrics.csv."""
@@ -1928,7 +2013,7 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertTrue(any(str(arg).startswith("IN_VCF=/data/in/") for arg in commands[1]))
 
     def test_main_full_mode_plain_hdt_uses_partitioned_merge_pipeline(self):
-        """Plain aggregate HDT uses chunk-local rdf2hdt plus HDTCat and indexing."""
+        """Plain aggregate HDT uses the ephemeral container-side merge pipeline."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             input_dir, rules_path = prepare_inputs(tmp_path)
@@ -2021,8 +2106,15 @@ class WrapperUnitTests(VerboseTestCase):
                 os.chdir(old_cwd)
 
             self.assertEqual(rc, 0)
-            self.assertTrue(any('"$HDTCAT_BIN"' in str(cmd[-1]) for cmd in commands if isinstance(cmd, list) and cmd))
-            self.assertTrue(any("ensure_hdt_index.sh" in str(cmd[-1]) for cmd in commands if isinstance(cmd, list) and cmd))
+            runner_commands = [
+                cmd
+                for cmd in commands
+                if vcf_rdfizer.PARTITIONED_COMPRESSION_RUNNER_CONTAINER in cmd
+            ]
+            self.assertEqual(len(runner_commands), 1)
+            self.assertIn("target=/work", " ".join(runner_commands[0]))
+            self.assertIn("--methods hdt", " ".join(runner_commands[0]))
+            self.assertFalse((out_dir / "sample" / ".compression_partitioned").exists())
             self.assertTrue((out_dir / "sample" / "sample.hdt").exists())
 
     def test_main_full_mode_plain_storage_sets_storage_mode(self):
