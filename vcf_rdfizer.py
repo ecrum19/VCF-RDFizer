@@ -108,6 +108,9 @@ COMPRESSION_METHOD_COLUMNS = {
         "user_seconds_hdt",
         "sys_seconds_hdt",
         "max_rss_kb_hdt",
+        "source_triples_hdt",
+        "decoded_triples_hdt",
+        "validation_hdt",
     ],
     "hdt_gzip": [
         "gzip_on_hdt_size_bytes",
@@ -148,6 +151,9 @@ COMPRESSION_METHOD_COLUMNS = {
         "user_seconds_cottas",
         "sys_seconds_cottas",
         "max_rss_kb_cottas",
+        "source_triples_cottas",
+        "decoded_triples_cottas",
+        "validation_cottas",
     ],
 }
 
@@ -1757,7 +1763,8 @@ def metrics_header_for_methods(selected_methods: list[str]) -> list[str]:
     if "brotli" in methods:
         header.extend(COMPRESSION_METHOD_COLUMNS["brotli"])
 
-    if "cottas" in methods:
+    uses_cottas = any(method in COTTAS_COMPRESSION_METHODS for method in methods)
+    if uses_cottas:
         header.extend(COMPRESSION_METHOD_COLUMNS["cottas"])
 
     uses_hdt = any(method in HDT_COMPRESSION_METHODS for method in methods)
@@ -1863,6 +1870,18 @@ def update_metrics_csv_with_compression(
         "max_rss_kb_brotli": "null",
         "max_rss_kb_hdt": "null",
         "hdt_source": "not_used",
+        "source_triples_hdt": "null",
+        "decoded_triples_hdt": "null",
+        "validation_hdt": "null",
+        "cottas_size_bytes": "0",
+        "exit_code_cottas": "0",
+        "wall_seconds_cottas": "null",
+        "user_seconds_cottas": "null",
+        "sys_seconds_cottas": "null",
+        "max_rss_kb_cottas": "null",
+        "source_triples_cottas": "null",
+        "decoded_triples_cottas": "null",
+        "validation_cottas": "null",
         "gzip_on_hdt_size_bytes": "0",
         "brotli_on_hdt_size_bytes": "0",
         "exit_code_gzip_on_hdt": "0",
@@ -1920,6 +1939,22 @@ def update_metrics_csv_with_compression(
         if rss_col in row:
             row[rss_col] = "null" if rss_val is None else str(int(rss_val))
 
+    def assign_validation(method: str, result: dict):
+        validation = result.get("validation") or result.get("details", {}).get("validation") or {}
+        if not validation:
+            return
+        source_key = f"source_triples_{method}"
+        decoded_key = f"decoded_triples_{method}"
+        valid_key = f"validation_{method}"
+        if source_key in row:
+            source = validation.get("source_triples")
+            row[source_key] = "null" if source is None else str(int(source))
+        if decoded_key in row:
+            decoded = validation.get("decoded_triples")
+            row[decoded_key] = "null" if decoded is None else str(int(decoded))
+        if valid_key in row:
+            row[valid_key] = "true" if validation.get("valid") and validation.get("count_match") else "false"
+
     for method in ("gzip", "brotli", "hdt", "cottas"):
         result = method_results.get(method)
         if result is None:
@@ -1931,6 +1966,8 @@ def update_metrics_csv_with_compression(
         if exit_key in row:
             row[exit_key] = str(int(result.get("exit_code") or 0))
         assign_timing(method, result)
+        if method in {"hdt", "cottas"}:
+            assign_validation(method, result)
 
     hdt_result = method_results.get("hdt")
     if hdt_result is not None and "hdt_source" in row:
@@ -2003,6 +2040,16 @@ def write_compression_metrics_artifacts(
             f"output_path={result.get('output_path', '')}",
             f"output_size_bytes={result.get('output_size_bytes', 0)}",
         ]
+        validation = result.get("validation") or result.get("details", {}).get("validation")
+        if validation:
+            lines.extend(
+                [
+                    f"validation_valid={str(bool(validation.get('valid'))).lower()}",
+                    f"validation_count_match={str(bool(validation.get('count_match'))).lower()}",
+                    f"source_triples={validation.get('source_triples', 'null')}",
+                    f"decoded_triples={validation.get('decoded_triples', 'null')}",
+                ]
+            )
         time_log.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     gzip_result = method_results.get("gzip", {})
@@ -2048,12 +2095,16 @@ def write_compression_metrics_artifacts(
             "output_cottas_size_bytes": int(cottas_result.get("output_size_bytes") or 0),
             "exit_code": int(cottas_result.get("exit_code") or 0),
             "timing": timing_payload(cottas_result),
+            "validation": cottas_result.get("validation")
+            or cottas_result.get("details", {}).get("validation"),
         },
         "hdt_conversion": {
             "output_hdt_path": hdt_result.get("output_path", ""),
             "output_hdt_size_bytes": int(hdt_result.get("output_size_bytes") or 0),
             "exit_code": int(hdt_result.get("exit_code") or 0),
             "timing": timing_payload(hdt_result),
+            "validation": hdt_result.get("validation")
+            or hdt_result.get("details", {}).get("validation"),
         },
         "gzip_on_hdt": {
             "output_hdt_gz_path": hdt_gzip_result.get("output_path", ""),
@@ -2115,6 +2166,7 @@ def write_raw_compression_metrics_artifact(
     }
 
     for method, result in method_results.items():
+        details = result.get("details", {})
         payload["methods"][method] = {
             "exit_code": int(result.get("exit_code") or 0),
             "wall_seconds": result.get("wall_seconds"),
@@ -2124,7 +2176,8 @@ def write_raw_compression_metrics_artifact(
             "output_path": result.get("output_path", ""),
             "output_size_bytes": int(result.get("output_size_bytes") or 0),
             "source": result.get("source"),
-            "details": result.get("details", {}),
+            "details": details,
+            "validation": result.get("validation") or details.get("validation"),
         }
 
     raw_json = raw_json_dir / f"{run_id}.json"
@@ -2505,6 +2558,7 @@ def run_compression_methods_for_rdf(
     run_id: str | None = None,
     timestamp: str | None = None,
     output_name: str | None = None,
+    expected_triples: int | None = None,
 ):
     """Run selected compression stages for a single RDF file.
 
@@ -2556,7 +2610,13 @@ def run_compression_methods_for_rdf(
     safe_output_name = safe_metrics_name(metrics_output_name)
     safe_rdf_name = safe_metrics_name(rdf_path.name)
 
-    def run_container_command(*, method: str, artifact_name: str, command: str):
+    def run_container_command(
+        *,
+        method: str,
+        artifact_name: str,
+        command: str,
+        record_method: bool = True,
+    ):
         """Execute one compression command in Docker and capture timing/size."""
         timing_name = f".{input_stem}.{method}.time"
         timing_container = f"{target_out_container}/{timing_name}"
@@ -2586,7 +2646,7 @@ def run_compression_methods_for_rdf(
         elapsed = time.perf_counter() - started
         timing = parse_time_log_metrics(timing_host)
         output_path = target_out_dir / artifact_name
-        method_results[method] = {
+        result = {
             "exit_code": exit_code,
             # Prefer the wrapper-observed docker runtime over the inner
             # `/usr/bin/time` elapsed field for long-running jobs.
@@ -2597,7 +2657,9 @@ def run_compression_methods_for_rdf(
             "output_path": str(output_path),
             "output_size_bytes": int(file_size_bytes(output_path) or 0),
         }
-        if metrics_dir is not None and run_id is not None and timing_host.exists():
+        if record_method:
+            method_results[method] = result
+        if record_method and metrics_dir is not None and run_id is not None and timing_host.exists():
             raw_time_dir = (
                 metrics_dir
                 / "raw_metrics"
@@ -2617,12 +2679,71 @@ def run_compression_methods_for_rdf(
                 timing_host.unlink()
             except OSError:
                 pass
-        if method == "hdt":
+        if record_method and method == "hdt":
             method_results[method]["source"] = "generated"
-        if exit_code != 0:
+        if exit_code != 0 and record_method:
             eprint(f"Error: {method} compression failed. See log: {wrapper_log_path}")
             return False
         return True
+
+    def validate_container_artifact(
+        *,
+        method: str,
+        artifact_name: str,
+        artifact_format: str,
+        artifact_container: str,
+    ) -> tuple[bool, dict]:
+        """Validate a base representation before any packaging or cleanup."""
+        report_name = f".{input_stem}.{artifact_format}.validation.json"
+        report_path = target_out_dir / report_name
+        report_container = f"{target_out_container}/{report_name}"
+        command_parts = [
+            "set -euo pipefail;",
+            f"rm -f {shlex.quote(report_container)};",
+            'PYTHON_BIN="${COTTAS_PYTHON_BIN:-$(command -v python3 || true)}";',
+            'if [[ -z "$PYTHON_BIN" || ! -x "$PYTHON_BIN" ]]; then ',
+            'echo "Missing Python executable in container" >&2; exit 127; fi;',
+            'VALIDATOR="/opt/vcf-rdfizer/validate_compression.py";',
+            'if [[ ! -f "$VALIDATOR" ]]; then ',
+            'echo "Missing compression validator in container" >&2; exit 127; fi;',
+            '"$PYTHON_BIN" "$VALIDATOR"',
+            f"--source {shlex.quote(input_container)}",
+            f"--artifact {shlex.quote(artifact_container)}",
+            f"--format {shlex.quote(artifact_format)}",
+            f"--result-path {shlex.quote(report_container)}",
+        ]
+        if expected_triples is not None:
+            command_parts.append(f"--expected-triples {int(expected_triples)}")
+        command = " ".join(command_parts)
+        if not run_container_command(
+            method=f"{method}-validation",
+            artifact_name=report_name,
+            command=command,
+            record_method=False,
+        ):
+            report = {
+                "valid": False,
+                "count_match": False,
+                "error": f"{artifact_format.upper()} validation command failed",
+            }
+        else:
+            try:
+                report = json.loads(report_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                report = {
+                    "valid": False,
+                    "count_match": False,
+                    "error": f"validator did not produce a valid report: {exc}",
+                }
+        report_path.unlink(missing_ok=True)
+        valid = bool(report.get("valid")) and bool(report.get("count_match"))
+        if not valid:
+            eprint(
+                f"Error: {artifact_format.upper()} validation failed for {artifact_name}: "
+                f"{report.get('error', 'decoded triple count mismatch')}. "
+                f"See log: {wrapper_log_path}"
+            )
+        return valid, report
 
     def ensure_hdt_available():
         """Ensure `.hdt` exists for HDT-based compound methods."""
@@ -2630,7 +2751,6 @@ def run_compression_methods_for_rdf(
         if hdt_is_ready:
             return True
         if hdt_path.exists():
-            hdt_is_ready = True
             hdt_source = "existing"
             method_results.setdefault(
                 "hdt",
@@ -2644,6 +2764,16 @@ def run_compression_methods_for_rdf(
                     "output_size_bytes": int(file_size_bytes(hdt_path) or 0),
                 },
             )
+            valid, report = validate_container_artifact(
+                method="hdt",
+                artifact_name=hdt_name,
+                artifact_format="hdt",
+                artifact_container=hdt_container,
+            )
+            if not valid:
+                return False
+            method_results["hdt"]["validation"] = report
+            hdt_is_ready = True
             return True
         hdt_command = (
             "set -euo pipefail; "
@@ -2662,6 +2792,15 @@ def run_compression_methods_for_rdf(
         )
         if not run_container_command(method="hdt", artifact_name=hdt_name, command=hdt_command):
             return False
+        valid, report = validate_container_artifact(
+            method="hdt",
+            artifact_name=hdt_name,
+            artifact_format="hdt",
+            artifact_container=hdt_container,
+        )
+        if not valid:
+            return False
+        method_results["hdt"]["validation"] = report
         hdt_is_ready = True
         hdt_source = "generated"
         return True
@@ -2672,7 +2811,6 @@ def run_compression_methods_for_rdf(
         if cottas_is_ready:
             return True
         if cottas_path.exists():
-            cottas_is_ready = True
             method_results.setdefault(
                 "cottas",
                 {
@@ -2686,6 +2824,16 @@ def run_compression_methods_for_rdf(
                     "source": "existing",
                 },
             )
+            valid, report = validate_container_artifact(
+                method="cottas",
+                artifact_name=cottas_name,
+                artifact_format="cottas",
+                artifact_container=cottas_container,
+            )
+            if not valid:
+                return False
+            method_results["cottas"]["validation"] = report
+            cottas_is_ready = True
             return True
         cottas_command = (
             "set -euo pipefail; "
@@ -2702,6 +2850,15 @@ def run_compression_methods_for_rdf(
             command=cottas_command,
         ):
             return False
+        valid, report = validate_container_artifact(
+            method="cottas",
+            artifact_name=cottas_name,
+            artifact_format="cottas",
+            artifact_container=cottas_container,
+        )
+        if not valid:
+            return False
+        method_results["cottas"]["validation"] = report
         cottas_is_ready = True
         return True
 
@@ -2869,6 +3026,7 @@ def run_containerized_partitioned_representation_methods(
     target_chunk_bytes: int,
     min_chunk_bytes: int,
     max_chunk_bytes: int,
+    expected_triples: int | None = None,
 ):
     """Run partitioned compression in an ephemeral Docker-managed volume.
 
@@ -2947,6 +3105,7 @@ def run_containerized_partitioned_representation_methods(
                 str(min_chunk_bytes),
                 "--max-chunk-bytes",
                 str(max_chunk_bytes),
+                *(["--expected-triples", str(expected_triples)] if expected_triples is not None else []),
                 "--result-path",
                 f"/data/out/{result_path.name}",
             ]
@@ -3038,6 +3197,7 @@ def run_partitioned_representation_methods_for_rdf_files(
     target_chunk_bytes: int,
     min_chunk_bytes: int,
     max_chunk_bytes: int,
+    expected_triples: int | None = None,
 ):
     """Dispatch aggregate RDF to the ephemeral container pipeline.
 
@@ -3068,6 +3228,7 @@ def run_partitioned_representation_methods_for_rdf_files(
         target_chunk_bytes=target_chunk_bytes,
         min_chunk_bytes=min_chunk_bytes,
         max_chunk_bytes=max_chunk_bytes,
+        expected_triples=expected_triples,
     )
 
 
@@ -3436,6 +3597,7 @@ def run_full_mode(
                     run_id=run_id,
                     timestamp=timestamp,
                     output_name=output_name,
+                    expected_triples=triples_produced,
                 )
                 if not ok:
                     fail_current(
@@ -3460,6 +3622,7 @@ def run_full_mode(
                     target_chunk_bytes=chunk_target_bytes,
                     min_chunk_bytes=chunk_min_bytes,
                     max_chunk_bytes=chunk_max_bytes,
+                    expected_triples=triples_produced,
                 )
                 if not ok:
                     fail_current(

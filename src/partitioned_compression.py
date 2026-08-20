@@ -31,6 +31,12 @@ HDT_CAT_CANDIDATES = (
 )
 
 
+def is_triple_line(line: bytes) -> bool:
+    """Identify an N-Triples record without parsing or copying its terms."""
+    stripped = line.strip()
+    return bool(stripped) and not stripped.startswith(b"#") and stripped.endswith(b".")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="VCF-RDFizer partitioned compression runner")
     parser.add_argument("--source", required=True, help="plain or gzip-compressed N-Triples input")
@@ -40,6 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-chunk-bytes", required=True, type=int)
     parser.add_argument("--min-chunk-bytes", required=True, type=int)
     parser.add_argument("--max-chunk-bytes", required=True, type=int)
+    parser.add_argument("--expected-triples", type=int)
     parser.add_argument("--result-path", required=True)
     return parser.parse_args()
 
@@ -124,7 +131,8 @@ def plan_chunks(
             handle.write(line)
             chunk_size += line_size
             logical_offset += line_size
-            record_count += 1
+            if is_triple_line(line):
+                record_count += 1
     finally:
         close_chunk()
 
@@ -306,6 +314,12 @@ def main() -> int:
         )
         if not chunks:
             raise ValueError("RDF source contains no complete records")
+        source_triples = int(plan["record_count"])
+        if args.expected_triples is not None and source_triples != args.expected_triples:
+            raise ValueError(
+                "source triple count does not match the upstream conversion count: "
+                f"source={source_triples}, expected={args.expected_triples}"
+            )
         hdt_paths: list[Path] = []
         cottas_paths: list[Path] = []
         needs_hdt = any(method in HDT_METHODS for method in methods)
@@ -325,6 +339,65 @@ def main() -> int:
         cottas_python = os.environ.get("COTTAS_PYTHON_BIN") or shutil.which("python3")
         if any(method in COTTAS_METHODS for method in methods) and not cottas_python:
             raise RuntimeError("Missing Python runtime for COTTAS")
+
+        def validate_artifact(
+            *,
+            name: str,
+            artifact: Path,
+            artifact_format: str,
+            python_bin: str,
+            skip_index_check: bool = False,
+        ) -> dict:
+            """Decode/count one final artifact and return its validation report."""
+            validation_path = work_dir / f".{name}.validation.json"
+            command = [
+                python_bin,
+                "/opt/vcf-rdfizer/validate_compression.py",
+                "--source",
+                str(source),
+                "--artifact",
+                str(artifact),
+                "--format",
+                artifact_format,
+                "--source-triples",
+                str(source_triples),
+                "--result-path",
+                str(validation_path),
+            ]
+            if args.expected_triples is not None:
+                command.extend(["--expected-triples", str(args.expected_triples)])
+            if skip_index_check:
+                command.append("--skip-index-check")
+            stage = runner.run(name, command, validation_path)
+            try:
+                report = json.loads(validation_path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, json.JSONDecodeError) as exc:
+                report = {
+                    "valid": False,
+                    "count_match": False,
+                    "error": f"validator did not produce a valid report: {exc}",
+                }
+            finally:
+                validation_path.unlink(missing_ok=True)
+            report.setdefault(
+                "timing",
+                {
+                    "wall_seconds": stage.get("wall_seconds"),
+                    "user_seconds": stage.get("user_seconds"),
+                    "sys_seconds": stage.get("sys_seconds"),
+                    "max_rss_kb": stage.get("max_rss_kb"),
+                },
+            )
+            if (
+                stage["exit_code"] != 0
+                or not report.get("valid")
+                or not report.get("count_match")
+            ):
+                raise RuntimeError(
+                    f"{artifact_format.upper()} validation failed for {artifact.name}: "
+                    f"{report.get('error', 'decoded triple count mismatch')}"
+                )
+            return report
 
         for index, chunk in enumerate(chunks):
             if needs_hdt:
@@ -369,6 +442,13 @@ def main() -> int:
             add_totals(hdt_total, index_stage)
             if index_stage["exit_code"] != 0:
                 raise RuntimeError("final HDT index initialization failed")
+            hdt_validation = validate_artifact(
+                name="hdt-validate",
+                artifact=output_hdt,
+                artifact_format="hdt",
+                python_bin=sys.executable,
+                skip_index_check=True,
+            )
             results["hdt"] = {
                 **finalize_totals(hdt_total),
                 "output_path": str(output_hdt),
@@ -379,6 +459,7 @@ def main() -> int:
                     "merge_rounds": hdt_rounds,
                     "index_path": str(output_index),
                     "index_size_bytes": output_index.stat().st_size,
+                    "validation": hdt_validation,
                 },
             }
 
@@ -395,12 +476,23 @@ def main() -> int:
                 raise RuntimeError("COTTAS merge failed")
             shutil.copyfile(final_cottas, output_cottas)
             final_cottas.unlink(missing_ok=True)
+            cottas_validation = validate_artifact(
+                name="cottas-validate",
+                artifact=output_cottas,
+                artifact_format="cottas",
+                python_bin=cottas_python,
+            )
             results["cottas"] = {
                 **finalize_totals(cottas_total),
                 "output_path": str(output_cottas),
                 "output_size_bytes": output_cottas.stat().st_size,
                 "source": "partitioned_generated",
-                "details": {**plan, "merge_rounds": cottas_rounds, "index": "spo"},
+                "details": {
+                    **plan,
+                    "merge_rounds": cottas_rounds,
+                    "index": "spo",
+                    "validation": cottas_validation,
+                },
             }
 
         for method in methods:

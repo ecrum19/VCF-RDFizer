@@ -1,4 +1,6 @@
 import csv
+import gzip
+import importlib.util
 import json
 import os
 import re
@@ -48,7 +50,17 @@ def emulate_partitioned_runner(cmd):
             "output_path": f"/data/out/{artifact_name}",
             "output_size_bytes": artifact_path.stat().st_size,
             "source": "partitioned_generated",
-            "details": {"chunk_count": 2, "merge_rounds": 1},
+            "details": {
+                "chunk_count": 2,
+                "merge_rounds": 1,
+                "validation": {
+                    "valid": True,
+                    "source_triples": 12,
+                    "decoded_triples": 12,
+                    "expected_triples": 12,
+                    "count_match": True,
+                },
+            },
         }
     if "hdt" in methods:
         (out_mount / f"{output_name}.hdt.index").write_text("mock-index\n")
@@ -56,6 +68,39 @@ def emulate_partitioned_runner(cmd):
     result_path = out_mount / result_container_path.replace("/data/out/", "", 1)
     result_path.write_text(
         json.dumps({"exit_code": 0, "methods": method_results, "stages": []})
+    )
+    return True
+
+
+def emulate_validation_command(cmd):
+    """Make mocked Docker validation return a successful one-triple report."""
+    rendered = str(cmd[-1]) if cmd else ""
+    if "validate_compression.py" not in rendered:
+        return False
+    out_mount = next(
+        (
+            Path(part.split(":", 1)[0])
+            for part in cmd
+            if isinstance(part, str) and part.endswith(":/data/out")
+        ),
+        None,
+    )
+    result_match = re.search(r"--result-path\s+['\"]?(/data/out/[^\s'\";]+)", rendered)
+    if out_mount is None or result_match is None:
+        return False
+    result_path = out_mount / result_match.group(1).replace("/data/out/", "", 1)
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    result_path.write_text(
+        json.dumps(
+            {
+                "valid": True,
+                "source_triples": 1,
+                "decoded_triples": 1,
+                "expected_triples": 1,
+                "count_match": True,
+                "validator": "mock",
+            }
+        )
     )
     return True
 
@@ -97,6 +142,8 @@ def invoke_main(argv, *, auto_storage=True):
     def run_with_default_aggregate(cmd, cwd=None, env=None):
         """Make successful mocked RMLStreamer calls produce the new aggregate artifact."""
         if isinstance(cmd, list) and "volume" in cmd and "docker" in cmd:
+            return 0
+        if emulate_validation_command(cmd):
             return 0
         result = original_run(cmd, cwd=cwd, env=env)
         if result == 0 and emulate_partitioned_runner(cmd):
@@ -209,6 +256,24 @@ def latest_metrics_run_dir(metrics_root: Path) -> Path:
 
 
 class WrapperUnitTests(VerboseTestCase):
+    def test_validator_counts_plain_and_gzip_ntriples(self):
+        """The Docker validator's fallback source count handles .nt and .nt.gz."""
+        validator_path = Path(__file__).parents[1] / "src" / "validate_compression.py"
+        spec = importlib.util.spec_from_file_location("validate_compression", validator_path)
+        validator = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(validator)
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            payload = b"# comment\n<s1> <p> <o1> .\n\n<s2> <p> <o2> .\n"
+            plain = tmp_path / "sample.nt"
+            plain.write_bytes(payload)
+            compressed = tmp_path / "sample.nt.gz"
+            with gzip.open(compressed, "wb") as handle:
+                handle.write(payload)
+            self.assertEqual(validator.count_nt(plain), 2)
+            self.assertEqual(validator.count_nt(compressed), 2)
+
     def test_print_summary_lists_all_selected_compression_sizes(self):
         """Summary printer includes one size line per requested compression method."""
         with tempfile.TemporaryDirectory() as td:
@@ -339,6 +404,8 @@ class WrapperUnitTests(VerboseTestCase):
                     ),
                     None,
                 )
+                if emulate_validation_command(cmd):
+                    return 0
                 script = str(cmd[-1]) if cmd else ""
                 time_match = re.search(r"-o\s+(/data/metrics/raw_metrics/tsv_time/[^\s;]+)", script)
                 if metrics_mount and time_match:
@@ -391,6 +458,8 @@ class WrapperUnitTests(VerboseTestCase):
             rdf_path.write_text("<s> <p> <o> .\n")
 
             def fake_run(cmd, cwd=None, env=None):
+                if emulate_validation_command(cmd):
+                    return 0
                 script = str(cmd[-1]) if cmd else ""
                 time_match = re.search(r"-o\s+(/data/out/[^\s;]+)", script)
                 if time_match:
@@ -476,6 +545,8 @@ class WrapperUnitTests(VerboseTestCase):
             rdf_path.write_text("<s> <p> <o> .\n")
 
             def fake_run(cmd, cwd=None, env=None):
+                if emulate_validation_command(cmd):
+                    return 0
                 script = str(cmd[-1]) if cmd else ""
                 time_match = re.search(r"-o\s+(/data/out/[^\s;]+)", script)
                 if time_match:
@@ -492,7 +563,7 @@ class WrapperUnitTests(VerboseTestCase):
                 return 0
 
             with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch(
-                "vcf_rdfizer.time.perf_counter", side_effect=[1000.0, 3700.0]
+                "vcf_rdfizer.time.perf_counter", side_effect=[1000.0, 3700.0, 3700.0, 3700.0]
             ):
                 ok, method_results = vcf_rdfizer.run_compression_methods_for_rdf(
                     rdf_path=rdf_path,
@@ -520,6 +591,8 @@ class WrapperUnitTests(VerboseTestCase):
             rdf_path.write_text("<s> <p> <o> .\n")
 
             def fake_run(cmd, cwd=None, env=None):
+                if emulate_validation_command(cmd):
+                    return 0
                 script = str(cmd[-1]) if cmd else ""
                 time_match = re.search(r"-o\s+(/data/out/[^\s;]+)", script)
                 if time_match:
@@ -587,6 +660,8 @@ class WrapperUnitTests(VerboseTestCase):
             rdf_path.write_text("<s> <p> <o> .\n")
 
             def fake_run(cmd, cwd=None, env=None):
+                if emulate_validation_command(cmd):
+                    return 0
                 script = str(cmd[-1]) if cmd else ""
                 time_match = re.search(r"-o\s+(/data/out/[^\s;]+)", script)
                 if time_match:
@@ -642,6 +717,58 @@ class WrapperUnitTests(VerboseTestCase):
             payload = json.loads(raw_json.read_text())
             self.assertIn("cottas_gzip", payload["methods"])
             self.assertIn("cottas_brotli", payload["methods"])
+
+    def test_compression_validation_mismatch_fails_before_success(self):
+        """A decoded triple-count mismatch fails compression and preserves RDF input."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            out_dir = tmp_path / "out"
+            target_dir = out_dir / "sample"
+            target_dir.mkdir(parents=True)
+            rdf_path = target_dir / "sample.nt"
+            rdf_path.write_text("<s> <p> <o> .\n")
+
+            def fake_run(cmd, cwd=None, env=None):
+                if emulate_validation_command(cmd):
+                    rendered = str(cmd[-1])
+                    result_match = re.search(
+                        r"--result-path\s+['\"]?(/data/out/[^\s'\";]+)",
+                        rendered,
+                    )
+                    result_path = out_dir / result_match.group(1).replace(
+                        "/data/out/", "", 1
+                    )
+                    result_path.write_text(
+                        json.dumps(
+                            {
+                                "valid": False,
+                                "source_triples": 1,
+                                "decoded_triples": 0,
+                                "count_match": False,
+                                "error": "decoded triple count does not match the source",
+                            }
+                        )
+                    )
+                    return 1
+                rendered = str(cmd[-1])
+                if 'HDT_BIN="${RDF2HDT_BIN' in rendered:
+                    (target_dir / "sample.hdt").write_text("mock-hdt\n")
+                return 0
+
+            with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run):
+                ok, method_results = vcf_rdfizer.run_compression_methods_for_rdf(
+                    rdf_path=rdf_path,
+                    out_dir=out_dir,
+                    target_out_dir=target_dir,
+                    image_ref="example/vcf-rdfizer:latest",
+                    methods=["hdt"],
+                    wrapper_log_path=tmp_path / "wrapper.log",
+                    status_indent=None,
+                )
+
+            self.assertFalse(ok)
+            self.assertEqual(method_results["hdt"]["exit_code"], 0)
+            self.assertTrue(rdf_path.exists())
 
     def test_plan_partitioned_hdt_chunks_groups_small_inputs_and_splits_large_ones(self):
         """Partition planning coalesces small RDF parts and line-splits oversized ones."""
@@ -738,6 +865,7 @@ class WrapperUnitTests(VerboseTestCase):
                     target_chunk_bytes=40,
                     min_chunk_bytes=10,
                     max_chunk_bytes=60,
+                    expected_triples=12,
                 )
 
             self.assertTrue(ok)
@@ -748,6 +876,13 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertTrue((out_dir / "sample.cottas").exists())
             self.assertTrue((out_dir / "sample.cottas.gz").exists())
             self.assertTrue(any("target=/work" in " ".join(cmd) for cmd in commands))
+            runner_command = next(
+                cmd
+                for cmd in commands
+                if vcf_rdfizer.PARTITIONED_COMPRESSION_RUNNER_CONTAINER in cmd
+            )
+            self.assertIn("--expected-triples", runner_command)
+            self.assertIn("12", runner_command)
             self.assertGreaterEqual(method_results["hdt"]["details"]["chunk_count"], 2)
             self.assertGreaterEqual(method_results["hdt"]["details"]["merge_rounds"], 1)
 

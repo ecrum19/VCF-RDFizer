@@ -353,6 +353,16 @@ Compression metrics now include per-method:
 - `sys_seconds_*`
 - `max_rss_kb_*`
 
+When HDT or COTTAS is selected, compression also validates the final base
+artifact before packaging or RDF cleanup. The validator reads the source
+triple count, streams the artifact back through the native decoder, and
+requires equal counts. HDT validation also initializes the `.hdt.index`
+sidecar. Validation results and `source_triples`/`decoded_triples` are stored
+in the per-run compression JSON and in the HDT/COTTAS columns of `metrics.csv`.
+Compression fails closed if the artifact cannot be decoded or the counts do
+not match. In compression-only mode, the source count is obtained by a
+streaming fallback when no upstream conversion metrics are available.
+
 For partitioned HDT/COTTAS runs, the final method metric reports one
 sample-level result, while raw metrics also include a sample-scoped
 `__partitioned_compression__` artifact describing chunk conversion, merge
@@ -377,11 +387,20 @@ HDT index is generated after merging through HDT Java's indexed search loader,
 and COTTAS chunks are merged with `pycottas.cat`, which rebuilds the query
 indexes for the merged representation.
 
+After each final HDT/COTTAS base artifact is produced, VCF-RDFizer performs a
+streaming decode/count check. This verifies both readability and that the
+decoded artifact contains exactly the number of source triples. The check is
+performed before `.hdt.gz`, `.hdt.br`, `.cottas.gz`, or `.cottas.br` packaging,
+and before raw RDF cleanup.
+
 Partitioned HDT/COTTAS compression runs in an ephemeral Docker-managed
 workspace. Temporary RDF chunks, COTTAS/DuckDB scratch data, intermediate
 representations, and merge files are not written to the output directory.
 After a successful or failed run, the temporary workspace is removed; only
 the selected final artifacts and normal run metrics remain on the host.
+Each COTTAS conversion and merge also receives a fresh container-local DuckDB
+workspace, which is removed as soon as that operation completes. This prevents
+state from one chunk being reused by another and requires no user configuration.
 
 HDT Java 3.0.10 does not provide a standalone `hdtGenerateIndex` executable.
 VCF-RDFizer sends an `exit` command to the supported `hdtSearch.sh` launcher;

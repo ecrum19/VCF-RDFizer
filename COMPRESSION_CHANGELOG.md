@@ -146,6 +146,17 @@ The Docker image installs `pycottas` in `/opt/pycottas-venv` and invokes the
 small adapter at `/opt/vcf-rdfizer/cottas_tool.py`. COTTAS is therefore part of
 the Docker workflow, not a dependency of the lightweight pip/conda wrapper.
 
+The adapter runs every `pycottas.rdf2cottas` and `pycottas.cat` operation in a
+new temporary subdirectory of the container-local `/work` filesystem. pycottas
+uses a default `pycottas.duckdb` database in its current working directory;
+without isolation, a later chunk can reopen the prior database and fail while
+creating its existing `quads` table. Input and output paths are resolved before
+entering the temporary directory, so COTTAS artifacts remain in the designated
+workspace/output mount while the DuckDB database and related scratch files are
+removed immediately after each operation. `COTTAS_SCRATCH_DIR` can override
+`/work` for image-internal deployments, but the wrapper does not require users
+to set it.
+
 ## Metrics and Cleanup
 
 Every chunk conversion, merge, index-generation, and final representation
@@ -161,6 +172,30 @@ already the requested gzip artifact and is retained. Cleanup is enabled by
 default; `--remove-rdf-storage-output` makes aggregate removal explicit, while
 `--keep-rmlstreamer-rdf-output` retains the aggregate produced by RMLStreamer.
 The two flags are mutually exclusive.
+
+### Representation Validation
+
+Every generated base HDT or COTTAS representation is validated before any
+packaging stage and before raw RDF cleanup. The validation has two parts:
+
+1. The artifact is opened and decoded with its native reader. HDT is loaded
+   through `ensure_hdt_index.sh`/HDT Java and streamed through `hdt2rdf`;
+   COTTAS is streamed through `pycottas.cottas2rdf`.
+2. The decoded N-Triples stream is counted and compared with the source count.
+
+Full mode passes the `output_triples` count recorded by RMLStreamer whenever
+it is available. The partition planner already reads the source once, so its
+record count is reused for validation. Compression-only mode has no upstream
+conversion metric; in that case the validator counts plain or gzip-compressed
+N-Triples directly as a fallback. No decoded RDF file is written during this
+check.
+
+A missing decoder, unreadable artifact, or count mismatch makes the
+compression stage fail and prevents RDF cleanup. Reports are stored in the
+method details of the raw compression JSON and expose `source_triples`,
+`decoded_triples`, `count_match`, and `valid`. The aggregate `metrics.csv`
+also records the source count, decoded count, and validation status for HDT
+and COTTAS.
 
 ## Compatibility and Limits
 

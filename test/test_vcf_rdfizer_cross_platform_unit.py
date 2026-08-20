@@ -1,4 +1,6 @@
+import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -109,6 +111,31 @@ class WrapperCrossPlatformUnitTests(VerboseTestCase):
 
             def fake_run(cmd, cwd=None, env=None):
                 commands.append(cmd)
+                rendered = str(cmd[-1]) if cmd else ""
+                if "validate_compression.py" in rendered:
+                    out_mount = next(
+                        Path(part.split(":", 1)[0])
+                        for part in cmd
+                        if isinstance(part, str) and part.endswith(":/data/out")
+                    )
+                    result_match = re.search(
+                        r"--result-path\s+['\"]?(/data/out/[^\s'\";]+)",
+                        rendered,
+                    )
+                    result_path = out_mount / result_match.group(1).replace(
+                        "/data/out/", "", 1
+                    )
+                    result_path.parent.mkdir(parents=True, exist_ok=True)
+                    result_path.write_text(
+                        json.dumps(
+                            {
+                                "valid": True,
+                                "source_triples": 1,
+                                "decoded_triples": 1,
+                                "count_match": True,
+                            }
+                        )
+                    )
                 return 0
 
             old_cwd = os.getcwd()
