@@ -35,6 +35,18 @@ def invoke_main(argv):
         return vcf_rdfizer.main()
 
 
+def host_path_for_bind_mount(command, container_path: str) -> Path:
+    """Return a Docker bind-mount source without splitting Windows drive letters."""
+    suffix = f":{container_path}"
+    for index, token in enumerate(command[:-1]):
+        if token != "-v":
+            continue
+        mount = str(command[index + 1])
+        if mount.endswith(suffix):
+            return Path(mount[: -len(suffix)])
+    raise AssertionError(f"missing bind mount for {container_path}: {command}")
+
+
 class WrapperCrossPlatformUnitTests(VerboseTestCase):
     def test_help_flag_prints_usage(self):
         """CLI help succeeds and prints usage examples."""
@@ -99,6 +111,14 @@ class WrapperCrossPlatformUnitTests(VerboseTestCase):
         self.assertEqual(vcf_rdfizer.detect_compressed_format(Path("sample.nt.br")), "brotli")
         self.assertEqual(vcf_rdfizer.detect_compressed_format(Path("sample.hdt")), "hdt")
 
+    def test_bind_mount_parser_preserves_windows_drive_letter(self):
+        """Validation mocks preserve Windows bind-mount source paths."""
+        mount = r"C:\Users\runneradmin\AppData\Local\Temp\output:/data/out"
+        self.assertEqual(
+            str(host_path_for_bind_mount(["docker", "run", "-v", mount], "/data/out")),
+            r"C:\Users\runneradmin\AppData\Local\Temp\output",
+        )
+
     def test_compress_mode_runs_with_mocks(self):
         """Compress mode succeeds with mocked Docker execution across OSes."""
         with tempfile.TemporaryDirectory() as td:
@@ -113,11 +133,7 @@ class WrapperCrossPlatformUnitTests(VerboseTestCase):
                 commands.append(cmd)
                 rendered = str(cmd[-1]) if cmd else ""
                 if "validate_compression.py" in rendered:
-                    out_mount = next(
-                        Path(part.split(":", 1)[0])
-                        for part in cmd
-                        if isinstance(part, str) and part.endswith(":/data/out")
-                    )
+                    out_mount = host_path_for_bind_mount(cmd, "/data/out")
                     result_match = re.search(
                         r"--result-path\s+['\"]?(/data/out/[^\s'\";]+)",
                         rendered,
