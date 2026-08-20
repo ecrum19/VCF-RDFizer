@@ -99,9 +99,9 @@ def validate(args: argparse.Namespace) -> dict:
                     "HDT index/readability check failed with status "
                     f"{index_check.returncode}"
                 )
-        # hdt2rdf must open and walk the complete HDT triples section. Using
-        # /dev/stdout makes that check stream-only and avoids a second RDF file.
-        decoded_triples = count_decoded([resolve_hdt2rdf(), str(artifact), "/dev/stdout"])
+        # hdt2rdf uses "-" (not /dev/stdout) as its stdout sentinel. This
+        # keeps the decoded RDF in the pipe and avoids another large file.
+        decoded_triples = count_decoded([resolve_hdt2rdf(), str(artifact), "-"])
         validator = "hdt2rdf"
     else:
         try:

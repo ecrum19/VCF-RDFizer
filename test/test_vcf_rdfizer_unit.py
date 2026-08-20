@@ -1,3 +1,4 @@
+import argparse
 import csv
 import gzip
 import importlib.util
@@ -273,6 +274,43 @@ class WrapperUnitTests(VerboseTestCase):
                 handle.write(payload)
             self.assertEqual(validator.count_nt(plain), 2)
             self.assertEqual(validator.count_nt(compressed), 2)
+
+    def test_validator_streams_hdt_decode_to_stdout(self):
+        """HDT validation uses hdt2rdf's '-' stdout sentinel, not a file path."""
+        validator_path = Path(__file__).parents[1] / "src" / "validate_compression.py"
+        spec = importlib.util.spec_from_file_location("validate_compression", validator_path)
+        validator = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(validator)
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            source = tmp_path / "sample.nt"
+            artifact = tmp_path / "sample.hdt"
+            source.write_text("<s> <p> <o> .\n", encoding="utf-8")
+            artifact.write_bytes(b"mock-hdt")
+            commands: list[list[str]] = []
+
+            def count_decoded(command):
+                commands.append(command)
+                return 1
+
+            args = argparse.Namespace(
+                source=str(source),
+                artifact=str(artifact),
+                format="hdt",
+                source_triples=None,
+                expected_triples=None,
+                skip_index_check=True,
+            )
+            with (
+                mock.patch.object(validator, "resolve_hdt2rdf", return_value="hdt2rdf"),
+                mock.patch.object(validator, "count_decoded", side_effect=count_decoded),
+            ):
+                report = validator.validate(args)
+
+            self.assertTrue(report["valid"])
+            self.assertTrue(report["count_match"])
+            self.assertEqual(commands, [["hdt2rdf", str(artifact), "-"]])
 
     def test_print_summary_lists_all_selected_compression_sizes(self):
         """Summary printer includes one size line per requested compression method."""
