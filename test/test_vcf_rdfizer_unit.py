@@ -312,6 +312,101 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertTrue(report["count_match"])
             self.assertEqual(commands, [["hdt2rdf", str(artifact), "-"]])
 
+    def test_nt_and_nt_gz_share_a_base_output_directory_and_artifact_names(self):
+        """Both supported RDF inputs produce artifacts under the same basename."""
+        output_dir = Path("results")
+        for rdf_name in ("test-larger.nt", "test-larger.nt.gz"):
+            rdf_path = Path(rdf_name)
+            self.assertEqual(vcf_rdfizer.rdf_output_basename(rdf_path), "test-larger")
+            planned = vcf_rdfizer.planned_output_paths(
+                out_dir=output_dir,
+                output_name=vcf_rdfizer.rdf_output_basename(rdf_path),
+                rdf_name=None,
+                methods=["hdt", "hdt_gzip", "cottas"],
+                partitioned=True,
+            )
+            self.assertIn(output_dir / "test-larger" / "test-larger.hdt", planned)
+            self.assertIn(
+                output_dir / "test-larger" / "test-larger.hdt.index.v1-1",
+                planned,
+            )
+            self.assertIn(output_dir / "test-larger" / "test-larger.hdt.gz", planned)
+            self.assertIn(output_dir / "test-larger" / "test-larger.cottas", planned)
+            self.assertFalse(any("test-larger.nt" in str(path) for path in planned))
+
+    def test_compress_mode_partitioned_nt_gz_uses_base_output_directory(self):
+        """Partitioned compression does not create a `<name>.nt` output directory."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            rdf_path = tmp_path / "test-larger.nt.gz"
+            rdf_path.write_bytes(b"not-read-by-this-mock")
+            out_dir = tmp_path / "out"
+            with (
+                mock.patch.object(
+                    vcf_rdfizer,
+                    "run_partitioned_representation_methods_for_rdf_files",
+                    return_value=(True, {"hdt": {"exit_code": 0}}),
+                ) as run_partitioned,
+                mock.patch.object(vcf_rdfizer, "print_nt_hdt_summary"),
+            ):
+                rc = vcf_rdfizer.run_compress_mode(
+                    rdf_path=rdf_path,
+                    out_dir=out_dir,
+                    metrics_dir=tmp_path / "metrics",
+                    run_id="run-output-name",
+                    timestamp="2026-08-20T17:00:00",
+                    image_ref="example/vcf-rdfizer:latest",
+                    methods=["hdt"],
+                    hdt_strategy="partitioned",
+                    chunk_target_bytes=40,
+                    chunk_min_bytes=10,
+                    chunk_max_bytes=60,
+                    wrapper_log_path=tmp_path / "wrapper.log",
+                )
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(
+                run_partitioned.call_args.kwargs["out_dir"], out_dir / "test-larger"
+            )
+            self.assertEqual(run_partitioned.call_args.kwargs["output_name"], "test-larger")
+
+    def test_compress_mode_rejects_existing_artifact_before_docker_preflight(self):
+        """Existing final outputs are rejected without starting Docker or the pipeline."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            rdf_path = tmp_path / "test-larger.nt.gz"
+            rdf_path.write_bytes(b"fake-gzip")
+            out_dir = tmp_path / "out"
+            artifact = out_dir / "test-larger" / "test-larger.hdt"
+            artifact.parent.mkdir(parents=True)
+            artifact.write_bytes(b"existing")
+
+            with mock.patch.object(
+                vcf_rdfizer,
+                "check_docker",
+                side_effect=AssertionError("Docker preflight must not run"),
+            ), redirect_stderr(StringIO()) as stderr:
+                rc = invoke_main(
+                    [
+                        "--mode",
+                        "compress",
+                        "--rdf",
+                        str(rdf_path),
+                        "--representations",
+                        "hdt",
+                        "--rdf-compression",
+                        "none",
+                        "--artifact-compression",
+                        "none",
+                        "--out",
+                        str(out_dir),
+                    ]
+                )
+
+            self.assertEqual(rc, 2)
+            self.assertIn("Refusing to overwrite existing output file", stderr.getvalue())
+            self.assertIn(str(artifact), stderr.getvalue())
+
     def test_print_summary_lists_all_selected_compression_sizes(self):
         """Summary printer includes one size line per requested compression method."""
         with tempfile.TemporaryDirectory() as td:
@@ -1485,8 +1580,8 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertIn("brotli -q 7 -c", commands[1][-1])
             self.assertIn("/data/out/sample/sample.nt.br", commands[1][-1])
 
-    def test_main_compress_mode_hdt_gzip_reuses_existing_hdt(self):
-        """Compound method hdt_gzip reuses a preexisting HDT artifact instead of regenerating it."""
+    def test_main_compress_mode_hdt_gzip_rejects_existing_hdt(self):
+        """Compound HDT packaging refuses to overwrite a preexisting HDT artifact."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             nt_path = tmp_path / "sample.nt"
@@ -1495,20 +1590,14 @@ class WrapperUnitTests(VerboseTestCase):
             sample_out = out_dir / "sample"
             sample_out.mkdir(parents=True, exist_ok=True)
             (sample_out / "sample.hdt").write_text("prebuilt-hdt\n")
-            commands = []
-
-            def fake_run(cmd, cwd=None, env=None):
-                commands.append(cmd)
-                return 0
-
             old_cwd = os.getcwd()
             os.chdir(tmp_path)
             try:
-                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch.object(
-                    vcf_rdfizer, "check_docker", return_value=True
-                ), mock.patch.object(
-                    vcf_rdfizer, "docker_image_exists", return_value=True
-                ):
+                with mock.patch.object(
+                    vcf_rdfizer,
+                    "check_docker",
+                    side_effect=AssertionError("Docker preflight must not run"),
+                ), redirect_stderr(StringIO()) as stderr:
                     rc = invoke_main(
                         [
                             "--mode",
@@ -1524,13 +1613,8 @@ class WrapperUnitTests(VerboseTestCase):
             finally:
                 os.chdir(old_cwd)
 
-            self.assertEqual(rc, 0)
-            self.assertEqual(len(commands), 1)
-            self.assertIn(
-                "gzip -c /data/out/sample/sample.hdt > /data/out/sample/sample.hdt.gz",
-                commands[0][-1],
-            )
-            self.assertNotIn("rdf2hdt", commands[0][-1])
+            self.assertEqual(rc, 2)
+            self.assertIn("Refusing to overwrite existing output file", stderr.getvalue())
 
     def test_main_compress_mode_hdt_brotli_generates_hdt_then_compresses_hdt(self):
         """Compound method hdt_brotli runs rdf2hdt first, then brotli on the generated HDT file."""

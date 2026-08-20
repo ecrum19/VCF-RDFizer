@@ -28,7 +28,7 @@ if [[ "$RDF_STORAGE_MODE" != "plain" && "$RDF_STORAGE_MODE" != "space-optimized"
   exit 2
 fi
 LOGDIR=${LOGDIR:-run_metrics}
-mkdir -p "$LOGDIR" "$OUT_DIR"
+mkdir -p "$LOGDIR" "$OUT_DIR" "$OUT"
 
 RUN_ID=${RUN_ID:-$(date +%Y%m%dT%H%M%S)}
 TIMESTAMP=${TIMESTAMP:-$(date +"%Y-%m-%dT%H:%M:%S")}
@@ -36,6 +36,27 @@ SAFE_OUT_NAME=$(printf "%s" "$OUT_NAME" | tr -cs 'A-Za-z0-9._-' '_')
 if [[ -z "$SAFE_OUT_NAME" ]]; then
   SAFE_OUT_NAME="rdf"
 fi
+MERGED_NT="$OUT/$OUT_NAME.nt"
+if [[ "$RDF_STORAGE_MODE" == "space-optimized" ]]; then
+  FINAL_RDF="${MERGED_NT}.gz"
+else
+  FINAL_RDF="$MERGED_NT"
+fi
+if [[ -e "$FINAL_RDF" ]]; then
+  echo "ERROR: refusing to overwrite existing RDF output '$FINAL_RDF'." >&2
+  exit 2
+fi
+# Keep RMLStreamer parts isolated from final artifacts. This lets the wrapper
+# preserve unrelated files in an existing sample directory.
+PARTS_DIR="$OUT/.rmlstreamer-parts-${SAFE_OUT_NAME}-$$"
+if [[ -e "$PARTS_DIR" ]]; then
+  echo "ERROR: temporary RMLStreamer directory already exists: '$PARTS_DIR'." >&2
+  exit 2
+fi
+cleanup_parts_dir() {
+  rm -rf "$PARTS_DIR"
+}
+trap cleanup_parts_dir EXIT
 TIME_LOG_DIR="$LOGDIR/conversion_time/${SAFE_OUT_NAME}"
 METRICS_JSON_DIR="$LOGDIR/conversion_metrics/${SAFE_OUT_NAME}"
 mkdir -p "$TIME_LOG_DIR" "$METRICS_JSON_DIR"
@@ -222,14 +243,9 @@ fi
 
 # Build Java command in a macOS Bash-3-compatible way:
 # with `set -u`, expanding an empty array (`"${arr[@]}"`) raises "unbound variable".
-JAVA_CMD=(java -jar "$JAR" toFile -m "$IN" -o "$OUT_DIR/$OUT_NAME")
+JAVA_CMD=(java -jar "$JAR" toFile -m "$IN" -o "$PARTS_DIR")
 if (( ${#JAVA_SPARK_OPTS[@]} > 0 )); then
-  JAVA_CMD=(java "${JAVA_SPARK_OPTS[@]}" -jar "$JAR" toFile -m "$IN" -o "$OUT_DIR/$OUT_NAME")
-fi
-
-# Ensure repeated runs with the same OUT_NAME do not accumulate old artifacts.
-if [[ -d "$OUT_DIR/$OUT_NAME" ]]; then
-  rm -rf "$OUT_DIR/$OUT_NAME"
+  JAVA_CMD=(java "${JAVA_SPARK_OPTS[@]}" -jar "$JAR" toFile -m "$IN" -o "$PARTS_DIR")
 fi
 
 # ---------- Pre-run ----------
@@ -244,13 +260,10 @@ else
   { time -p "${JAVA_CMD[@]}"; } >"$TIME_LOG" 2>&1 || EXIT_CODE=$?
 fi
 
-# ---------- Post-run normalization ----------
-mkdir -p "$OUT_DIR/$OUT_NAME"
-
 # Normalize output files to .nt for downstream line-oriented processing. The
 # wrapper does not infer or rewrite RDF syntax beyond preserving the part as a
 # line-oriented file; callers must validate whether the stream is NT or NQ.
-for RDF_FILE in "$OUT_DIR/$OUT_NAME"/*; do
+for RDF_FILE in "$PARTS_DIR"/*; do
   if [[ ! -f "$RDF_FILE" ]]; then
     continue
   fi
@@ -263,20 +276,18 @@ done
 # Merge all RMLStreamer output parts into one aggregate named after the output
 # basename. Stream merge + delete each part immediately to avoid temporary 2x
 # disk spikes.
-MERGED_NT="$OUT_DIR/$OUT_NAME/$OUT_NAME.nt"
 shopt -s nullglob
-PART_FILES=("$OUT_DIR/$OUT_NAME"/*.nt)
+PART_FILES=("$PARTS_DIR"/*.nt)
 if [[ "$RDF_STORAGE_MODE" == "space-optimized" ]]; then
     MERGED_RDF="${MERGED_NT}.gz"
-    MERGED_TMP="${MERGED_RDF}.partial"
+    MERGED_TMP="${MERGED_RDF}.partial.$$"
     # Keep duplicate-part protection in the compressed path as well. Hashing
     # each part is linear in the bytes already being read and avoids retaining
     # an uncompressed duplicate just to compare it later.
-    SEEN_HASH_FILE="$OUT_DIR/$OUT_NAME/.seen_part_hashes.$$"
-    SEEN_MAP_FILE="$OUT_DIR/$OUT_NAME/.seen_part_hash_map.$$"
+    SEEN_HASH_FILE="$PARTS_DIR/.seen_part_hashes"
+    SEEN_MAP_FILE="$PARTS_DIR/.seen_part_hash_map"
     : > "$SEEN_HASH_FILE"
     : > "$SEEN_MAP_FILE"
-    rm -f "$MERGED_TMP" "$MERGED_RDF"
     # Feed an empty stream on stdin for GNU and BSD gzip compatibility.
     gzip -c < /dev/null > "$MERGED_TMP"
     for PART_NT in "${PART_FILES[@]}"; do
@@ -303,8 +314,8 @@ if [[ "$RDF_STORAGE_MODE" == "space-optimized" ]]; then
     # Defensive dedupe: some Spark/RMLStreamer runs can emit identical part
     # files for the same dataset. Skip exact duplicate part payloads to avoid
     # doubling every triple in the merged output.
-    SEEN_HASH_FILE="$OUT_DIR/$OUT_NAME/.seen_part_hashes.$$"
-    SEEN_MAP_FILE="$OUT_DIR/$OUT_NAME/.seen_part_hash_map.$$"
+    SEEN_HASH_FILE="$PARTS_DIR/.seen_part_hashes"
+    SEEN_MAP_FILE="$PARTS_DIR/.seen_part_hash_map"
     : > "$SEEN_HASH_FILE"
     : > "$SEEN_MAP_FILE"
     for PART_NT in "${PART_FILES[@]}"; do
@@ -332,6 +343,9 @@ fi
   if [[ "$RDF_STORAGE_MODE" != "space-optimized" ]]; then
     OUTPUT_PATH="$MERGED_NT"
   fi
+
+rm -rf "$PARTS_DIR"
+trap - EXIT
 
 # Apply ontology-compliant null datatype annotation to produced RDF files.
 if [[ -f "$OUTPUT_PATH" && "$OUTPUT_PATH" != *.gz ]]; then

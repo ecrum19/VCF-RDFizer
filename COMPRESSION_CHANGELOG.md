@@ -53,6 +53,17 @@ The storage mode is passed to `src/run_conversion.sh` through
 `RDF_STORAGE_MODE`. The conversion metrics JSON records the selected mode,
 serialization, compressed state, logical output path, and triple count.
 
+## Output Namespace Safety
+
+Final artifacts use the RDF/VCF basename, with `.nt` and `.nt.gz` treated as
+equivalent inputs. For example, both `test-larger.nt` and `test-larger.nt.gz`
+write `test-larger.hdt` and `test-larger.hdt.index.v1-1` under the single
+`test-larger/` output directory. Before invoking Docker, the wrapper computes
+the planned aggregate, representation, package, and index paths and rejects
+any collision. RMLStreamer writes temporary parts in an isolated hidden
+directory, so the conversion step no longer removes the enclosing output
+directory to clear stale parts.
+
 ## Record-Safe Chunk Planning
 
 HDT and COTTAS use the same chunk planner. The public controls are:

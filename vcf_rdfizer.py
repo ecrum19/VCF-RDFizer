@@ -1132,13 +1132,22 @@ def rdf_label_for_path(path: Path) -> str:
     return "RDF"
 
 
+def rdf_output_basename(path: Path) -> str:
+    """Return the common output basename for ``.nt`` and ``.nt.gz`` RDF."""
+    if path.name.endswith(".nt.gz"):
+        return path.name[: -len(".nt.gz")]
+    if path.name.endswith(".nt"):
+        return path.name[: -len(".nt")]
+    return path.stem
+
+
 def compression_artifact_name_for_method(path: Path, method: str) -> str:
     """Compute expected compressed artifact filename for a method."""
     if path.name.endswith(".nt.gz"):
-        stem = path.name[: -len(".nt.gz")]
+        stem = rdf_output_basename(path)
         ext = "nt"
     else:
-        stem = path.stem
+        stem = rdf_output_basename(path)
         ext = path.suffix.lstrip(".") or "nt"
     if method == "gzip":
         return f"{stem}.{ext}.gz"
@@ -1157,6 +1166,64 @@ def compression_artifact_name_for_method(path: Path, method: str) -> str:
     if method == "cottas_brotli":
         return f"{stem}.cottas.br"
     return f"{stem}.{method}"
+
+
+def planned_output_paths(
+    *,
+    out_dir: Path,
+    output_name: str,
+    rdf_name: str | None,
+    methods: list[str],
+    partitioned: bool,
+) -> set[Path]:
+    """List final output paths that a compression plan would create."""
+    target_dir = out_dir / output_name
+    planned: set[Path] = set()
+    if rdf_name is not None:
+        planned.add(target_dir / rdf_name)
+
+    rdf_path = Path(rdf_name or f"{output_name}.nt")
+    planned.update(
+        target_dir / compression_artifact_name_for_method(rdf_path, method)
+        for method in methods
+    )
+    if any(method in HDT_COMPRESSION_METHODS for method in methods):
+        planned.add(target_dir / f"{output_name}.hdt")
+        # The pinned HDT Java package generates this versioned sidecar.
+        planned.add(target_dir / f"{output_name}.hdt.index.v1-1")
+    if any(method in COTTAS_COMPRESSION_METHODS for method in methods):
+        planned.add(target_dir / f"{output_name}.cottas")
+    if partitioned:
+        planned.add(target_dir / f".{safe_metrics_name(output_name)}.partitioned-results.json")
+    return planned
+
+
+def validate_no_output_collisions(plans: dict[str, set[Path]]):
+    """Fail before execution rather than overwriting planned output artifacts."""
+    claimed_by: dict[Path, list[str]] = {}
+    existing: set[Path] = set()
+    for owner, paths in plans.items():
+        for path in paths:
+            claimed_by.setdefault(path, []).append(owner)
+            if path.exists():
+                existing.add(path)
+            if path.parent.exists() and not path.parent.is_dir():
+                existing.add(path.parent)
+            if ".hdt.index." in path.name:
+                hdt_name = path.name.split(".index.", 1)[0]
+                existing.update(path.parent.glob(f"{hdt_name}.index.*"))
+
+    duplicate_plans = [path for path, owners in claimed_by.items() if len(owners) > 1]
+    if not existing and not duplicate_plans:
+        return
+
+    conflicts = sorted({*existing, *duplicate_plans}, key=lambda path: str(path))
+    listed = ", ".join(str(path) for path in conflicts)
+    raise ValueError(
+        "Refusing to overwrite existing output file(s): "
+        f"{listed}. VCF-RDFizer does not overwrite outputs; choose a different "
+        "--out directory or rename/remove the conflicting file(s) and try again."
+    )
 
 
 def compression_method_label_for_path(path: Path, method: str) -> str:
@@ -2577,12 +2644,8 @@ def run_compression_methods_for_rdf(
     """
     in_dir = rdf_path.parent
     input_container = f"/data/in/{rdf_path.name}"
-    if rdf_path.name.endswith(".nt.gz"):
-        input_stem = rdf_path.name[: -len(".nt.gz")]
-        input_ext = "nt"
-    else:
-        input_stem = rdf_path.stem
-        input_ext = rdf_path.suffix.lstrip(".") or "nt"
+    input_stem = rdf_output_basename(rdf_path)
+    input_ext = "nt" if rdf_path.name.endswith(".nt.gz") else rdf_path.suffix.lstrip(".") or "nt"
     if target_out_dir is None:
         target_out_dir = out_dir / input_stem
     ensure_dir(target_out_dir)
@@ -3950,7 +4013,7 @@ def run_compress_mode(
             )
 
     ensure_dir(out_dir)
-    input_stem = rdf_path.stem
+    input_stem = rdf_output_basename(rdf_path)
     use_partitioned_compression = compression_uses_partitioning(methods) and (
         any(method in COTTAS_COMPRESSION_METHODS for method in methods)
         or should_use_partitioned_hdt(
@@ -4463,6 +4526,29 @@ def main():
                 spark_partitions = parse_positive_int(
                     args.spark_partitions, name="--spark-partitions"
                 )
+            full_uses_partitioning = compression_uses_partitioning(full_methods) and (
+                any(method in COTTAS_COMPRESSION_METHODS for method in full_methods)
+                or should_use_partitioned_hdt(
+                    mode="full",
+                    methods=full_methods,
+                    hdt_strategy=args.hdt_strategy,
+                    rdf_storage_mode=args.rdf_storage_mode,
+                )
+            )
+            output_plans = {}
+            for index, prefix in enumerate(expected_prefixes, start=1):
+                output_name = slugify(prefix) or slugify(args.out_name)
+                rdf_name = f"{output_name}.nt"
+                if args.rdf_storage_mode == "space-optimized":
+                    rdf_name += ".gz"
+                output_plans[f"input {index} ({prefix})"] = planned_output_paths(
+                    out_dir=out_dir,
+                    output_name=output_name,
+                    rdf_name=rdf_name,
+                    methods=full_methods,
+                    partitioned=full_uses_partitioning,
+                )
+            validate_no_output_collisions(output_plans)
         elif mode == "tsv":
             if args.spark_partitions is not None:
                 raise ValueError("--spark-partitions is only valid in --mode full")
@@ -4513,6 +4599,26 @@ def main():
                     "use --hdt-strategy partitioned"
                 )
             validate_mode_dirs([out_root, out_dir, metrics_root])
+            compression_uses_partitioning_for_input = compression_uses_partitioning(methods) and (
+                any(method in COTTAS_COMPRESSION_METHODS for method in methods)
+                or should_use_partitioned_hdt(
+                    mode="compress",
+                    methods=methods,
+                    hdt_strategy=args.hdt_strategy,
+                )
+            )
+            output_name = rdf_output_basename(rdf_path)
+            validate_no_output_collisions(
+                {
+                    f"RDF input {rdf_path.name}": planned_output_paths(
+                        out_dir=out_dir,
+                        output_name=output_name,
+                        rdf_name=None,
+                        methods=methods,
+                        partitioned=compression_uses_partitioning_for_input,
+                    )
+                }
+            )
         elif mode == "index":
             if args.spark_partitions is not None:
                 raise ValueError("--spark-partitions is only valid in --mode full")
@@ -4524,6 +4630,14 @@ def main():
             if hdt_path.suffix != ".hdt":
                 raise ValueError("HDT index input must end with .hdt")
             validate_mode_dirs([out_root, out_dir, metrics_root])
+            existing_indexes = sorted(hdt_path.parent.glob(f"{hdt_path.name}.index.*"))
+            if existing_indexes:
+                raise ValueError(
+                    "Refusing to overwrite existing output file(s): "
+                    + ", ".join(str(path) for path in existing_indexes)
+                    + ". VCF-RDFizer does not overwrite outputs; rename/remove the "
+                    "existing index and try again."
+                )
         else:
             if args.spark_partitions is not None:
                 raise ValueError("--spark-partitions is only valid in --mode full")
@@ -4545,6 +4659,11 @@ def main():
                     )
             if decompressed_out.exists() and decompressed_out.is_dir():
                 raise ValueError(f"decompression output path is a directory: {decompressed_out}")
+            if decompressed_out.exists():
+                raise ValueError(
+                    f"Refusing to overwrite existing output file: {decompressed_out}. "
+                    "Choose a different --decompress-out path and try again."
+                )
             if decompressed_out.parent.exists() and not decompressed_out.parent.is_dir():
                 raise ValueError(
                     f"decompression output parent is not a directory: {decompressed_out.parent}"

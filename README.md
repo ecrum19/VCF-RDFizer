@@ -330,6 +330,21 @@ Given `--out ./results`:
 - hidden intermediates:
   - `./results/.intermediate/tsv/`
 
+For an existing RDF input named `test-larger.nt` or `test-larger.nt.gz`,
+`--mode compress --out ./results` always uses one directory:
+
+```text
+./results/test-larger/test-larger.hdt
+./results/test-larger/test-larger.hdt.index.v1-1
+./results/test-larger/test-larger.cottas
+./results/test-larger/test-larger.nt.gz
+```
+
+The same basename rule applies in full mode. VCF-RDFizer performs an output
+collision check before Docker or conversion starts and never overwrites a
+planned artifact. Choose a new `--out` directory, or rename/remove the
+conflicting output before rerunning.
+
 Intermediates are hidden by default.
 Raw RDF files are removed after successful compression by default. Use
 `--remove-rdf-storage-output` to make that cleanup explicit, or use

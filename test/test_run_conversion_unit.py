@@ -83,6 +83,62 @@ printf '<s> <p> <o> .\\n' > "$out/part-000"
             self.assertEqual(row["output_name"], "rdf")
             self.assertEqual(row["exit_code_java"], "0")
 
+    def test_run_conversion_preserves_unrelated_files_in_existing_output_directory(self):
+        """RMLStreamer parts do not require deleting the sample output directory."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            fake_bin = tmp_path / "bin"
+            fake_bin.mkdir()
+            make_executable(
+                fake_bin / "java",
+                """#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "-version" ]]; then
+  echo 'openjdk version "11.0.0"' >&2
+  exit 0
+fi
+out=""
+while [[ $# -gt 0 ]]; do
+  if [[ "$1" == "-o" ]]; then
+    out="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+mkdir -p "$out"
+printf '<s> <p> <o> .\\n' > "$out/part-000"
+""",
+            )
+            out_dir = tmp_path / "out"
+            sample_dir = out_dir / "rdf"
+            sample_dir.mkdir(parents=True)
+            note = sample_dir / "notes.txt"
+            note.write_text("preserve me\n", encoding="utf-8")
+            rules = tmp_path / "rules.ttl"
+            rules.write_text("@prefix ex: <http://example.org/> .\n", encoding="utf-8")
+            vcf = tmp_path / "input.vcf"
+            vcf.write_text("##fileformat=VCFv4.2\n#CHROM\tPOS\n1\t5\n", encoding="utf-8")
+
+            env = env_with_path(fake_bin)
+            env.update(
+                {
+                    "JAR": "fake.jar",
+                    "IN": str(rules),
+                    "IN_VCF": str(vcf),
+                    "OUT_DIR": str(out_dir),
+                    "OUT_NAME": "rdf",
+                    "LOGDIR": str(tmp_path / "metrics"),
+                    "RUN_ID": "run-preserve",
+                }
+            )
+            result = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True)
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertEqual(note.read_text(encoding="utf-8"), "preserve me\n")
+            self.assertTrue((sample_dir / "rdf.nt").is_file())
+            self.assertEqual(list(sample_dir.glob(".rmlstreamer-parts-*")), [])
+
     def test_run_conversion_records_normalized_size_for_gz_input_vcf(self):
         """input_vcf_size_bytes uses decompressed size for .vcf.gz inputs."""
         with tempfile.TemporaryDirectory() as td:
