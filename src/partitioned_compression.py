@@ -157,6 +157,14 @@ def resolve_executable(candidates: tuple[str, ...], label: str) -> str:
     raise RuntimeError(f"Missing {label} in container")
 
 
+def find_hdt_index_sidecar(hdt_path: Path) -> Path | None:
+    """Locate HDT Java's non-empty versioned index sidecar."""
+    for candidate in sorted(hdt_path.parent.glob(f"{hdt_path.name}.index.*")):
+        if candidate.is_file() and candidate.stat().st_size > 0:
+            return candidate
+    return None
+
+
 def parse_time_log(path: Path) -> dict:
     if not path.exists():
         return {"user_seconds": None, "sys_seconds": None, "max_rss_kb": None}
@@ -421,7 +429,6 @@ def main() -> int:
             chunk.unlink(missing_ok=True)
 
         output_hdt = output_dir / f"{args.output_name}.hdt"
-        output_index = Path(str(output_hdt) + ".index")
         if hdt_paths:
             final_hdt, hdt_rounds = merge_pairwise(
                 hdt_paths,
@@ -437,10 +444,16 @@ def main() -> int:
             index_stage = runner.run(
                 "hdt-index",
                 ["/opt/vcf-rdfizer/ensure_hdt_index.sh", str(output_hdt)],
-                output_index,
             )
             add_totals(hdt_total, index_stage)
-            if index_stage["exit_code"] != 0:
+            output_index = find_hdt_index_sidecar(output_hdt)
+            if output_index is not None:
+                # The filename is versioned by HDT Java, so record the actual
+                # sidecar after the helper completes instead of assuming .index.
+                index_stage["output_path"] = str(output_index)
+                index_stage["output_size_bytes"] = output_index.stat().st_size
+                runner.stages[-1].update(index_stage)
+            if index_stage["exit_code"] != 0 or output_index is None:
                 raise RuntimeError("final HDT index initialization failed")
             hdt_validation = validate_artifact(
                 name="hdt-validate",

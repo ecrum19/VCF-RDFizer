@@ -63,7 +63,7 @@ def emulate_partitioned_runner(cmd):
             },
         }
     if "hdt" in methods:
-        (out_mount / f"{output_name}.hdt.index").write_text("mock-index\n")
+        (out_mount / f"{output_name}.hdt.index.v1-1").write_text("mock-index\n")
     result_container_path = cmd[cmd.index("--result-path") + 1]
     result_path = out_mount / result_container_path.replace("/data/out/", "", 1)
     result_path.write_text(
@@ -871,7 +871,11 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertTrue(ok)
             self.assertEqual(method_results["hdt"]["source"], "partitioned_generated")
             self.assertTrue((out_dir / "sample.hdt").exists())
-            self.assertTrue((out_dir / "sample.hdt.index").exists())
+            self.assertTrue((out_dir / "sample.hdt.index.v1-1").exists())
+            self.assertEqual(
+                method_results["hdt"]["details"]["index_path"],
+                str(out_dir / "sample.hdt.index.v1-1"),
+            )
             self.assertTrue((out_dir / "sample.hdt.gz").exists())
             self.assertTrue((out_dir / "sample.cottas").exists())
             self.assertTrue((out_dir / "sample.cottas.gz").exists())
@@ -2006,7 +2010,7 @@ class WrapperUnitTests(VerboseTestCase):
                 commands.append(cmd)
                 rendered = str(cmd[-1])
                 if "ensure_hdt_index.sh" in rendered:
-                    Path(str(hdt_path) + ".index").write_text("index\n")
+                    Path(str(hdt_path) + ".index.v1-1").write_text("index\n")
                 return 0
 
             old_cwd = os.getcwd()
@@ -2031,12 +2035,17 @@ class WrapperUnitTests(VerboseTestCase):
                 os.chdir(old_cwd)
 
             self.assertEqual(rc, 0)
-            self.assertTrue((tmp_path / "sample.hdt.index").exists())
+            self.assertTrue((tmp_path / "sample.hdt.index.v1-1").exists())
             self.assertEqual(len(commands), 1)
             self.assertIn("ensure_hdt_index.sh", commands[0][-1])
             self.assertTrue(any(arg.endswith(":/data/hdt") for arg in commands[0]))
             metrics = latest_metrics_run_dir(out_dir / "run_metrics") / "hdt_index_metrics.json"
-            self.assertEqual(json.loads(metrics.read_text())["index_status"], "generated")
+            payload = json.loads(metrics.read_text())
+            self.assertEqual(payload["index_status"], "generated")
+            self.assertEqual(
+                Path(payload["index_path"]).resolve(),
+                (tmp_path / "sample.hdt.index.v1-1").resolve(),
+            )
 
     def test_hdt_index_helper_uses_exit_only_and_verifies_sidecar(self):
         """The Docker-side helper initializes the index without issuing a query."""
@@ -2050,7 +2059,7 @@ class WrapperUnitTests(VerboseTestCase):
                 "#!/usr/bin/env bash\n"
                 "read -r command\n"
                 "[[ \"$command\" == \"exit\" ]] || exit 3\n"
-                "printf 'index\\n' > \"${1}.index\"\n",
+                "printf 'index\\n' > \"${1}.index.v1-1\"\n",
                 encoding="utf-8",
             )
             search.chmod(0o755)
@@ -2066,7 +2075,8 @@ class WrapperUnitTests(VerboseTestCase):
             )
 
             self.assertEqual(result.returncode, 0, msg=result.stderr)
-            self.assertTrue(Path(str(hdt_path) + ".index").exists())
+            self.assertTrue(Path(str(hdt_path) + ".index.v1-1").exists())
+            self.assertIn(f"HDT index ready: {hdt_path}.index.v1-1", result.stdout)
 
     def test_main_decompress_mode_rejects_unknown_extension(self):
         """Decompression mode rejects unsupported compressed RDF extensions."""
@@ -2203,7 +2213,7 @@ class WrapperUnitTests(VerboseTestCase):
                     index_match = re.search(r"ensure_hdt_index\.sh\s+(/data/out/[^\s;]+\.hdt)", rendered)
                     if index_match:
                         hdt_path = Path(out_mount) / index_match.group(1).replace("/data/out/", "", 1)
-                        Path(str(hdt_path) + ".index").write_text("index\n")
+                        Path(str(hdt_path) + ".index.v1-1").write_text("index\n")
                 return 0
 
             old_cwd = os.getcwd()

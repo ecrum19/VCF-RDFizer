@@ -24,9 +24,19 @@ fi
 # materializing an unbounded result set.
 printf 'exit\n' | "$HDT_SEARCH_BIN" "$HDT_PATH" >/dev/null
 
-INDEX_PATH="${HDT_PATH}.index"
-if [[ ! -s "$INDEX_PATH" ]]; then
-  echo "HDT Java did not create a non-empty index: $INDEX_PATH" >&2
+shopt -s nullglob
+# HDT Java 3.0.10 writes the v1-1 index as ``.hdt.index.v1-1``.
+INDEX_CANDIDATES=("${HDT_PATH}".index.*)
+INDEX_PATH=""
+for candidate in "${INDEX_CANDIDATES[@]}"; do
+  if [[ -f "$candidate" && -s "$candidate" ]]; then
+    INDEX_PATH=$candidate
+    break
+  fi
+done
+
+if [[ -z "$INDEX_PATH" ]]; then
+  echo "HDT Java did not create a non-empty index beside: $HDT_PATH" >&2
   exit 1
 fi
 

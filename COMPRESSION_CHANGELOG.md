@@ -103,7 +103,7 @@ record-safe temporary .nt chunks + in-volume guide
         |                         |
         v                         v
  final HDT + generated       final COTTAS + rebuilt indexes
- .hdt.index                  + optional gzip/Brotli packaging
+ .hdt.index.v1-1             + optional gzip/Brotli packaging
 ```
 
 The aggregate is always mounted read-only; final artifacts are written
@@ -121,7 +121,10 @@ Each chunk is converted with `rdf2hdt`. Intermediate HDTs are merged pairwise
 in a balanced tree using HDTCat. Unpaired files are carried into the next
 round. After the final HDT is produced, the bundled HDT Java `hdtSearch.sh`
 launcher is fed only `exit`. This invokes `mapIndexedHDT()`, eagerly creating
-the final sibling `.hdt.index` without executing a potentially large query.
+the final sibling `.hdt.index.v1-1` sidecar without executing a potentially
+large query. This is HDT Java 3.0.10's v1-1 index format. The helper accepts
+the versioned `.hdt.index.*` filename and records the actual sidecar path in
+metrics.
 Intermediate indexes are intentionally not copied: the final dictionary and
 triple layout are the authoritative query representation.
 

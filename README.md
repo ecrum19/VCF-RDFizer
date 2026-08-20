@@ -64,7 +64,7 @@ inside this directory.
 - `tsv`: VCF -> TSV only (benchmarking)
 - `compress`: compress an existing `.nt` or `.nt.gz`
 - `decompress`: decompress `.nt.gz`, `.nt.br`, or `.hdt`
-- `index`: eagerly initialize the `.hdt.index` sidecar for an existing `.hdt`
+- `index`: eagerly initialize HDT Java's versioned `.hdt.index.*` sidecar for an existing `.hdt`
 
 In `full` mode with multiple VCF inputs, failures are isolated per input:
 - the run continues with remaining files
@@ -160,7 +160,7 @@ when queries must run without a decompression step.
 ## HDT Index Mode Flags
 
 - `-H, --hdt` required existing `.hdt` file
-- The generated `.hdt.index` is written beside the input HDT.
+- HDT Java 3.0.10 generates an HDT v1-1 index named `<file>.hdt.index.v1-1`.
 - The operation is also run automatically after each partitioned HDT merge.
 
 ## Quick Start
@@ -356,7 +356,7 @@ Compression metrics now include per-method:
 When HDT or COTTAS is selected, compression also validates the final base
 artifact before packaging or RDF cleanup. The validator reads the source
 triple count, streams the artifact back through the native decoder, and
-requires equal counts. HDT validation also initializes the `.hdt.index`
+requires equal counts. HDT validation also initializes the versioned `.hdt.index.*`
 sidecar. Validation results and `source_triples`/`decoded_triples` are stored
 in the per-run compression JSON and in the HDT/COTTAS columns of `metrics.csv`.
 Compression fails closed if the artifact cannot be decoded or the counts do
@@ -406,6 +406,8 @@ HDT Java 3.0.10 does not provide a standalone `hdtGenerateIndex` executable.
 VCF-RDFizer sends an `exit` command to the supported `hdtSearch.sh` launcher;
 this opens the HDT through `mapIndexedHDT()` without executing a data query and
 creates the sibling `.hdt.index` sidecar before the run is marked successful.
+For the pinned HDT Java 3.0.10 distribution, this is the HDT v1-1 sidecar
+`<file>.hdt.index.v1-1`; VCF-RDFizer reports the actual path in its metrics.
 
 The record-safe chunk plan and per-stage timings are retained in the raw
 partitioned-compression metrics JSON for diagnostics. The temporary chunk

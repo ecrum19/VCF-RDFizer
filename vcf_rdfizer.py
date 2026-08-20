@@ -634,6 +634,15 @@ def file_size_bytes(path: Path):
     return path.stat().st_size
 
 
+def find_hdt_index_sidecar(hdt_path: Path) -> Path | None:
+    """Return HDT Java's non-empty versioned index sidecar."""
+    for candidate in sorted(hdt_path.parent.glob(f"{hdt_path.name}.index.*")):
+        size = file_size_bytes(candidate)
+        if size is not None and size > 0:
+            return candidate
+    return None
+
+
 def write_nt_chunk(chunk_path: Path, source_paths: list[Path]) -> int:
     """Concatenate one or more RDF files into a chunk-local `.nt` input."""
     ensure_dir(chunk_path.parent)
@@ -3128,10 +3137,9 @@ def run_containerized_partitioned_representation_methods(
                 result["output_size_bytes"] = int(file_size_bytes(artifact_path) or 0)
                 details = result.setdefault("details", {})
                 if method == "hdt":
-                    details["index_path"] = str(Path(str(artifact_path) + ".index"))
-                    details["index_size_bytes"] = int(
-                        file_size_bytes(Path(str(artifact_path) + ".index")) or 0
-                    )
+                    index_path = find_hdt_index_sidecar(artifact_path)
+                    details["index_path"] = str(index_path) if index_path else ""
+                    details["index_size_bytes"] = int(file_size_bytes(index_path) or 0) if index_path else 0
                 if "source_paths" in details:
                     details["source_paths"] = [str(source_rdf_path)]
                 for chunk in details.get("chunks", []):
@@ -4053,8 +4061,8 @@ def run_hdt_index_mode(
     """Eagerly create the HDT Java index beside an existing HDT file."""
     print("Step 3/3: Initializing HDT index")
     ensure_dir(metrics_dir)
-    index_path = Path(str(hdt_path) + ".index")
-    index_existed = index_path.exists() and index_path.stat().st_size > 0
+    existing_index_path = find_hdt_index_sidecar(hdt_path)
+    index_existed = existing_index_path is not None
     source_container = f"/data/hdt/{hdt_path.name}"
     command = (
         "set -euo pipefail; "
@@ -4073,17 +4081,18 @@ def run_hdt_index_mode(
     started = time.perf_counter()
     exit_code = run(cmd)
     elapsed = time.perf_counter() - started
-    index_ready = index_path.exists() and index_path.stat().st_size > 0
+    index_path = find_hdt_index_sidecar(hdt_path)
+    index_ready = index_path is not None
     final_code = int(exit_code) if int(exit_code) != 0 else (0 if index_ready else 1)
     payload = {
         "hdt_path": str(hdt_path),
-        "index_path": str(index_path),
+        "index_path": str(index_path) if index_path else "",
         "exit_code": final_code,
         "wall_seconds": elapsed,
         "index_status": (
             "existing" if index_existed else "generated"
         ) if index_ready else "failed",
-        "index_size_bytes": file_size_bytes(index_path) or 0,
+        "index_size_bytes": file_size_bytes(index_path) if index_path else 0,
     }
     (metrics_dir / "hdt_index_metrics.json").write_text(
         json.dumps(payload, indent=2) + "\n",
@@ -4229,7 +4238,7 @@ def main():
         "-H",
         "--hdt",
         default=None,
-        help="Existing HDT file for --mode index; the .hdt.index sidecar is created beside it",
+        help="Existing HDT file for --mode index; HDT Java creates a versioned .hdt.index.* sidecar beside it",
     )
     parser.add_argument(
         "-d",
