@@ -3,12 +3,12 @@ name: publish-python
 on:
   push:
     tags:
-      - "v*"
+      - "v*.*.*"
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Optional Git tag to sync from, for example v1.2.3"
-        required: false
+        description: "Existing Git tag to validate, for example v1.2.4. Manual runs never publish to PyPI."
+        required: true
         type: string
 
 env:
@@ -18,20 +18,21 @@ jobs:
   build:
     name: build-sdist-wheel
     runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.release_tag || github.ref_name }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.release_tag || github.ref }}
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Sync release metadata from tag
-        env:
-          RELEASE_TAG: ${{ github.event.inputs.release_tag || github.ref_name }}
-        run: |
-          python scripts/release.py --tag "${RELEASE_TAG}" --workflow
+      - name: Validate committed release metadata
+        run: python scripts/release.py --check-tag "${RELEASE_TAG}"
 
       - name: Build package
         run: |
@@ -41,8 +42,6 @@ jobs:
           python -m twine check dist/*
 
       - name: Verify built artifact versions
-        env:
-          RELEASE_TAG: ${{ github.event.inputs.release_tag || github.ref_name }}
         run: |
           python - <<'PY'
           from pathlib import Path
@@ -87,6 +86,27 @@ jobs:
           for name in names:
               print(f"  {name}")
           PY
+
+      - name: Smoke-test installed wheel
+        run: |
+          python -m venv /tmp/vcf-rdfizer-wheel-test
+          /tmp/vcf-rdfizer-wheel-test/bin/python -m pip install --no-deps dist/*.whl
+          (
+            cd /tmp
+            /tmp/vcf-rdfizer-wheel-test/bin/vcf-rdfizer --help
+            /tmp/vcf-rdfizer-wheel-test/bin/python - <<'PY'
+          import importlib.resources
+          from pathlib import Path
+
+          import vcf_rdfizer
+
+          rules = importlib.resources.files("vcf_rdfizer_data").joinpath("rules/default_rules.ttl")
+          if not rules.is_file():
+              raise SystemExit("Packaged default rules are missing")
+          if not vcf_rdfizer.resolve_default_rules_path(Path(vcf_rdfizer.__file__).resolve().parent).is_file():
+              raise SystemExit("Installed wrapper cannot resolve packaged default rules")
+          PY
+          )
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

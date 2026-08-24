@@ -47,6 +47,9 @@ or pull the prebuilt Docker image directly:
 docker pull ecrum19/vcf-rdfizer:latest
 ```
 
+Release maintainers: see [`RELEASING.md`](RELEASING.md) for the PyPI,
+Docker Hub, and conda-forge release procedure.
+
 ## Important CLI Rule
 
 `--out` is required for all modes.

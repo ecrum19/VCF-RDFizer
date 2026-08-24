@@ -7,7 +7,7 @@ package:
 
 source:
   url: https://github.com/ecrum19/VCF-RDFizer/archive/refs/tags/v{{ version }}.tar.gz
-  sha256: REPLACE_WITH_GITHUB_TARBALL_SHA256
+  sha256: 1587e0b51e4394eff884b503cff64f7283f2ea5bf13039ed262be8763f8ff691
 
 build:
   noarch: python
@@ -20,7 +20,7 @@ requirements:
   host:
     - python {{ python_min }}
     - pip
-    - setuptools >=69
+    - setuptools >=77
     - wheel
   run:
     - python >={{ python_min }}
