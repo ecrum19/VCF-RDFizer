@@ -7,11 +7,11 @@ do not submit this package to `staged-recipes`.
 
 ## Before submitting to conda-forge
 
-1. Commit the version bump, then create and push a Git tag (for example `v1.2.3`).
+1. Commit the version bump, then create and push a Git tag (for example `v2.0.0`).
 2. Download the source tarball and compute sha256:
    ```bash
    curl -L -o vcf-rdfizer.tar.gz \
-     https://github.com/ecrum19/VCF-RDFizer/archive/refs/tags/v1.2.3.tar.gz
+     https://github.com/ecrum19/VCF-RDFizer/archive/refs/tags/v2.0.0.tar.gz
    shasum -a 256 vcf-rdfizer.tar.gz
    ```
 3. Replace `version` and `sha256` in the feedstock's `recipe/meta.yaml`.
