@@ -4092,13 +4092,21 @@ def run_compress_mode(
 
 def detect_compressed_format(path: Path):
     """Infer compressed RDF format from filename/extension."""
+    if (
+        path.name.endswith(".cottas")
+        or path.name.endswith(".cottas.gz")
+        or path.name.endswith(".cottas.br")
+    ):
+        return "cottas"
     if path.name.endswith(".nt.gz") or path.suffix == ".gz":
         return "gzip"
     if path.name.endswith(".nt.br") or path.suffix == ".br":
         return "brotli"
     if path.suffix == ".hdt":
         return "hdt"
-    raise ValueError("Compressed input must end with .gz, .br, or .hdt")
+    raise ValueError(
+        "Compressed input must end with .nt.gz, .nt.br, .hdt, .cottas, .cottas.gz, or .cottas.br"
+    )
 
 
 def default_decompressed_name(path: Path, fmt: str):
@@ -4111,6 +4119,10 @@ def default_decompressed_name(path: Path, fmt: str):
         if path.name.endswith(".nt.br"):
             return path.name[: -len(".br")]
         return f"{path.stem}.nt"
+    if fmt == "cottas":
+        for suffix in (".cottas.gz", ".cottas.br", ".cottas"):
+            if path.name.endswith(suffix):
+                return f"{path.name[: -len(suffix)]}.nt"
     return f"{path.stem}.nt"
 
 
@@ -4178,7 +4190,7 @@ def run_decompress_mode(
     image_ref: str,
     wrapper_log_path: Path,
 ):
-    """Execute decompression-only mode (.gz/.br/.hdt -> RDF)."""
+    """Execute decompression-only mode (.gz/.br/.hdt/.cottas -> RDF)."""
     print("Step 3/3: Decompressing RDF input")
     fmt = detect_compressed_format(compressed_path)
     ensure_dir(decompressed_out.parent)
@@ -4198,7 +4210,7 @@ def run_decompress_mode(
             f"rm -f {shlex.quote(output_container)}; "
             f"brotli -d -c {shlex.quote(source_container)} > {shlex.quote(output_container)}"
         )
-    else:
+    elif fmt == "hdt":
         command = (
             "set -euo pipefail; "
             f"rm -f {shlex.quote(output_container)}; "
@@ -4213,6 +4225,36 @@ def run_decompress_mode(
             "fi; "
             '"$HDT2RDF_BIN" '
             f"{shlex.quote(source_container)} {shlex.quote(output_container)}"
+        )
+    else:
+        # COTTAS is seekable, so packaged `.cottas.gz`/`.cottas.br` inputs are
+        # unwrapped inside the container before pycottas reads them. The
+        # temporary representation never appears on the host filesystem.
+        cottas_input = source_container
+        cleanup = ""
+        if compressed_path.name.endswith(".cottas.gz"):
+            cottas_input = "/work/vcf-rdfizer-cottas-input"
+            cleanup = (
+                f"rm -f {shlex.quote(cottas_input)}; "
+                f"trap 'rm -f {shlex.quote(cottas_input)}' EXIT; "
+                f"gzip -dc {shlex.quote(source_container)} > {shlex.quote(cottas_input)}; "
+            )
+        elif compressed_path.name.endswith(".cottas.br"):
+            cottas_input = "/work/vcf-rdfizer-cottas-input"
+            cleanup = (
+                f"rm -f {shlex.quote(cottas_input)}; "
+                f"trap 'rm -f {shlex.quote(cottas_input)}' EXIT; "
+                f"brotli -d -c {shlex.quote(source_container)} > {shlex.quote(cottas_input)}; "
+            )
+        command = (
+            "set -euo pipefail; "
+            f"{cleanup}"
+            'COTTAS_PYTHON_BIN="${COTTAS_PYTHON_BIN:-$(command -v python3 || true)}"; '
+            'if [[ -z "$COTTAS_PYTHON_BIN" ]]; then '
+            'echo "Missing pycottas Python executable in container" >&2; exit 127; '
+            "fi; "
+            f'"$COTTAS_PYTHON_BIN" /opt/vcf-rdfizer/cottas_tool.py decompress '
+            f"{shlex.quote(cottas_input)} {shlex.quote(output_container)}"
         )
 
     cmd = [
@@ -4295,7 +4337,7 @@ def main():
         "-C",
         "--compressed-input",
         default=None,
-        help="Compressed RDF input (.gz/.br/.hdt) for --mode decompress",
+        help="Compressed RDF input (.nt.gz/.nt.br/.hdt/.cottas[.gz|.br]) for --mode decompress",
     )
     parser.add_argument(
         "-H",
