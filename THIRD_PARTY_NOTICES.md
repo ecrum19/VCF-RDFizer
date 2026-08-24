@@ -21,6 +21,12 @@ their respective authors and apply to those components.
 - License files copied into image:
   - `/usr/share/licenses/vcf-rdfizer/RMLStreamer.LICENSE`
 
+3. `pycottas`
+- Repository: <https://github.com/cottas-rdf/pycottas>
+- Usage in this project: RDF chunk compression and indexed COTTAS merging
+- Upstream license: Apache License 2.0
+- Installed in the image's `/opt/pycottas-venv` environment
+
 ## Notes for package users
 
 - The `pip` and `conda` packages install the Python wrapper CLI only.
