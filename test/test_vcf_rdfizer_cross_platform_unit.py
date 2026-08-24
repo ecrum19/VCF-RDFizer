@@ -110,6 +110,23 @@ class WrapperCrossPlatformUnitTests(VerboseTestCase):
         self.assertEqual(vcf_rdfizer.detect_compressed_format(Path("sample.nt.gz")), "gzip")
         self.assertEqual(vcf_rdfizer.detect_compressed_format(Path("sample.nt.br")), "brotli")
         self.assertEqual(vcf_rdfizer.detect_compressed_format(Path("sample.hdt")), "hdt")
+        self.assertEqual(vcf_rdfizer.detect_compressed_format(Path("sample.cottas")), "cottas")
+        self.assertEqual(vcf_rdfizer.detect_compressed_format(Path("sample.cottas.gz")), "cottas")
+        self.assertEqual(vcf_rdfizer.detect_compressed_format(Path("sample.cottas.br")), "cottas")
+
+    def test_default_decompressed_name_for_cottas_variants(self):
+        self.assertEqual(
+            vcf_rdfizer.default_decompressed_name(Path("sample.cottas"), "cottas"),
+            "sample.nt",
+        )
+        self.assertEqual(
+            vcf_rdfizer.default_decompressed_name(Path("sample.cottas.gz"), "cottas"),
+            "sample.nt",
+        )
+        self.assertEqual(
+            vcf_rdfizer.default_decompressed_name(Path("sample.cottas.br"), "cottas"),
+            "sample.nt",
+        )
 
     def test_bind_mount_parser_preserves_windows_drive_letter(self):
         """Validation mocks preserve Windows bind-mount source paths."""

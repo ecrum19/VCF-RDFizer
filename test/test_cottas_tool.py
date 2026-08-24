@@ -102,3 +102,40 @@ class CottasToolTests(unittest.TestCase):
             self.assertTrue(output.is_file())
             self.assertEqual(len(observed_workspaces), 1)
             self.assertFalse(any(scratch_root.iterdir()))
+
+    def test_decompress_uses_pycottas_and_isolated_scratch(self):
+        """COTTAS decompression writes RDF while cleaning container-local state."""
+        module = load_cottas_tool()
+        observed_workspaces = []
+
+        def fake_cottas2rdf(cottas_path, rdf_path):
+            self.assertTrue(Path(cottas_path).is_absolute())
+            self.assertTrue(Path(rdf_path).is_absolute())
+            Path(rdf_path).write_text("<s> <p> <o> .\n")
+            database_path = Path.cwd() / "pycottas.duckdb"
+            database_path.write_text("temporary DuckDB state\n")
+            observed_workspaces.append(Path.cwd())
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            scratch_root = (root / "scratch").resolve()
+            source = root / "input.cottas"
+            output = root / "output.nt"
+            source.write_text("COTTAS input\n")
+
+            with mock.patch.dict(
+                sys.modules,
+                {"pycottas": types.SimpleNamespace(cottas2rdf=fake_cottas2rdf)},
+            ), mock.patch.dict(
+                os.environ, {"COTTAS_SCRATCH_DIR": str(scratch_root)}, clear=False
+            ), mock.patch.object(
+                sys,
+                "argv",
+                ["cottas_tool.py", "decompress", str(source), str(output)],
+            ):
+                self.assertEqual(module.main(), 0)
+
+            self.assertTrue(output.is_file())
+            self.assertEqual(output.read_text(), "<s> <p> <o> .\n")
+            self.assertEqual(len(observed_workspaces), 1)
+            self.assertFalse(any(scratch_root.iterdir()))

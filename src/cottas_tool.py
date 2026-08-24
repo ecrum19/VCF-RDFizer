@@ -42,6 +42,10 @@ def main() -> int:
     merge.add_argument("cottas_path")
     merge.add_argument("index", nargs="?", default="spo")
 
+    decompress = subparsers.add_parser("decompress", help="convert COTTAS to RDF")
+    decompress.add_argument("cottas_path")
+    decompress.add_argument("rdf_path")
+
     args = parser.parse_args()
     try:
         import pycottas
@@ -61,6 +65,15 @@ def main() -> int:
                 index=args.index,
                 disk=True,
             )
+        return 0
+
+    if args.command == "decompress":
+        cottas_path = str(Path(args.cottas_path).resolve())
+        rdf_path = str(Path(args.rdf_path).resolve())
+        # Keep DuckDB scratch state in the container-local workspace while
+        # pycottas writes the decoded RDF directly to the mounted output.
+        with cottas_scratch_workspace():
+            pycottas.cottas2rdf(cottas_path, rdf_path)
         return 0
 
     left_path = str(Path(args.left_path).resolve())

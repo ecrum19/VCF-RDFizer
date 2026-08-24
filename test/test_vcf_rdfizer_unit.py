@@ -2119,6 +2119,61 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertTrue(any(arg.endswith("/out/sample:/data/out") for arg in commands[0]))
             self.assertIn("/data/out/sample.nt", commands[0][-1])
 
+    def test_main_decompress_mode_cottas_supports_raw_and_packaged_inputs(self):
+        """COTTAS decompression accepts raw, gzip-packaged, and Brotli-packaged files."""
+        cases = (
+            ("sample.cottas", None),
+            ("sample.cottas.gz", "gzip -dc"),
+            ("sample.cottas.br", "brotli -d -c"),
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            for index, (filename, unpack_command) in enumerate(cases):
+                compressed = tmp_path / filename
+                compressed.write_bytes(b"fake-cottas-bytes")
+                out_dir = tmp_path / f"out-{index}"
+                commands = []
+
+                def fake_run(cmd, cwd=None, env=None):
+                    commands.append(cmd)
+                    return 0
+
+                old_cwd = os.getcwd()
+                os.chdir(tmp_path)
+                try:
+                    with mock.patch.object(
+                        vcf_rdfizer, "run", side_effect=fake_run
+                    ), mock.patch.object(
+                        vcf_rdfizer, "check_docker", return_value=True
+                    ), mock.patch.object(
+                        vcf_rdfizer, "docker_image_exists", return_value=True
+                    ):
+                        rc = invoke_main(
+                            [
+                                "--mode",
+                                "decompress",
+                                "--compressed-input",
+                                str(compressed),
+                                "--out",
+                                str(out_dir),
+                            ]
+                        )
+                finally:
+                    os.chdir(old_cwd)
+
+                self.assertEqual(rc, 0)
+                self.assertEqual(len(commands), 1)
+                command = commands[0][-1]
+                self.assertIn("cottas_tool.py decompress", command)
+                self.assertIn("/data/out/sample.nt", command)
+                self.assertIn("/data/in/" + filename, command)
+                if unpack_command is None:
+                    self.assertNotIn("gzip -dc", command)
+                    self.assertNotIn("brotli -d -c", command)
+                else:
+                    self.assertIn(unpack_command, command)
+
     def test_main_index_mode_initializes_existing_hdt(self):
         """Index mode runs the container helper and records the sidecar artifact."""
         with tempfile.TemporaryDirectory() as td:

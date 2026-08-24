@@ -66,7 +66,7 @@ inside this directory.
 - `full`: VCF -> TSV -> RDF -> compression
 - `tsv`: VCF -> TSV only (benchmarking)
 - `compress`: compress an existing `.nt` or `.nt.gz`
-- `decompress`: decompress `.nt.gz`, `.nt.br`, or `.hdt`
+- `decompress`: decompress `.nt.gz`, `.nt.br`, `.hdt`, `.cottas`, `.cottas.gz`, or `.cottas.br`
 - `index`: eagerly initialize HDT Java's versioned `.hdt.index.*` sidecar for an existing `.hdt`
 
 In `full` mode with multiple VCF inputs, failures are isolated per input:
@@ -119,6 +119,11 @@ Packaged `.hdt.gz`, `.hdt.br`, `.cottas.gz`, and `.cottas.br` files are archives
 not directly queryable indexed files. Keep the unwrapped `.hdt`/`.cottas` file
 when queries must run without a decompression step.
 
+Use `--mode decompress` to decode either base representation. COTTAS packages
+are unpacked inside the Docker container before `pycottas` writes the decoded
+N-Triples output, so the temporary unwrapped COTTAS file is not added to the
+host filesystem.
+
 ## Full Mode Flags
 
 - `-i, --input` required VCF file or directory
@@ -157,7 +162,7 @@ when queries must run without a decompression step.
 
 ## Decompression Mode Flags
 
-- `-C, --compressed-input` required `.nt.gz`, `.nt.br`, or `.hdt`
+- `-C, --compressed-input` required `.nt.gz`, `.nt.br`, `.hdt`, `.cottas`, `.cottas.gz`, or `.cottas.br`
 - `-d, --decompress-out` optional explicit output `.nt` path (must be inside `--out`)
 
 ## HDT Index Mode Flags
@@ -313,6 +318,15 @@ vcf-rdfizer \
   --out ./results
 ```
 
+COTTAS decompression, including an externally packaged COTTAS file:
+
+```bash
+vcf-rdfizer \
+  --mode decompress \
+  --compressed-input ./results/sample/sample.cottas.gz \
+  --out ./results
+```
+
 Initialize an index for an existing HDT:
 
 ```bash
@@ -423,7 +437,7 @@ state from one chunk being reused by another and requires no user configuration.
 HDT Java 3.0.10 does not provide a standalone `hdtGenerateIndex` executable.
 VCF-RDFizer sends an `exit` command to the supported `hdtSearch.sh` launcher;
 this opens the HDT through `mapIndexedHDT()` without executing a data query and
-creates the sibling `.hdt.index` sidecar before the run is marked successful.
+creates the versioned `.hdt.index.v1-1` sidecar before the run is marked successful.
 For the pinned HDT Java 3.0.10 distribution, this is the HDT v1-1 sidecar
 `<file>.hdt.index.v1-1`; VCF-RDFizer reports the actual path in its metrics.
 
@@ -431,8 +445,9 @@ The record-safe chunk plan and per-stage timings are retained in the raw
 partitioned-compression metrics JSON for diagnostics. The temporary chunk
 files and guide are not retained as host files.
 
-See [`COMPRESSION_CHANGELOG.md`](COMPRESSION_CHANGELOG.md) for the detailed
-implementation approach and operational constraints.
+The implementation keeps COTTAS conversion scratch state inside the Docker
+container and removes temporary unpacked package files when decompression
+finishes.
 
 ## Rules
 
@@ -460,7 +475,7 @@ Safe termination:
 
 If you use VCF-RDFizer in a publication, please cite:
 
-VCF-RDFizer maintainers. (2026). *VCF-RDFizer* (Version 2.0.0) [Computer software]. GitHub. https://github.com/ecrum19/VCF-RDFizer
+VCF-RDFizer maintainers. (2026). *VCF-RDFizer* (Version 2.1.0) [Computer software]. GitHub. https://github.com/ecrum19/VCF-RDFizer
 
 BibTeX:
 
@@ -469,7 +484,7 @@ BibTeX:
   author  = {{VCF-RDFizer maintainers}},
   title   = {VCF-RDFizer},
   year    = {2026},
-  version = {2.0.0},
+  version = {2.1.0},
   url     = {https://github.com/ecrum19/VCF-RDFizer},
   note    = {Computer software}
 }
