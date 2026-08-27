@@ -42,6 +42,13 @@ def main() -> int:
     merge.add_argument("cottas_path")
     merge.add_argument("index", nargs="?", default="spo")
 
+    reindex = subparsers.add_parser(
+        "reindex",
+        help="rebuild the embedded COTTAS query index in place",
+    )
+    reindex.add_argument("cottas_path")
+    reindex.add_argument("index", nargs="?", default="spo")
+
     decompress = subparsers.add_parser("decompress", help="convert COTTAS to RDF")
     decompress.add_argument("cottas_path")
     decompress.add_argument("rdf_path")
@@ -74,6 +81,41 @@ def main() -> int:
         # pycottas writes the decoded RDF directly to the mounted output.
         with cottas_scratch_workspace():
             pycottas.cottas2rdf(cottas_path, rdf_path)
+        return 0
+
+    if args.command == "reindex":
+        cottas_path = Path(args.cottas_path).resolve()
+        if not cottas_path.is_file():
+            print(f"COTTAS file not found: {cottas_path}", file=sys.stderr)
+            return 2
+
+        # COTTAS indexes are part of the Parquet artifact rather than sibling
+        # files. Rebuild into a temporary file in the same directory, then
+        # replace the original only after pycottas has completed successfully.
+        temporary_path = None
+        try:
+            file_descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{cottas_path.name}.reindex-",
+                suffix=".cottas",
+                dir=str(cottas_path.parent),
+            )
+            os.close(file_descriptor)
+            temporary_path = Path(temporary_name)
+            temporary_path.unlink()
+            with cottas_scratch_workspace():
+                pycottas.cat(
+                    [str(cottas_path)],
+                    str(temporary_path),
+                    index=args.index,
+                    remove_input_files=False,
+                )
+            if not temporary_path.is_file() or temporary_path.stat().st_size == 0:
+                raise RuntimeError("pycottas did not create a non-empty reindexed file")
+            os.replace(temporary_path, cottas_path)
+            temporary_path = None
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
         return 0
 
     left_path = str(Path(args.left_path).resolve())

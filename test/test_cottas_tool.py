@@ -139,3 +139,68 @@ class CottasToolTests(unittest.TestCase):
             self.assertEqual(output.read_text(), "<s> <p> <o> .\n")
             self.assertEqual(len(observed_workspaces), 1)
             self.assertFalse(any(scratch_root.iterdir()))
+
+    def test_reindex_rewrites_atomically_without_removing_input(self):
+        """Reindex uses one-file cat and replaces the source only on success."""
+        module = load_cottas_tool()
+        calls = []
+
+        def fake_cat(paths, cottas_path, *, index, remove_input_files):
+            calls.append((paths, cottas_path, index, remove_input_files))
+            self.assertNotEqual(Path(cottas_path), source)
+            self.assertTrue(Path(cottas_path).name.startswith(f".{source.name}.reindex-"))
+            Path(cottas_path).write_text("reindexed COTTAS\n")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            scratch_root = root / "scratch"
+            source = root / "input.cottas"
+            source.write_text("original COTTAS\n")
+
+            with mock.patch.dict(
+                sys.modules,
+                {"pycottas": types.SimpleNamespace(cat=fake_cat)},
+            ), mock.patch.dict(
+                os.environ, {"COTTAS_SCRATCH_DIR": str(scratch_root)}, clear=False
+            ), mock.patch.object(
+                sys,
+                "argv",
+                ["cottas_tool.py", "reindex", str(source)],
+            ):
+                self.assertEqual(module.main(), 0)
+
+            self.assertEqual(source.read_text(), "reindexed COTTAS\n")
+            self.assertEqual(
+                calls,
+                [([str(source.resolve())], mock.ANY, "spo", False)],
+            )
+            self.assertEqual(list(root.glob(".input.cottas.reindex-*.cottas")), [])
+
+    def test_reindex_keeps_original_when_pycottas_fails(self):
+        """A failed COTTAS rebuild does not replace the existing artifact."""
+        module = load_cottas_tool()
+
+        def failing_cat(*args, **kwargs):
+            raise RuntimeError("simulated reindex failure")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            scratch_root = root / "scratch"
+            source = root / "input.cottas"
+            source.write_text("original COTTAS\n")
+
+            with mock.patch.dict(
+                sys.modules,
+                {"pycottas": types.SimpleNamespace(cat=failing_cat)},
+            ), mock.patch.dict(
+                os.environ, {"COTTAS_SCRATCH_DIR": str(scratch_root)}, clear=False
+            ), mock.patch.object(
+                sys,
+                "argv",
+                ["cottas_tool.py", "reindex", str(source)],
+            ):
+                with self.assertRaisesRegex(RuntimeError, "simulated reindex failure"):
+                    module.main()
+
+            self.assertEqual(source.read_text(), "original COTTAS\n")
+            self.assertEqual(list(root.glob(".input.cottas.reindex-*.cottas")), [])

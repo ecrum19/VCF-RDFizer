@@ -1423,6 +1423,7 @@ class WrapperUnitTests(VerboseTestCase):
         self.assertIn("--rdf-compression", text)
         self.assertIn("--representations", text)
         self.assertIn("--artifact-compression", text)
+        self.assertIn("--cottas", text)
         self.assertNotIn("--keep-rdf", text)
         self.assertNotIn("--compression", text)
 
@@ -2308,6 +2309,120 @@ class WrapperUnitTests(VerboseTestCase):
                 (tmp_path / "sample.hdt.index.v1-1").resolve(),
             )
 
+    def test_main_index_mode_regenerates_existing_hdt_sidecar(self):
+        """Index mode permits an existing HDT sidecar and invokes regeneration."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            hdt_path = tmp_path / "sample.hdt"
+            hdt_path.write_bytes(b"fake-hdt")
+            existing_index = tmp_path / "sample.hdt.index.v1-1"
+            existing_index.write_text("old-index\n")
+            out_dir = tmp_path / "out"
+            commands = []
+
+            def fake_run(cmd, cwd=None, env=None):
+                commands.append(cmd)
+                rendered = str(cmd[-1])
+                if "ensure_hdt_index.sh" in rendered:
+                    existing_index.write_text("new-index\n")
+                return 0
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch.object(
+                    vcf_rdfizer, "check_docker", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "docker_image_exists", return_value=True
+                ):
+                    rc = invoke_main(
+                        [
+                            "--mode",
+                            "index",
+                            "--hdt",
+                            str(hdt_path),
+                            "--out",
+                            str(out_dir),
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(existing_index.read_text(), "new-index\n")
+            payload = json.loads(
+                (latest_metrics_run_dir(out_dir / "run_metrics") / "index_metrics.json").read_text()
+            )
+            self.assertEqual(payload["index_status"], "regenerated")
+
+    def test_main_index_mode_reindexes_existing_cottas(self):
+        """Index mode invokes the COTTAS adapter and records embedded-index metadata."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            cottas_path = tmp_path / "sample.cottas"
+            cottas_path.write_text("old-cottas\n")
+            out_dir = tmp_path / "out"
+            commands = []
+
+            def fake_run(cmd, cwd=None, env=None):
+                commands.append(cmd)
+                rendered = str(cmd[-1])
+                if "cottas_tool.py" in rendered and " reindex " in rendered:
+                    cottas_path.write_text("reindexed-cottas\n")
+                return 0
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch.object(
+                    vcf_rdfizer, "check_docker", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "docker_image_exists", return_value=True
+                ):
+                    rc = invoke_main(
+                        [
+                            "--mode",
+                            "index",
+                            "--cottas",
+                            str(cottas_path),
+                            "--out",
+                            str(out_dir),
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(cottas_path.read_text(), "reindexed-cottas\n")
+            self.assertEqual(len(commands), 1)
+            self.assertIn("cottas_tool.py reindex", commands[0][-1])
+            self.assertTrue(any(arg.endswith(":/data/cottas") for arg in commands[0]))
+            payload = json.loads(
+                (latest_metrics_run_dir(out_dir / "run_metrics") / "index_metrics.json").read_text()
+            )
+            self.assertEqual(payload["index_format"], "cottas")
+            self.assertEqual(payload["index_location"], "embedded")
+            self.assertEqual(payload["index_status"], "regenerated")
+            self.assertTrue(
+                (latest_metrics_run_dir(out_dir / "run_metrics") / "cottas_index_metrics.json").exists()
+            )
+
+    def test_main_index_mode_requires_exactly_one_index_input(self):
+        """Index mode rejects missing or ambiguous HDT/COTTAS inputs."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            hdt_path = tmp_path / "sample.hdt"
+            cottas_path = tmp_path / "sample.cottas"
+            hdt_path.write_bytes(b"hdt")
+            cottas_path.write_bytes(b"cottas")
+
+            for options in (
+                [],
+                ["--hdt", str(hdt_path), "--cottas", str(cottas_path)],
+            ):
+                rc = invoke_main(["--mode", "index", *options, "--out", str(tmp_path / "out")])
+                self.assertEqual(rc, 2)
+
     def test_hdt_index_helper_uses_exit_only_and_verifies_sidecar(self):
         """The helper uses HDT Java's bounded-memory disk indexer."""
         with tempfile.TemporaryDirectory() as td:
@@ -2331,6 +2446,8 @@ class WrapperUnitTests(VerboseTestCase):
             search.chmod(0o755)
             hdt_path = tmp_path / "sample.hdt"
             hdt_path.write_bytes(b"fake-hdt")
+            existing_index = Path(str(hdt_path) + ".index.v1-1")
+            existing_index.write_text("old-index\n", encoding="utf-8")
             helper = Path(__file__).parents[1] / "src" / "ensure_hdt_index.sh"
 
             result = subprocess.run(
@@ -2347,6 +2464,7 @@ class WrapperUnitTests(VerboseTestCase):
 
             self.assertEqual(result.returncode, 0, msg=result.stderr)
             self.assertTrue(Path(str(hdt_path) + ".index.v1-1").exists())
+            self.assertEqual(existing_index.read_text(encoding="utf-8"), "index\n")
             self.assertIn(f"HDT index ready: {hdt_path}.index.v1-1", result.stdout)
             invocation = invocation_path.read_text(encoding="utf-8").splitlines()
             self.assertEqual(invocation[0:2], ["-quiet", "-options"])
@@ -2355,6 +2473,45 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertIn("bitmaptriples.sequence.disk.subindex=true", invocation[2])
             self.assertIn("bitmaptriples.sequence.disk.location=", invocation[2])
             self.assertEqual(invocation[3], str(hdt_path))
+            self.assertEqual(list(work_root.iterdir()), [])
+
+    def test_hdt_index_helper_restores_existing_sidecar_on_failure(self):
+        """Failed HDT regeneration restores the sidecar that was moved aside."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            java_home = tmp_path / "java-home"
+            bin_dir = java_home / "bin"
+            bin_dir.mkdir(parents=True)
+            work_root = tmp_path / "index-work"
+            work_root.mkdir()
+            search = bin_dir / "hdtSearch.sh"
+            search.write_text(
+                "#!/usr/bin/env bash\n"
+                "read -r command\n"
+                "[[ \"$command\" == \"exit\" ]] || exit 3\n"
+                "exit 7\n",
+                encoding="utf-8",
+            )
+            search.chmod(0o755)
+            hdt_path = tmp_path / "sample.hdt"
+            hdt_path.write_bytes(b"fake-hdt")
+            existing_index = Path(str(hdt_path) + ".index.v1-1")
+            existing_index.write_text("old-index\n", encoding="utf-8")
+            helper = Path(__file__).parents[1] / "src" / "ensure_hdt_index.sh"
+
+            result = subprocess.run(
+                ["bash", str(helper), str(hdt_path)],
+                env={
+                    **os.environ,
+                    "HDT_JAVA_HOME": str(java_home),
+                    "HDT_INDEX_WORK_ROOT": str(work_root),
+                },
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 7, msg=result.stderr)
+            self.assertEqual(existing_index.read_text(encoding="utf-8"), "old-index\n")
             self.assertEqual(list(work_root.iterdir()), [])
 
     def test_main_decompress_mode_rejects_unknown_extension(self):

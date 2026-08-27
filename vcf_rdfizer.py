@@ -6,7 +6,8 @@ This module orchestrates the end-to-end Dockerized pipeline:
 2) convert VCF -> TSV
 3) run RMLStreamer conversion
 4) run selected compression/decompression operations
-5) persist run and compression metrics
+5) optionally regenerate the query index for an existing HDT or COTTAS file
+6) persist run and compression metrics
 
 The implementation is intentionally split into small helpers so failures can be
 diagnosed at a specific stage and future workflow changes stay localized.
@@ -185,6 +186,7 @@ DEFAULT_CHUNK_TARGET_BYTES = 512 * 1024 * 1024
 DEFAULT_CHUNK_MIN_BYTES = 128 * 1024 * 1024
 DEFAULT_CHUNK_MAX_BYTES = 1024 * 1024 * 1024
 HDT_INDEX_HELPER_CONTAINER = "/opt/vcf-rdfizer/ensure_hdt_index.sh"
+COTTAS_TOOL_CONTAINER = "/opt/vcf-rdfizer/cottas_tool.py"
 PARTITIONED_COMPRESSION_RUNNER_CONTAINER = "/opt/vcf-rdfizer/partitioned_compression.py"
 SAMPLE_CALLS_HEADER = [
     "SOURCE_FILE",
@@ -4449,27 +4451,47 @@ def default_decompressed_name(path: Path, fmt: str):
     return f"{path.stem}.nt"
 
 
-def run_hdt_index_mode(
+def run_index_mode(
     *,
-    hdt_path: Path,
+    index_path: Path,
+    index_format: str,
     metrics_dir: Path,
     image_ref: str,
     wrapper_log_path: Path,
 ):
-    """Eagerly create the HDT Java index beside an existing HDT file."""
-    print("Step 3/3: Initializing HDT index")
+    """Generate or regenerate the query index for one existing artifact.
+
+    HDT writes its index as a versioned sibling sidecar. COTTAS stores its
+    query index in the Parquet artifact itself, so the Docker-side adapter
+    rewrites that file atomically with the requested index order.
+    """
+    format_label = index_format.upper()
+    print(f"Step 3/3: Regenerating {format_label} index")
     ensure_dir(metrics_dir)
-    existing_index_path = find_hdt_index_sidecar(hdt_path)
-    index_existed = existing_index_path is not None
-    source_container = f"/data/hdt/{hdt_path.name}"
-    command = (
-        "set -euo pipefail; "
-        f"{shlex.quote(HDT_INDEX_HELPER_CONTAINER)} {shlex.quote(source_container)}"
+
+    existing_index_path = (
+        find_hdt_index_sidecar(index_path) if index_format == "hdt" else None
     )
+    mount_name = "hdt" if index_format == "hdt" else "cottas"
+    source_container = f"/data/{mount_name}/{index_path.name}"
+    if index_format == "hdt":
+        command = (
+            "set -euo pipefail; "
+            f"{shlex.quote(HDT_INDEX_HELPER_CONTAINER)} {shlex.quote(source_container)}"
+        )
+    else:
+        command = (
+            "set -euo pipefail; "
+            'PYTHON_BIN="${COTTAS_PYTHON_BIN:-$(command -v python3 || true)}"; '
+            'if [[ -z "$PYTHON_BIN" || ! -x "$PYTHON_BIN" ]]; then '
+            'echo "Missing pycottas Python executable in container" >&2; exit 127; fi; '
+            f'"$PYTHON_BIN" {shlex.quote(COTTAS_TOOL_CONTAINER)} reindex '
+            f"{shlex.quote(source_container)} spo"
+        )
     cmd = [
         *docker_run_base(),
         "-v",
-        f"{str(hdt_path.parent)}:/data/hdt",
+        f"{str(index_path.parent)}:/data/{mount_name}",
         image_ref,
         "bash",
         "-lc",
@@ -4479,31 +4501,69 @@ def run_hdt_index_mode(
     started = time.perf_counter()
     exit_code = run(cmd)
     elapsed = time.perf_counter() - started
-    index_path = find_hdt_index_sidecar(hdt_path)
-    index_ready = index_path is not None
+    index_path_after = (
+        find_hdt_index_sidecar(index_path)
+        if index_format == "hdt"
+        else (index_path if file_size_bytes(index_path) else None)
+    )
+    index_ready = index_path_after is not None
     final_code = int(exit_code) if int(exit_code) != 0 else (0 if index_ready else 1)
+    index_was_present = existing_index_path is not None or index_format == "cottas"
     payload = {
-        "hdt_path": str(hdt_path),
-        "index_path": str(index_path) if index_path else "",
+        "index_format": index_format,
+        "input_path": str(index_path),
+        "index_path": str(index_path_after) if index_path_after else "",
+        "index_location": "sidecar" if index_format == "hdt" else "embedded",
         "exit_code": final_code,
         "wall_seconds": elapsed,
         "index_status": (
-            "existing" if index_existed else "generated"
+            "regenerated" if index_was_present else "generated"
         ) if index_ready else "failed",
-        "index_size_bytes": file_size_bytes(index_path) if index_path else 0,
+        "index_size_bytes": file_size_bytes(index_path_after) if index_path_after else 0,
     }
-    (metrics_dir / "hdt_index_metrics.json").write_text(
+    if index_format == "hdt":
+        # Preserve the field used by the original HDT-only metrics payload.
+        payload["hdt_path"] = str(index_path)
+    else:
+        payload["cottas_path"] = str(index_path)
+    metrics_path = metrics_dir / "index_metrics.json"
+    metrics_path.write_text(
         json.dumps(payload, indent=2) + "\n",
         encoding="utf-8",
     )
+    # Keep a format-specific metrics filename for discovery/compatibility,
+    # while the generic filename is used for both supported formats.
+    legacy_metrics_path = metrics_dir / f"{index_format}_index_metrics.json"
+    if legacy_metrics_path != metrics_path:
+        legacy_metrics_path.write_text(
+            json.dumps(payload, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
     if final_code != 0:
-        eprint(f"Error: HDT index initialization failed. See log: {wrapper_log_path}")
+        eprint(f"Error: {format_label} index regeneration failed. See log: {wrapper_log_path}")
         return 1
 
-    print(f"HDT index ready: {index_path}")
-    print(f"HDT index metrics: {metrics_dir / 'hdt_index_metrics.json'}")
+    print(f"{format_label} index ready: {index_path_after}")
+    print(f"Index metrics: {metrics_path}")
     return 0
+
+
+def run_hdt_index_mode(
+    *,
+    hdt_path: Path,
+    metrics_dir: Path,
+    image_ref: str,
+    wrapper_log_path: Path,
+):
+    """Backward-compatible wrapper for the HDT-only index helper."""
+    return run_index_mode(
+        index_path=hdt_path,
+        index_format="hdt",
+        metrics_dir=metrics_dir,
+        image_ref=image_ref,
+        wrapper_log_path=wrapper_log_path,
+    )
 
 
 def run_decompress_mode(
@@ -4634,8 +4694,10 @@ def main():
             "--rdf-compression gzip --representations hdt --artifact-compression gzip -o ./results\n"
             "  Decompression-only:\n"
             "    vcf_rdfizer.py -m decompress -C ./results/out/sample/sample.nt.gz -o ./results\n"
-            "  Initialize an existing HDT index:\n"
+            "  Generate or regenerate an index for an existing HDT:\n"
             "    vcf_rdfizer.py -m index -H ./results/sample/sample.hdt -o ./results\n"
+            "  Generate or regenerate an index for an existing COTTAS file:\n"
+            "    vcf_rdfizer.py -m index --cottas ./results/sample/sample.cottas -o ./results\n"
         ),
     )
     parser.add_argument(
@@ -4643,7 +4705,7 @@ def main():
         "--mode",
         choices=["full", "compress", "decompress", "tsv", "index"],
         default="full",
-        help="Run mode: full pipeline, TSV benchmark, compression, decompression, or HDT index initialization",
+        help="Run mode: full pipeline, TSV benchmark, compression, decompression, or index-only regeneration",
     )
     parser.add_argument(
         "-i",
@@ -4666,7 +4728,12 @@ def main():
         "-H",
         "--hdt",
         default=None,
-        help="Existing HDT file for --mode index; HDT Java creates a versioned .hdt.index.* sidecar beside it",
+        help="Existing .hdt file for --mode index; creates or regenerates its versioned .hdt.index.* sidecar",
+    )
+    parser.add_argument(
+        "--cottas",
+        default=None,
+        help="Existing .cottas file for --mode index; rebuilds its embedded query index in place",
     )
     parser.add_argument(
         "-d",
@@ -4987,22 +5054,25 @@ def main():
         elif mode == "index":
             if args.spark_partitions is not None:
                 raise ValueError("--spark-partitions is only valid in --mode full")
-            if not args.hdt:
-                raise ValueError("--hdt is required in --mode index")
-            hdt_path = Path(args.hdt).expanduser().resolve()
-            if not hdt_path.exists() or not hdt_path.is_file():
-                raise ValueError(f"HDT input file not found: {hdt_path}")
-            if hdt_path.suffix != ".hdt":
-                raise ValueError("HDT index input must end with .hdt")
-            validate_mode_dirs([out_root, out_dir, metrics_root])
-            existing_indexes = sorted(hdt_path.parent.glob(f"{hdt_path.name}.index.*"))
-            if existing_indexes:
+            if bool(args.hdt) == bool(args.cottas):
                 raise ValueError(
-                    "Refusing to overwrite existing output file(s): "
-                    + ", ".join(str(path) for path in existing_indexes)
-                    + ". VCF-RDFizer does not overwrite outputs; rename/remove the "
-                    "existing index and try again."
+                    "provide exactly one of --hdt or --cottas in --mode index"
                 )
+            if args.hdt:
+                index_format = "hdt"
+                index_path = Path(args.hdt).expanduser().resolve()
+                if index_path.suffix != ".hdt":
+                    raise ValueError("HDT index input must end with .hdt")
+            else:
+                index_format = "cottas"
+                index_path = Path(args.cottas).expanduser().resolve()
+                if index_path.suffix != ".cottas":
+                    raise ValueError("COTTAS index input must end with .cottas")
+            if not index_path.exists() or not index_path.is_file():
+                raise ValueError(
+                    f"{index_format.upper()} input file not found: {index_path}"
+                )
+            validate_mode_dirs([out_root, out_dir, metrics_root])
         else:
             if args.spark_partitions is not None:
                 raise ValueError("--spark-partitions is only valid in --mode full")
@@ -5134,7 +5204,7 @@ def main():
         elif mode == "index":
             metrics_write_target = metrics_dir if metrics_dir.exists() else metrics_dir.parent
             writable_targets = [
-                (hdt_path.parent, True),
+                (index_path.parent, True),
                 (metrics_write_target, True),
             ]
         else:
@@ -5225,8 +5295,9 @@ def main():
                 wrapper_log_path=wrapper_log_path,
             )
         if mode == "index":
-            return run_hdt_index_mode(
-                hdt_path=hdt_path,
+            return run_index_mode(
+                index_path=index_path,
+                index_format=index_format,
                 metrics_dir=metrics_dir,
                 image_ref=image_ref,
                 wrapper_log_path=wrapper_log_path,

@@ -32,13 +32,32 @@ if [[ ! -d "$HDT_INDEX_WORK_ROOT" || ! -w "$HDT_INDEX_WORK_ROOT" ]]; then
 fi
 
 INDEX_WORK_DIR=$(mktemp -d "$HDT_INDEX_WORK_ROOT/vcf-rdfizer-hdt-index.XXXXXXXX")
+INDEX_BACKUP_DIR="$INDEX_WORK_DIR/existing-indexes"
+mkdir -p "$INDEX_BACKUP_DIR"
+INDEX_REGEN_COMPLETE=0
 cleanup() {
+  if [[ "$INDEX_REGEN_COMPLETE" -eq 0 ]]; then
+    shopt -s nullglob
+    for backup in "$INDEX_BACKUP_DIR"/*; do
+      mv -- "$backup" "$(dirname "$HDT_PATH")/$(basename "$backup")"
+    done
+  fi
   rm -rf -- "$INDEX_WORK_DIR"
 }
 trap cleanup EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+# `mapIndexedHDT()` reuses an existing sidecar when one is present. Move all
+# versioned sidecars out of the way so this command really regenerates the
+# index. If indexing fails, the EXIT trap restores the previous sidecars.
+shopt -s nullglob
+for existing_index in "${HDT_PATH}".index.*; do
+  if [[ -e "$existing_index" ]]; then
+    mv -- "$existing_index" "$INDEX_BACKUP_DIR/$(basename "$existing_index")"
+  fi
+done
 
 HDT_INDEX_OPTIONS="bitmaptriples.indexmethod=disk;bitmaptriples.sequence.disk=true;bitmaptriples.sequence.disk.subindex=true;bitmaptriples.sequence.disk.location=$INDEX_WORK_DIR"
 
@@ -63,4 +82,5 @@ if [[ -z "$INDEX_PATH" ]]; then
   exit 1
 fi
 
+INDEX_REGEN_COMPLETE=1
 echo "HDT index ready: $INDEX_PATH"

@@ -67,7 +67,7 @@ inside this directory.
 - `tsv`: VCF -> TSV only (benchmarking)
 - `compress`: compress an existing `.nt` or `.nt.gz`
 - `decompress`: decompress `.nt.gz`, `.nt.br`, `.hdt`, `.cottas`, `.cottas.gz`, or `.cottas.br`
-- `index`: eagerly initialize HDT Java's versioned `.hdt.index.*` sidecar for an existing `.hdt`
+- `index`: only generate or regenerate the query index for an existing `.hdt` or `.cottas`
 
 In `full` mode with multiple VCF inputs, failures are isolated per input:
 - the run continues with remaining files
@@ -165,10 +165,18 @@ host filesystem.
 - `-C, --compressed-input` required `.nt.gz`, `.nt.br`, `.hdt`, `.cottas`, `.cottas.gz`, or `.cottas.br`
 - `-d, --decompress-out` optional explicit output `.nt` path (must be inside `--out`)
 
-## HDT Index Mode Flags
+## Index-Only Mode Flags
 
-- `-H, --hdt` required existing `.hdt` file
-- HDT Java 3.0.10 generates an HDT v1-1 index named `<file>.hdt.index.v1-1`.
+- `-H, --hdt` existing `.hdt` file; creates or regenerates its sibling sidecar
+- `--cottas` existing `.cottas` file; rebuilds its embedded query index in place
+- Exactly one of `--hdt` or `--cottas` is required.
+- HDT Java 3.0.10 generates an HDT v1-1 sidecar named `<file>.hdt.index.v1-1`.
+- COTTAS indexes are stored inside the Parquet-based `.cottas` file, so the
+  file is rewritten atomically; no separate COTTAS index file is expected.
+- Existing indexes are intentionally replaced. Use this mode when an HDT
+  sidecar is missing/stale or when a COTTAS file needs its query ordering and
+  zone-map metadata rebuilt. No VCF conversion, RDF conversion, packaging, or
+  decompression output is produced.
 - The operation is also run automatically after each partitioned HDT merge.
 
 ## Quick Start
@@ -336,6 +344,23 @@ vcf-rdfizer \
   --out ./results
 ```
 
+Regenerate the embedded index for an existing COTTAS file:
+
+```bash
+vcf-rdfizer \
+  --mode index \
+  --cottas ./results/sample/sample.cottas \
+  --out ./results
+```
+
+`--mode index` is deliberately an in-place maintenance operation. It mounts
+only the directory containing the selected artifact and writes metrics under
+`<out>/run_metrics/<RUN_ID>/index_metrics.json`. HDT indexing creates a
+versioned sidecar beside the input. COTTAS indexing rewrites the existing
+`.cottas` file through `pycottas.cat` with one input file, keeping the data in
+the same artifact while rebuilding its embedded index. If the operation fails,
+the original COTTAS file is left in place; HDT's previous sidecars are restored.
+
 ## Output Layout
 
 Given `--out ./results`:
@@ -359,8 +384,10 @@ For an existing RDF input named `test-larger.nt` or `test-larger.nt.gz`,
 
 The same basename rule applies in full mode. VCF-RDFizer performs an output
 collision check before Docker or conversion starts and never overwrites a
-planned artifact. Choose a new `--out` directory, or rename/remove the
-conflicting output before rerunning.
+planned pipeline artifact. The exception is the deliberate `--mode index`
+maintenance operation, which regenerates the selected artifact's index in
+place. Choose a new `--out` directory, or rename/remove a conflicting pipeline
+artifact before rerunning.
 
 Intermediates are hidden by default.
 Raw RDF files are removed after successful compression by default. Use
@@ -376,7 +403,9 @@ For each run, VCF-RDFizer writes:
 - `run_metrics/<RUN_ID>/metrics.csv`
 - `run_metrics/<RUN_ID>/wrapper_execution_times.csv`
 - `run_metrics/<RUN_ID>/progress.log`
-- `run_metrics/<RUN_ID>/hdt_index_metrics.json` for standalone HDT index mode
+- `run_metrics/<RUN_ID>/index_metrics.json` for standalone HDT/COTTAS index mode
+- `run_metrics/<RUN_ID>/<format>_index_metrics.json` is also written for the
+  selected format (`hdt` or `cottas`) for compatibility/discovery
 
 Compression metrics now include per-method:
 
@@ -438,6 +467,9 @@ HDT Java 3.0.10 does not provide a standalone `hdtGenerateIndex` executable.
 VCF-RDFizer sends an `exit` command to the supported `hdtSearch.sh` launcher;
 this opens the HDT through `mapIndexedHDT()` without executing a data query and
 creates the versioned `.hdt.index.v1-1` sidecar before the run is marked successful.
+For standalone index mode, any existing versioned sidecars are moved aside
+while regeneration runs and restored if indexing fails, so rerunning the mode
+really rebuilds the index without leaving a partially written replacement.
 The helper explicitly selects HDT Java's external-sort disk indexer rather than
 the launcher's heap-based default (whose launcher heap is only 1 GiB). Temporary
 sort runs and disk-backed sequences are kept under `/work` and removed when the
@@ -445,6 +477,14 @@ index command finishes. `HDT_INDEX_WORK_ROOT` can override that scratch root
 when invoking the helper directly.
 For the pinned HDT Java 3.0.10 distribution, this is the HDT v1-1 sidecar
 `<file>.hdt.index.v1-1`; VCF-RDFizer reports the actual path in its metrics.
+
+COTTAS does not expose a separate index sidecar. Its index is part of the
+Parquet artifact and is selected when the artifact is written. Standalone
+COTTAS index mode uses `pycottas.cat` to write a new temporary COTTAS file from
+the existing one with the default `spo` index, then atomically replaces the
+original. This is still index-only from the pipeline's point of view: it does
+not rerun VCF-to-RDF conversion or create an RDF output, but it may require
+temporary disk space and time comparable to rewriting the COTTAS file.
 
 The record-safe chunk plan and per-stage timings are retained in the raw
 partitioned-compression metrics JSON for diagnostics. The temporary chunk
