@@ -1,5 +1,6 @@
 ARG RMLSTREAMER_VERSION=2.5.0
 ARG HDT_JAVA_PACKAGE_VERSION=3.0.10
+ARG HDTC_VERSION=1.1.0
 
 FROM eclipse-temurin:11-jre AS build-hdt-cpp
 
@@ -35,6 +36,29 @@ RUN mkdir -p /opt/third_party_licenses \
   && cp /opt/RMLStreamer/LICENSE /opt/third_party_licenses/RMLStreamer.LICENSE
 
 
+FROM rust:1.93-slim AS build-hdtc
+
+ARG HDTC_VERSION
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    git \
+    libbz2-dev \
+    liblzma-dev \
+    pkg-config \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt
+RUN git clone --branch "v${HDTC_VERSION}" --depth 1 \
+    https://github.com/frink-okn/hdtc.git
+
+WORKDIR /opt/hdtc
+RUN cargo build --locked --release \
+  && mkdir -p /opt/third_party_licenses \
+  && cp LICENSE /opt/third_party_licenses/HDTC.LICENSE
+
+
 FROM eclipse-temurin:11-jre
 
 ARG RMLSTREAMER_VERSION
@@ -50,6 +74,8 @@ RUN apt-get update \
     findutils \
     gawk \
     gzip \
+    libbz2-1.0 \
+    liblzma5 \
     libserd-0-0 \
     nodejs \
     python3 \
@@ -77,6 +103,8 @@ COPY --from=build-hdt-cpp /usr/local/bin/hdt2rdf /usr/local/bin/hdt2rdf
 COPY --from=build-hdt-cpp /usr/local/lib/libcds* /usr/local/lib/
 COPY --from=build-hdt-cpp /usr/local/lib/libhdt* /usr/local/lib/
 COPY --from=build-hdt-cpp /opt/third_party_licenses/ /usr/share/licenses/vcf-rdfizer/
+COPY --from=build-hdtc /opt/hdtc/target/release/hdtc /usr/local/bin/hdtc
+COPY --from=build-hdtc /opt/third_party_licenses/ /usr/share/licenses/vcf-rdfizer/
 COPY THIRD_PARTY_NOTICES.md /usr/share/licenses/vcf-rdfizer/THIRD_PARTY_NOTICES.md
 COPY src/*.sh /opt/vcf-rdfizer/
 COPY src/*.py /opt/vcf-rdfizer/
@@ -84,11 +112,14 @@ COPY src/*.py /opt/vcf-rdfizer/
 RUN chmod +x /opt/vcf-rdfizer/*.sh \
   && find /opt/hdt-java/bin -type f -exec chmod +x {} \; \
   && chmod +x /usr/local/bin/rdf2hdt \
-  && chmod +x /usr/local/bin/hdt2rdf
+  && chmod +x /usr/local/bin/hdt2rdf \
+  && chmod +x /usr/local/bin/hdtc
 
 ENV RMLSTREAMER_JAR=/opt/rmlstreamer/RMLStreamer-v${RMLSTREAMER_VERSION}-standalone.jar
 ENV JAR=/opt/rmlstreamer/RMLStreamer-v${RMLSTREAMER_VERSION}-standalone.jar
 ENV HDT_JAVA_HOME=/opt/hdt-java
+ENV HDTC_BIN=/usr/local/bin/hdtc
+ENV HDT_INDEX_MEMORY_LIMIT=512M
 ENV RDF2HDT_BIN=/usr/local/bin/rdf2hdt
 ENV HDT2RDF_BIN=/usr/local/bin/hdt2rdf
 ENV COTTAS_PYTHON_BIN=/opt/pycottas-venv/bin/python

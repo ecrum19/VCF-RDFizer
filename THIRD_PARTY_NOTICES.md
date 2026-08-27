@@ -27,6 +27,14 @@ their respective authors and apply to those components.
 - Upstream license: Apache License 2.0
 - Installed in the image's `/opt/pycottas-venv` environment
 
+4. `hdtc`
+- Repository: <https://github.com/frink-okn/hdtc>
+- Usage in this project: Java-free, disk-backed index generation for existing
+  HDT files
+- Upstream license: MIT
+- License files copied into image:
+  - `/usr/share/licenses/vcf-rdfizer/HDTC.LICENSE`
+
 ## Notes for package users
 
 - The `pip` and `conda` packages install the Python wrapper CLI only.

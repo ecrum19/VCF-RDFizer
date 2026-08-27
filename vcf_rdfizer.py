@@ -422,6 +422,14 @@ def docker_run_base(*, as_user: bool = True):
     return base
 
 
+def docker_hdt_index_env_args() -> list[str]:
+    """Forward an optional host-side hdtc memory budget into Docker."""
+    memory_limit = os.environ.get("HDT_INDEX_MEMORY_LIMIT", "").strip()
+    if not memory_limit:
+        return []
+    return ["-e", f"HDT_INDEX_MEMORY_LIMIT={memory_limit}"]
+
+
 def _can_write_dir(path: Path) -> bool:
     """Best-effort write probe for directories."""
     try:
@@ -678,7 +686,7 @@ def file_size_bytes(path: Path):
 
 
 def find_hdt_index_sidecar(hdt_path: Path) -> Path | None:
-    """Return HDT Java's non-empty versioned index sidecar."""
+    """Return the non-empty canonical HDT versioned index sidecar."""
     for candidate in sorted(hdt_path.parent.glob(f"{hdt_path.name}.index.*")):
         size = file_size_bytes(candidate)
         if size is not None and size > 0:
@@ -1245,7 +1253,7 @@ def planned_output_paths(
     )
     if any(method in HDT_COMPRESSION_METHODS for method in methods):
         planned.add(target_dir / f"{output_name}.hdt")
-        # The pinned HDT Java package generates this versioned sidecar.
+        # The pinned Java-free indexer generates this canonical sidecar.
         planned.add(target_dir / f"{output_name}.hdt.index.v1-1")
     if any(method in COTTAS_COMPRESSION_METHODS for method in methods):
         planned.add(target_dir / f"{output_name}.cottas")
@@ -3015,6 +3023,7 @@ def run_compression_methods_for_rdf(
         )
         cmd = [
             *docker_run_base(),
+            *docker_hdt_index_env_args(),
             "-v",
             f"{str(in_dir)}:/data/in:ro",
             "-v",
@@ -3586,6 +3595,7 @@ def run_containerized_partitioned_representation_methods(
 
         command = [
             *docker_run_base(),
+            *docker_hdt_index_env_args(),
             "--mount",
             f"type=volume,source={volume_name},target=/work",
         ]
@@ -4712,6 +4722,7 @@ def run_index_mode(
         )
     cmd = [
         *docker_run_base(),
+        *docker_hdt_index_env_args(),
         "-v",
         f"{str(index_path.parent)}:/data/{mount_name}",
         image_ref,

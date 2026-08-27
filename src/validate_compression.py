@@ -82,8 +82,8 @@ def validate(args: argparse.Namespace) -> dict:
         }
 
     if args.format == "hdt":
-        # Loading through the bundled Java launcher also verifies that the HDT
-        # structure is readable and eagerly creates the query index.
+        # The bundled Java-free helper streams the HDT and eagerly creates the
+        # query index. hdt2rdf below independently checks decoded readability.
         if not args.skip_index_check:
             index_helper = Path("/opt/vcf-rdfizer/ensure_hdt_index.sh")
             if not index_helper.is_file():

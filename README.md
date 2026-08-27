@@ -170,7 +170,8 @@ host filesystem.
 - `-H, --hdt` existing `.hdt` file; creates or regenerates its sibling sidecar
 - `--cottas` existing `.cottas` file; rebuilds its embedded query index in place
 - Exactly one of `--hdt` or `--cottas` is required.
-- HDT Java 3.0.10 generates an HDT v1-1 sidecar named `<file>.hdt.index.v1-1`.
+- HDT indexing is Java-free: the image uses `hdtc` 1.1.0 to generate the
+  canonical v1-1 sidecar named `<file>.hdt.index.v1-1`.
 - COTTAS indexes are stored inside the Parquet-based `.cottas` file, so the
   file is rewritten atomically; no separate COTTAS index file is expected.
 - Existing indexes are intentionally replaced. Use this mode when an HDT
@@ -361,6 +362,22 @@ versioned sidecar beside the input. COTTAS indexing rewrites the existing
 the same artifact while rebuilding its embedded index. If the operation fails,
 the original COTTAS file is left in place; HDT's previous sidecars are restored.
 
+HDT indexing does not start Java. It uses `hdtc index`, which streams the HDT
+through disk-backed external sorters. The default soft memory budget is 512 MiB;
+override it for any wrapper mode with an environment variable such as:
+
+```bash
+HDT_INDEX_MEMORY_LIMIT=2G vcf-rdfizer \
+  --mode index \
+  --hdt ./results/sample/sample.hdt \
+  --out ./results
+```
+
+Accepted values use an `M` or `G` suffix. Lower values reduce in-memory sort
+buffers and may increase temporary I/O; higher values can improve indexing
+speed when memory is available. Temporary files live in the container's
+`/work` area and are removed after the attempt.
+
 In `full` mode, an HDT sidecar-index failure is non-fatal when the HDT data
 itself remains readable; the run continues and the HDT can be repaired later
 with the standalone command above. If COTTAS generation/indexing cannot
@@ -463,7 +480,7 @@ aggregate.
 When HDT or COTTAS is selected, the aggregate is read sequentially and split
 into complete N-Triples records. The same temporary chunks are consumed by
 both converters before cleanup. HDT chunks are merged with `HDTCat`, the final
-HDT index is generated after merging through HDT Java's indexed search loader,
+HDT index is generated after merging with the Java-free `hdtc index` command,
 and COTTAS chunks are merged with `pycottas.cat`, which rebuilds the query
 indexes for the merged representation.
 
@@ -482,20 +499,21 @@ Each COTTAS conversion and merge also receives a fresh container-local DuckDB
 workspace, which is removed as soon as that operation completes. This prevents
 state from one chunk being reused by another and requires no user configuration.
 
-HDT Java 3.0.10 does not provide a standalone `hdtGenerateIndex` executable.
-VCF-RDFizer sends an `exit` command to the supported `hdtSearch.sh` launcher;
-this opens the HDT through `mapIndexedHDT()` without executing a data query and
-creates the versioned `.hdt.index.v1-1` sidecar before the run is marked successful.
-For standalone index mode, any existing versioned sidecars are moved aside
-while regeneration runs and restored if indexing fails, so rerunning the mode
-really rebuilds the index without leaving a partially written replacement.
-The helper explicitly selects HDT Java's external-sort disk indexer rather than
-the launcher's heap-based default (whose launcher heap is only 1 GiB). Temporary
-sort runs and disk-backed sequences are kept under `/work` and removed when the
-index command finishes. `HDT_INDEX_WORK_ROOT` can override that scratch root
-when invoking the helper directly.
-For the pinned HDT Java 3.0.10 distribution, this is the HDT v1-1 sidecar
-`<file>.hdt.index.v1-1`; VCF-RDFizer reports the actual path in its metrics.
+HDT index generation uses the pinned Rust `hdtc` 1.1.0 executable, not
+`hdtSearch.sh` or another Java process. `hdtc index` reads BitmapTriples as a
+stream and builds the object/predicate orderings with disk-backed external
+sorts. This avoids the JVM heap path that can fail with
+`java.lang.OutOfMemoryError` while producing the same canonical HDT v1-1
+sidecar, `<file>.hdt.index.v1-1`, used by hdt-java and hdt-cpp.
+
+For standalone index mode, existing versioned sidecars are moved aside while
+regeneration runs and restored if indexing fails. Incomplete replacements are
+removed before restoration, so a failed or interrupted attempt does not leave
+a partial index. Sort runs use `/work` and are removed when the command exits.
+The image defaults `HDT_INDEX_MEMORY_LIMIT` to `512M`; the wrapper forwards a
+host value of that variable into standalone, partitioned, and full-run Docker
+commands. `HDT_INDEX_WORK_ROOT` can override the scratch root when invoking
+`/opt/vcf-rdfizer/ensure_hdt_index.sh` directly inside the container.
 
 COTTAS does not expose a separate index sidecar. Its index is part of the
 Parquet artifact and is selected when the artifact is written. Standalone

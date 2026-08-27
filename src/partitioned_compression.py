@@ -163,7 +163,7 @@ def resolve_executable(candidates: tuple[str, ...], label: str) -> str:
 
 
 def find_hdt_index_sidecar(hdt_path: Path) -> Path | None:
-    """Locate HDT Java's non-empty versioned index sidecar."""
+    """Locate the non-empty canonical HDT versioned index sidecar."""
     for candidate in sorted(hdt_path.parent.glob(f"{hdt_path.name}.index.*")):
         if candidate.is_file() and candidate.stat().st_size > 0:
             return candidate
@@ -506,7 +506,7 @@ def main() -> int:
             add_totals(hdt_total, index_stage)
             output_index = find_hdt_index_sidecar(output_hdt)
             if output_index is not None:
-                # The filename is versioned by HDT Java, so record the actual
+                # The canonical filename is versioned, so record the actual
                 # sidecar after the helper completes instead of assuming .index.
                 index_stage["output_path"] = str(output_index)
                 index_stage["output_size_bytes"] = output_index.stat().st_size

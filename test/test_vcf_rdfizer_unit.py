@@ -257,6 +257,14 @@ def latest_metrics_run_dir(metrics_root: Path) -> Path:
 
 
 class WrapperUnitTests(VerboseTestCase):
+    def test_hdt_index_memory_limit_is_forwarded_to_docker(self):
+        """A host hdtc memory override is passed to indexing containers."""
+        with mock.patch.dict(os.environ, {"HDT_INDEX_MEMORY_LIMIT": "2G"}):
+            self.assertEqual(
+                vcf_rdfizer.docker_hdt_index_env_args(),
+                ["-e", "HDT_INDEX_MEMORY_LIMIT=2G"],
+            )
+
     def test_validator_counts_plain_and_gzip_ntriples(self):
         """The Docker validator's fallback source count handles .nt and .nt.gz."""
         validator_path = Path(__file__).parents[1] / "src" / "validate_compression.py"
@@ -2534,27 +2542,23 @@ class WrapperUnitTests(VerboseTestCase):
                 rc = invoke_main(["--mode", "index", *options, "--out", str(tmp_path / "out")])
                 self.assertEqual(rc, 2)
 
-    def test_hdt_index_helper_uses_exit_only_and_verifies_sidecar(self):
-        """The helper uses HDT Java's bounded-memory disk indexer."""
+    def test_hdt_index_helper_uses_hdtc_and_verifies_sidecar(self):
+        """The helper uses hdtc's Java-free bounded-memory index command."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
-            java_home = tmp_path / "java-home"
-            bin_dir = java_home / "bin"
-            bin_dir.mkdir(parents=True)
             work_root = tmp_path / "index-work"
             work_root.mkdir()
             invocation_path = tmp_path / "invocation.txt"
-            search = bin_dir / "hdtSearch.sh"
-            search.write_text(
+            hdtc = tmp_path / "hdtc"
+            hdtc.write_text(
                 "#!/usr/bin/env bash\n"
-                "read -r command\n"
-                "[[ \"$command\" == \"exit\" ]] || exit 3\n"
                 "printf '%s\\n' \"$@\" > \"$HDT_TEST_INVOCATION\"\n"
-                "hdt_path=${!#}\n"
+                "[[ \"$1\" == \"--quiet\" && \"$2\" == \"index\" ]] || exit 3\n"
+                "hdt_path=$3\n"
                 "printf 'index\\n' > \"${hdt_path}.index.v1-1\"\n",
                 encoding="utf-8",
             )
-            search.chmod(0o755)
+            hdtc.chmod(0o755)
             hdt_path = tmp_path / "sample.hdt"
             hdt_path.write_bytes(b"fake-hdt")
             existing_index = Path(str(hdt_path) + ".index.v1-1")
@@ -2565,8 +2569,9 @@ class WrapperUnitTests(VerboseTestCase):
                 ["bash", str(helper), str(hdt_path)],
                 env={
                     **os.environ,
-                    "HDT_JAVA_HOME": str(java_home),
+                    "HDTC_BIN": str(hdtc),
                     "HDT_INDEX_WORK_ROOT": str(work_root),
+                    "HDT_INDEX_MEMORY_LIMIT": "768M",
                     "HDT_TEST_INVOCATION": str(invocation_path),
                 },
                 capture_output=True,
@@ -2578,32 +2583,29 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertEqual(existing_index.read_text(encoding="utf-8"), "index\n")
             self.assertIn(f"HDT index ready: {hdt_path}.index.v1-1", result.stdout)
             invocation = invocation_path.read_text(encoding="utf-8").splitlines()
-            self.assertEqual(invocation[0:2], ["-quiet", "-options"])
-            self.assertIn("bitmaptriples.indexmethod=disk", invocation[2])
-            self.assertIn("bitmaptriples.sequence.disk=true", invocation[2])
-            self.assertIn("bitmaptriples.sequence.disk.subindex=true", invocation[2])
-            self.assertIn("bitmaptriples.sequence.disk.location=", invocation[2])
-            self.assertEqual(invocation[3], str(hdt_path))
+            self.assertEqual(
+                invocation[0:5],
+                ["--quiet", "index", str(hdt_path), "--memory-limit", "768M"],
+            )
+            self.assertEqual(invocation[5], "--temp-dir")
+            self.assertTrue(Path(invocation[6]).parent.samefile(work_root))
             self.assertEqual(list(work_root.iterdir()), [])
 
     def test_hdt_index_helper_restores_existing_sidecar_on_failure(self):
         """Failed HDT regeneration restores the sidecar that was moved aside."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
-            java_home = tmp_path / "java-home"
-            bin_dir = java_home / "bin"
-            bin_dir.mkdir(parents=True)
             work_root = tmp_path / "index-work"
             work_root.mkdir()
-            search = bin_dir / "hdtSearch.sh"
-            search.write_text(
+            hdtc = tmp_path / "hdtc"
+            hdtc.write_text(
                 "#!/usr/bin/env bash\n"
-                "read -r command\n"
-                "[[ \"$command\" == \"exit\" ]] || exit 3\n"
+                "hdt_path=$3\n"
+                "printf 'partial-index\\n' > \"${hdt_path}.index.v1-1\"\n"
                 "exit 7\n",
                 encoding="utf-8",
             )
-            search.chmod(0o755)
+            hdtc.chmod(0o755)
             hdt_path = tmp_path / "sample.hdt"
             hdt_path.write_bytes(b"fake-hdt")
             existing_index = Path(str(hdt_path) + ".index.v1-1")
@@ -2614,7 +2616,7 @@ class WrapperUnitTests(VerboseTestCase):
                 ["bash", str(helper), str(hdt_path)],
                 env={
                     **os.environ,
-                    "HDT_JAVA_HOME": str(java_home),
+                    "HDTC_BIN": str(hdtc),
                     "HDT_INDEX_WORK_ROOT": str(work_root),
                 },
                 capture_output=True,
