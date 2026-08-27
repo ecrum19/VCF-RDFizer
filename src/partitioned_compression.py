@@ -48,6 +48,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-chunk-bytes", required=True, type=int)
     parser.add_argument("--expected-triples", type=int)
     parser.add_argument("--result-path", required=True)
+    parser.add_argument(
+        "--allow-index-failures",
+        action="store_true",
+        help="continue with other representations when HDT/COTTAS indexing fails",
+    )
     return parser.parse_args()
 
 
@@ -303,9 +308,48 @@ def main() -> int:
     chunk_dir = work_dir / "rdf_chunks"
     runner = StageRunner(work_dir)
     results: dict[str, dict] = {}
+    index_warnings: list[dict] = []
 
     hdt_total = {"exit_code": 0, "wall_seconds": 0.0, "user_seconds": 0.0, "sys_seconds": 0.0, "max_rss_kb": 0, "has_user": False, "has_sys": False, "has_rss": False}
     cottas_total = {"exit_code": 0, "wall_seconds": 0.0, "user_seconds": 0.0, "sys_seconds": 0.0, "max_rss_kb": 0, "has_user": False, "has_sys": False, "has_rss": False}
+    output_hdt = output_dir / f"{args.output_name}.hdt"
+    output_cottas = output_dir / f"{args.output_name}.cottas"
+    cottas_failed = False
+    cottas_warning = None
+
+    def record_index_warning(index_format: str, stage: str, artifact: Path, message: str) -> dict:
+        warning = {
+            "format": index_format,
+            "stage": stage,
+            "status": "index_unavailable",
+            "artifact_path": str(artifact),
+            "message": " ".join(str(message).split()),
+        }
+        index_warnings.append(warning)
+        print(
+            f"Warning: {index_format.upper()} index generation failed for '{artifact}'; "
+            f"continuing with the remaining pipeline. {warning['message']}",
+            file=sys.stderr,
+        )
+        return warning
+
+    def skipped_cottas_result(method: str) -> dict:
+        artifact = {
+            "cottas": output_cottas,
+            "cottas_gzip": output_dir / f"{args.output_name}.cottas.gz",
+            "cottas_brotli": output_dir / f"{args.output_name}.cottas.br",
+        }[method]
+        return {
+            "exit_code": 1,
+            "wall_seconds": 0.0,
+            "user_seconds": 0.0,
+            "sys_seconds": 0.0,
+            "max_rss_kb": 0,
+            "output_path": str(artifact),
+            "output_size_bytes": 0,
+            "source": "index_unavailable",
+            "details": {"index_status": "failed", "index_warning": cottas_warning},
+        }
 
     try:
         if not source.is_file():
@@ -416,6 +460,9 @@ def main() -> int:
                     raise RuntimeError("partitioned HDT chunk conversion failed")
                 hdt_paths.append(chunk_hdt)
             if any(method in COTTAS_METHODS for method in methods):
+                if cottas_failed:
+                    chunk.unlink(missing_ok=True)
+                    continue
                 chunk_cottas = work_dir / f"chunk-{index:05d}.cottas"
                 stage = runner.run(
                     f"cottas-build-{index:05d}",
@@ -424,11 +471,22 @@ def main() -> int:
                 )
                 add_totals(cottas_total, stage)
                 if stage["exit_code"] != 0:
-                    raise RuntimeError("partitioned COTTAS chunk conversion failed")
+                    if not args.allow_index_failures:
+                        raise RuntimeError("partitioned COTTAS chunk conversion failed")
+                    cottas_failed = True
+                    cottas_total["exit_code"] = 0
+                    cottas_warning = record_index_warning(
+                        "cottas",
+                        "cottas-index",
+                        output_cottas,
+                        "partitioned COTTAS conversion/index creation failed for a chunk",
+                    )
+                    chunk_cottas.unlink(missing_ok=True)
+                    chunk.unlink(missing_ok=True)
+                    continue
                 cottas_paths.append(chunk_cottas)
             chunk.unlink(missing_ok=True)
 
-        output_hdt = output_dir / f"{args.output_name}.hdt"
         if hdt_paths:
             final_hdt, hdt_rounds = merge_pairwise(
                 hdt_paths,
@@ -454,7 +512,17 @@ def main() -> int:
                 index_stage["output_size_bytes"] = output_index.stat().st_size
                 runner.stages[-1].update(index_stage)
             if index_stage["exit_code"] != 0 or output_index is None:
-                raise RuntimeError("final HDT index initialization failed")
+                if not args.allow_index_failures:
+                    raise RuntimeError("final HDT index initialization failed")
+                hdt_total["exit_code"] = 0
+                hdt_index_warning = record_index_warning(
+                    "hdt",
+                    "hdt-index",
+                    output_hdt,
+                    "the HDT artifact remains available, but its query index was not created",
+                )
+            else:
+                hdt_index_warning = None
             hdt_validation = validate_artifact(
                 name="hdt-validate",
                 artifact=output_hdt,
@@ -471,13 +539,14 @@ def main() -> int:
                     **plan,
                     "merge_rounds": hdt_rounds,
                     "index_path": str(output_index),
-                    "index_size_bytes": output_index.stat().st_size,
+                    "index_size_bytes": output_index.stat().st_size if output_index else 0,
+                    "index_status": "failed" if hdt_index_warning else "ready",
+                    "index_warning": hdt_index_warning,
                     "validation": hdt_validation,
                 },
             }
 
-        output_cottas = output_dir / f"{args.output_name}.cottas"
-        if cottas_paths:
+        if cottas_paths and not cottas_failed:
             final_cottas, cottas_rounds = merge_pairwise(
                 cottas_paths,
                 prefix="cottas",
@@ -486,27 +555,54 @@ def main() -> int:
                 total=cottas_total,
             )
             if final_cottas is None:
-                raise RuntimeError("COTTAS merge failed")
-            shutil.copyfile(final_cottas, output_cottas)
-            final_cottas.unlink(missing_ok=True)
-            cottas_validation = validate_artifact(
-                name="cottas-validate",
-                artifact=output_cottas,
-                artifact_format="cottas",
-                python_bin=cottas_python,
-            )
-            results["cottas"] = {
-                **finalize_totals(cottas_total),
-                "output_path": str(output_cottas),
-                "output_size_bytes": output_cottas.stat().st_size,
-                "source": "partitioned_generated",
-                "details": {
-                    **plan,
-                    "merge_rounds": cottas_rounds,
-                    "index": "spo",
-                    "validation": cottas_validation,
-                },
-            }
+                if not args.allow_index_failures:
+                    raise RuntimeError("COTTAS merge failed")
+                cottas_failed = True
+                cottas_total["exit_code"] = 0
+                cottas_warning = record_index_warning(
+                    "cottas",
+                    "cottas-index",
+                    output_cottas,
+                    "COTTAS merge/index creation failed",
+                )
+            else:
+                shutil.copyfile(final_cottas, output_cottas)
+                final_cottas.unlink(missing_ok=True)
+                try:
+                    cottas_validation = validate_artifact(
+                        name="cottas-validate",
+                        artifact=output_cottas,
+                        artifact_format="cottas",
+                        python_bin=cottas_python,
+                    )
+                except RuntimeError as exc:
+                    if not args.allow_index_failures:
+                        raise
+                    cottas_failed = True
+                    cottas_total["exit_code"] = 0
+                    output_cottas.unlink(missing_ok=True)
+                    cottas_warning = record_index_warning(
+                        "cottas",
+                        "cottas-index",
+                        output_cottas,
+                        str(exc),
+                    )
+                if not cottas_failed:
+                    results["cottas"] = {
+                        **finalize_totals(cottas_total),
+                        "output_path": str(output_cottas),
+                        "output_size_bytes": output_cottas.stat().st_size,
+                        "source": "partitioned_generated",
+                        "details": {
+                            **plan,
+                            "merge_rounds": cottas_rounds,
+                            "index": "spo",
+                            "validation": cottas_validation,
+                        },
+                    }
+
+        if any(method in COTTAS_METHODS for method in methods) and cottas_failed:
+            results["cottas"] = skipped_cottas_result("cottas")
 
         for method in methods:
             if method == "hdt_gzip":
@@ -516,9 +612,15 @@ def main() -> int:
                 artifact = output_dir / f"{args.output_name}.hdt.br"
                 stage = runner.run("hdt-brotli", ["brotli", "-q", "7", "-c", str(output_hdt)], artifact, artifact)
             elif method == "cottas_gzip":
+                if cottas_failed:
+                    results[method] = skipped_cottas_result(method)
+                    continue
                 artifact = output_dir / f"{args.output_name}.cottas.gz"
                 stage = runner.run("cottas-gzip", ["gzip", "-c", str(output_cottas)], artifact, artifact)
             elif method == "cottas_brotli":
+                if cottas_failed:
+                    results[method] = skipped_cottas_result(method)
+                    continue
                 artifact = output_dir / f"{args.output_name}.cottas.br"
                 stage = runner.run("cottas-brotli", ["brotli", "-q", "7", "-c", str(output_cottas)], artifact, artifact)
             else:
@@ -528,7 +630,7 @@ def main() -> int:
             results[method] = stage
 
         result_path.parent.mkdir(parents=True, exist_ok=True)
-        result_path.write_text(json.dumps({"exit_code": 0, "methods": results, "stages": runner.stages}, indent=2) + "\n", encoding="utf-8")
+        result_path.write_text(json.dumps({"exit_code": 0, "methods": results, "stages": runner.stages, "index_warnings": index_warnings}, indent=2) + "\n", encoding="utf-8")
         return 0
     except Exception as exc:
         result_path.parent.mkdir(parents=True, exist_ok=True)

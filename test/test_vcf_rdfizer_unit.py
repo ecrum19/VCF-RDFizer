@@ -851,6 +851,117 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertIn("cottas_gzip", payload["methods"])
             self.assertIn("cottas_brotli", payload["methods"])
 
+    def test_full_compression_recovers_from_hdt_index_failure(self):
+        """A readable HDT remains packageable when only index creation fails."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir = tmp_path / "input"
+            out_dir = tmp_path / "out"
+            target_dir = out_dir / "sample"
+            input_dir.mkdir()
+            target_dir.mkdir(parents=True)
+            rdf_path = input_dir / "sample.nt"
+            rdf_path.write_text("<s> <p> <o> .\n")
+            hdt_path = target_dir / "sample.hdt"
+            hdt_path.write_text("readable-hdt\n")
+            warnings = []
+            validation_calls = []
+
+            def fake_run(cmd, cwd=None, env=None):
+                rendered = str(cmd[-1]) if cmd else ""
+                if "validate_compression.py" not in rendered:
+                    if "gzip -c /data/out/sample/sample.hdt" in rendered:
+                        (target_dir / "sample.hdt.gz").write_text("packaged-hdt\n")
+                    return 0
+                validation_calls.append(rendered)
+                result_match = re.search(
+                    r"--result-path\s+['\"]?(/data/out/[^\s'\";]+)",
+                    rendered,
+                )
+                result_path = out_dir / result_match.group(1).replace("/data/out/", "", 1)
+                result_path.parent.mkdir(parents=True, exist_ok=True)
+                if "--skip-index-check" in rendered:
+                    result_path.write_text(
+                        json.dumps(
+                            {
+                                "valid": True,
+                                "source_triples": 1,
+                                "decoded_triples": 1,
+                                "count_match": True,
+                            }
+                        )
+                    )
+                    return 0
+                result_path.write_text(
+                    json.dumps(
+                        {
+                            "valid": False,
+                            "source_triples": 1,
+                            "decoded_triples": 1,
+                            "count_match": False,
+                            "error": "HDT index/readability check failed",
+                        }
+                    )
+                )
+                return 1
+
+            with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run):
+                ok, method_results = vcf_rdfizer.run_compression_methods_for_rdf(
+                    rdf_path=rdf_path,
+                    out_dir=out_dir,
+                    target_out_dir=target_dir,
+                    image_ref="example/vcf-rdfizer:latest",
+                    methods=["hdt", "hdt_gzip"],
+                    wrapper_log_path=tmp_path / "wrapper.log",
+                    status_indent=None,
+                    index_warnings=warnings,
+                )
+
+            self.assertTrue(ok)
+            self.assertEqual(len(validation_calls), 2)
+            self.assertEqual(method_results["hdt"]["index_status"], "failed")
+            self.assertEqual(method_results["hdt_gzip"]["exit_code"], 0)
+            self.assertEqual(warnings[0]["format"], "hdt")
+
+    def test_full_compression_continues_after_cottas_index_failure(self):
+        """COTTAS failure is recorded while independent raw RDF compression continues."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir = tmp_path / "input"
+            out_dir = tmp_path / "out"
+            target_dir = out_dir / "sample"
+            input_dir.mkdir()
+            target_dir.mkdir(parents=True)
+            rdf_path = input_dir / "sample.nt"
+            rdf_path.write_text("<s> <p> <o> .\n")
+            warnings = []
+
+            def fake_run(cmd, cwd=None, env=None):
+                rendered = str(cmd[-1]) if cmd else ""
+                if "cottas_tool.py convert" in rendered:
+                    return 1
+                if "gzip -c /data/in/sample.nt" in rendered:
+                    (target_dir / "sample.nt.gz").write_text("gzip\n")
+                return 0
+
+            with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run):
+                ok, method_results = vcf_rdfizer.run_compression_methods_for_rdf(
+                    rdf_path=rdf_path,
+                    out_dir=out_dir,
+                    target_out_dir=target_dir,
+                    image_ref="example/vcf-rdfizer:latest",
+                    methods=["cottas", "gzip"],
+                    wrapper_log_path=tmp_path / "wrapper.log",
+                    status_indent=None,
+                    index_warnings=warnings,
+                )
+
+            self.assertTrue(ok)
+            self.assertEqual(method_results["cottas"]["exit_code"], 1)
+            self.assertEqual(method_results["gzip"]["exit_code"], 0)
+            self.assertEqual(warnings[0]["format"], "cottas")
+            self.assertTrue((target_dir / "sample.nt.gz").exists())
+
     def test_compression_validation_mismatch_fails_before_success(self):
         """A decoded triple-count mismatch fails compression and preserves RDF input."""
         with tempfile.TemporaryDirectory() as td:
@@ -2695,8 +2806,90 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertEqual(len(runner_commands), 1)
             self.assertIn("target=/work", " ".join(runner_commands[0]))
             self.assertIn("--methods hdt", " ".join(runner_commands[0]))
+            self.assertIn("--allow-index-failures", runner_commands[0])
             self.assertFalse((out_dir / "sample" / ".compression_partitioned").exists())
             self.assertTrue((out_dir / "sample" / "sample.hdt").exists())
+
+    def test_main_full_mode_records_cottas_index_warning_and_continues(self):
+        """Full mode succeeds and writes an index-warning report for skipped COTTAS output."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+            out_dir = tmp_path / "out"
+            stdout = StringIO()
+            stderr = StringIO()
+
+            def fake_run(cmd, cwd=None, env=None):
+                if "/opt/vcf-rdfizer/run_conversion.sh" in cmd:
+                    sample_dir = out_dir / "sample"
+                    sample_dir.mkdir(parents=True, exist_ok=True)
+                    (sample_dir / "sample.nt").write_text("<s> <p> <o> .\n")
+                return 0
+
+            def fake_partitioned(**kwargs):
+                warning = {
+                    "format": "cottas",
+                    "stage": "cottas-index",
+                    "status": "index_unavailable",
+                    "artifact_path": str(out_dir / "sample" / "sample.cottas"),
+                    "message": "COTTAS index creation failed",
+                }
+                kwargs["index_warnings"].append(warning)
+                return True, {
+                    "cottas": {
+                        "exit_code": 1,
+                        "output_path": str(out_dir / "sample" / "sample.cottas"),
+                        "output_size_bytes": 0,
+                        "index_status": "failed",
+                        "index_warning": warning,
+                    }
+                }
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with (
+                    mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run),
+                    mock.patch.object(vcf_rdfizer, "check_docker", return_value=True),
+                    mock.patch.object(vcf_rdfizer, "docker_image_exists", return_value=True),
+                    mock.patch.object(vcf_rdfizer, "discover_tsv_triplets", return_value=mocked_triplets()),
+                    mock.patch.object(
+                        vcf_rdfizer,
+                        "run_partitioned_representation_methods_for_rdf_files",
+                        side_effect=fake_partitioned,
+                    ),
+                    redirect_stdout(stdout),
+                    redirect_stderr(stderr),
+                ):
+                    rc = invoke_main(
+                        [
+                            "--input",
+                            str(input_dir),
+                            "--rules",
+                            str(rules_path),
+                            "--rdf-storage-mode",
+                            "plain",
+                            "--rdf-compression",
+                            "none",
+                            "--representations",
+                            "cottas",
+                            "--artifact-compression",
+                            "none",
+                            "--out",
+                            str(out_dir),
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 0)
+            run_metrics_dir = latest_metrics_run_dir(out_dir / "run_metrics")
+            warning_path = run_metrics_dir / "index_warnings.json"
+            self.assertTrue(warning_path.exists())
+            self.assertEqual(json.loads(warning_path.read_text())["warning_count"], 1)
+            self.assertIn("Conversion process finished with index warnings.", stdout.getvalue())
+            self.assertIn("index_warnings.json", stdout.getvalue())
+            self.assertTrue((out_dir / "sample" / "sample.nt").exists())
 
     def test_main_full_mode_plain_storage_sets_storage_mode(self):
         """Plain storage passes the canonical storage mode to conversion."""

@@ -361,6 +361,15 @@ versioned sidecar beside the input. COTTAS indexing rewrites the existing
 the same artifact while rebuilding its embedded index. If the operation fails,
 the original COTTAS file is left in place; HDT's previous sidecars are restored.
 
+In `full` mode, an HDT sidecar-index failure is non-fatal when the HDT data
+itself remains readable; the run continues and the HDT can be repaired later
+with the standalone command above. If COTTAS generation/indexing cannot
+produce a usable artifact, COTTAS-specific outputs are skipped while the rest
+of the full pipeline continues. These warnings are printed in the run output
+and written to `run_metrics/<RUN_ID>/index_warnings.json`. The raw RDF is
+retained when a representation-dependent output was unavailable so the
+standalone index command or a later rerun has a recoverable source.
+
 ## Output Layout
 
 Given `--out ./results`:
@@ -403,6 +412,8 @@ For each run, VCF-RDFizer writes:
 - `run_metrics/<RUN_ID>/metrics.csv`
 - `run_metrics/<RUN_ID>/wrapper_execution_times.csv`
 - `run_metrics/<RUN_ID>/progress.log`
+- `run_metrics/<RUN_ID>/index_warnings.json` when full-run HDT/COTTAS index
+  generation was unsuccessful but the pipeline continued
 - `run_metrics/<RUN_ID>/index_metrics.json` for standalone HDT/COTTAS index mode
 - `run_metrics/<RUN_ID>/<format>_index_metrics.json` is also written for the
   selected format (`hdt` or `cottas`) for compatibility/discovery
@@ -423,6 +434,14 @@ in the per-run compression JSON and in the HDT/COTTAS columns of `metrics.csv`.
 Compression fails closed if the artifact cannot be decoded or the counts do
 not match. In compression-only mode, the source count is obtained by a
 streaming fallback when no upstream conversion metrics are available.
+
+For full runs, a readable HDT whose sidecar index could not be created is
+validated with the index check skipped, marked with `index_status: "failed"`,
+and reported in `index_warnings.json`; this allows packaging and later stages
+to continue. COTTAS failures are reported the same way, but dependent COTTAS
+artifacts are marked as not generated because the COTTAS file itself is not
+usable. Explicit standalone `--mode index` runs remain strict and return a
+failure status when regeneration fails.
 
 For partitioned HDT/COTTAS runs, the final method metric reports one
 sample-level result, while raw metrics also include a sample-scoped

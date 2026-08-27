@@ -1105,6 +1105,19 @@ def write_failed_inputs_report(*, metrics_dir: Path, failures: list[dict]):
     return report_path
 
 
+def write_index_warnings_report(*, metrics_dir: Path, run_id: str, warnings: list[dict]):
+    """Write non-fatal full-run HDT/COTTAS index warnings as JSON."""
+    ensure_dir(metrics_dir)
+    report_path = metrics_dir / "index_warnings.json"
+    payload = {
+        "run_id": run_id,
+        "warning_count": len(warnings),
+        "warnings": warnings,
+    }
+    report_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return report_path
+
+
 def print_nt_hdt_summary(
     *,
     output_root: Path,
@@ -2387,6 +2400,7 @@ def write_compression_metrics_artifacts(
     combined_size_bytes: int,
     selected_methods: list[str],
     method_results: dict[str, dict],
+    index_warnings: list[dict] | None = None,
 ):
     """Write per-output compression artifacts (time files + structured JSON)."""
     metrics_dir.mkdir(parents=True, exist_ok=True)
@@ -2443,6 +2457,7 @@ def write_compression_metrics_artifacts(
         "compression_methods": ",".join(selected_methods) if selected_methods else "none",
         "combined_rdf_path": str(source_rdf_path),
         "combined_rdf_size_bytes": int(combined_size_bytes),
+        "index_warnings": list(index_warnings or []),
         "hdt_source": str(hdt_result.get("source") or "not_used"),
         "gzip_raw_rdf": {
             "output_gz_path": gzip_result.get("output_path", ""),
@@ -2514,6 +2529,7 @@ def write_raw_compression_metrics_artifact(
     source_rdf_path: Path,
     selected_methods: list[str],
     method_results: dict[str, dict],
+    index_warnings: list[dict] | None = None,
 ):
     """Persist per-RDF-file compression metrics under `raw_metrics/`."""
     safe_output = safe_metrics_name(output_name)
@@ -2528,6 +2544,7 @@ def write_raw_compression_metrics_artifact(
         "rdf_name": rdf_name,
         "source_rdf_path": str(source_rdf_path),
         "compression_methods": ",".join(selected_methods) if selected_methods else "none",
+        "index_warnings": list(index_warnings or []),
         "methods": {},
     }
 
@@ -2925,6 +2942,7 @@ def run_compression_methods_for_rdf(
     timestamp: str | None = None,
     output_name: str | None = None,
     expected_triples: int | None = None,
+    index_warnings: list[dict] | None = None,
 ):
     """Run selected compression stages for a single RDF file.
 
@@ -2959,6 +2977,7 @@ def run_compression_methods_for_rdf(
         target_out_container = f"/data/out/{relative_out.as_posix()}"
 
     method_results: dict[str, dict] = {}
+    allow_index_failure = index_warnings is not None
     hdt_name = f"{input_stem}.hdt"
     hdt_path = target_out_dir / hdt_name
     hdt_container = f"{target_out_container}/{hdt_name}"
@@ -2968,6 +2987,7 @@ def run_compression_methods_for_rdf(
     cottas_path = target_out_dir / cottas_name
     cottas_container = f"{target_out_container}/{cottas_name}"
     cottas_is_ready = False
+    cottas_failure_warning: dict | None = None
     metrics_output_name = output_name or target_out_dir.name
     safe_output_name = safe_metrics_name(metrics_output_name)
     safe_rdf_name = safe_metrics_name(rdf_path.name)
@@ -2978,6 +2998,7 @@ def run_compression_methods_for_rdf(
         artifact_name: str,
         command: str,
         record_method: bool = True,
+        quiet_failure: bool = False,
     ):
         """Execute one compression command in Docker and capture timing/size."""
         timing_name = f".{input_stem}.{method}.time"
@@ -3043,10 +3064,35 @@ def run_compression_methods_for_rdf(
                 pass
         if record_method and method == "hdt":
             method_results[method]["source"] = "generated"
-        if exit_code != 0 and record_method:
-            eprint(f"Error: {method} compression failed. See log: {wrapper_log_path}")
+        if exit_code != 0:
+            if record_method and not quiet_failure:
+                eprint(f"Error: {method} compression failed. See log: {wrapper_log_path}")
             return False
         return True
+
+    def record_index_warning(
+        *,
+        index_format: str,
+        artifact_path: Path,
+        message: str,
+        stage: str,
+    ) -> dict:
+        """Record one recoverable representation/index problem for a full run."""
+        compact = " ".join(str(message).split())
+        warning = {
+            "format": index_format,
+            "stage": stage,
+            "status": "index_unavailable",
+            "artifact_path": str(artifact_path),
+            "message": compact,
+        }
+        if warning not in index_warnings:
+            index_warnings.append(warning)
+            eprint(
+                f"Warning: {index_format.upper()} index generation failed for "
+                f"'{artifact_path}'; continuing with the remaining pipeline. {compact}"
+            )
+        return warning
 
     def validate_container_artifact(
         *,
@@ -3056,56 +3102,81 @@ def run_compression_methods_for_rdf(
         artifact_container: str,
     ) -> tuple[bool, dict]:
         """Validate a base representation before any packaging or cleanup."""
-        report_name = f".{input_stem}.{artifact_format}.validation.json"
-        report_path = target_out_dir / report_name
-        report_container = f"{target_out_container}/{report_name}"
-        command_parts = [
-            "set -euo pipefail;",
-            f"rm -f {shlex.quote(report_container)};",
-            'PYTHON_BIN="${COTTAS_PYTHON_BIN:-$(command -v python3 || true)}";',
-            'if [[ -z "$PYTHON_BIN" || ! -x "$PYTHON_BIN" ]]; then ',
-            'echo "Missing Python executable in container" >&2; exit 127; fi;',
-            'VALIDATOR="/opt/vcf-rdfizer/validate_compression.py";',
-            'if [[ ! -f "$VALIDATOR" ]]; then ',
-            'echo "Missing compression validator in container" >&2; exit 127; fi;',
-            '"$PYTHON_BIN" "$VALIDATOR"',
-            f"--source {shlex.quote(input_container)}",
-            f"--artifact {shlex.quote(artifact_container)}",
-            f"--format {shlex.quote(artifact_format)}",
-            f"--result-path {shlex.quote(report_container)}",
-        ]
-        if expected_triples is not None:
-            command_parts.append(f"--expected-triples {int(expected_triples)}")
-        command = " ".join(command_parts)
-        if not run_container_command(
-            method=f"{method}-validation",
-            artifact_name=report_name,
-            command=command,
-            record_method=False,
-        ):
-            report = {
-                "valid": False,
-                "count_match": False,
-                "error": f"{artifact_format.upper()} validation command failed",
-            }
-        else:
+        def perform_validation(*, skip_index_check: bool) -> tuple[bool, dict]:
+            report_name = f".{input_stem}.{artifact_format}.validation.json"
+            report_path = target_out_dir / report_name
+            report_container = f"{target_out_container}/{report_name}"
+            command_parts = [
+                "set -euo pipefail;",
+                f"rm -f {shlex.quote(report_container)};",
+                'PYTHON_BIN="${COTTAS_PYTHON_BIN:-$(command -v python3 || true)}";',
+                'if [[ -z "$PYTHON_BIN" || ! -x "$PYTHON_BIN" ]]; then ',
+                'echo "Missing Python executable in container" >&2; exit 127; fi;',
+                'VALIDATOR="/opt/vcf-rdfizer/validate_compression.py";',
+                'if [[ ! -f "$VALIDATOR" ]]; then ',
+                'echo "Missing compression validator in container" >&2; exit 127; fi;',
+                '"$PYTHON_BIN" "$VALIDATOR"',
+                f"--source {shlex.quote(input_container)}",
+                f"--artifact {shlex.quote(artifact_container)}",
+                f"--format {shlex.quote(artifact_format)}",
+                f"--result-path {shlex.quote(report_container)}",
+            ]
+            if expected_triples is not None:
+                command_parts.append(f"--expected-triples {int(expected_triples)}")
+            if skip_index_check:
+                command_parts.append("--skip-index-check")
+            command = " ".join(command_parts)
+            command_ok = run_container_command(
+                method=f"{method}-validation",
+                artifact_name=report_name,
+                command=command,
+                record_method=False,
+                quiet_failure=skip_index_check,
+            )
             try:
                 report = json.loads(report_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
                 report = {
                     "valid": False,
                     "count_match": False,
-                    "error": f"validator did not produce a valid report: {exc}",
+                    "error": (
+                        f"{artifact_format.upper()} validation command failed"
+                        if not command_ok
+                        else f"validator did not produce a valid report: {exc}"
+                    ),
                 }
-        report_path.unlink(missing_ok=True)
-        valid = bool(report.get("valid")) and bool(report.get("count_match"))
-        if not valid:
-            eprint(
-                f"Error: {artifact_format.upper()} validation failed for {artifact_name}: "
-                f"{report.get('error', 'decoded triple count mismatch')}. "
-                f"See log: {wrapper_log_path}"
+            report_path.unlink(missing_ok=True)
+            return (
+                bool(report.get("valid")) and bool(report.get("count_match")),
+                report,
             )
-        return valid, report
+
+        valid, report = perform_validation(skip_index_check=False)
+        if valid:
+            return True, report
+
+        if allow_index_failure and artifact_format == "hdt":
+            readable, readable_report = perform_validation(skip_index_check=True)
+            if readable:
+                warning = record_index_warning(
+                    index_format="hdt",
+                    artifact_path=target_out_dir / artifact_name,
+                    stage="hdt-index",
+                    message=report.get(
+                        "error",
+                        "HDT validation succeeded when the index check was skipped",
+                    ),
+                )
+                readable_report["index_status"] = "failed"
+                readable_report["index_warning"] = warning
+                return True, readable_report
+
+        eprint(
+            f"Error: {artifact_format.upper()} validation failed for {artifact_name}: "
+            f"{report.get('error', 'decoded triple count mismatch')}. "
+            f"See log: {wrapper_log_path}"
+        )
+        return False, report
 
     def ensure_hdt_available():
         """Ensure `.hdt` exists for HDT-based compound methods."""
@@ -3133,8 +3204,21 @@ def run_compression_methods_for_rdf(
                 artifact_container=hdt_container,
             )
             if not valid:
+                if allow_index_failure:
+                    cottas_failure_warning = record_index_warning(
+                        index_format="cottas",
+                        artifact_path=cottas_path,
+                        stage="cottas-index",
+                        message=report.get(
+                            "error",
+                            "existing COTTAS validation/index check failed",
+                        ),
+                    )
                 return False
             method_results["hdt"]["validation"] = report
+            if report.get("index_status"):
+                method_results["hdt"]["index_status"] = report["index_status"]
+                method_results["hdt"]["index_warning"] = report.get("index_warning")
             hdt_is_ready = True
             return True
         hdt_command = (
@@ -3163,15 +3247,20 @@ def run_compression_methods_for_rdf(
         if not valid:
             return False
         method_results["hdt"]["validation"] = report
+        if report.get("index_status"):
+            method_results["hdt"]["index_status"] = report["index_status"]
+            method_results["hdt"]["index_warning"] = report.get("index_warning")
         hdt_is_ready = True
         hdt_source = "generated"
         return True
 
     def ensure_cottas_available():
         """Ensure `.cottas` exists for COTTAS packaging stages."""
-        nonlocal cottas_is_ready
+        nonlocal cottas_is_ready, cottas_failure_warning
         if cottas_is_ready:
             return True
+        if cottas_failure_warning is not None:
+            return False
         if cottas_path.exists():
             method_results.setdefault(
                 "cottas",
@@ -3210,7 +3299,15 @@ def run_compression_methods_for_rdf(
             method="cottas",
             artifact_name=cottas_name,
             command=cottas_command,
+            quiet_failure=allow_index_failure,
         ):
+            if allow_index_failure:
+                cottas_failure_warning = record_index_warning(
+                    index_format="cottas",
+                    artifact_path=cottas_path,
+                    stage="cottas-index",
+                    message="COTTAS conversion/index creation did not produce a usable artifact",
+                )
             return False
         valid, report = validate_container_artifact(
             method="cottas",
@@ -3219,10 +3316,47 @@ def run_compression_methods_for_rdf(
             artifact_container=cottas_container,
         )
         if not valid:
+            if allow_index_failure:
+                cottas_failure_warning = record_index_warning(
+                    index_format="cottas",
+                    artifact_path=cottas_path,
+                    stage="cottas-index",
+                    message=report.get(
+                        "error",
+                        "COTTAS validation failed after conversion/index creation",
+                    ),
+                )
             return False
         method_results["cottas"]["validation"] = report
         cottas_is_ready = True
         return True
+
+    def mark_cottas_method_unavailable(method: str):
+        """Mark COTTAS and dependent packaging methods as skipped after a failure."""
+        warning = cottas_failure_warning
+        if warning is None:
+            return
+        result = method_results.setdefault(
+            method,
+            {
+                "exit_code": 1,
+                "wall_seconds": 0.0,
+                "user_seconds": 0.0,
+                "sys_seconds": 0.0,
+                "max_rss_kb": 0,
+                "output_path": str(
+                    {
+                        "cottas": cottas_path,
+                        "cottas_gzip": target_out_dir / f"{input_stem}.cottas.gz",
+                        "cottas_brotli": target_out_dir / f"{input_stem}.cottas.br",
+                    }.get(method, cottas_path)
+                ),
+                "output_size_bytes": 0,
+            },
+        )
+        result["exit_code"] = 1
+        result["index_status"] = "failed"
+        result["index_warning"] = warning
 
     for method in methods:
         if method == "gzip":
@@ -3279,7 +3413,10 @@ def run_compression_methods_for_rdf(
 
         if method == "cottas":
             if not ensure_cottas_available():
-                return False, method_results
+                if not allow_index_failure:
+                    return False, method_results
+                mark_cottas_method_unavailable(method)
+                continue
             if status_indent is not None:
                 suffix = " (reused existing COTTAS)" if method_results[method].get("source") == "existing" else ""
                 print(f"{status_indent}- {method}: {cottas_name} {success_symbol()}{suffix}")
@@ -3329,7 +3466,10 @@ def run_compression_methods_for_rdf(
 
         if method == "cottas_gzip":
             if not ensure_cottas_available():
-                return False, method_results
+                if not allow_index_failure:
+                    return False, method_results
+                mark_cottas_method_unavailable(method)
+                continue
             artifact_name = f"{input_stem}.cottas.gz"
             out_container = f"{target_out_container}/{artifact_name}"
             command = (
@@ -3345,7 +3485,10 @@ def run_compression_methods_for_rdf(
 
         if method == "cottas_brotli":
             if not ensure_cottas_available():
-                return False, method_results
+                if not allow_index_failure:
+                    return False, method_results
+                mark_cottas_method_unavailable(method)
+                continue
             artifact_name = f"{input_stem}.cottas.br"
             out_container = f"{target_out_container}/{artifact_name}"
             command = (
@@ -3369,6 +3512,7 @@ def run_compression_methods_for_rdf(
             source_rdf_path=rdf_path,
             selected_methods=methods,
             method_results=method_results,
+            index_warnings=index_warnings,
         )
 
     return True, method_results
@@ -3389,6 +3533,7 @@ def run_containerized_partitioned_representation_methods(
     min_chunk_bytes: int,
     max_chunk_bytes: int,
     expected_triples: int | None = None,
+    index_warnings: list[dict] | None = None,
 ):
     """Run partitioned compression in an ephemeral Docker-managed volume.
 
@@ -3472,6 +3617,8 @@ def run_containerized_partitioned_representation_methods(
                 f"/data/out/{result_path.name}",
             ]
         )
+        if index_warnings is not None:
+            command.append("--allow-index-failures")
         run_exit_code = run(command)
         payload = None
         if result_path.is_file():
@@ -3481,6 +3628,22 @@ def run_containerized_partitioned_representation_methods(
                 eprint(f"Error: invalid partitioned compression result: {exc}. See log: {wrapper_log_path}")
 
         if payload is not None:
+            for warning in payload.get("index_warnings", []):
+                artifact_path = str(warning.get("artifact_path", ""))
+                if artifact_path.startswith("/data/out/"):
+                    warning["artifact_path"] = str(
+                        out_dir / artifact_path.removeprefix("/data/out/")
+                    )
+                if warning not in (index_warnings or []):
+                    if index_warnings is not None:
+                        index_warnings.append(warning)
+                    eprint(
+                        "Warning: "
+                        f"{str(warning.get('format', 'representation')).upper()} index generation "
+                        f"failed for '{warning.get('artifact_path', output_name)}'; "
+                        "continuing with the remaining pipeline. "
+                        f"{warning.get('message', '')}"
+                    )
             method_results = payload.get("methods", {})
             for method, result in method_results.items():
                 artifact_path = out_dir / compression_artifact_name_for_method(
@@ -3525,6 +3688,7 @@ def run_containerized_partitioned_representation_methods(
                 source_rdf_path=out_dir,
                 selected_methods=methods,
                 method_results=method_results,
+                index_warnings=index_warnings,
             )
         return True, method_results
     finally:
@@ -3559,6 +3723,7 @@ def run_partitioned_representation_methods_for_rdf_files(
     min_chunk_bytes: int,
     max_chunk_bytes: int,
     expected_triples: int | None = None,
+    index_warnings: list[dict] | None = None,
 ):
     """Dispatch aggregate RDF to the ephemeral container pipeline.
 
@@ -3590,6 +3755,7 @@ def run_partitioned_representation_methods_for_rdf_files(
         min_chunk_bytes=min_chunk_bytes,
         max_chunk_bytes=max_chunk_bytes,
         expected_triples=expected_triples,
+        index_warnings=index_warnings,
     )
 
 
@@ -3661,6 +3827,7 @@ def run_full_mode(
     total_triples_produced = 0
     saw_triple_counts = False
     input_failures: list[dict] = []
+    index_warnings: list[dict] = []
 
     total_inputs = len(container_inputs)
     for idx, (container_input, expected_prefix) in enumerate(
@@ -3674,6 +3841,7 @@ def run_full_mode(
         except ValueError:
             input_vcf = container_input
         input_failed = False
+        input_index_warnings: list[dict] = []
 
         def fail_current(stage: str, message: str):
             nonlocal input_failed
@@ -3994,6 +4162,7 @@ def run_full_mode(
                     timestamp=timestamp,
                     output_name=output_name,
                     expected_triples=triples_produced,
+                    index_warnings=input_index_warnings,
                 )
                 if not ok:
                     fail_current(
@@ -4019,12 +4188,19 @@ def run_full_mode(
                     min_chunk_bytes=chunk_min_bytes,
                     max_chunk_bytes=chunk_max_bytes,
                     expected_triples=triples_produced,
+                    index_warnings=input_index_warnings,
                 )
                 if not ok:
                     fail_current(
                         "compression",
                         f"partitioned compression failed for '{output_name}'. See log: {wrapper_log_path}",
                     )
+        for warning in input_index_warnings:
+            warning.setdefault("input_index", idx)
+            warning.setdefault("input_vcf", input_vcf)
+            warning.setdefault("expected_prefix", expected_prefix)
+            if warning not in index_warnings:
+                index_warnings.append(warning)
         if input_failed:
             continue
         print(f"    * Compression {success_symbol()}")
@@ -4050,6 +4226,7 @@ def run_full_mode(
                 combined_size_bytes=combined_size_before_cleanup,
                 selected_methods=selected_methods,
                 method_results=aggregated_results,
+                index_warnings=input_index_warnings,
             )
             update_metrics_csv_with_compression(
                 metrics_csv=metrics_dir / "metrics.csv",
@@ -4079,11 +4256,27 @@ def run_full_mode(
             # Cleanup raw RDF only after every selected compression method has
             # completed successfully for that specific RDF artifact.
             cleanup_failed = False
+            warning_formats = {
+                warning.get("format")
+                for warning in input_index_warnings
+                if warning.get("format") in {"hdt", "cottas"}
+            }
+            optional_failed_methods = {
+                method
+                for method in selected_methods
+                if (
+                    (method in HDT_COMPRESSION_METHODS and "hdt" in warning_formats)
+                    or (method in COTTAS_COMPRESSION_METHODS and "cottas" in warning_formats)
+                )
+            }
             if use_partitioned_compression:
                 missing_or_failed_hdt = []
                 for method in partitioned_methods:
                     result = partitioned_representation_results.get(method)
-                    if result is None or int(result.get("exit_code", 1)) != 0:
+                    if (
+                        method not in optional_failed_methods
+                        and (result is None or int(result.get("exit_code", 1)) != 0)
+                    ):
                         missing_or_failed_hdt.append(method)
                 if missing_or_failed_hdt:
                     fail_current(
@@ -4103,7 +4296,10 @@ def run_full_mode(
                 missing_or_failed = []
                 for method in methods_to_validate:
                     result = method_results.get(method)
-                    if result is None or int(result.get("exit_code", 1)) != 0:
+                    if (
+                        method not in optional_failed_methods
+                        and (result is None or int(result.get("exit_code", 1)) != 0)
+                    ):
                         missing_or_failed.append(method)
                 if missing_or_failed:
                     fail_current(
@@ -4114,6 +4310,13 @@ def run_full_mode(
                         f"See log: {wrapper_log_path}",
                     )
                     cleanup_failed = True
+                    break
+
+                if optional_failed_methods:
+                    eprint(
+                        f"Warning: retaining raw RDF '{raw_rdf_path.name}' because "
+                        "one or more COTTAS/HDT index-dependent outputs were unavailable."
+                    )
                     break
 
                 # In space-optimized mode the aggregate `.nt.gz` is itself
@@ -4281,6 +4484,19 @@ def run_full_mode(
     elif not selected_methods:
         print("Total triples produced (full run): unavailable")
 
+    index_warning_report = None
+    if index_warnings:
+        index_warning_report = write_index_warnings_report(
+            metrics_dir=metrics_dir,
+            run_id=run_id,
+            warnings=index_warnings,
+        )
+        eprint(
+            f"Index generation warnings were recorded for {len(index_warnings)} item(s): "
+            f"{index_warning_report}"
+        )
+        print(f"Index warnings: {index_warning_report}")
+
     if input_failures:
         report_path = write_failed_inputs_report(metrics_dir=metrics_dir, failures=input_failures)
         eprint(
@@ -4295,9 +4511,15 @@ def run_full_mode(
             )
         return 1
 
-    print("Conversion process finished.")
+    if index_warning_report is not None:
+        print("Conversion process finished with index warnings.")
+    else:
+        print("Conversion process finished.")
     if run_tracker is not None:
-        run_tracker.mark("Full pipeline finished successfully")
+        run_tracker.mark(
+            "Full pipeline finished successfully"
+            + (f" with index warnings; report: {index_warning_report}" if index_warning_report else "")
+        )
     return 0
 
 
