@@ -11,9 +11,11 @@
 # - /data/tsv/<sample>.file_metadata.tsv
 # - /data/tsv/<sample>.header_lines.tsv
 # - /data/tsv/<sample>.records.tsv
-# - /data/tsv/<sample>.sample_calls.tsv (derived by wrapper)
-# - /data/tsv/<sample>.sample_format_values.tsv (derived by wrapper)
+# - /data/tsv/<sample>.sample_calls.tsv (header-only compatibility source)
+# - /data/tsv/<sample>.sample_format_values.tsv (header-only compatibility source)
 # The wrapper rewrites the template paths below for each input sample.
+# Canonical sample/FORMAT triples are streamed directly into the RDF aggregate
+# so chromosome-scale multi-sample VCFs do not require expanded helper tables.
 #
 # Output format:
 # - The default conversion now targets triples (N-Triples) without named graph terms.

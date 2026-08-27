@@ -1261,6 +1261,90 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertIn("sample.vcf\t2\t1\tSAMPLE-A\tSAMPLE-A\t0/1:42", sample_calls_rows)
             self.assertIn("sample.vcf\t2\t2\tSAMPLE/B\tSAMPLE_B\t0/0:18", sample_calls_rows)
 
+    def test_default_sample_maps_stream_without_expanded_helper_tables(self):
+        """Canonical sample maps emit RDF directly while compatibility TSVs stay empty."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            records_tsv = tmp_path / "sample.records.tsv"
+            records_tsv.write_text(
+                "SOURCE_FILE\tROW_ID\tCHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE-A SAMPLE/B\n"
+                "sample.vcf\t2\t1\t100\t.\tA\tG\t50\tPASS\t.\tGT:DP\t0/1:42 ./.:.\n",
+                encoding="utf-8",
+            )
+            rdf_path = tmp_path / "sample.nt"
+            rdf_path.write_text("<base> <predicate> <object> .\n", encoding="utf-8")
+            sample_calls_tsv = tmp_path / "sample.sample_calls.tsv"
+            sample_format_tsv = tmp_path / "sample.sample_format_values.tsv"
+
+            vcf_rdfizer.write_sample_support_headers(sample_calls_tsv, sample_format_tsv)
+            stats = vcf_rdfizer.append_canonical_sample_rdf(
+                records_tsv,
+                rdf_path,
+                progress_interval_records=0,
+            )
+
+            self.assertEqual(sample_calls_tsv.read_text().splitlines(), ["\t".join(vcf_rdfizer.SAMPLE_CALLS_HEADER)])
+            self.assertEqual(sample_format_tsv.read_text().splitlines(), ["\t".join(vcf_rdfizer.SAMPLE_FORMAT_HEADER)])
+            self.assertEqual(stats["records"], 1)
+            self.assertEqual(stats["sample_calls"], 2)
+            self.assertEqual(stats["format_values"], 4)
+            self.assertEqual(stats["triples"], 18)
+            rdf_lines = rdf_path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(rdf_lines), 19)
+            self.assertIn(
+                "<file://sample.vcf#call/2> <https://w3id.org/vcf-rdfizer/vocab#hasSampleCall> "
+                "<file://sample.vcf#sample/2/SAMPLE-A> .",
+                rdf_lines,
+            )
+            self.assertIn(
+                '"."^^<https://w3id.org/vcf-rdfizer/vocab#Null> .',
+                rdf_lines[-1],
+            )
+
+    def test_sample_streaming_accepts_a_csv_field_larger_than_python_default(self):
+        """Thousands of long sample payloads do not hit csv.field_size_limit."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            sample_ids = [f"S{i:04d}" for i in range(2504)]
+            payload = "A" * 60
+            records_tsv = tmp_path / "large.records.tsv"
+            records_tsv.write_text(
+                "SOURCE_FILE\tROW_ID\tCHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t"
+                + " ".join(sample_ids)
+                + "\nlarge.vcf\t1\t20\t1\t.\tA\tG\t.\tPASS\t.\tGT\t"
+                + " ".join([payload] * len(sample_ids))
+                + "\n",
+                encoding="utf-8",
+            )
+            rdf_path = tmp_path / "large.nt.gz"
+            with gzip.open(rdf_path, "wt", encoding="utf-8") as handle:
+                handle.write("<base> <predicate> <object> .\n")
+
+            stats = vcf_rdfizer.append_canonical_sample_rdf(
+                records_tsv,
+                rdf_path,
+                progress_interval_records=0,
+            )
+
+            self.assertEqual(stats["sample_calls"], 2504)
+            self.assertEqual(stats["format_values"], 2504)
+            self.assertEqual(stats["triples"], 2504 * 6)
+            with gzip.open(rdf_path, "rt", encoding="utf-8") as handle:
+                self.assertEqual(sum(1 for _line in handle), 1 + (2504 * 6))
+
+    def test_sample_support_strategy_preserves_custom_helper_consumers(self):
+        """Only the exact canonical helper maps use direct RDF streaming."""
+        default_rules = Path(__file__).parents[1] / "rules" / "default_rules.ttl"
+        self.assertEqual(vcf_rdfizer.sample_support_strategy(default_rules), "stream")
+        with tempfile.TemporaryDirectory() as td:
+            custom_rules = Path(td) / "custom.ttl"
+            custom_rules.write_text(
+                default_rules.read_text(encoding="utf-8")
+                + '\n<#Extra> csvw:url "/data/tsv/sample_calls.tsv" .\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(vcf_rdfizer.sample_support_strategy(custom_rules), "expanded")
+
     def test_render_rules_for_triplet_rewrites_helper_tsv_placeholders(self):
         """Rule rendering rewrites records/header/metadata and helper TSV placeholders."""
         with tempfile.TemporaryDirectory() as td:
@@ -2225,18 +2309,23 @@ class WrapperUnitTests(VerboseTestCase):
             )
 
     def test_hdt_index_helper_uses_exit_only_and_verifies_sidecar(self):
-        """The Docker-side helper initializes the index without issuing a query."""
+        """The helper uses HDT Java's bounded-memory disk indexer."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             java_home = tmp_path / "java-home"
             bin_dir = java_home / "bin"
             bin_dir.mkdir(parents=True)
+            work_root = tmp_path / "index-work"
+            work_root.mkdir()
+            invocation_path = tmp_path / "invocation.txt"
             search = bin_dir / "hdtSearch.sh"
             search.write_text(
                 "#!/usr/bin/env bash\n"
                 "read -r command\n"
                 "[[ \"$command\" == \"exit\" ]] || exit 3\n"
-                "printf 'index\\n' > \"${1}.index.v1-1\"\n",
+                "printf '%s\\n' \"$@\" > \"$HDT_TEST_INVOCATION\"\n"
+                "hdt_path=${!#}\n"
+                "printf 'index\\n' > \"${hdt_path}.index.v1-1\"\n",
                 encoding="utf-8",
             )
             search.chmod(0o755)
@@ -2246,7 +2335,12 @@ class WrapperUnitTests(VerboseTestCase):
 
             result = subprocess.run(
                 ["bash", str(helper), str(hdt_path)],
-                env={**os.environ, "HDT_JAVA_HOME": str(java_home)},
+                env={
+                    **os.environ,
+                    "HDT_JAVA_HOME": str(java_home),
+                    "HDT_INDEX_WORK_ROOT": str(work_root),
+                    "HDT_TEST_INVOCATION": str(invocation_path),
+                },
                 capture_output=True,
                 text=True,
             )
@@ -2254,6 +2348,14 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertEqual(result.returncode, 0, msg=result.stderr)
             self.assertTrue(Path(str(hdt_path) + ".index.v1-1").exists())
             self.assertIn(f"HDT index ready: {hdt_path}.index.v1-1", result.stdout)
+            invocation = invocation_path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(invocation[0:2], ["-quiet", "-options"])
+            self.assertIn("bitmaptriples.indexmethod=disk", invocation[2])
+            self.assertIn("bitmaptriples.sequence.disk=true", invocation[2])
+            self.assertIn("bitmaptriples.sequence.disk.subindex=true", invocation[2])
+            self.assertIn("bitmaptriples.sequence.disk.location=", invocation[2])
+            self.assertEqual(invocation[3], str(hdt_path))
+            self.assertEqual(list(work_root.iterdir()), [])
 
     def test_main_decompress_mode_rejects_unknown_extension(self):
         """Decompression mode rejects unsupported compressed RDF extensions."""

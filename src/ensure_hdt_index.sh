@@ -19,10 +19,33 @@ if [[ ! -x "$HDT_SEARCH_BIN" ]]; then
   exit 127
 fi
 
+# The HDT Java launcher defaults to a 1 GiB heap. Its default "recommended"
+# indexer still builds and sorts object lists in that heap, so a large but
+# otherwise valid HDT can fail here after the merge has already succeeded.
+# HDT Java 3.0.10 provides an external-sort indexer for this case. Keep its
+# sequences, bitmap sub-indexes, and sort runs in a disposable directory so
+# peak heap usage is bounded by the indexer's chunk budget.
+HDT_INDEX_WORK_ROOT=${HDT_INDEX_WORK_ROOT:-/work}
+if [[ ! -d "$HDT_INDEX_WORK_ROOT" || ! -w "$HDT_INDEX_WORK_ROOT" ]]; then
+  echo "HDT index work directory is not writable: $HDT_INDEX_WORK_ROOT" >&2
+  exit 2
+fi
+
+INDEX_WORK_DIR=$(mktemp -d "$HDT_INDEX_WORK_ROOT/vcf-rdfizer-hdt-index.XXXXXXXX")
+cleanup() {
+  rm -rf -- "$INDEX_WORK_DIR"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+HDT_INDEX_OPTIONS="bitmaptriples.indexmethod=disk;bitmaptriples.sequence.disk=true;bitmaptriples.sequence.disk.subindex=true;bitmaptriples.sequence.disk.location=$INDEX_WORK_DIR"
+
 # hdtSearch uses HDT Java's mapIndexedHDT(), which creates the sibling index
 # lazily. Sending only `exit` initializes the index without running a query or
 # materializing an unbounded result set.
-printf 'exit\n' | "$HDT_SEARCH_BIN" "$HDT_PATH" >/dev/null
+printf 'exit\n' | "$HDT_SEARCH_BIN" -quiet -options "$HDT_INDEX_OPTIONS" "$HDT_PATH" >/dev/null
 
 shopt -s nullglob
 # HDT Java 3.0.10 writes the v1-1 index as ``.hdt.index.v1-1``.

@@ -13,9 +13,13 @@ This directory contains RML mappings used by the conversion pipeline.
     - `/data/tsv/records.tsv`
     - `/data/tsv/sample_calls.tsv`
     - `/data/tsv/sample_format_values.tsv`
-  - `sample_calls.tsv` and `sample_format_values.tsv` are derived by the Python wrapper
-    from `records.tsv` at runtime so FORMAT fields (e.g., `GT:DP:AD`) can be
-    mapped to per-sample values consistently.
+  - For the built-in sample maps, `sample_calls.tsv` and
+    `sample_format_values.tsv` are header-only compatibility sources. The Python
+    wrapper streams their equivalent `SampleCall` and `FormatFieldValue` triples
+    directly from `records.tsv` into the RDF aggregate, avoiding helper-table
+    expansion proportional to variants × samples × FORMAT fields.
+  - Custom mappings with additional consumers of either helper source retain
+    expanded TSV generation for compatibility.
   - The Python wrapper rewrites these template paths per input VCF to:
     - `/data/tsv/<sample>.file_metadata.tsv`
     - `/data/tsv/<sample>.header_lines.tsv`

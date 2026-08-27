@@ -27,6 +27,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote_plus
 
 
 RMLSTREAMER_JAR_CONTAINER = "/opt/rmlstreamer/RMLStreamer-v2.5.0-standalone.jar"
@@ -185,6 +186,46 @@ DEFAULT_CHUNK_MIN_BYTES = 128 * 1024 * 1024
 DEFAULT_CHUNK_MAX_BYTES = 1024 * 1024 * 1024
 HDT_INDEX_HELPER_CONTAINER = "/opt/vcf-rdfizer/ensure_hdt_index.sh"
 PARTITIONED_COMPRESSION_RUNNER_CONTAINER = "/opt/vcf-rdfizer/partitioned_compression.py"
+SAMPLE_CALLS_HEADER = [
+    "SOURCE_FILE",
+    "ROW_ID",
+    "SAMPLE_INDEX",
+    "SAMPLE_ID",
+    "SAMPLE_URI_ID",
+    "SAMPLE_PAYLOAD",
+]
+SAMPLE_FORMAT_HEADER = [
+    "SOURCE_FILE",
+    "ROW_ID",
+    "SAMPLE_INDEX",
+    "SAMPLE_ID",
+    "SAMPLE_URI_ID",
+    "FORMAT_INDEX",
+    "FORMAT_KEY",
+    "FORMAT_VALUE",
+]
+CANONICAL_SAMPLE_RULE_MARKERS = (
+    "<#VariantCallToSampleLinkMap>",
+    "<#SampleCallMap>",
+    "<#SampleCallToFormatValueLinkMap>",
+    "<#FormatFieldValueMap>",
+)
+CANONICAL_SAMPLE_RULE_FRAGMENTS = (
+    'rr:template "file://{SOURCE_FILE}#call/{ROW_ID}"',
+    "rr:predicate vcfr:hasSampleCall",
+    'rr:template "file://{SOURCE_FILE}#sample/{ROW_ID}/{SAMPLE_URI_ID}"',
+    "rr:class vcfr:SampleCall",
+    "rr:predicate vcfr:sampleId",
+    'rml:reference "SAMPLE_ID"',
+    "rr:predicate vcfr:hasFormatValue",
+    'rr:template "file://{SOURCE_FILE}#sample/{ROW_ID}/{SAMPLE_URI_ID}/fmt/{FORMAT_KEY}"',
+    "rr:class vcfr:FormatFieldValue",
+    "rr:predicate vcfr:fieldValue",
+    'rml:reference "FORMAT_VALUE"',
+)
+VCFR_NAMESPACE = "https://w3id.org/vcf-rdfizer/vocab#"
+RDF_TYPE_URI = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+SAMPLE_RDF_BUFFER_BYTES = 8 * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -1483,6 +1524,279 @@ def discover_tsv_triplets(tsv_dir: Path):
     )
 
 
+def write_sample_support_headers(sample_calls_tsv: Path, sample_format_tsv: Path):
+    """Create empty sample helper tables with their canonical TSV headers."""
+    sample_calls_tsv.parent.mkdir(parents=True, exist_ok=True)
+    sample_format_tsv.parent.mkdir(parents=True, exist_ok=True)
+    with sample_calls_tsv.open("w", newline="", encoding="utf-8") as sample_calls_handle, \
+        sample_format_tsv.open("w", newline="", encoding="utf-8") as sample_format_handle:
+        csv.writer(sample_calls_handle, delimiter="\t").writerow(SAMPLE_CALLS_HEADER)
+        csv.writer(sample_format_handle, delimiter="\t").writerow(SAMPLE_FORMAT_HEADER)
+
+
+def sample_support_strategy(rules_path: Path) -> str:
+    """Choose no, streamed, or expanded sample handling for one mapping file.
+
+    The built-in four sample maps can be emitted directly as N-Triples without
+    writing their enormous Cartesian helper TSVs. A custom mapping with extra
+    helper-table consumers retains the expanded TSV behavior.
+    """
+    text = rules_path.read_text(encoding="utf-8")
+    calls_refs = text.count('/data/tsv/sample_calls.tsv')
+    format_refs = text.count('/data/tsv/sample_format_values.tsv')
+    if calls_refs == 0 and format_refs == 0:
+        return "none"
+    if (
+        calls_refs == 2
+        and format_refs == 2
+        and all(marker in text for marker in CANONICAL_SAMPLE_RULE_MARKERS)
+        and all(fragment in text for fragment in CANONICAL_SAMPLE_RULE_FRAGMENTS)
+    ):
+        return "stream"
+    return "expanded"
+
+
+def _set_max_csv_field_size():
+    """Allow chromosome-scale multi-sample payload columns in Python's CSV reader."""
+    limit = sys.maxsize
+    while True:
+        try:
+            csv.field_size_limit(limit)
+            return
+        except OverflowError:
+            limit //= 10
+
+
+def _sample_id_to_uri_id(sample_id: str, fallback_index: int) -> str:
+    candidate = re.sub(r"[^A-Za-z0-9._~-]+", "_", sample_id).strip("_")
+    return candidate or f"sample_{fallback_index}"
+
+
+def _rml_uri_component(value: str) -> str:
+    """Match RMLStreamer's Java URLEncoder-based template substitution."""
+    encoded = quote_plus(value, safe="*-._", encoding="utf-8", errors="strict")
+    # urllib follows current RFC rules and always leaves '~' unescaped, whereas
+    # java.net.URLEncoder (used by RMLStreamer 2.5.0) encodes it.
+    return encoded.replace("+", "%20").replace("~", "%7E")
+
+
+def _ntriples_literal(value: str) -> str:
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
+    literal = f'"{escaped}"'
+    if value == ".":
+        literal += f"^^<{VCFR_NAMESPACE}Null>"
+    return literal
+
+
+def append_canonical_sample_rdf(
+    records_tsv: Path,
+    rdf_path: Path,
+    *,
+    progress_interval_records: int = 10_000,
+) -> dict:
+    """Stream the built-in sample mappings directly into an RDF aggregate.
+
+    This produces the same canonical SampleCall and FormatFieldValue triples as
+    the default RML maps without first materializing V*S and V*S*F TSV rows.
+    The aggregate is rolled back to its original byte length if streaming fails.
+    """
+    stats = {
+        "records": 0,
+        "sample_calls": 0,
+        "format_values": 0,
+        "triples": 0,
+        "appended_bytes": 0,
+    }
+    if not records_tsv.is_file():
+        return stats
+    if not rdf_path.is_file():
+        raise FileNotFoundError(f"RDF aggregate not found for sample streaming: {rdf_path}")
+
+    _set_max_csv_field_size()
+    original_size = rdf_path.stat().st_size
+    opener = gzip.open if rdf_path.name.endswith(".gz") else Path.open
+    mode = "ab"
+    output_handle = None
+    buffer = bytearray()
+
+    def emit(line: str):
+        nonlocal buffer
+        buffer.extend(line.encode("utf-8"))
+        stats["triples"] += 1
+        if len(buffer) >= SAMPLE_RDF_BUFFER_BYTES:
+            output_handle.write(buffer)
+            buffer = bytearray()
+
+    try:
+        output_handle = opener(rdf_path, mode)
+        with records_tsv.open(newline="", encoding="utf-8") as records_handle:
+            reader = csv.reader(records_handle, delimiter="\t")
+            header = next(reader, None)
+            if not header:
+                output_handle.close()
+                output_handle = None
+                stats["appended_bytes"] = rdf_path.stat().st_size - original_size
+                return stats
+
+            sample_header = header[-1].strip() if len(header) >= 12 else ""
+            declared_sample_ids = (
+                []
+                if sample_header == "SAMPLES"
+                else [token for token in sample_header.split() if token]
+            )
+
+            for row in reader:
+                if not row:
+                    continue
+                if len(row) < len(header):
+                    row += [""] * (len(header) - len(row))
+
+                source_file = row[0] if len(row) > 0 else ""
+                row_id = row[1] if len(row) > 1 else ""
+                format_raw = row[10] if len(row) > 10 else ""
+                samples_raw = row[-1] if len(row) >= 12 else ""
+                format_keys = format_raw.split(":") if format_raw else []
+                sample_payloads = samples_raw.split() if samples_raw else []
+                total_samples = max(len(declared_sample_ids), len(sample_payloads))
+                if total_samples == 0:
+                    continue
+
+                source_component = _rml_uri_component(source_file)
+                row_component = _rml_uri_component(row_id)
+                call_uri = f"file://{source_component}#call/{row_component}"
+                sample_uri_seen: dict[str, int] = {}
+
+                for sample_idx in range(total_samples):
+                    sample_id = (
+                        declared_sample_ids[sample_idx]
+                        if sample_idx < len(declared_sample_ids)
+                        else f"SAMPLE_{sample_idx + 1}"
+                    )
+                    sample_payload = (
+                        sample_payloads[sample_idx]
+                        if sample_idx < len(sample_payloads)
+                        else ""
+                    )
+                    sample_uri_id_base = _sample_id_to_uri_id(sample_id, sample_idx + 1)
+                    sample_uri_seen[sample_uri_id_base] = sample_uri_seen.get(sample_uri_id_base, 0) + 1
+                    duplicate_index = sample_uri_seen[sample_uri_id_base]
+                    sample_uri_id = (
+                        f"{sample_uri_id_base}_{duplicate_index}"
+                        if duplicate_index > 1
+                        else sample_uri_id_base
+                    )
+                    sample_component = _rml_uri_component(sample_uri_id)
+                    sample_uri = f"file://{source_component}#sample/{row_component}/{sample_component}"
+
+                    emit(f"<{call_uri}> <{VCFR_NAMESPACE}hasSampleCall> <{sample_uri}> .\n")
+                    emit(f"<{sample_uri}> <{RDF_TYPE_URI}> <{VCFR_NAMESPACE}SampleCall> .\n")
+                    emit(f"<{sample_uri}> <{VCFR_NAMESPACE}sampleId> {_ntriples_literal(sample_id)} .\n")
+                    stats["sample_calls"] += 1
+
+                    value_tokens = sample_payload.split(":") if sample_payload else []
+                    total_fields = max(len(format_keys), len(value_tokens))
+                    for format_idx in range(total_fields):
+                        format_key = (
+                            format_keys[format_idx]
+                            if format_idx < len(format_keys) and format_keys[format_idx]
+                            else f"FIELD_{format_idx + 1}"
+                        )
+                        format_value = value_tokens[format_idx] if format_idx < len(value_tokens) else ""
+                        format_component = _rml_uri_component(format_key)
+                        format_uri = f"{sample_uri}/fmt/{format_component}"
+                        emit(f"<{sample_uri}> <{VCFR_NAMESPACE}hasFormatValue> <{format_uri}> .\n")
+                        emit(f"<{format_uri}> <{RDF_TYPE_URI}> <{VCFR_NAMESPACE}FormatFieldValue> .\n")
+                        if format_value:
+                            emit(
+                                f"<{format_uri}> <{VCFR_NAMESPACE}fieldValue> "
+                                f"{_ntriples_literal(format_value)} .\n"
+                            )
+                        stats["format_values"] += 1
+
+                stats["records"] += 1
+                if progress_interval_records > 0 and stats["records"] % progress_interval_records == 0:
+                    print(
+                        "    * Sample RDF streaming: "
+                        f"{stats['records']:,} variants, {stats['sample_calls']:,} calls",
+                        flush=True,
+                    )
+
+        if buffer:
+            output_handle.write(buffer)
+        output_handle.close()
+        output_handle = None
+        stats["appended_bytes"] = rdf_path.stat().st_size - original_size
+        return stats
+    except BaseException:
+        if output_handle is not None:
+            try:
+                output_handle.close()
+            except OSError:
+                pass
+        with rdf_path.open("r+b") as rollback_handle:
+            rollback_handle.truncate(original_size)
+        raise
+
+
+def update_conversion_metrics_after_sample_stream(
+    *,
+    metrics_dir: Path,
+    output_name: str,
+    run_id: str,
+    rdf_path: Path,
+    total_triples: int,
+    sample_stats: dict,
+):
+    """Bring conversion JSON/CSV metrics in sync after direct sample emission."""
+    safe_name = safe_metrics_name(output_name)
+    metrics_json = metrics_dir / "conversion_metrics" / safe_name / f"{run_id}.json"
+    output_size = int(rdf_path.stat().st_size)
+    if metrics_json.is_file():
+        try:
+            payload = json.loads(metrics_json.read_text(encoding="utf-8"))
+            artifacts = payload.setdefault("artifacts", {})
+            prior_triples = artifacts.get("output_triples")
+            if isinstance(prior_triples, dict):
+                for key in list(prior_triples):
+                    prior_triples[key] = int(total_triples)
+                prior_triples["TOTAL"] = int(total_triples)
+            else:
+                artifacts["output_triples"] = int(total_triples)
+            artifacts["output_size_bytes"] = output_size
+            payload["sample_streaming"] = sample_stats
+            metrics_json.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    metrics_csv = metrics_dir / "metrics.csv"
+    if not metrics_csv.is_file():
+        return
+    try:
+        with metrics_csv.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            fieldnames = list(reader.fieldnames or [])
+            rows = list(reader)
+        changed = False
+        for row in rows:
+            if row.get("run_id") == run_id and row.get("output_name") == output_name:
+                row["output_triples"] = str(int(total_triples))
+                row["output_dir_size_bytes"] = str(output_size)
+                changed = True
+        if changed:
+            with metrics_csv.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+    except OSError:
+        pass
+
+
 def build_sample_support_tsvs(records_tsv: Path, sample_calls_tsv: Path, sample_format_tsv: Path):
     """Materialize per-sample helper TSVs from records.tsv.
 
@@ -1491,46 +1805,16 @@ def build_sample_support_tsvs(records_tsv: Path, sample_calls_tsv: Path, sample_
     - one `SampleCall` per sample/record
     - one `FormatFieldValue` per sample/record/FORMAT key
     """
-    sample_calls_tsv.parent.mkdir(parents=True, exist_ok=True)
-    sample_format_tsv.parent.mkdir(parents=True, exist_ok=True)
-
-    def sample_id_to_uri_id(sample_id: str, fallback_index: int) -> str:
-        candidate = re.sub(r"[^A-Za-z0-9._~-]+", "_", sample_id).strip("_")
-        if not candidate:
-            candidate = f"sample_{fallback_index}"
-        return candidate
-
-    with sample_calls_tsv.open("w", newline="", encoding="utf-8") as sample_calls_handle, \
-        sample_format_tsv.open("w", newline="", encoding="utf-8") as sample_format_handle:
+    write_sample_support_headers(sample_calls_tsv, sample_format_tsv)
+    with sample_calls_tsv.open("a", newline="", encoding="utf-8") as sample_calls_handle, \
+        sample_format_tsv.open("a", newline="", encoding="utf-8") as sample_format_handle:
         sample_calls_writer = csv.writer(sample_calls_handle, delimiter="\t")
         sample_format_writer = csv.writer(sample_format_handle, delimiter="\t")
-
-        sample_calls_writer.writerow(
-            [
-                "SOURCE_FILE",
-                "ROW_ID",
-                "SAMPLE_INDEX",
-                "SAMPLE_ID",
-                "SAMPLE_URI_ID",
-                "SAMPLE_PAYLOAD",
-            ]
-        )
-        sample_format_writer.writerow(
-            [
-                "SOURCE_FILE",
-                "ROW_ID",
-                "SAMPLE_INDEX",
-                "SAMPLE_ID",
-                "SAMPLE_URI_ID",
-                "FORMAT_INDEX",
-                "FORMAT_KEY",
-                "FORMAT_VALUE",
-            ]
-        )
 
         if not records_tsv.exists():
             return
 
+        _set_max_csv_field_size()
         with records_tsv.open(newline="", encoding="utf-8") as records_handle:
             reader = csv.reader(records_handle, delimiter="\t")
             header = next(reader, None)
@@ -1538,7 +1822,11 @@ def build_sample_support_tsvs(records_tsv: Path, sample_calls_tsv: Path, sample_
                 return
 
             sample_header = header[-1].strip() if len(header) >= 12 else ""
-            declared_sample_ids = [token for token in sample_header.split() if token]
+            declared_sample_ids = (
+                []
+                if sample_header == "SAMPLES"
+                else [token for token in sample_header.split() if token]
+            )
 
             for row in reader:
                 if not row:
@@ -1571,7 +1859,7 @@ def build_sample_support_tsvs(records_tsv: Path, sample_calls_tsv: Path, sample_
                         else ""
                     )
                     sample_index_value = str(sample_idx + 1)
-                    sample_uri_id_base = sample_id_to_uri_id(sample_id, sample_idx + 1)
+                    sample_uri_id_base = _sample_id_to_uri_id(sample_id, sample_idx + 1)
                     sample_uri_seen[sample_uri_id_base] = sample_uri_seen.get(sample_uri_id_base, 0) + 1
                     if sample_uri_seen[sample_uri_id_base] > 1:
                         sample_uri_id = f"{sample_uri_id_base}_{sample_uri_seen[sample_uri_id_base]}"
@@ -3340,6 +3628,7 @@ def run_full_mode(
     ensure_dir(metrics_dir)
 
     selected_methods = list(methods)
+    sample_strategy = sample_support_strategy(rules_path)
     use_partitioned_hdt = should_use_partitioned_hdt(
         mode="full",
         methods=selected_methods,
@@ -3409,13 +3698,10 @@ def run_full_mode(
 
         # Pre-flight write checks for expected TSV outputs to fail fast on
         # permission/mount problems before starting container work.
-        for suffix in (
-            "records.tsv",
-            "header_lines.tsv",
-            "file_metadata.tsv",
-            "sample_calls.tsv",
-            "sample_format_values.tsv",
-        ):
+        expected_tsv_suffixes = ["records.tsv", "header_lines.tsv", "file_metadata.tsv"]
+        if sample_strategy != "none":
+            expected_tsv_suffixes.extend(["sample_calls.tsv", "sample_format_values.tsv"])
+        for suffix in expected_tsv_suffixes:
             expected_tsv_output = tsv_dir / f"{expected_prefix}.{suffix}"
             if not ensure_writable_path_or_fix(
                 target_path=expected_tsv_output,
@@ -3471,11 +3757,16 @@ def run_full_mode(
         sample_calls_tsv = tsv_dir / f"{prefix}.sample_calls.tsv"
         sample_format_tsv = tsv_dir / f"{prefix}.sample_format_values.tsv"
         try:
-            build_sample_support_tsvs(
-                records_tsv=triplet["records"],
-                sample_calls_tsv=sample_calls_tsv,
-                sample_format_tsv=sample_format_tsv,
-            )
+            if sample_strategy == "expanded":
+                build_sample_support_tsvs(
+                    records_tsv=triplet["records"],
+                    sample_calls_tsv=sample_calls_tsv,
+                    sample_format_tsv=sample_format_tsv,
+                )
+            elif sample_strategy == "stream":
+                # RMLStreamer sees valid, empty canonical sources. Their
+                # equivalent triples are appended directly after base mapping.
+                write_sample_support_headers(sample_calls_tsv, sample_format_tsv)
         except Exception as exc:
             fail_current(
                 "tsv-derivation",
@@ -3632,8 +3923,40 @@ def run_full_mode(
             )
             continue
 
+        sample_stats = None
+        if sample_strategy == "stream":
+            print("    * Streaming canonical multi-sample RDF (no expanded helper TSVs)")
+            try:
+                sample_stats = append_canonical_sample_rdf(
+                    records_tsv=triplet["records"],
+                    rdf_path=raw_rdf_files[0],
+                )
+            except Exception as exc:
+                fail_current(
+                    "sample-rdf-streaming",
+                    f"failed streaming sample RDF for '{prefix}': {exc}. "
+                    f"See log: {wrapper_log_path}",
+                )
+                continue
+            if triples_produced is not None:
+                triples_produced += int(sample_stats["triples"])
+            print(
+                "    * Sample calls streamed: "
+                f"{sample_stats['sample_calls']:,}; FORMAT values: "
+                f"{sample_stats['format_values']:,}"
+            )
+
         if triples_produced is None:
             triples_produced = count_triples_in_nt_files(raw_rdf_files)
+        if sample_stats is not None and triples_produced is not None:
+            update_conversion_metrics_after_sample_stream(
+                metrics_dir=metrics_dir,
+                output_name=output_name,
+                run_id=run_id,
+                rdf_path=raw_rdf_files[0],
+                total_triples=triples_produced,
+                sample_stats=sample_stats,
+            )
         if triples_produced is not None:
             saw_triple_counts = True
             total_triples_produced += triples_produced

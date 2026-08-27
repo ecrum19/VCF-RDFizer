@@ -438,12 +438,26 @@ HDT Java 3.0.10 does not provide a standalone `hdtGenerateIndex` executable.
 VCF-RDFizer sends an `exit` command to the supported `hdtSearch.sh` launcher;
 this opens the HDT through `mapIndexedHDT()` without executing a data query and
 creates the versioned `.hdt.index.v1-1` sidecar before the run is marked successful.
+The helper explicitly selects HDT Java's external-sort disk indexer rather than
+the launcher's heap-based default (whose launcher heap is only 1 GiB). Temporary
+sort runs and disk-backed sequences are kept under `/work` and removed when the
+index command finishes. `HDT_INDEX_WORK_ROOT` can override that scratch root
+when invoking the helper directly.
 For the pinned HDT Java 3.0.10 distribution, this is the HDT v1-1 sidecar
 `<file>.hdt.index.v1-1`; VCF-RDFizer reports the actual path in its metrics.
 
 The record-safe chunk plan and per-stage timings are retained in the raw
 partitioned-compression metrics JSON for diagnostics. The temporary chunk
 files and guide are not retained as host files.
+
+For the default mapping, multi-sample VCF columns remain compact in
+`records.tsv`. Canonical `SampleCall` and `FormatFieldValue` triples are streamed
+directly into the final `.nt` or `.nt.gz` aggregate instead of first writing
+`variants × samples` and `variants × samples × FORMAT fields` helper rows.
+The compatibility helper TSVs therefore contain only headers. Custom mappings
+that add consumers of those helper sources continue to use expanded tables.
+This removes the large temporary-disk multiplier, although the final RDF still
+scales with the number of emitted sample and FORMAT triples.
 
 The implementation keeps COTTAS conversion scratch state inside the Docker
 container and removes temporary unpacked package files when decompression
@@ -461,7 +475,10 @@ If Docker permission issues occur, rerun with a Docker-allowed user (or configur
 If HDT compression fails on very large RDF files, use
 `--rdf-storage-mode space-optimized` or `--rdf-storage-mode plain` with
 `--hdt-strategy partitioned`, then lower `--chunk-target-bytes` and
-`--chunk-max-bytes` to reduce each converter's working set.
+`--chunk-max-bytes` to reduce each converter's working set. Final HDT index
+creation is disk-backed, so ensure the Docker data volume has enough temporary
+space for the external sort; free space in the output filesystem alone does
+not increase the JVM heap.
 
 Safe termination:
 
