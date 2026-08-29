@@ -11,6 +11,7 @@ DuckDB scratch database, from consuming the user's output filesystem.
 from __future__ import annotations
 
 import argparse
+import errno
 import gzip
 import json
 import os
@@ -63,41 +64,67 @@ def iter_rdf_lines(path: Path):
         yield from handle
 
 
-def plan_chunks(
+def stream_chunks(
     source: Path,
     chunk_dir: Path,
     *,
     target_bytes: int,
     min_bytes: int,
     max_bytes: int,
-) -> tuple[list[Path], dict]:
-    """Create chunks on complete N-Triples records in one sequential pass."""
+) -> tuple[object, dict]:
+    """Yield complete-record chunks while building a mutable chunk plan.
+
+    The old implementation returned only after expanding the *entire* source
+    into raw ``.nt`` chunks.  A space-optimized aggregate is normally gzip
+    compressed, so that made the Docker workspace hold another full,
+    uncompressed copy of the aggregate before either converter could reclaim a
+    single byte.  The caller now converts and unlinks each yielded chunk before
+    asking for the next one.
+    """
     if target_bytes <= 0 or min_bytes <= 0 or max_bytes <= 0:
         raise ValueError("RDF chunk sizes must be positive")
     if min_bytes > target_bytes or target_bytes > max_bytes:
         raise ValueError("RDF chunk sizes must satisfy min <= target <= max")
 
     chunk_dir.mkdir(parents=True, exist_ok=True)
-    chunk_paths: list[Path] = []
-    chunk_metadata: list[dict] = []
-    handle = None
-    chunk_path = None
-    chunk_size = 0
-    chunk_start_offset = 0
-    chunk_start_record = 0
-    logical_offset = 0
-    record_count = 0
-    chunk_index = 0
+    plan = {
+        "source_file_count": 1,
+        "source_paths": [str(source)],
+        "chunk_count": 0,
+        "chunk_input_bytes": 0,
+        "record_count": 0,
+        "target_chunk_bytes": target_bytes,
+        "min_chunk_bytes": min_bytes,
+        "max_chunk_bytes": max_bytes,
+        "chunks": [],
+    }
 
-    def close_chunk():
-        nonlocal handle, chunk_path, chunk_size
-        if handle is None or chunk_path is None:
-            return
-        handle.close()
-        chunk_paths.append(chunk_path)
-        chunk_metadata.append(
-            {
-                "chunk_id": len(chunk_metadata),
+    def generate():
+        handle = None
+        chunk_path = None
+        chunk_size = 0
+        chunk_start_offset = 0
+        chunk_start_record = 0
+        logical_offset = 0
+        record_count = 0
+        chunk_index = 0
+
+        def open_chunk():
+            nonlocal handle, chunk_path, chunk_size, chunk_start_offset, chunk_start_record, chunk_index
+            chunk_path = chunk_dir / f"chunk-{chunk_index:05d}.nt"
+            chunk_index += 1
+            handle = chunk_path.open("wb")
+            chunk_size = 0
+            chunk_start_offset = logical_offset
+            chunk_start_record = record_count
+
+        def close_chunk():
+            nonlocal handle, chunk_path, chunk_size
+            if handle is None or chunk_path is None:
+                return None
+            handle.close()
+            metadata = {
+                "chunk_id": len(plan["chunks"]),
                 "path": str(chunk_path),
                 "start_record": chunk_start_record,
                 "end_record": record_count,
@@ -106,52 +133,78 @@ def plan_chunks(
                 "record_count": record_count - chunk_start_record,
                 "payload_bytes": chunk_size,
             }
-        )
-        handle = None
-        chunk_path = None
-        chunk_size = 0
+            plan["chunks"].append(metadata)
+            plan["chunk_count"] = len(plan["chunks"])
+            completed_path = chunk_path
+            handle = None
+            chunk_path = None
+            chunk_size = 0
+            return completed_path, metadata
 
-    try:
-        for line in iter_rdf_lines(source):
-            if not line.endswith(b"\n"):
-                raise ValueError(f"RDF source contains a non-line-terminated record: {source}")
-            line_size = len(line)
-            if handle is None:
-                chunk_path = chunk_dir / f"chunk-{chunk_index:05d}.nt"
-                chunk_index += 1
-                handle = chunk_path.open("wb")
-                chunk_start_offset = logical_offset
-                chunk_start_record = record_count
-            elif chunk_size > 0 and (
-                (chunk_size >= target_bytes and chunk_size >= min_bytes)
-                or chunk_size + line_size > max_bytes
-            ):
-                close_chunk()
-                chunk_path = chunk_dir / f"chunk-{chunk_index:05d}.nt"
-                chunk_index += 1
-                handle = chunk_path.open("wb")
-                chunk_start_offset = logical_offset
-                chunk_start_record = record_count
+        try:
+            for line in iter_rdf_lines(source):
+                if not line.endswith(b"\n"):
+                    raise ValueError(f"RDF source contains a non-line-terminated record: {source}")
+                line_size = len(line)
+                if handle is None:
+                    open_chunk()
+                elif chunk_size > 0 and (
+                    (chunk_size >= target_bytes and chunk_size >= min_bytes)
+                    or chunk_size + line_size > max_bytes
+                ):
+                    completed_chunk = close_chunk()
+                    if completed_chunk is not None:
+                        yield completed_chunk
+                    open_chunk()
 
-            handle.write(line)
-            chunk_size += line_size
-            logical_offset += line_size
-            if is_triple_line(line):
-                record_count += 1
-    finally:
-        close_chunk()
+                handle.write(line)
+                chunk_size += line_size
+                logical_offset += line_size
+                if is_triple_line(line):
+                    record_count += 1
+                plan["chunk_input_bytes"] = logical_offset
+                plan["record_count"] = record_count
 
-    return chunk_paths, {
-        "source_file_count": 1,
-        "source_paths": [str(source)],
-        "chunk_count": len(chunk_paths),
-        "chunk_input_bytes": logical_offset,
-        "record_count": record_count,
-        "target_chunk_bytes": target_bytes,
-        "min_chunk_bytes": min_bytes,
-        "max_chunk_bytes": max_bytes,
-        "chunks": chunk_metadata,
-    }
+            completed_chunk = close_chunk()
+            if completed_chunk is not None:
+                yield completed_chunk
+        finally:
+            # A write/decompression error can leave one unyielded, partial
+            # chunk. It has no consumer, so remove it before the volume is
+            # released.
+            if handle is not None:
+                try:
+                    handle.close()
+                finally:
+                    if chunk_path is not None:
+                        chunk_path.unlink(missing_ok=True)
+
+    return generate(), plan
+
+
+def plan_chunks(
+    source: Path,
+    chunk_dir: Path,
+    *,
+    target_bytes: int,
+    min_bytes: int,
+    max_bytes: int,
+) -> tuple[list[Path], dict]:
+    """Materialize chunks for callers that explicitly need every path.
+
+    The production compressor uses :func:`stream_chunks` so it never retains a
+    full uncompressed copy of a gzip aggregate. This compatibility helper is
+    deliberately kept for diagnostics and standalone callers.
+    """
+    stream, plan = stream_chunks(
+        source,
+        chunk_dir,
+        target_bytes=target_bytes,
+        min_bytes=min_bytes,
+        max_bytes=max_bytes,
+    )
+    chunk_paths = [path for path, _metadata in stream]
+    return chunk_paths, plan
 
 
 def resolve_executable(candidates: tuple[str, ...], label: str) -> str:
@@ -317,6 +370,17 @@ def main() -> int:
     cottas_failed = False
     cottas_warning = None
 
+    def write_result(payload: dict):
+        """Best-effort result handoff that never hides the original failure."""
+        try:
+            result_path.parent.mkdir(parents=True, exist_ok=True)
+            result_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        except OSError as write_error:
+            print(
+                f"Warning: unable to write partitioned-compression result to {result_path}: {write_error}",
+                file=sys.stderr,
+            )
+
     def record_index_warning(index_format: str, stage: str, artifact: Path, message: str) -> dict:
         warning = {
             "format": index_format,
@@ -357,21 +421,6 @@ def main() -> int:
         if not methods or not all(method in HDT_METHODS | COTTAS_METHODS for method in methods):
             raise ValueError(f"Unsupported partitioned method list: {methods}")
 
-        chunks, plan = plan_chunks(
-            source,
-            chunk_dir,
-            target_bytes=args.target_chunk_bytes,
-            min_bytes=args.min_chunk_bytes,
-            max_bytes=args.max_chunk_bytes,
-        )
-        if not chunks:
-            raise ValueError("RDF source contains no complete records")
-        source_triples = int(plan["record_count"])
-        if args.expected_triples is not None and source_triples != args.expected_triples:
-            raise ValueError(
-                "source triple count does not match the upstream conversion count: "
-                f"source={source_triples}, expected={args.expected_triples}"
-            )
         hdt_paths: list[Path] = []
         cottas_paths: list[Path] = []
         needs_hdt = any(method in HDT_METHODS for method in methods)
@@ -391,6 +440,13 @@ def main() -> int:
         cottas_python = os.environ.get("COTTAS_PYTHON_BIN") or shutil.which("python3")
         if any(method in COTTAS_METHODS for method in methods) and not cottas_python:
             raise RuntimeError("Missing Python runtime for COTTAS")
+        chunk_stream, plan = stream_chunks(
+            source,
+            chunk_dir,
+            target_bytes=args.target_chunk_bytes,
+            min_bytes=args.min_chunk_bytes,
+            max_bytes=args.max_chunk_bytes,
+        )
 
         def validate_artifact(
             *,
@@ -451,41 +507,55 @@ def main() -> int:
                 )
             return report
 
-        for index, chunk in enumerate(chunks):
-            if needs_hdt:
-                chunk_hdt = work_dir / f"chunk-{index:05d}.hdt"
-                stage = runner.run(f"hdt-build-{index:05d}", [hdt_bin, str(chunk), str(chunk_hdt)], chunk_hdt)
-                add_totals(hdt_total, stage)
-                if stage["exit_code"] != 0:
-                    raise RuntimeError("partitioned HDT chunk conversion failed")
-                hdt_paths.append(chunk_hdt)
-            if any(method in COTTAS_METHODS for method in methods):
-                if cottas_failed:
-                    chunk.unlink(missing_ok=True)
-                    continue
-                chunk_cottas = work_dir / f"chunk-{index:05d}.cottas"
-                stage = runner.run(
-                    f"cottas-build-{index:05d}",
-                    [cottas_python, "/opt/vcf-rdfizer/cottas_tool.py", "convert", str(chunk), str(chunk_cottas), "spo"],
-                    chunk_cottas,
-                )
-                add_totals(cottas_total, stage)
-                if stage["exit_code"] != 0:
-                    if not args.allow_index_failures:
-                        raise RuntimeError("partitioned COTTAS chunk conversion failed")
-                    cottas_failed = True
-                    cottas_total["exit_code"] = 0
-                    cottas_warning = record_index_warning(
-                        "cottas",
-                        "cottas-index",
-                        output_cottas,
-                        "partitioned COTTAS conversion/index creation failed for a chunk",
+        # Convert each uncompressed chunk before requesting the next one from
+        # the gzip reader. This bounds raw-RDF workspace use to one chunk,
+        # rather than the entire decompressed aggregate.
+        for index, (chunk, _chunk_metadata) in enumerate(chunk_stream):
+            try:
+                if needs_hdt:
+                    chunk_hdt = work_dir / f"chunk-{index:05d}.hdt"
+                    stage = runner.run(
+                        f"hdt-build-{index:05d}",
+                        [hdt_bin, str(chunk), str(chunk_hdt)],
+                        chunk_hdt,
                     )
-                    chunk_cottas.unlink(missing_ok=True)
-                    chunk.unlink(missing_ok=True)
-                    continue
-                cottas_paths.append(chunk_cottas)
-            chunk.unlink(missing_ok=True)
+                    add_totals(hdt_total, stage)
+                    if stage["exit_code"] != 0:
+                        raise RuntimeError("partitioned HDT chunk conversion failed")
+                    hdt_paths.append(chunk_hdt)
+                if any(method in COTTAS_METHODS for method in methods) and not cottas_failed:
+                    chunk_cottas = work_dir / f"chunk-{index:05d}.cottas"
+                    stage = runner.run(
+                        f"cottas-build-{index:05d}",
+                        [cottas_python, "/opt/vcf-rdfizer/cottas_tool.py", "convert", str(chunk), str(chunk_cottas), "spo"],
+                        chunk_cottas,
+                    )
+                    add_totals(cottas_total, stage)
+                    if stage["exit_code"] != 0:
+                        if not args.allow_index_failures:
+                            raise RuntimeError("partitioned COTTAS chunk conversion failed")
+                        cottas_failed = True
+                        cottas_total["exit_code"] = 0
+                        cottas_warning = record_index_warning(
+                            "cottas",
+                            "cottas-index",
+                            output_cottas,
+                            "partitioned COTTAS conversion/index creation failed for a chunk",
+                        )
+                        chunk_cottas.unlink(missing_ok=True)
+                    else:
+                        cottas_paths.append(chunk_cottas)
+            finally:
+                chunk.unlink(missing_ok=True)
+
+        if not plan["chunks"]:
+            raise ValueError("RDF source contains no complete records")
+        source_triples = int(plan["record_count"])
+        if args.expected_triples is not None and source_triples != args.expected_triples:
+            raise ValueError(
+                "source triple count does not match the upstream conversion count: "
+                f"source={source_triples}, expected={args.expected_triples}"
+            )
 
         if hdt_paths:
             final_hdt, hdt_rounds = merge_pairwise(
@@ -629,13 +699,26 @@ def main() -> int:
                 raise RuntimeError(f"{method} packaging failed")
             results[method] = stage
 
-        result_path.parent.mkdir(parents=True, exist_ok=True)
-        result_path.write_text(json.dumps({"exit_code": 0, "methods": results, "stages": runner.stages, "index_warnings": index_warnings}, indent=2) + "\n", encoding="utf-8")
+        write_result(
+            {
+                "exit_code": 0,
+                "methods": results,
+                "stages": runner.stages,
+                "index_warnings": index_warnings,
+            }
+        )
         return 0
     except Exception as exc:
-        result_path.parent.mkdir(parents=True, exist_ok=True)
-        result_path.write_text(json.dumps({"exit_code": 1, "methods": results, "stages": runner.stages, "error": str(exc)}, indent=2) + "\n", encoding="utf-8")
-        print(f"partitioned compression failed: {exc}", file=sys.stderr)
+        error = str(exc)
+        if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+            error = (
+                "temporary partitioned-compression workspace (/work) ran out of storage. "
+                "Chunks are streamed one at a time, but the workspace must still hold "
+                "one raw chunk plus the in-progress HDT/COTTAS artifacts. Reduce "
+                "--chunk-target-bytes and --chunk-max-bytes, or increase Docker's disk limit."
+            )
+        write_result({"exit_code": 1, "methods": results, "stages": runner.stages, "error": error})
+        print(f"partitioned compression failed: {error}", file=sys.stderr)
         return 1
 
 

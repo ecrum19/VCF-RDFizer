@@ -478,11 +478,13 @@ one, so it avoids retaining both the part files and a full uncompressed
 aggregate.
 
 When HDT or COTTAS is selected, the aggregate is read sequentially and split
-into complete N-Triples records. The same temporary chunks are consumed by
-both converters before cleanup. HDT chunks are merged with `HDTCat`, the final
-HDT index is generated after merging with the Java-free `hdtc index` command,
-and COTTAS chunks are merged with `pycottas.cat`, which rebuilds the query
-indexes for the merged representation.
+into complete N-Triples records. Only one uncompressed chunk is present at a
+time: it is consumed by both converters and removed before the next chunk is
+read. This is especially important for `space-optimized` `.nt.gz` aggregates,
+which must not be expanded into a second full raw-RDF copy. HDT chunks are
+merged with `HDTCat`, the final HDT index is generated after merging with the
+Java-free `hdtc index` command, and COTTAS chunks are merged with
+`pycottas.cat`, which rebuilds the query indexes for the merged representation.
 
 After each final HDT/COTTAS base artifact is produced, VCF-RDFizer performs a
 streaming decode/count check. This verifies both readability and that the
