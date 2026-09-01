@@ -1407,9 +1407,14 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertEqual(stats["records"], 1)
             self.assertEqual(stats["sample_calls"], 2)
             self.assertEqual(stats["format_values"], 4)
-            self.assertEqual(stats["triples"], 18)
+            self.assertEqual(stats["triples"], 19)
             rdf_lines = rdf_path.read_text(encoding="utf-8").splitlines()
-            self.assertEqual(len(rdf_lines), 19)
+            self.assertEqual(len(rdf_lines), 20)
+            self.assertIn(
+                "<file://sample.vcf> <https://w3id.org/vcf-rdfizer/vocab#representationProfile> "
+                "<https://w3id.org/vcf-rdfizer/vocab#DenseRepresentation> .",
+                rdf_lines,
+            )
             self.assertIn(
                 "<file://sample.vcf#call/2> <https://w3id.org/vcf-rdfizer/vocab#hasSampleCall> "
                 "<file://sample.vcf#sample/2/SAMPLE-A> .",
@@ -1447,9 +1452,9 @@ class WrapperUnitTests(VerboseTestCase):
 
             self.assertEqual(stats["sample_calls"], 2504)
             self.assertEqual(stats["format_values"], 2504)
-            self.assertEqual(stats["triples"], 2504 * 6)
+            self.assertEqual(stats["triples"], 1 + (2504 * 6))
             with gzip.open(rdf_path, "rt", encoding="utf-8") as handle:
-                self.assertEqual(sum(1 for _line in handle), 1 + (2504 * 6))
+                self.assertEqual(sum(1 for _line in handle), 2 + (2504 * 6))
 
     def test_sample_support_strategy_preserves_custom_helper_consumers(self):
         """Only the exact canonical helper maps use direct RDF streaming."""
@@ -1463,6 +1468,187 @@ class WrapperUnitTests(VerboseTestCase):
                 encoding="utf-8",
             )
             self.assertEqual(vcf_rdfizer.sample_support_strategy(custom_rules), "expanded")
+
+    def test_sample_workflow_resolver_selects_one_compatible_branch(self):
+        """Dense and condensed plans are mutually exclusive and rules-aware."""
+        default_rules = Path(__file__).parents[1] / "rules" / "default_rules.ttl"
+
+        dense = vcf_rdfizer.resolve_sample_workflow("dense", default_rules)
+        condensed = vcf_rdfizer.resolve_sample_workflow("condensed", default_rules)
+
+        self.assertEqual(dense.helper_strategy, "header-only")
+        self.assertEqual(dense.emitter, "dense")
+        self.assertEqual(condensed.helper_strategy, "header-only")
+        self.assertEqual(condensed.emitter, "condensed")
+
+        with tempfile.TemporaryDirectory() as td:
+            custom_rules = Path(td) / "custom.ttl"
+            custom_rules.write_text(
+                default_rules.read_text(encoding="utf-8")
+                + '\n<#Extra> csvw:url "/data/tsv/sample_calls.tsv" .\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                vcf_rdfizer.resolve_sample_workflow("dense", custom_rules).helper_strategy,
+                "expanded",
+            )
+            with self.assertRaisesRegex(ValueError, "cannot be combined"):
+                vcf_rdfizer.resolve_sample_workflow("condensed", custom_rules)
+
+    def test_condensed_sample_emitter_uses_shared_samples_and_ordered_vectors(self):
+        """Condensed mode emits one SampleSet and FORMAT vector per key, not dense calls."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            records_tsv = tmp_path / "cohort.records.tsv"
+            records_tsv.write_text(
+                "SOURCE_FILE\tROW_ID\tCHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1 S2 S3\n"
+                "cohort.vcf\t7\t1\t100\t.\tA\tG\t50\tPASS\t.\tGT:DP:AD\t"
+                "0/1:42:30,12 ./.:.:. 1/1:9\n",
+                encoding="utf-8",
+            )
+            headers_tsv = tmp_path / "cohort.header_lines.tsv"
+            headers_tsv.write_text(
+                "SOURCE_FILE\tHEADER_INDEX\tHEADER_KEY\tHEADER_VALUE\tRAW_LINE\n"
+                "cohort.vcf\t1\tFORMAT\t<ID=GT,Number=1,Type=String,Description=Genotype>\tx\n"
+                "cohort.vcf\t2\tFORMAT\t<ID=DP,Number=1,Type=Integer,Description=Depth>\tx\n"
+                "cohort.vcf\t3\tFORMAT\t<ID=AD,Number=R,Type=Integer,Description=Depths>\tx\n",
+                encoding="utf-8",
+            )
+            rdf_path = tmp_path / "cohort.nt"
+            rdf_path.write_text("<base> <predicate> <object> .\n", encoding="utf-8")
+
+            stats = vcf_rdfizer.append_condensed_sample_rdf(
+                records_tsv,
+                headers_tsv,
+                rdf_path,
+                progress_interval_records=0,
+            )
+
+            self.assertEqual(stats["representation"], "condensed")
+            self.assertEqual(stats["samples"], 3)
+            self.assertEqual(stats["matrices"], 1)
+            self.assertEqual(stats["format_vectors"], 3)
+            self.assertEqual(stats["format_definitions"], 3)
+            self.assertEqual(stats["triples"], 45)
+            rdf_text = rdf_path.read_text(encoding="utf-8")
+            self.assertIn("vocab#CondensedRepresentation", rdf_text)
+            self.assertIn("vocab#SampleSet", rdf_text)
+            self.assertIn("#samples/S3> <https://w3id.org/vcf-rdfizer/vocab#sampleIndex>", rdf_text)
+            self.assertIn("#call/7/matrix/fmt/GT", rdf_text)
+            self.assertIn('"0/1\\t./.\\t1/1"', rdf_text)
+            self.assertIn('"30,12\\t.\\t."', rdf_text)
+            self.assertIn("#header/line/1> .", rdf_text)
+            self.assertIn("vocab#fieldNumber> \"1\"", rdf_text)
+            self.assertIn("vocab#fieldDescription> \"Genotype\"", rdf_text)
+            self.assertNotIn("vocab#hasSampleCall", rdf_text)
+            self.assertNotIn("vocab#FormatFieldValue", rdf_text)
+
+    def test_structured_format_header_parser_preserves_quoted_commas(self):
+        """FORMAT descriptions with commas and escaped quotes remain one attribute."""
+        fields = vcf_rdfizer._parse_structured_header_fields(
+            '<ID=GT,Number=1,Type=String,Description="Genotype, with \\"quoted\\" text">'
+        )
+
+        self.assertEqual(fields["ID"], "GT")
+        self.assertEqual(fields["Number"], "1")
+        self.assertEqual(fields["Description"], 'Genotype, with "quoted" text')
+
+    def test_condensed_sample_emitter_rolls_back_on_sample_count_mismatch(self):
+        """Malformed sample alignment fails atomically without a partial condensed graph."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            records_tsv = tmp_path / "bad.records.tsv"
+            records_tsv.write_text(
+                "SOURCE_FILE\tROW_ID\tCHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n"
+                "bad.vcf\t1\t1\t100\t.\tA\tG\t50\tPASS\t.\tGT\t0/1 0/0\n",
+                encoding="utf-8",
+            )
+            headers_tsv = tmp_path / "bad.header_lines.tsv"
+            headers_tsv.write_text(
+                "SOURCE_FILE\tHEADER_INDEX\tHEADER_KEY\tHEADER_VALUE\tRAW_LINE\n",
+                encoding="utf-8",
+            )
+            rdf_path = tmp_path / "bad.nt"
+            original = "<base> <predicate> <object> .\n"
+            rdf_path.write_text(original, encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "2 sample payloads"):
+                vcf_rdfizer.append_condensed_sample_rdf(
+                    records_tsv,
+                    headers_tsv,
+                    rdf_path,
+                    progress_interval_records=0,
+                )
+
+            self.assertEqual(rdf_path.read_text(encoding="utf-8"), original)
+
+    def test_main_condensed_mode_runs_only_the_condensed_emitter(self):
+        """The full CLI routes default rules to condensed output without dense sample triples."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_file = tmp_path / "cohort.vcf"
+            input_file.write_text(
+                "##fileformat=VCFv4.2\n"
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\n"
+                "1\t100\t.\tA\tG\t50\tPASS\t.\tGT\t0/1\t0/0\n",
+                encoding="utf-8",
+            )
+            out_dir = tmp_path / "out"
+
+            def fake_tsv_conversion(**kwargs):
+                tsv_dir = kwargs["tsv_dir"]
+                prefix = kwargs["prefix"]
+                tsv_dir.mkdir(parents=True, exist_ok=True)
+                (tsv_dir / f"{prefix}.records.tsv").write_text(
+                    "SOURCE_FILE\tROW_ID\tCHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1 S2\n"
+                    "cohort.vcf\t1\t1\t100\t.\tA\tG\t50\tPASS\t.\tGT\t0/1 0/0\n",
+                    encoding="utf-8",
+                )
+                (tsv_dir / f"{prefix}.header_lines.tsv").write_text(
+                    "SOURCE_FILE\tHEADER_INDEX\tHEADER_KEY\tHEADER_VALUE\tRAW_LINE\n"
+                    "cohort.vcf\t1\tFORMAT\t<ID=GT,Number=1,Type=String,Description=Genotype>\tx\n",
+                    encoding="utf-8",
+                )
+                (tsv_dir / f"{prefix}.file_metadata.tsv").write_text(
+                    "SOURCE_FILE\tFILE_FORMAT\tFILE_DATE\tSOURCE_SOFTWARE\tREFERENCE_GENOME\tHEADER_COUNT\tRECORD_COUNT\n"
+                    "cohort.vcf\tVCFv4.2\t\t\t\t1\t1\n",
+                    encoding="utf-8",
+                )
+                return {"exit_code": 0, "output_size_bytes": 1}
+
+            with mock.patch.object(vcf_rdfizer, "run", return_value=0), mock.patch.object(
+                vcf_rdfizer, "check_docker", return_value=True
+            ), mock.patch.object(
+                vcf_rdfizer, "docker_image_exists", return_value=True
+            ), mock.patch.object(
+                vcf_rdfizer,
+                "run_tsv_conversion_with_metrics",
+                side_effect=fake_tsv_conversion,
+            ):
+                rc = invoke_main(
+                    [
+                        "--input",
+                        str(input_file),
+                        "--out",
+                        str(out_dir),
+                        "--sample-representation",
+                        "condensed",
+                        "--compression",
+                        "none",
+                        "--keep-tsv",
+                    ]
+                )
+
+            self.assertEqual(rc, 0)
+            rdf_text = (out_dir / "cohort" / "cohort.nt").read_text(encoding="utf-8")
+            self.assertIn("vocab#CondensedRepresentation", rdf_text)
+            self.assertIn("vocab#CohortCallMatrix", rdf_text)
+            self.assertNotIn("vocab#SampleCall", rdf_text)
+            self.assertNotIn("vocab#FormatFieldValue", rdf_text)
+            helper_rows = (
+                out_dir / ".intermediate" / "tsv" / "cohort.sample_calls.tsv"
+            ).read_text(encoding="utf-8").splitlines()
+            self.assertEqual(helper_rows, ["\t".join(vcf_rdfizer.SAMPLE_CALLS_HEADER)])
 
     def test_render_rules_for_triplet_rewrites_helper_tsv_placeholders(self):
         """Rule rendering rewrites records/header/metadata and helper TSV placeholders."""

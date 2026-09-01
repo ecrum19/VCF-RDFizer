@@ -14,12 +14,14 @@ This directory contains RML mappings used by the conversion pipeline.
     - `/data/tsv/sample_calls.tsv`
     - `/data/tsv/sample_format_values.tsv`
   - For the built-in sample maps, `sample_calls.tsv` and
-    `sample_format_values.tsv` are header-only compatibility sources. The Python
-    wrapper streams their equivalent `SampleCall` and `FormatFieldValue` triples
-    directly from `records.tsv` into the RDF aggregate, avoiding helper-table
-    expansion proportional to variants × samples × FORMAT fields.
+    `sample_format_values.tsv` are header-only compatibility sources. In
+    `--sample-representation dense`, the Python wrapper streams their equivalent
+    `SampleCall` and `FormatFieldValue` triples directly from `records.tsv`. In
+    `--sample-representation condensed`, it instead streams `SampleSet`,
+    `CohortCallMatrix`, and `FormatValueVector` resources. Only one emitter runs.
   - Custom mappings with additional consumers of either helper source retain
-    expanded TSV generation for compatibility.
+    expanded TSV generation in dense mode. They are rejected in condensed mode
+    to prevent simultaneous dense and condensed output.
   - The Python wrapper rewrites these template paths per input VCF to:
     - `/data/tsv/<sample>.file_metadata.tsv`
     - `/data/tsv/<sample>.header_lines.tsv`
@@ -36,8 +38,13 @@ This directory contains RML mappings used by the conversion pipeline.
 5. Run the wrapper with your custom mapping:
 
 ```bash
-python3 vcf_rdfizer.py --input <vcf-or-dir> --rules rules/my_rules.ttl
+python3 vcf_rdfizer.py --input <vcf-or-dir> --rules rules/my_rules.ttl \
+  --rdf-storage-mode plain --out ./results
 ```
+
+Custom rules that do not consume either sample helper table can be used with
+`--sample-representation condensed`; the wrapper adds the condensed sample graph
+after RMLStreamer emits the custom record-level graph.
 
 ## SHACL Notes
 
@@ -51,3 +58,5 @@ The default mapping is structured to align with those classes/properties, especi
 - `vcfr:VCFHeader` + `vcfr:hasHeaderLine`
 - `vcfr:VCFRecord` core fields (`chrom`, `pos`, `ref`, `alt`)
 - `vcfr:VariantCall` with raw call attributes
+- dense `vcfr:SampleCall` / `vcfr:FormatFieldValue` resources, or condensed
+  `vcfr:CohortCallMatrix` / `vcfr:FormatValueVector` resources

@@ -26,6 +26,7 @@ import signal
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote_plus
@@ -227,7 +228,9 @@ CANONICAL_SAMPLE_RULE_FRAGMENTS = (
 )
 VCFR_NAMESPACE = "https://w3id.org/vcf-rdfizer/vocab#"
 RDF_TYPE_URI = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+XSD_POSITIVE_INTEGER_URI = "http://www.w3.org/2001/XMLSchema#positiveInteger"
 SAMPLE_RDF_BUFFER_BYTES = 8 * 1024 * 1024
+SAMPLE_REPRESENTATION_CHOICES = {"dense", "condensed"}
 
 
 # ---------------------------------------------------------------------------
@@ -1579,6 +1582,47 @@ def sample_support_strategy(rules_path: Path) -> str:
     return "expanded"
 
 
+@dataclass(frozen=True)
+class SampleWorkflow:
+    """One mutually exclusive sample-representation execution plan."""
+
+    representation: str
+    helper_strategy: str
+    emitter: str | None
+
+
+def resolve_sample_workflow(representation: str, rules_path: Path) -> SampleWorkflow:
+    """Resolve rules compatibility into exactly one sample workflow.
+
+    Dense mode preserves custom helper-table mappings. Condensed mode emits its
+    RDF directly from records.tsv; it cannot safely coexist with custom rules
+    that consume expanded dense helper tables because that would execute both
+    representations and reintroduce semantic inflation.
+    """
+    if representation not in SAMPLE_REPRESENTATION_CHOICES:
+        choices = ", ".join(sorted(SAMPLE_REPRESENTATION_CHOICES))
+        raise ValueError(
+            f"unsupported sample representation '{representation}'; choose {choices}"
+        )
+
+    rules_strategy = sample_support_strategy(rules_path)
+    if representation == "dense":
+        if rules_strategy == "stream":
+            return SampleWorkflow("dense", "header-only", "dense")
+        if rules_strategy == "expanded":
+            return SampleWorkflow("dense", "expanded", None)
+        return SampleWorkflow("dense", "none", None)
+
+    if rules_strategy == "expanded":
+        raise ValueError(
+            "--sample-representation condensed cannot be combined with custom rules "
+            "that consume expanded sample_calls.tsv or sample_format_values.tsv tables. "
+            "Remove those dense helper-table consumers or use dense mode."
+        )
+    helper_strategy = "header-only" if rules_strategy == "stream" else "none"
+    return SampleWorkflow("condensed", helper_strategy, "condensed")
+
+
 def _set_max_csv_field_size():
     """Allow chromosome-scale multi-sample payload columns in Python's CSV reader."""
     limit = sys.maxsize
@@ -1603,7 +1647,8 @@ def _rml_uri_component(value: str) -> str:
     return encoded.replace("+", "%20").replace("~", "%7E")
 
 
-def _ntriples_literal(value: str) -> str:
+def _ntriples_string_literal(value: str) -> str:
+    """Serialize an RDF 1.1 plain/xsd:string literal for N-Triples."""
     escaped = (
         value.replace("\\", "\\\\")
         .replace('"', '\\"')
@@ -1611,40 +1656,162 @@ def _ntriples_literal(value: str) -> str:
         .replace("\r", "\\r")
         .replace("\t", "\\t")
     )
-    literal = f'"{escaped}"'
+    return f'"{escaped}"'
+
+
+def _ntriples_literal(value: str) -> str:
+    literal = _ntriples_string_literal(value)
     if value == ".":
         literal += f"^^<{VCFR_NAMESPACE}Null>"
     return literal
 
 
-def append_canonical_sample_rdf(
-    records_tsv: Path,
-    rdf_path: Path,
-    *,
-    progress_interval_records: int = 10_000,
-) -> dict:
-    """Stream the built-in sample mappings directly into an RDF aggregate.
+@dataclass(frozen=True)
+class SampleColumn:
+    """One reusable VCF sample column."""
 
-    This produces the same canonical SampleCall and FormatFieldValue triples as
-    the default RML maps without first materializing V*S and V*S*F TSV rows.
-    The aggregate is rolled back to its original byte length if streaming fails.
-    """
-    stats = {
-        "records": 0,
-        "sample_calls": 0,
-        "format_values": 0,
-        "triples": 0,
-        "appended_bytes": 0,
-    }
-    if not records_tsv.is_file():
-        return stats
-    if not rdf_path.is_file():
-        raise FileNotFoundError(f"RDF aggregate not found for sample streaming: {rdf_path}")
+    index: int
+    sample_id: str
+    uri_id: str
 
-    _set_max_csv_field_size()
+
+@dataclass(frozen=True)
+class ParsedSampleRecord:
+    """One VCF record with FORMAT keys aligned to all sample columns."""
+
+    source_file: str
+    row_id: str
+    format_keys: tuple[str, ...]
+    sample_payloads: tuple[str, ...]
+    sample_values: tuple[tuple[str, ...], ...]
+
+
+class SampleRecordStream:
+    """Read a records.tsv sample block once and expose a stable sample schema."""
+
+    def __init__(self, records_tsv: Path):
+        self.records_tsv = records_tsv
+        self.columns: tuple[SampleColumn, ...] = ()
+        self.source_file = ""
+        self._handle = None
+        self._reader = None
+        self._header: list[str] = []
+        self._pending_row: list[str] | None = None
+
+    def __enter__(self):
+        _set_max_csv_field_size()
+        self._handle = self.records_tsv.open(newline="", encoding="utf-8")
+        self._reader = csv.reader(self._handle, delimiter="\t")
+        self._header = next(self._reader, None) or []
+        self._pending_row = self._next_nonempty_row()
+        if self._pending_row:
+            self.source_file = self._pending_row[0] if self._pending_row else ""
+
+        sample_header = self._header[-1].strip() if len(self._header) >= 12 else ""
+        declared_ids = (
+            []
+            if sample_header == "SAMPLES"
+            else [token for token in sample_header.split() if token]
+        )
+        if not declared_ids and self._pending_row is not None and len(self._header) >= 12:
+            samples_raw = self._pending_row[-1] if self._pending_row else ""
+            payload_count = len(samples_raw.split()) if samples_raw else 0
+            declared_ids = [f"SAMPLE_{index}" for index in range(1, payload_count + 1)]
+
+        uri_id_counts: dict[str, int] = {}
+        columns: list[SampleColumn] = []
+        for index, sample_id in enumerate(declared_ids, start=1):
+            uri_id_base = _sample_id_to_uri_id(sample_id, index)
+            uri_id_counts[uri_id_base] = uri_id_counts.get(uri_id_base, 0) + 1
+            occurrence = uri_id_counts[uri_id_base]
+            uri_id = f"{uri_id_base}_{occurrence}" if occurrence > 1 else uri_id_base
+            columns.append(SampleColumn(index, sample_id, uri_id))
+        self.columns = tuple(columns)
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self._handle is not None:
+            self._handle.close()
+        self._handle = None
+        self._reader = None
+
+    def _next_nonempty_row(self) -> list[str] | None:
+        if self._reader is None:
+            return None
+        for row in self._reader:
+            if row:
+                return row
+        return None
+
+    def __iter__(self):
+        if self._reader is None:
+            raise RuntimeError("SampleRecordStream must be used as a context manager")
+        pending = self._pending_row
+        self._pending_row = None
+        if pending is not None:
+            yield self._parse_row(pending)
+        for row in self._reader:
+            if row:
+                yield self._parse_row(row)
+
+    def _parse_row(self, row: list[str]) -> ParsedSampleRecord:
+        if len(row) < len(self._header):
+            row = row + [""] * (len(self._header) - len(row))
+
+        source_file = row[0] if len(row) > 0 else ""
+        if self.source_file and source_file != self.source_file:
+            raise ValueError(
+                f"records TSV mixes SOURCE_FILE values '{self.source_file}' and "
+                f"'{source_file}'"
+            )
+        row_id = row[1] if len(row) > 1 else ""
+        format_raw = row[10] if len(row) > 10 else ""
+        samples_raw = row[-1] if len(row) >= 12 else ""
+        declared_format_keys = format_raw.split(":") if format_raw else []
+        sample_payloads = samples_raw.split() if samples_raw else []
+        if len(sample_payloads) > len(self.columns):
+            raise ValueError(
+                f"record {row_id or '(unknown)'} contains {len(sample_payloads)} sample "
+                f"payloads but the TSV header declares {len(self.columns)} sample columns"
+            )
+        sample_payloads.extend([""] * (len(self.columns) - len(sample_payloads)))
+
+        raw_sample_values = [
+            payload.split(":") if payload else [] for payload in sample_payloads
+        ]
+        total_fields = max(
+            [len(declared_format_keys), *(len(values) for values in raw_sample_values)],
+            default=0,
+        )
+        format_keys = tuple(
+            declared_format_keys[index]
+            if index < len(declared_format_keys) and declared_format_keys[index]
+            else f"FIELD_{index + 1}"
+            for index in range(total_fields)
+        )
+        if len(set(format_keys)) != len(format_keys):
+            raise ValueError(
+                f"record {row_id or '(unknown)'} contains duplicate FORMAT keys: "
+                + ":".join(format_keys)
+            )
+
+        sample_values = tuple(
+            tuple(values[index] if index < len(values) else "" for index in range(total_fields))
+            for values in raw_sample_values
+        )
+        return ParsedSampleRecord(
+            source_file=source_file,
+            row_id=row_id,
+            format_keys=format_keys,
+            sample_payloads=tuple(sample_payloads),
+            sample_values=sample_values,
+        )
+
+
+def _append_rdf_atomically(rdf_path: Path, stats: dict, producer):
+    """Append generated N-Triples and restore the original artifact on failure."""
     original_size = rdf_path.stat().st_size
     opener = gzip.open if rdf_path.name.endswith(".gz") else Path.open
-    mode = "ab"
     output_handle = None
     buffer = bytearray()
 
@@ -1657,80 +1824,78 @@ def append_canonical_sample_rdf(
             buffer = bytearray()
 
     try:
-        output_handle = opener(rdf_path, mode)
-        with records_tsv.open(newline="", encoding="utf-8") as records_handle:
-            reader = csv.reader(records_handle, delimiter="\t")
-            header = next(reader, None)
-            if not header:
+        output_handle = opener(rdf_path, "ab")
+        producer(emit)
+        if buffer:
+            output_handle.write(buffer)
+        output_handle.close()
+        output_handle = None
+        stats["appended_bytes"] = rdf_path.stat().st_size - original_size
+        return stats
+    except BaseException:
+        if output_handle is not None:
+            try:
                 output_handle.close()
-                output_handle = None
-                stats["appended_bytes"] = rdf_path.stat().st_size - original_size
-                return stats
+            except OSError:
+                pass
+        with rdf_path.open("r+b") as rollback_handle:
+            rollback_handle.truncate(original_size)
+        raise
 
-            sample_header = header[-1].strip() if len(header) >= 12 else ""
-            declared_sample_ids = (
-                []
-                if sample_header == "SAMPLES"
-                else [token for token in sample_header.split() if token]
+
+def append_dense_sample_rdf(
+    records_tsv: Path,
+    rdf_path: Path,
+    *,
+    progress_interval_records: int = 10_000,
+) -> dict:
+    """Append the dense SampleCall/FormatFieldValue representation.
+
+    This produces the same canonical SampleCall and FormatFieldValue triples as
+    the default RML maps without materializing V*S and V*S*F helper TSV rows.
+    """
+    stats = {
+        "representation": "dense",
+        "records": 0,
+        "sample_calls": 0,
+        "format_values": 0,
+        "triples": 0,
+        "appended_bytes": 0,
+    }
+    if not records_tsv.is_file():
+        return stats
+    if not rdf_path.is_file():
+        raise FileNotFoundError(f"RDF aggregate not found for sample streaming: {rdf_path}")
+
+    with SampleRecordStream(records_tsv) as record_stream:
+        if not record_stream.columns or not record_stream.source_file:
+            return stats
+
+        def produce(emit):
+            source_component = _rml_uri_component(record_stream.source_file)
+            file_uri = f"file://{source_component}"
+            emit(
+                f"<{file_uri}> <{VCFR_NAMESPACE}representationProfile> "
+                f"<{VCFR_NAMESPACE}DenseRepresentation> .\n"
             )
+            for record in record_stream:
+                row_component = _rml_uri_component(record.row_id)
+                call_uri = f"{file_uri}#call/{row_component}"
 
-            for row in reader:
-                if not row:
-                    continue
-                if len(row) < len(header):
-                    row += [""] * (len(header) - len(row))
-
-                source_file = row[0] if len(row) > 0 else ""
-                row_id = row[1] if len(row) > 1 else ""
-                format_raw = row[10] if len(row) > 10 else ""
-                samples_raw = row[-1] if len(row) >= 12 else ""
-                format_keys = format_raw.split(":") if format_raw else []
-                sample_payloads = samples_raw.split() if samples_raw else []
-                total_samples = max(len(declared_sample_ids), len(sample_payloads))
-                if total_samples == 0:
-                    continue
-
-                source_component = _rml_uri_component(source_file)
-                row_component = _rml_uri_component(row_id)
-                call_uri = f"file://{source_component}#call/{row_component}"
-                sample_uri_seen: dict[str, int] = {}
-
-                for sample_idx in range(total_samples):
-                    sample_id = (
-                        declared_sample_ids[sample_idx]
-                        if sample_idx < len(declared_sample_ids)
-                        else f"SAMPLE_{sample_idx + 1}"
-                    )
-                    sample_payload = (
-                        sample_payloads[sample_idx]
-                        if sample_idx < len(sample_payloads)
-                        else ""
-                    )
-                    sample_uri_id_base = _sample_id_to_uri_id(sample_id, sample_idx + 1)
-                    sample_uri_seen[sample_uri_id_base] = sample_uri_seen.get(sample_uri_id_base, 0) + 1
-                    duplicate_index = sample_uri_seen[sample_uri_id_base]
-                    sample_uri_id = (
-                        f"{sample_uri_id_base}_{duplicate_index}"
-                        if duplicate_index > 1
-                        else sample_uri_id_base
-                    )
-                    sample_component = _rml_uri_component(sample_uri_id)
+                for sample_index, sample_column in enumerate(record_stream.columns):
+                    sample_component = _rml_uri_component(sample_column.uri_id)
                     sample_uri = f"file://{source_component}#sample/{row_component}/{sample_component}"
 
                     emit(f"<{call_uri}> <{VCFR_NAMESPACE}hasSampleCall> <{sample_uri}> .\n")
                     emit(f"<{sample_uri}> <{RDF_TYPE_URI}> <{VCFR_NAMESPACE}SampleCall> .\n")
-                    emit(f"<{sample_uri}> <{VCFR_NAMESPACE}sampleId> {_ntriples_literal(sample_id)} .\n")
+                    emit(
+                        f"<{sample_uri}> <{VCFR_NAMESPACE}sampleId> "
+                        f"{_ntriples_literal(sample_column.sample_id)} .\n"
+                    )
                     stats["sample_calls"] += 1
 
-                    value_tokens = sample_payload.split(":") if sample_payload else []
-                    total_fields = max(len(format_keys), len(value_tokens))
-                    for format_idx in range(total_fields):
-                        format_key = (
-                            format_keys[format_idx]
-                            if format_idx < len(format_keys) and format_keys[format_idx]
-                            else f"FIELD_{format_idx + 1}"
-                        )
-                        format_value = value_tokens[format_idx] if format_idx < len(value_tokens) else ""
+                    for format_index, format_key in enumerate(record.format_keys):
+                        format_value = record.sample_values[sample_index][format_index]
                         format_component = _rml_uri_component(format_key)
                         format_uri = f"{sample_uri}/fmt/{format_component}"
                         emit(f"<{sample_uri}> <{VCFR_NAMESPACE}hasFormatValue> <{format_uri}> .\n")
@@ -1750,21 +1915,253 @@ def append_canonical_sample_rdf(
                         flush=True,
                     )
 
-        if buffer:
-            output_handle.write(buffer)
-        output_handle.close()
-        output_handle = None
-        stats["appended_bytes"] = rdf_path.stat().st_size - original_size
+        return _append_rdf_atomically(rdf_path, stats, produce)
+
+
+def append_canonical_sample_rdf(
+    records_tsv: Path,
+    rdf_path: Path,
+    *,
+    progress_interval_records: int = 10_000,
+) -> dict:
+    """Backward-compatible name for the dense sample RDF emitter."""
+    return append_dense_sample_rdf(
+        records_tsv,
+        rdf_path,
+        progress_interval_records=progress_interval_records,
+    )
+
+
+@dataclass(frozen=True)
+class FormatDefinition:
+    """Structured attributes and RDF identity for one FORMAT declaration."""
+
+    uri: str
+    field_number: str
+    description: str
+
+
+def _parse_structured_header_fields(value: str) -> dict[str, str]:
+    """Parse comma-delimited VCF header attributes while respecting quotes."""
+    inner = value.strip()
+    if inner.startswith("<") and inner.endswith(">"):
+        inner = inner[1:-1]
+
+    tokens: list[str] = []
+    token: list[str] = []
+    in_quotes = False
+    escaped = False
+    for character in inner:
+        if escaped:
+            token.append(character)
+            escaped = False
+        elif character == "\\" and in_quotes:
+            token.append(character)
+            escaped = True
+        elif character == '"':
+            token.append(character)
+            in_quotes = not in_quotes
+        elif character == "," and not in_quotes:
+            tokens.append("".join(token))
+            token = []
+        else:
+            token.append(character)
+    tokens.append("".join(token))
+
+    fields: dict[str, str] = {}
+    for item in tokens:
+        if "=" not in item:
+            continue
+        key, raw_value = item.split("=", 1)
+        parsed_value = raw_value.strip()
+        if len(parsed_value) >= 2 and parsed_value[0] == parsed_value[-1] == '"':
+            parsed_value = parsed_value[1:-1]
+            parsed_value = parsed_value.replace('\\"', '"').replace("\\\\", "\\")
+        fields[key.strip()] = parsed_value
+    return fields
+
+
+def _load_format_definitions(header_lines_tsv: Path) -> dict[str, FormatDefinition]:
+    """Map FORMAT IDs to structured definitions backed by emitted HeaderLine IRIs."""
+    definitions: dict[str, FormatDefinition] = {}
+    if not header_lines_tsv.is_file():
+        return definitions
+    _set_max_csv_field_size()
+    with header_lines_tsv.open(newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle, delimiter="\t"):
+            if (row.get("HEADER_KEY") or "").upper() != "FORMAT":
+                continue
+            fields = _parse_structured_header_fields(row.get("HEADER_VALUE") or "")
+            format_id = fields.get("ID", "").strip()
+            if not format_id:
+                continue
+            source_component = _rml_uri_component(row.get("SOURCE_FILE") or "")
+            index_component = _rml_uri_component(row.get("HEADER_INDEX") or "")
+            definitions.setdefault(
+                format_id,
+                FormatDefinition(
+                    uri=f"file://{source_component}#header/line/{index_component}",
+                    field_number=fields.get("Number") or ".",
+                    description=(
+                        fields.get("Description")
+                        or f"FORMAT field {format_id} (source declaration has no Description)"
+                    ),
+                ),
+            )
+    return definitions
+
+
+def append_condensed_sample_rdf(
+    records_tsv: Path,
+    header_lines_tsv: Path,
+    rdf_path: Path,
+    *,
+    progress_interval_records: int = 10_000,
+) -> dict:
+    """Append sample-ordered cohort matrices and FORMAT value vectors."""
+    stats = {
+        "representation": "condensed",
+        "records": 0,
+        "samples": 0,
+        "matrices": 0,
+        "format_vectors": 0,
+        "format_definitions": 0,
+        "triples": 0,
+        "appended_bytes": 0,
+    }
+    if not records_tsv.is_file():
         return stats
-    except BaseException:
-        if output_handle is not None:
-            try:
-                output_handle.close()
-            except OSError:
-                pass
-        with rdf_path.open("r+b") as rollback_handle:
-            rollback_handle.truncate(original_size)
-        raise
+    if not rdf_path.is_file():
+        raise FileNotFoundError(f"RDF aggregate not found for sample streaming: {rdf_path}")
+
+    definitions = _load_format_definitions(header_lines_tsv)
+    with SampleRecordStream(records_tsv) as record_stream:
+        if not record_stream.columns or not record_stream.source_file:
+            return stats
+
+        def produce(emit):
+            source_component = _rml_uri_component(record_stream.source_file)
+            file_uri = f"file://{source_component}"
+            sample_set_uri = f"{file_uri}#samples"
+            emitted_definitions: set[str] = set()
+
+            emit(
+                f"<{file_uri}> <{VCFR_NAMESPACE}representationProfile> "
+                f"<{VCFR_NAMESPACE}CondensedRepresentation> .\n"
+            )
+            emit(f"<{file_uri}> <{VCFR_NAMESPACE}hasSampleSet> <{sample_set_uri}> .\n")
+            emit(f"<{sample_set_uri}> <{RDF_TYPE_URI}> <{VCFR_NAMESPACE}SampleSet> .\n")
+
+            for sample_column in record_stream.columns:
+                sample_component = _rml_uri_component(sample_column.uri_id)
+                sample_uri = f"{sample_set_uri}/{sample_component}"
+                emit(f"<{sample_set_uri}> <{VCFR_NAMESPACE}hasSample> <{sample_uri}> .\n")
+                emit(f"<{sample_uri}> <{RDF_TYPE_URI}> <{VCFR_NAMESPACE}VCFSample> .\n")
+                emit(
+                    f"<{sample_uri}> <{VCFR_NAMESPACE}sampleName> "
+                    f"{_ntriples_string_literal(sample_column.sample_id)} .\n"
+                )
+                emit(
+                    f"<{sample_uri}> <{VCFR_NAMESPACE}sampleIndex> "
+                    f'"{sample_column.index}"^^<{XSD_POSITIVE_INTEGER_URI}> .\n'
+                )
+                stats["samples"] += 1
+
+            for record in record_stream:
+                if not record.format_keys:
+                    continue
+                row_component = _rml_uri_component(record.row_id)
+                call_uri = f"{file_uri}#call/{row_component}"
+                matrix_uri = f"{call_uri}/matrix"
+                emit(f"<{call_uri}> <{VCFR_NAMESPACE}hasCallMatrix> <{matrix_uri}> .\n")
+                emit(f"<{matrix_uri}> <{RDF_TYPE_URI}> <{VCFR_NAMESPACE}CohortCallMatrix> .\n")
+                emit(
+                    f"<{matrix_uri}> <{VCFR_NAMESPACE}appliesToSampleSet> "
+                    f"<{sample_set_uri}> .\n"
+                )
+                stats["matrices"] += 1
+
+                for format_index, format_key in enumerate(record.format_keys):
+                    format_component = _rml_uri_component(format_key)
+                    vector_uri = f"{matrix_uri}/fmt/{format_component}"
+                    definition = definitions.get(format_key)
+                    if definition is None:
+                        definition = FormatDefinition(
+                            uri=f"{file_uri}#header/format/{format_component}",
+                            field_number=".",
+                            description=(
+                                f"Synthesized definition for undeclared FORMAT key {format_key}"
+                            ),
+                        )
+                    definition_uri = definition.uri
+                    if definition_uri not in emitted_definitions:
+                        emit(
+                            f"<{definition_uri}> <{RDF_TYPE_URI}> "
+                            f"<{VCFR_NAMESPACE}FormatFieldDefinition> .\n"
+                        )
+                        emit(
+                            f"<{definition_uri}> <{VCFR_NAMESPACE}fieldId> "
+                            f"{_ntriples_string_literal(format_key)} .\n"
+                        )
+                        emit(
+                            f"<{definition_uri}> <{VCFR_NAMESPACE}fieldNumber> "
+                            f"{_ntriples_string_literal(definition.field_number)} .\n"
+                        )
+                        emit(
+                            f"<{definition_uri}> <{VCFR_NAMESPACE}fieldDescription> "
+                            f"{_ntriples_string_literal(definition.description)} .\n"
+                        )
+                        emitted_definitions.add(definition_uri)
+                        stats["format_definitions"] += 1
+
+                    encoded_values = "\t".join(
+                        values[format_index] or "." for values in record.sample_values
+                    )
+                    emit(
+                        f"<{matrix_uri}> <{VCFR_NAMESPACE}hasFormatValueVector> "
+                        f"<{vector_uri}> .\n"
+                    )
+                    emit(f"<{vector_uri}> <{RDF_TYPE_URI}> <{VCFR_NAMESPACE}FormatValueVector> .\n")
+                    emit(
+                        f"<{vector_uri}> <{VCFR_NAMESPACE}declaredBy> "
+                        f"<{definition_uri}> .\n"
+                    )
+                    emit(
+                        f"<{vector_uri}> <{VCFR_NAMESPACE}valueEncoding> "
+                        f"<{VCFR_NAMESPACE}VCFTextVector> .\n"
+                    )
+                    emit(
+                        f"<{vector_uri}> <{VCFR_NAMESPACE}encodedValues> "
+                        f"{_ntriples_string_literal(encoded_values)} .\n"
+                    )
+                    stats["format_vectors"] += 1
+
+                stats["records"] += 1
+                if progress_interval_records > 0 and stats["records"] % progress_interval_records == 0:
+                    print(
+                        "    * Condensed sample RDF streaming: "
+                        f"{stats['records']:,} variants, {stats['format_vectors']:,} vectors",
+                        flush=True,
+                    )
+
+        return _append_rdf_atomically(rdf_path, stats, produce)
+
+
+def emit_sample_representation(
+    workflow: SampleWorkflow,
+    *,
+    records_tsv: Path,
+    header_lines_tsv: Path,
+    rdf_path: Path,
+) -> dict | None:
+    """Execute the workflow's sole direct RDF emitter, if it has one."""
+    if workflow.emitter is None:
+        return None
+    if workflow.emitter == "dense":
+        return append_dense_sample_rdf(records_tsv, rdf_path)
+    if workflow.emitter == "condensed":
+        return append_condensed_sample_rdf(records_tsv, header_lines_tsv, rdf_path)
+    raise RuntimeError(f"unknown sample RDF emitter: {workflow.emitter}")
 
 
 def update_conversion_metrics_after_sample_stream(
@@ -1792,6 +2189,8 @@ def update_conversion_metrics_after_sample_stream(
             else:
                 artifacts["output_triples"] = int(total_triples)
             artifacts["output_size_bytes"] = output_size
+            payload["sample_representation"] = sample_stats
+            # Retained for consumers of pre-condensed conversion metrics.
             payload["sample_streaming"] = sample_stats
             metrics_json.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         except (OSError, json.JSONDecodeError):
@@ -1837,92 +2236,31 @@ def build_sample_support_tsvs(records_tsv: Path, sample_calls_tsv: Path, sample_
         if not records_tsv.exists():
             return
 
-        _set_max_csv_field_size()
-        with records_tsv.open(newline="", encoding="utf-8") as records_handle:
-            reader = csv.reader(records_handle, delimiter="\t")
-            header = next(reader, None)
-            if not header:
-                return
-
-            sample_header = header[-1].strip() if len(header) >= 12 else ""
-            declared_sample_ids = (
-                []
-                if sample_header == "SAMPLES"
-                else [token for token in sample_header.split() if token]
-            )
-
-            for row in reader:
-                if not row:
-                    continue
-                if len(row) < len(header):
-                    row = row + [""] * (len(header) - len(row))
-
-                source_file = row[0] if len(row) > 0 else ""
-                row_id = row[1] if len(row) > 1 else ""
-                format_raw = row[10] if len(row) > 10 else ""
-                samples_raw = row[-1] if len(row) >= 12 else ""
-
-                format_keys = [token for token in format_raw.split(":")] if format_raw else []
-                sample_payloads = [token for token in samples_raw.split()] if samples_raw else []
-
-                total_samples = max(len(declared_sample_ids), len(sample_payloads))
-                if total_samples == 0:
-                    continue
-
-                sample_uri_seen: dict[str, int] = {}
-                for sample_idx in range(total_samples):
-                    sample_id = (
-                        declared_sample_ids[sample_idx]
-                        if sample_idx < len(declared_sample_ids)
-                        else f"SAMPLE_{sample_idx + 1}"
-                    )
-                    sample_payload = (
-                        sample_payloads[sample_idx]
-                        if sample_idx < len(sample_payloads)
-                        else ""
-                    )
-                    sample_index_value = str(sample_idx + 1)
-                    sample_uri_id_base = _sample_id_to_uri_id(sample_id, sample_idx + 1)
-                    sample_uri_seen[sample_uri_id_base] = sample_uri_seen.get(sample_uri_id_base, 0) + 1
-                    if sample_uri_seen[sample_uri_id_base] > 1:
-                        sample_uri_id = f"{sample_uri_id_base}_{sample_uri_seen[sample_uri_id_base]}"
-                    else:
-                        sample_uri_id = sample_uri_id_base
-
+        with SampleRecordStream(records_tsv) as record_stream:
+            for record in record_stream:
+                for sample_offset, sample_column in enumerate(record_stream.columns):
                     sample_calls_writer.writerow(
                         [
-                            source_file,
-                            row_id,
-                            sample_index_value,
-                            sample_id,
-                            sample_uri_id,
-                            sample_payload,
+                            record.source_file,
+                            record.row_id,
+                            str(sample_column.index),
+                            sample_column.sample_id,
+                            sample_column.uri_id,
+                            record.sample_payloads[sample_offset],
                         ]
                     )
 
-                    value_tokens = sample_payload.split(":") if sample_payload else []
-                    total_fields = max(len(format_keys), len(value_tokens))
-                    for format_idx in range(total_fields):
-                        format_key = (
-                            format_keys[format_idx]
-                            if format_idx < len(format_keys) and format_keys[format_idx]
-                            else f"FIELD_{format_idx + 1}"
-                        )
-                        format_value = (
-                            value_tokens[format_idx]
-                            if format_idx < len(value_tokens)
-                            else ""
-                        )
+                    for format_offset, format_key in enumerate(record.format_keys):
                         sample_format_writer.writerow(
                             [
-                                source_file,
-                                row_id,
-                                sample_index_value,
-                                sample_id,
-                                sample_uri_id,
-                                str(format_idx + 1),
+                                record.source_file,
+                                record.row_id,
+                                str(sample_column.index),
+                                sample_column.sample_id,
+                                sample_column.uri_id,
+                                str(format_offset + 1),
                                 format_key,
-                                format_value,
+                                record.sample_values[sample_offset][format_offset],
                             ]
                         )
 
@@ -3781,6 +4119,7 @@ def run_full_mode(
     metrics_dir: Path,
     image_ref: str,
     out_name: str,
+    sample_workflow: SampleWorkflow,
     rdf_storage_mode: str,
     methods: list[str],
     hdt_strategy: str,
@@ -3800,13 +4139,13 @@ def run_full_mode(
     print("Step 3/5: Processing per-input pipeline (TSV -> RDF -> compression)")
     if spark_partitions is not None:
         print(f"  Spark partition hint: {spark_partitions}")
+    print(f"  Sample representation: {sample_workflow.representation}")
     intermediate_dir = tsv_dir.parent
     ensure_dir(tsv_dir)
     ensure_dir(out_dir)
     ensure_dir(metrics_dir)
 
     selected_methods = list(methods)
-    sample_strategy = sample_support_strategy(rules_path)
     use_partitioned_hdt = should_use_partitioned_hdt(
         mode="full",
         methods=selected_methods,
@@ -3879,7 +4218,7 @@ def run_full_mode(
         # Pre-flight write checks for expected TSV outputs to fail fast on
         # permission/mount problems before starting container work.
         expected_tsv_suffixes = ["records.tsv", "header_lines.tsv", "file_metadata.tsv"]
-        if sample_strategy != "none":
+        if sample_workflow.helper_strategy != "none":
             expected_tsv_suffixes.extend(["sample_calls.tsv", "sample_format_values.tsv"])
         for suffix in expected_tsv_suffixes:
             expected_tsv_output = tsv_dir / f"{expected_prefix}.{suffix}"
@@ -3937,16 +4276,20 @@ def run_full_mode(
         sample_calls_tsv = tsv_dir / f"{prefix}.sample_calls.tsv"
         sample_format_tsv = tsv_dir / f"{prefix}.sample_format_values.tsv"
         try:
-            if sample_strategy == "expanded":
+            if sample_workflow.helper_strategy == "expanded":
                 build_sample_support_tsvs(
                     records_tsv=triplet["records"],
                     sample_calls_tsv=sample_calls_tsv,
                     sample_format_tsv=sample_format_tsv,
                 )
-            elif sample_strategy == "stream":
+            elif sample_workflow.helper_strategy == "header-only":
                 # RMLStreamer sees valid, empty canonical sources. Their
                 # equivalent triples are appended directly after base mapping.
                 write_sample_support_headers(sample_calls_tsv, sample_format_tsv)
+            elif sample_workflow.helper_strategy != "none":
+                raise RuntimeError(
+                    f"unknown sample helper strategy: {sample_workflow.helper_strategy}"
+                )
         except Exception as exc:
             fail_current(
                 "tsv-derivation",
@@ -4104,27 +4447,41 @@ def run_full_mode(
             continue
 
         sample_stats = None
-        if sample_strategy == "stream":
-            print("    * Streaming canonical multi-sample RDF (no expanded helper TSVs)")
+        if sample_workflow.emitter is not None:
+            print(
+                f"    * Streaming {sample_workflow.representation} multi-sample RDF "
+                "(no expanded helper TSVs)"
+            )
             try:
-                sample_stats = append_canonical_sample_rdf(
+                sample_stats = emit_sample_representation(
+                    sample_workflow,
                     records_tsv=triplet["records"],
+                    header_lines_tsv=triplet["headers"],
                     rdf_path=raw_rdf_files[0],
                 )
             except Exception as exc:
                 fail_current(
-                    "sample-rdf-streaming",
-                    f"failed streaming sample RDF for '{prefix}': {exc}. "
+                    f"{sample_workflow.representation}-sample-rdf-streaming",
+                    f"failed streaming {sample_workflow.representation} sample RDF "
+                    f"for '{prefix}': {exc}. "
                     f"See log: {wrapper_log_path}",
                 )
                 continue
             if triples_produced is not None:
                 triples_produced += int(sample_stats["triples"])
-            print(
-                "    * Sample calls streamed: "
-                f"{sample_stats['sample_calls']:,}; FORMAT values: "
-                f"{sample_stats['format_values']:,}"
-            )
+            if sample_workflow.representation == "dense":
+                print(
+                    "    * Sample calls streamed: "
+                    f"{sample_stats['sample_calls']:,}; FORMAT values: "
+                    f"{sample_stats['format_values']:,}"
+                )
+            else:
+                print(
+                    "    * Condensed matrices streamed: "
+                    f"{sample_stats['matrices']:,}; FORMAT vectors: "
+                    f"{sample_stats['format_vectors']:,}; reusable samples: "
+                    f"{sample_stats['samples']:,}"
+                )
 
         if triples_produced is None:
             triples_produced = count_triples_in_nt_files(raw_rdf_files)
@@ -4909,6 +5266,9 @@ def main():
             "  Full pipeline (space-optimized aggregate):\n"
             "    vcf_rdfizer.py -m full -i ./vcf_files --rdf-storage-mode space-optimized "
             "--representations hdt,cottas --rdf-compression none -o ./results\n"
+            "  Condensed multi-sample representation:\n"
+            "    vcf_rdfizer.py -m full -i ./cohort.vcf.gz --sample-representation condensed "
+            "--rdf-storage-mode space-optimized --representations hdt -o ./results\n"
             "  Space-optimized full pipeline with shared HDT/COTTAS chunks:\n"
             "    vcf_rdfizer.py -m full -i ./vcf_files --rdf-storage-mode space-optimized "
             "--representations hdt,cottas --rdf-compression none "
@@ -4979,6 +5339,16 @@ def main():
         "--rules",
         default=None,
         help="RML mapping rules .ttl (default: <repo>/rules/default_rules.ttl)",
+    )
+    parser.add_argument(
+        "--sample-representation",
+        choices=sorted(SAMPLE_REPRESENTATION_CHOICES),
+        default="dense",
+        help=(
+            "Genotype representation for full mode: dense emits one SampleCall and "
+            "FORMAT value resource per sample; condensed emits a shared SampleSet and "
+            "one sample-ordered value vector per FORMAT key (default: dense)"
+        ),
     )
     parser.add_argument(
         "--rdf-storage-mode",
@@ -5160,6 +5530,10 @@ def main():
                 rules_path = Path(args.rules).expanduser().resolve()
             if not rules_path.exists() or not rules_path.is_file():
                 raise ValueError(f"rules file not found: {rules_path}")
+            sample_workflow = resolve_sample_workflow(
+                args.sample_representation,
+                rules_path,
+            )
             validate_mode_dirs([out_root, out_dir, tsv_dir, metrics_root])
             if args.legacy_compression is not None:
                 if (
@@ -5482,6 +5856,7 @@ def main():
                 metrics_dir=metrics_dir,
                 image_ref=image_ref,
                 out_name=args.out_name,
+                sample_workflow=sample_workflow,
                 rdf_storage_mode=args.rdf_storage_mode,
                 methods=full_methods,
                 hdt_strategy=args.hdt_strategy,

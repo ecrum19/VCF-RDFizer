@@ -14,8 +14,9 @@
 # - /data/tsv/<sample>.sample_calls.tsv (header-only compatibility source)
 # - /data/tsv/<sample>.sample_format_values.tsv (header-only compatibility source)
 # The wrapper rewrites the template paths below for each input sample.
-# Canonical sample/FORMAT triples are streamed directly into the RDF aggregate
-# so chromosome-scale multi-sample VCFs do not require expanded helper tables.
+# The wrapper selects exactly one direct sample emitter: dense SampleCall /
+# FormatFieldValue triples, or condensed SampleSet / CohortCallMatrix /
+# FormatValueVector triples. The helper tables stay header-only in either mode.
 #
 # Output format:
 # - The default conversion now targets triples (N-Triples) without named graph terms.

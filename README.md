@@ -82,6 +82,7 @@ In `full` mode with multiple VCF inputs, failures are isolated per input:
 - `--artifact-compression` packaging codecs for selected representations: `gzip`, `brotli`, or `none`
 - `--hdt-strategy {auto,partitioned,single}` HDT generation policy
 - `--chunk-target-bytes`, `--chunk-min-bytes`, `--chunk-max-bytes` shared record-safe chunk sizing
+- `--sample-representation {dense,condensed}` genotype graph shape (`dense` by default)
 - `-I, --image` Docker image repo (default `ecrum19/vcf-rdfizer`)
 - `-v, --image-version` Docker tag/version
 - `-b, --build` force Docker build
@@ -129,6 +130,9 @@ host filesystem.
 - `-i, --input` required VCF file or directory
 - `-r, --rules` mapping rules file (`.ttl`)
   - default: `rules/default_rules.ttl`
+- `--sample-representation {dense,condensed}` sample genotype representation
+  - `dense` (default): one `SampleCall` per record/sample and one `FormatFieldValue` per FORMAT key
+  - `condensed`: reusable file-level samples plus one ordered value vector per record/FORMAT key
 - `--rdf-storage-mode {plain,space-optimized}` required full-mode aggregate storage policy
   - `plain`: merge RMLStreamer parts into one uncompressed `.nt`
   - `space-optimized`: gzip each part into one `.nt.gz` aggregate and delete the source part immediately
@@ -149,6 +153,71 @@ host filesystem.
 - `-R, --keep-rmlstreamer-rdf-output` keep the aggregate RDF output produced by RMLStreamer
 - `--remove-rdf-storage-output` explicitly remove the aggregate `.nt`/`.nt.gz` after successful compression
 - `-e, --estimate-size` preflight size estimate
+
+## Sample Representation Modes
+
+Full mode has exactly two explicit sample workflows. There is no automatic
+sample-count threshold, so the same command always produces the same graph
+shape and downstream consumers can select the contract they support.
+
+### Dense (default)
+
+Use `--sample-representation dense` for single-sample and low-sample VCFs. It
+preserves the original vocabulary model:
+
+- every record/sample pair is a `vcfr:SampleCall`;
+- every represented FORMAT slot is a `vcfr:FormatFieldValue`;
+- the VCF file declares `vcfr:representationProfile vcfr:DenseRepresentation`.
+
+With the default rules, these triples are appended directly from `records.tsv`;
+the large expanded helper TSVs are not materialized. The final graph is still
+dense and grows approximately with `variants × samples × FORMAT fields`.
+
+```bash
+vcf-rdfizer --mode full \
+  --input ./small.vcf \
+  --sample-representation dense \
+  --rdf-storage-mode plain \
+  --out ./results
+```
+
+### Condensed
+
+Use `--sample-representation condensed` for large multi-sample cohorts. It
+uses the vocabulary introduced in VCF-RDFizer Vocabulary 1.1.0:
+
+- sample columns are declared once as an ordered `vcfr:SampleSet` of reusable
+  `vcfr:VCFSample` resources;
+- each genotype-bearing call has one `vcfr:CohortCallMatrix`;
+- each FORMAT key has one `vcfr:FormatValueVector`, rather than one RDF value
+  resource per sample;
+- the VCF file declares
+  `vcfr:representationProfile vcfr:CondensedRepresentation`.
+
+`vcfr:encodedValues` uses `vcfr:VCFTextVector`: one tab-separated lexical item
+per sample in `vcfr:sampleIndex` order. Commas inside a FORMAT value remain part
+of that item, and absent values are emitted as `.` so all vectors stay aligned.
+Consumers reconstruct sample `i`'s value for a FORMAT key by selecting position
+`i` from its vector. This changes genotype graph growth to approximately
+`samples + variants × FORMAT fields`; the literal payload still contains all
+source values, but they no longer cause per-value RDF structural triples.
+
+```bash
+vcf-rdfizer --mode full \
+  --input ./large-cohort.vcf.gz \
+  --sample-representation condensed \
+  --rdf-storage-mode space-optimized \
+  --representations hdt \
+  --out ./results
+```
+
+The workflow resolver runs only one sample emitter. Condensed mode rejects
+custom mappings that consume expanded `sample_calls.tsv` or
+`sample_format_values.tsv`, because running those dense maps alongside the
+condensed emitter would create both representations and restore the semantic
+inflation this mode is designed to avoid. Remove those helper-table consumers
+or select dense mode. Custom rules with no helper-table consumers remain
+compatible with condensed emission.
 
 ## TSV Mode Flags
 
@@ -530,13 +599,11 @@ partitioned-compression metrics JSON for diagnostics. The temporary chunk
 files and guide are not retained as host files.
 
 For the default mapping, multi-sample VCF columns remain compact in
-`records.tsv`. Canonical `SampleCall` and `FormatFieldValue` triples are streamed
-directly into the final `.nt` or `.nt.gz` aggregate instead of first writing
-`variants × samples` and `variants × samples × FORMAT fields` helper rows.
-The compatibility helper TSVs therefore contain only headers. Custom mappings
-that add consumers of those helper sources continue to use expanded tables.
-This removes the large temporary-disk multiplier, although the final RDF still
-scales with the number of emitted sample and FORMAT triples.
+`records.tsv`. In dense mode, canonical `SampleCall` and `FormatFieldValue`
+triples are streamed directly into the final `.nt` or `.nt.gz` aggregate rather
+than first writing expanded helper rows. In condensed mode, the same input pass
+emits shared samples, call matrices, and FORMAT vectors, avoiding both the
+helper-table multiplier and the per-sample RDF structural multiplier.
 
 The implementation keeps COTTAS conversion scratch state inside the Docker
 container and removes temporary unpacked package files when decompression
