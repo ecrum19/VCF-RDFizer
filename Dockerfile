@@ -82,7 +82,7 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 
 RUN python3 -m venv /opt/pycottas-venv \
-  && /opt/pycottas-venv/bin/pip install --no-cache-dir pycottas
+  && /opt/pycottas-venv/bin/pip install --no-cache-dir pycottas==1.1.0
 
 RUN mkdir -p /opt/rmlstreamer \
   && curl -fsSL \

@@ -103,6 +103,52 @@ class CottasToolTests(unittest.TestCase):
             self.assertEqual(len(observed_workspaces), 1)
             self.assertFalse(any(scratch_root.iterdir()))
 
+    def test_merge_many_passes_all_inputs_to_pycottas_cat(self):
+        """The large-graph merge path indexes a complete chunk set once."""
+        module = load_cottas_tool()
+        calls = []
+
+        def fake_cat(paths, cottas_path, *, index, remove_input_files):
+            calls.append((paths, cottas_path, index, remove_input_files))
+            self.assertEqual(index, "spo")
+            self.assertTrue(remove_input_files)
+            Path(cottas_path).write_text("merged COTTAS output\n")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            scratch_root = (root / "scratch").resolve()
+            inputs = []
+            for number in range(3):
+                path = root / f"chunk-{number}.cottas"
+                path.write_text(f"chunk {number}\n")
+                inputs.append(path)
+            output = root / "merged.cottas"
+
+            with mock.patch.dict(
+                sys.modules, {"pycottas": types.SimpleNamespace(cat=fake_cat)}
+            ), mock.patch.dict(
+                os.environ, {"COTTAS_SCRATCH_DIR": str(scratch_root)}, clear=False
+            ), mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "cottas_tool.py",
+                    "merge-many",
+                    "--input-cottas-files",
+                    *(str(path) for path in inputs),
+                    "--output-cottas-file",
+                    str(output),
+                ],
+            ):
+                self.assertEqual(module.main(), 0)
+
+            self.assertTrue(output.is_file())
+            self.assertEqual(
+                calls,
+                [([str(path.resolve()) for path in inputs], str(output.resolve()), "spo", True)],
+            )
+            self.assertFalse(any(scratch_root.iterdir()))
+
     def test_decompress_uses_pycottas_and_isolated_scratch(self):
         """COTTAS decompression writes RDF while cleaning container-local state."""
         module = load_cottas_tool()

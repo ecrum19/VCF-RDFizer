@@ -556,8 +556,14 @@ read. This is especially important for `space-optimized` `.nt.gz` aggregates,
 which must not be expanded into a second full raw-RDF copy. HDT chunks are
 merged with the Java-free `hdtc create` command, which accepts existing HDT
 inputs; the final HDT index is generated after merging with `hdtc index`.
-COTTAS chunks are merged with
-`pycottas.cat`, which rebuilds the query indexes for the merged representation.
+COTTAS chunks are merged with one multi-input `pycottas.cat` pass, which
+rebuilds the query index once for the complete representation. This avoids the
+repeated re-indexing and temporary-file amplification of a pairwise merge tree
+on large multi-sample graphs. If that stage fails in full mode, the warning
+contains the failing exit code and, when available, a `stderr_tail` from the
+COTTAS/DuckDB command. The same warning records the Docker workspace free-space
+sample before and after the stage;
+the raw RDF remains available for a retry.
 
 After each final HDT/COTTAS base artifact is produced, VCF-RDFizer performs a
 streaming decode/count check. This verifies both readability and that the
@@ -623,6 +629,15 @@ finishes.
 ## Troubleshooting
 
 If Docker permission issues occur, rerun with a Docker-allowed user (or configure Docker group/sudo access on your system).
+
+If COTTAS indexing/merging fails on a very large RDF file, first inspect the
+`cottas-merge-all` stage in the raw partitioned-compression metrics JSON and the
+run wrapper log. The warning's `stderr_tail` distinguishes a DuckDB/COTTAS
+error from an operating-system resource failure. The common resource remedy is
+to reduce `--chunk-target-bytes` (and `--chunk-max-bytes`) and ensure the
+Docker data volume has enough free space for the temporary DuckDB files and
+the final Parquet rewrite. Rebuild the image after upgrading so the pinned
+`pycottas==1.1.0` dependency and the multi-input merge adapter are installed.
 
 If HDT compression fails on very large RDF files, use
 `--rdf-storage-mode space-optimized` or `--rdf-storage-mode plain` with

@@ -25,6 +25,7 @@ their respective authors and apply to those components.
 - Repository: <https://github.com/cottas-rdf/pycottas>
 - Usage in this project: RDF chunk compression and indexed COTTAS merging
 - Upstream license: Apache License 2.0
+- Version bundled by the Docker image: `1.1.0`
 - Installed in the image's `/opt/pycottas-venv` environment
 
 4. `hdtc`

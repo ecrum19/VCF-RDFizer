@@ -24,6 +24,7 @@ from pathlib import Path
 
 HDT_METHODS = {"hdt", "hdt_gzip", "hdt_brotli"}
 COTTAS_METHODS = {"cottas", "cottas_gzip", "cottas_brotli"}
+STDERR_TAIL_BYTES = 16 * 1024
 
 
 def is_triple_line(line: bytes) -> bool:
@@ -253,6 +254,31 @@ def hdtc_merge_command(
     ]
 
 
+def cottas_merge_many_command(
+    python_bin: str,
+    inputs: list[Path],
+    merged: Path,
+) -> list[str]:
+    """Build one multi-input COTTAS merge command.
+
+    ``pycottas.cat`` accepts a list of COTTAS paths and builds the requested
+    zonemap index once.  Calling it once for the complete chunk set avoids the
+    repeated re-indexing and temporary-file amplification caused by a
+    pairwise merge tree on large graphs.
+    """
+    return [
+        python_bin,
+        "/opt/vcf-rdfizer/cottas_tool.py",
+        "merge-many",
+        "--input-cottas-files",
+        *(str(path) for path in inputs),
+        "--output-cottas-file",
+        str(merged),
+        "--index",
+        "spo",
+    ]
+
+
 def parse_time_log(path: Path) -> dict:
     if not path.exists():
         return {"user_seconds": None, "sys_seconds": None, "max_rss_kb": None}
@@ -291,24 +317,65 @@ class StageRunner:
         stdout_path: Path | None = None,
     ) -> dict:
         time_path = self.work_dir / f".{name}.time"
+        stderr_path = self.work_dir / f".{name}.stderr"
         if time_path.exists():
             time_path.unlink()
+        if stderr_path.exists():
+            stderr_path.unlink()
         started = time.perf_counter()
+        workspace_free_before = None
+        workspace_total = None
+        try:
+            workspace_usage = shutil.disk_usage(self.work_dir)
+            workspace_free_before = workspace_usage.free
+            workspace_total = workspace_usage.total
+        except OSError:
+            pass
         time_bin = "/usr/bin/time" if Path("/usr/bin/time").exists() else None
+        if time_bin:
+            # macOS ships a BSD ``time`` at this path; only GNU time supports
+            # the ``-v`` metrics format used by ``parse_time_log``.
+            probe = subprocess.run(
+                [time_bin, "--version"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            if probe.returncode != 0 or b"GNU time" not in probe.stdout + probe.stderr:
+                time_bin = None
         if time_bin:
             timed_command = [time_bin, "-v", "-o", str(time_path), *command]
         else:
             timed_command = command
         stdout_handle = None
+        stderr_handle = None
         try:
             if stdout_path is not None:
                 stdout_path.parent.mkdir(parents=True, exist_ok=True)
                 stdout_handle = stdout_path.open("wb")
-            completed = subprocess.run(timed_command, stdout=stdout_handle, check=False)
+            stderr_handle = stderr_path.open("wb")
+            completed = subprocess.run(
+                timed_command,
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+                check=False,
+            )
         finally:
             if stdout_handle is not None:
                 stdout_handle.close()
+            if stderr_handle is not None:
+                stderr_handle.close()
+        stderr_tail = ""
+        if stderr_path.exists():
+            try:
+                with stderr_path.open("rb") as handle:
+                    handle.seek(0, os.SEEK_END)
+                    handle.seek(max(0, handle.tell() - STDERR_TAIL_BYTES))
+                    stderr_tail = handle.read().decode("utf-8", errors="replace").strip()
+            finally:
+                stderr_path.unlink(missing_ok=True)
         result = {
+            "stage_name": name,
             "exit_code": completed.returncode,
             "wall_seconds": time.perf_counter() - started,
             "output_path": "" if output_path is None else str(output_path),
@@ -316,6 +383,18 @@ class StageRunner:
             if output_path is not None and output_path.is_file()
             else 0,
         }
+        try:
+            workspace_usage = shutil.disk_usage(self.work_dir)
+            result["workspace_free_bytes_after"] = workspace_usage.free
+            result["workspace_total_bytes"] = workspace_usage.total
+        except OSError:
+            pass
+        if workspace_free_before is not None:
+            result["workspace_free_bytes_before"] = workspace_free_before
+        if workspace_total is not None:
+            result.setdefault("workspace_total_bytes", workspace_total)
+        if stderr_tail:
+            result["stderr_tail"] = stderr_tail
         result.update(parse_time_log(time_path))
         self.stages.append({"name": name, **result})
         time_path.unlink(missing_ok=True)
@@ -416,7 +495,13 @@ def main() -> int:
                 file=sys.stderr,
             )
 
-    def record_index_warning(index_format: str, stage: str, artifact: Path, message: str) -> dict:
+    def record_index_warning(
+        index_format: str,
+        stage: str,
+        artifact: Path,
+        message: str,
+        stage_result: dict | None = None,
+    ) -> dict:
         warning = {
             "format": index_format,
             "stage": stage,
@@ -424,6 +509,19 @@ def main() -> int:
             "artifact_path": str(artifact),
             "message": " ".join(str(message).split()),
         }
+        if stage_result:
+            warning["stage_name"] = stage_result.get("stage_name", stage)
+            warning["exit_code"] = stage_result.get("exit_code")
+            for key in (
+                "workspace_free_bytes_before",
+                "workspace_free_bytes_after",
+                "workspace_total_bytes",
+            ):
+                if key in stage_result:
+                    warning[key] = stage_result[key]
+            stderr_tail = str(stage_result.get("stderr_tail") or "").strip()
+            if stderr_tail:
+                warning["stderr_tail"] = stderr_tail
         index_warnings.append(warning)
         print(
             f"Warning: {index_format.upper()} index generation failed for '{artifact}'; "
@@ -431,6 +529,20 @@ def main() -> int:
             file=sys.stderr,
         )
         return warning
+
+    def failure_message(stage_result: dict | None, fallback: str) -> str:
+        """Turn a failed subprocess result into an actionable warning."""
+        if not stage_result:
+            return fallback
+        exit_code = stage_result.get("exit_code")
+        diagnostics = []
+        if exit_code is not None:
+            diagnostics.append(f"exit_code={exit_code}")
+            if int(exit_code) == 137:
+                diagnostics.append("the process was killed (often Docker memory/OOM pressure)")
+            elif int(exit_code) == 143:
+                diagnostics.append("the process was terminated (SIGTERM)")
+        return f"{fallback} ({'; '.join(diagnostics)})" if diagnostics else fallback
 
     def skipped_cottas_result(method: str) -> dict:
         artifact = {
@@ -458,6 +570,15 @@ def main() -> int:
 
         hdt_paths: list[Path] = []
         cottas_paths: list[Path] = []
+
+        def cleanup_cottas_intermediates() -> None:
+            """Release COTTAS chunks/merge outputs after a failed attempt."""
+            for path in list(cottas_paths):
+                path.unlink(missing_ok=True)
+            cottas_paths.clear()
+            for path in work_dir.glob("cottas-merge-*.cottas"):
+                path.unlink(missing_ok=True)
+
         needs_hdt = any(method in HDT_METHODS for method in methods)
         hdt_bin = (
             resolve_executable(
@@ -589,9 +710,14 @@ def main() -> int:
                             "cottas",
                             "cottas-index",
                             output_cottas,
-                            "partitioned COTTAS conversion/index creation failed for a chunk",
+                            failure_message(
+                                stage,
+                                "partitioned COTTAS conversion/index creation failed for a chunk",
+                            ),
+                            stage_result=stage,
                         )
                         chunk_cottas.unlink(missing_ok=True)
+                        cleanup_cottas_intermediates()
                     else:
                         cottas_paths.append(chunk_cottas)
             finally:
@@ -676,27 +802,46 @@ def main() -> int:
             }
 
         if cottas_paths and not cottas_failed:
-            final_cottas, cottas_rounds = merge_pairwise(
-                cottas_paths,
-                prefix="cottas",
-                runner=runner,
-                merge_command=lambda left, right, merged: [cottas_python, "/opt/vcf-rdfizer/cottas_tool.py", "merge", str(left), str(right), str(merged), "spo"],
-                total=cottas_total,
-            )
+            # pycottas.cat supports a list of inputs. Use one indexed pass so
+            # a large multi-sample run does not repeatedly materialize and
+            # re-index the growing COTTAS graph at every pairwise round.
+            cottas_stage = None
+            cottas_rounds = 0
+            if len(cottas_paths) == 1:
+                final_cottas = cottas_paths[0]
+            else:
+                cottas_merged_path = work_dir / "cottas-merge-final.cottas"
+                cottas_stage = runner.run(
+                    "cottas-merge-all",
+                    cottas_merge_many_command(cottas_python, cottas_paths, cottas_merged_path),
+                    cottas_merged_path,
+                )
+                add_totals(cottas_total, cottas_stage)
+                cottas_rounds = 1
+                final_cottas = (
+                    cottas_merged_path
+                    if cottas_stage["exit_code"] == 0 and cottas_merged_path.is_file()
+                    else None
+                )
             if final_cottas is None:
                 if not args.allow_index_failures:
-                    raise RuntimeError("COTTAS merge failed")
+                    raise RuntimeError(
+                        failure_message(cottas_stage, "COTTAS merge/index creation failed")
+                    )
                 cottas_failed = True
                 cottas_total["exit_code"] = 0
+                cleanup_cottas_intermediates()
                 cottas_warning = record_index_warning(
                     "cottas",
                     "cottas-index",
                     output_cottas,
-                    "COTTAS merge/index creation failed",
+                    failure_message(cottas_stage, "COTTAS merge/index creation failed"),
+                    stage_result=cottas_stage,
                 )
             else:
                 shutil.copyfile(final_cottas, output_cottas)
                 final_cottas.unlink(missing_ok=True)
+                cleanup_cottas_intermediates()
                 try:
                     cottas_validation = validate_artifact(
                         name="cottas-validate",

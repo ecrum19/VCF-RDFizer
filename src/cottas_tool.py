@@ -42,6 +42,19 @@ def main() -> int:
     merge.add_argument("cottas_path")
     merge.add_argument("index", nargs="?", default="spo")
 
+    merge_many = subparsers.add_parser(
+        "merge-many",
+        help="merge multiple COTTAS files in one indexed pass",
+    )
+    merge_many.add_argument(
+        "--input-cottas-files",
+        nargs="+",
+        required=True,
+        help="COTTAS inputs to merge",
+    )
+    merge_many.add_argument("--output-cottas-file", required=True)
+    merge_many.add_argument("--index", default="spo")
+
     reindex = subparsers.add_parser(
         "reindex",
         help="rebuild the embedded COTTAS query index in place",
@@ -116,6 +129,24 @@ def main() -> int:
         finally:
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)
+        return 0
+
+    if args.command == "merge-many":
+        input_paths = [str(Path(path).resolve()) for path in args.input_cottas_files]
+        cottas_path = str(Path(args.output_cottas_file).resolve())
+        if len(input_paths) < 2:
+            print("merge-many requires at least two input COTTAS files", file=sys.stderr)
+            return 2
+        with cottas_scratch_workspace():
+            # pycottas.cat accepts a list of inputs and computes the requested
+            # index once.  This is materially cheaper for large partitioned
+            # graphs than repeatedly re-indexing pairwise intermediate files.
+            pycottas.cat(
+                input_paths,
+                cottas_path,
+                index=args.index,
+                remove_input_files=True,
+            )
         return 0
 
     left_path = str(Path(args.left_path).resolve())

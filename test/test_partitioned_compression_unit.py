@@ -56,6 +56,45 @@ class PartitionedCompressionUnitTests(VerboseTestCase):
             self.assertNotIn("java", " ".join(command).lower())
             self.assertNotIn("hdtcat", " ".join(command).lower())
 
+    def test_cottas_merge_many_command_uses_one_indexed_pass(self):
+        """Large COTTAS partitions are merged through pycottas.cat once."""
+        runner = load_runner_module()
+        command = runner.cottas_merge_many_command(
+            "/opt/pycottas-venv/bin/python",
+            [Path("/work/chunk-00000.cottas"), Path("/work/chunk-00001.cottas")],
+            Path("/work/cottas-merge-final.cottas"),
+        )
+        self.assertEqual(
+            command,
+            [
+                "/opt/pycottas-venv/bin/python",
+                "/opt/vcf-rdfizer/cottas_tool.py",
+                "merge-many",
+                "--input-cottas-files",
+                "/work/chunk-00000.cottas",
+                "/work/chunk-00001.cottas",
+                "--output-cottas-file",
+                "/work/cottas-merge-final.cottas",
+                "--index",
+                "spo",
+            ],
+        )
+
+    def test_stage_runner_keeps_failed_stderr_tail(self):
+        """Index warnings retain the subprocess diagnostic instead of hiding it."""
+        runner_module = load_runner_module()
+        with tempfile.TemporaryDirectory() as td:
+            work_dir = Path(td) / "work"
+            work_dir.mkdir()
+            stage_runner = runner_module.StageRunner(work_dir)
+            result = stage_runner.run(
+                "cottas-merge-all",
+                ["sh", "-c", "echo 'No space left on device' >&2; exit 1"],
+            )
+            self.assertEqual(result["exit_code"], 1)
+            self.assertIn("No space left on device", result["stderr_tail"])
+            self.assertFalse((work_dir / ".cottas-merge-all.stderr").exists())
+
     def test_stream_chunks_only_retains_the_chunk_being_consumed(self):
         """Gzip chunking does not stage a second full uncompressed aggregate."""
         runner = load_runner_module()
