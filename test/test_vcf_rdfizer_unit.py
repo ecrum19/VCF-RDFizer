@@ -265,6 +265,14 @@ class WrapperUnitTests(VerboseTestCase):
                 ["-e", "HDT_INDEX_MEMORY_LIMIT=2G"],
             )
 
+    def test_hdt_merge_memory_limit_is_forwarded_to_docker(self):
+        """A host hdtc merge-memory override is passed to partitioned containers."""
+        with mock.patch.dict(os.environ, {"HDT_MERGE_MEMORY_LIMIT": "768M"}):
+            self.assertEqual(
+                vcf_rdfizer.docker_hdt_merge_env_args(),
+                ["-e", "HDT_MERGE_MEMORY_LIMIT=768M"],
+            )
+
     def test_validator_counts_plain_and_gzip_ntriples(self):
         """The Docker validator's fallback source count handles .nt and .nt.gz."""
         validator_path = Path(__file__).parents[1] / "src" / "validate_compression.py"

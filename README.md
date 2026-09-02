@@ -140,7 +140,7 @@ host filesystem.
 - `--representations {hdt,cottas,none}` queryable primary representations
 - `--artifact-compression {gzip,brotli,none}` optional packaging applied to each selected representation
 - `--hdt-strategy {auto,partitioned,single}`
-  - `auto`: in full mode, build smaller HDT chunks and merge them with `HDTCat`
+  - `auto`: in full mode, build smaller HDT chunks and merge them with native `hdtc`
   - `partitioned`: always use chunked HDT generation for HDT-based methods
   - `single`: always use one `rdf2hdt` run per RDF input
   - with `space-optimized`, use `auto` or `partitioned`; `single` cannot consume the gzip stream without expanding it
@@ -269,7 +269,7 @@ vcf-rdfizer \
   --out ./results
 ```
 
-Full pipeline (plain aggregate, chunked HDT + HDTCat merge):
+Full pipeline (plain aggregate, chunked HDT + native `hdtc` merge):
 
 ```bash
 vcf-rdfizer \
@@ -431,9 +431,11 @@ versioned sidecar beside the input. COTTAS indexing rewrites the existing
 the same artifact while rebuilding its embedded index. If the operation fails,
 the original COTTAS file is left in place; HDT's previous sidecars are restored.
 
-HDT indexing does not start Java. It uses `hdtc index`, which streams the HDT
-through disk-backed external sorters. The default soft memory budget is 512 MiB;
-override it for any wrapper mode with an environment variable such as:
+HDT merging and indexing do not start a Java HDT tool. They use native `hdtc`:
+`hdtc create` merges partitioned HDTs and `hdtc index` streams an HDT through
+disk-backed external sorters. Both default to a 512 MiB soft memory budget.
+Override index creation for any wrapper mode with an environment variable such
+as:
 
 ```bash
 HDT_INDEX_MEMORY_LIMIT=2G vcf-rdfizer \
@@ -442,10 +444,11 @@ HDT_INDEX_MEMORY_LIMIT=2G vcf-rdfizer \
   --out ./results
 ```
 
+Use `HDT_MERGE_MEMORY_LIMIT` in the same way to tune a partitioned merge.
 Accepted values use an `M` or `G` suffix. Lower values reduce in-memory sort
-buffers and may increase temporary I/O; higher values can improve indexing
-speed when memory is available. Temporary files live in the container's
-`/work` area and are removed after the attempt.
+buffers and may increase temporary I/O; higher values can improve performance
+when memory is available. Temporary files live in the container's `/work` area
+and are removed after the attempt.
 
 In `full` mode, an HDT sidecar-index failure is non-fatal when the HDT data
 itself remains readable; the run continues and the HDT can be repaired later
@@ -551,8 +554,9 @@ into complete N-Triples records. Only one uncompressed chunk is present at a
 time: it is consumed by both converters and removed before the next chunk is
 read. This is especially important for `space-optimized` `.nt.gz` aggregates,
 which must not be expanded into a second full raw-RDF copy. HDT chunks are
-merged with `HDTCat`, the final HDT index is generated after merging with the
-Java-free `hdtc index` command, and COTTAS chunks are merged with
+merged with the Java-free `hdtc create` command, which accepts existing HDT
+inputs; the final HDT index is generated after merging with `hdtc index`.
+COTTAS chunks are merged with
 `pycottas.cat`, which rebuilds the query indexes for the merged representation.
 
 After each final HDT/COTTAS base artifact is produced, VCF-RDFizer performs a
@@ -570,20 +574,22 @@ Each COTTAS conversion and merge also receives a fresh container-local DuckDB
 workspace, which is removed as soon as that operation completes. This prevents
 state from one chunk being reused by another and requires no user configuration.
 
-HDT index generation uses the pinned Rust `hdtc` 1.1.0 executable, not
-`hdtSearch.sh` or another Java process. `hdtc index` reads BitmapTriples as a
-stream and builds the object/predicate orderings with disk-backed external
-sorts. This avoids the JVM heap path that can fail with
-`java.lang.OutOfMemoryError` while producing the same canonical HDT v1-1
-sidecar, `<file>.hdt.index.v1-1`, used by hdt-java and hdt-cpp.
+HDT merging and index generation use the pinned Rust `hdtc` 1.1.0 executable,
+not `hdtCat`, `hdtSearch.sh`, or another Java HDT process. `hdtc create`
+merges the chunk HDTs with disk-backed external sorts, and `hdtc index` reads
+BitmapTriples as a stream to build the object/predicate orderings. This avoids
+the JVM heap path that can fail with `java.lang.OutOfMemoryError` while
+producing the same canonical HDT v1-1 sidecar,
+`<file>.hdt.index.v1-1`, used by hdt-java and hdt-cpp.
 
 For standalone index mode, existing versioned sidecars are moved aside while
 regeneration runs and restored if indexing fails. Incomplete replacements are
 removed before restoration, so a failed or interrupted attempt does not leave
 a partial index. Sort runs use `/work` and are removed when the command exits.
-The image defaults `HDT_INDEX_MEMORY_LIMIT` to `512M`; the wrapper forwards a
-host value of that variable into standalone, partitioned, and full-run Docker
-commands. `HDT_INDEX_WORK_ROOT` can override the scratch root when invoking
+The image defaults both `HDT_INDEX_MEMORY_LIMIT` and
+`HDT_MERGE_MEMORY_LIMIT` to `512M`. The wrapper forwards an explicitly set
+host value of either variable into the relevant Docker command.
+`HDT_INDEX_WORK_ROOT` can override the scratch root when invoking
 `/opt/vcf-rdfizer/ensure_hdt_index.sh` directly inside the container.
 
 COTTAS does not expose a separate index sidecar. Its index is part of the
@@ -621,10 +627,13 @@ If Docker permission issues occur, rerun with a Docker-allowed user (or configur
 If HDT compression fails on very large RDF files, use
 `--rdf-storage-mode space-optimized` or `--rdf-storage-mode plain` with
 `--hdt-strategy partitioned`, then lower `--chunk-target-bytes` and
-`--chunk-max-bytes` to reduce each converter's working set. Final HDT index
-creation is disk-backed, so ensure the Docker data volume has enough temporary
-space for the external sort; free space in the output filesystem alone does
-not increase the JVM heap.
+`--chunk-max-bytes` to reduce each converter's working set. Both final HDT
+merge and index creation are disk-backed, so ensure the Docker data volume has
+enough temporary space for their external sorts. To reduce their bounded
+in-memory buffers further, set `HDT_MERGE_MEMORY_LIMIT` and/or
+`HDT_INDEX_MEMORY_LIMIT` (for example, `512M`); lower limits can require more
+temporary I/O. Free space in the output filesystem alone does not increase the
+Docker volume capacity.
 
 Safe termination:
 

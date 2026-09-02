@@ -29,8 +29,8 @@ their respective authors and apply to those components.
 
 4. `hdtc`
 - Repository: <https://github.com/frink-okn/hdtc>
-- Usage in this project: Java-free, disk-backed index generation for existing
-  HDT files
+- Usage in this project: Java-free, disk-backed merging of HDT chunks and
+  index generation for existing HDT files
 - Upstream license: MIT
 - License files copied into image:
   - `/usr/share/licenses/vcf-rdfizer/HDTC.LICENSE`

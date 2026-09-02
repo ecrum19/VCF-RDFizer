@@ -433,6 +433,14 @@ def docker_hdt_index_env_args() -> list[str]:
     return ["-e", f"HDT_INDEX_MEMORY_LIMIT={memory_limit}"]
 
 
+def docker_hdt_merge_env_args() -> list[str]:
+    """Forward an optional host-side hdtc merge memory budget into Docker."""
+    memory_limit = os.environ.get("HDT_MERGE_MEMORY_LIMIT", "").strip()
+    if not memory_limit:
+        return []
+    return ["-e", f"HDT_MERGE_MEMORY_LIMIT={memory_limit}"]
+
+
 def _can_write_dir(path: Path) -> bool:
     """Best-effort write probe for directories."""
     try:
@@ -2457,7 +2465,7 @@ def should_use_partitioned_hdt(
     hdt_strategy: str,
     rdf_storage_mode: str | None = None,
 ) -> bool:
-    """Resolve whether the HDT pipeline should use chunked generation + HDTCat."""
+    """Resolve whether the HDT pipeline should use chunked generation + hdtc merge."""
     if not compression_uses_hdt(methods):
         return False
     if hdt_strategy == "single":
@@ -3934,6 +3942,7 @@ def run_containerized_partitioned_representation_methods(
         command = [
             *docker_run_base(),
             *docker_hdt_index_env_args(),
+            *docker_hdt_merge_env_args(),
             "--mount",
             f"type=volume,source={volume_name},target=/work",
         ]
@@ -5435,7 +5444,7 @@ def main():
         choices=sorted(HDT_STRATEGY_CHOICES),
         default=DEFAULT_HDT_STRATEGY,
         help=(
-            "HDT generation strategy: auto uses partitioned HDT+HDTCat for full-mode aggregate storage, "
+            "HDT generation strategy: auto uses partitioned HDT+hdtc merge for full-mode aggregate storage, "
             "single uses one rdf2hdt run, partitioned forces chunked HDT generation"
         ),
     )

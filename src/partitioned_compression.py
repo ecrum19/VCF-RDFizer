@@ -24,12 +24,6 @@ from pathlib import Path
 
 HDT_METHODS = {"hdt", "hdt_gzip", "hdt_brotli"}
 COTTAS_METHODS = {"cottas", "cottas_gzip", "cottas_brotli"}
-HDT_CAT_CANDIDATES = (
-    "hdtCat",
-    "hdtCat.sh",
-    "/opt/hdt-java/bin/hdtCat.sh",
-    "/opt/hdt-java/bin/hdtCat",
-)
 
 
 def is_triple_line(line: bytes) -> bool:
@@ -223,6 +217,42 @@ def find_hdt_index_sidecar(hdt_path: Path) -> Path | None:
     return None
 
 
+def hdtc_merge_temp_dir(work_dir: Path, merged_path: Path) -> Path:
+    """Return the isolated disk workspace for one hdtc merge stage."""
+    return work_dir / f".{merged_path.stem}.hdtc-work"
+
+
+def hdtc_merge_command(
+    hdtc_bin: str,
+    left: Path,
+    right: Path,
+    merged: Path,
+    *,
+    work_dir: Path,
+    memory_limit: str,
+) -> list[str]:
+    """Build a bounded-memory native merge command for two HDT chunks.
+
+    ``hdtc create`` accepts existing ``.hdt`` inputs, so it performs the same
+    logical merge as hdt-java's ``hdtCat`` without constructing Java HashMaps.
+    Its temporary files are kept in a per-stage directory so they can be
+    removed immediately after each pairwise merge.
+    """
+    return [
+        hdtc_bin,
+        "--quiet",
+        "create",
+        str(left),
+        str(right),
+        "--output",
+        str(merged),
+        "--memory-limit",
+        memory_limit,
+        "--temp-dir",
+        str(hdtc_merge_temp_dir(work_dir, merged)),
+    ]
+
+
 def parse_time_log(path: Path) -> dict:
     if not path.exists():
         return {"user_seconds": None, "sys_seconds": None, "max_rss_kb": None}
@@ -323,6 +353,7 @@ def merge_pairwise(
     runner: StageRunner,
     merge_command,
     total: dict,
+    cleanup_merged_workspace=None,
 ) -> tuple[Path | None, int]:
     rounds = 0
     current = list(paths)
@@ -336,11 +367,15 @@ def merge_pairwise(
                 continue
             right = current[pair_index + 1]
             merged = left.parent / f"{prefix}-merge-r{rounds:02d}-{pair_index // 2:05d}{left.suffix}"
-            stage = runner.run(
-                f"{prefix}-merge-r{rounds:02d}-{pair_index // 2:05d}",
-                merge_command(left, right, merged),
-                merged,
-            )
+            try:
+                stage = runner.run(
+                    f"{prefix}-merge-r{rounds:02d}-{pair_index // 2:05d}",
+                    merge_command(left, right, merged),
+                    merged,
+                )
+            finally:
+                if cleanup_merged_workspace is not None:
+                    cleanup_merged_workspace(merged)
             add_totals(total, stage)
             if stage["exit_code"] != 0:
                 return None, rounds
@@ -436,7 +471,21 @@ def main() -> int:
             if needs_hdt
             else None
         )
-        hdt_cat = resolve_executable(HDT_CAT_CANDIDATES, "HDTCat") if needs_hdt else None
+        hdtc_bin = (
+            resolve_executable(
+                (
+                    os.environ.get("HDTC_BIN", ""),
+                    "/usr/local/bin/hdtc",
+                    "hdtc",
+                ),
+                "hdtc HDT merger",
+            )
+            if needs_hdt
+            else None
+        )
+        hdt_merge_memory_limit = os.environ.get("HDT_MERGE_MEMORY_LIMIT", "512M").strip()
+        if needs_hdt and not hdt_merge_memory_limit:
+            raise ValueError("HDT_MERGE_MEMORY_LIMIT must be a non-empty hdtc memory size")
         cottas_python = os.environ.get("COTTAS_PYTHON_BIN") or shutil.which("python3")
         if any(method in COTTAS_METHODS for method in methods) and not cottas_python:
             raise RuntimeError("Missing Python runtime for COTTAS")
@@ -562,11 +611,21 @@ def main() -> int:
                 hdt_paths,
                 prefix="hdt",
                 runner=runner,
-                merge_command=lambda left, right, merged: [hdt_cat, str(left), str(right), str(merged)],
+                merge_command=lambda left, right, merged: hdtc_merge_command(
+                    hdtc_bin,
+                    left,
+                    right,
+                    merged,
+                    work_dir=work_dir,
+                    memory_limit=hdt_merge_memory_limit,
+                ),
                 total=hdt_total,
+                cleanup_merged_workspace=lambda merged: shutil.rmtree(
+                    hdtc_merge_temp_dir(work_dir, merged), ignore_errors=True
+                ),
             )
             if final_hdt is None:
-                raise RuntimeError("HDTCat merge failed")
+                raise RuntimeError("hdtc HDT merge failed")
             shutil.copyfile(final_hdt, output_hdt)
             final_hdt.unlink(missing_ok=True)
             index_stage = runner.run(

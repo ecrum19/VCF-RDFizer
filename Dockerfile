@@ -1,5 +1,4 @@
 ARG RMLSTREAMER_VERSION=2.5.0
-ARG HDT_JAVA_PACKAGE_VERSION=3.0.10
 ARG HDTC_VERSION=1.1.0
 
 FROM eclipse-temurin:11-jre AS build-hdt-cpp
@@ -62,7 +61,6 @@ RUN cargo build --locked --release \
 FROM eclipse-temurin:11-jre
 
 ARG RMLSTREAMER_VERSION
-ARG HDT_JAVA_PACKAGE_VERSION
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
@@ -91,13 +89,6 @@ RUN mkdir -p /opt/rmlstreamer \
     -o /opt/rmlstreamer/RMLStreamer-v${RMLSTREAMER_VERSION}-standalone.jar \
     https://github.com/RMLio/RMLStreamer/releases/download/v${RMLSTREAMER_VERSION}/RMLStreamer-v${RMLSTREAMER_VERSION}-standalone.jar
 
-RUN mkdir -p /opt/hdt-java \
-  && curl -fsSL \
-    -o /tmp/hdt-java-package.tar.gz \
-    https://repo1.maven.org/maven2/org/rdfhdt/hdt-java-package/${HDT_JAVA_PACKAGE_VERSION}/hdt-java-package-${HDT_JAVA_PACKAGE_VERSION}-distribution.tar.gz \
-  && tar -xzf /tmp/hdt-java-package.tar.gz -C /opt/hdt-java --strip-components=1 \
-  && rm -f /tmp/hdt-java-package.tar.gz
-
 COPY --from=build-hdt-cpp /usr/local/bin/rdf2hdt /usr/local/bin/rdf2hdt
 COPY --from=build-hdt-cpp /usr/local/bin/hdt2rdf /usr/local/bin/hdt2rdf
 COPY --from=build-hdt-cpp /usr/local/lib/libcds* /usr/local/lib/
@@ -110,16 +101,15 @@ COPY src/*.sh /opt/vcf-rdfizer/
 COPY src/*.py /opt/vcf-rdfizer/
 
 RUN chmod +x /opt/vcf-rdfizer/*.sh \
-  && find /opt/hdt-java/bin -type f -exec chmod +x {} \; \
   && chmod +x /usr/local/bin/rdf2hdt \
   && chmod +x /usr/local/bin/hdt2rdf \
   && chmod +x /usr/local/bin/hdtc
 
 ENV RMLSTREAMER_JAR=/opt/rmlstreamer/RMLStreamer-v${RMLSTREAMER_VERSION}-standalone.jar
 ENV JAR=/opt/rmlstreamer/RMLStreamer-v${RMLSTREAMER_VERSION}-standalone.jar
-ENV HDT_JAVA_HOME=/opt/hdt-java
 ENV HDTC_BIN=/usr/local/bin/hdtc
 ENV HDT_INDEX_MEMORY_LIMIT=512M
+ENV HDT_MERGE_MEMORY_LIMIT=512M
 ENV RDF2HDT_BIN=/usr/local/bin/rdf2hdt
 ENV HDT2RDF_BIN=/usr/local/bin/hdt2rdf
 ENV COTTAS_PYTHON_BIN=/opt/pycottas-venv/bin/python

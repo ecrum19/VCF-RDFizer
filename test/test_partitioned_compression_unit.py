@@ -20,6 +20,42 @@ def load_runner_module():
 
 
 class PartitionedCompressionUnitTests(VerboseTestCase):
+    def test_hdtc_merge_command_uses_bounded_native_merge(self):
+        """Partitioned HDT merges must not route through hdt-java's hdtCat."""
+        runner = load_runner_module()
+        with tempfile.TemporaryDirectory() as td:
+            work_dir = Path(td) / "work"
+            left = work_dir / "chunk-00000.hdt"
+            right = work_dir / "chunk-00001.hdt"
+            merged = work_dir / "hdt-merge-r01-00000.hdt"
+            command = runner.hdtc_merge_command(
+                "/usr/local/bin/hdtc",
+                left,
+                right,
+                merged,
+                work_dir=work_dir,
+                memory_limit="512M",
+            )
+
+            self.assertEqual(
+                command,
+                [
+                    "/usr/local/bin/hdtc",
+                    "--quiet",
+                    "create",
+                    str(left),
+                    str(right),
+                    "--output",
+                    str(merged),
+                    "--memory-limit",
+                    "512M",
+                    "--temp-dir",
+                    str(work_dir / ".hdt-merge-r01-00000.hdtc-work"),
+                ],
+            )
+            self.assertNotIn("java", " ".join(command).lower())
+            self.assertNotIn("hdtcat", " ".join(command).lower())
+
     def test_stream_chunks_only_retains_the_chunk_being_consumed(self):
         """Gzip chunking does not stage a second full uncompressed aggregate."""
         runner = load_runner_module()
