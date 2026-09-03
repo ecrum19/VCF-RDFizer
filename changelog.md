@@ -1,15 +1,39 @@
 # Changelog
 
+## 2026-09-03 — Disk-backed COTTAS merge for condensed cohorts
+
+- Replaced the final COTTAS merge/reindex implementation with a dedicated
+  disk-backed DuckDB connection. `pycottas.cat` in version 1.1.0 performs its
+  global `DISTINCT` and `ORDER BY` through the process-global in-memory
+  connection, so both all-input and final pairwise merges could receive
+  `SIGKILL` on the 36-million-triple condensed cohort.
+- The new merge preserves the same global RDF set semantics and `spo` Parquet
+  ordering, but configures DuckDB with a dedicated `.duckdb` database,
+  `COTTAS_MERGE_MEMORY_LIMIT=512M`, `COTTAS_MERGE_THREADS=1`, and a disposable
+  `/work` spill directory. The final merge can therefore externalize sort and
+  distinct state instead of exhausting container memory.
+- Forwarded explicit host-side `COTTAS_MERGE_MEMORY_LIMIT` and
+  `COTTAS_MERGE_THREADS` values into partitioned full/compress runs and
+  standalone COTTAS index mode.
+- Updated diagnostics, README troubleshooting, and regression tests to target
+  `cottas-merge-disk` rather than the obsolete pairwise merge path.
+
+### Rerun guidance
+
+Build an image from this revision before retrying. Start with the default
+512 MiB/one-worker merge budget; if the Docker cgroup cap is below that,
+lower it (for example `COTTAS_MERGE_MEMORY_LIMIT=256M`). Ensure Docker has
+substantial free disk space for temporary DuckDB spill files. The preserved
+raw `.nt.gz` can be retried with `--mode compress`, avoiding another RDF run.
+
 ## 2026-09-03 — COTTAS SIGKILL/OOM handling
 
 - Classified `exit_code=-9` in partitioned index warnings as a child process
   killed by `SIGKILL` (normally the Linux kernel/Docker OOM killer). Shell
   wrappers can surface the same condition as exit code `137`.
-- Changed the production COTTAS merge back to a bounded pairwise merge tree:
-  each `pycottas.cat` invocation receives only two COTTAS inputs. This keeps
-  peak Parquet/index memory bounded; the previous one-shot multi-input merge
-  could exceed the container memory limit even though all per-chunk converts
-  succeeded.
+- Initially changed the production COTTAS merge to a bounded pairwise tree.
+  This reduced input fan-in but did not bound the final graph-wide
+  `DISTINCT`/`ORDER BY`; the disk-backed replacement above supersedes it.
 - Added the failing stage's `max_rss_kb` to `index_warnings.json`, alongside
   exit code, stderr tail, and workspace free-space samples, so OOM diagnosis
   can be compared directly with the container memory limit.
@@ -18,11 +42,9 @@
 
 ### Rerun guidance
 
-Rebuild the image and rerun the full conversion. If a pairwise COTTAS merge is
-still killed, lower `--chunk-target-bytes` and `--chunk-max-bytes` (for example,
-to 256 MiB or 128 MiB) and/or increase the Docker/container memory limit. The
-raw `.nt.gz` retained by the failed run is a valid recovery source; no
-RMLStreamer reconversion is required.
+Rebuild the image and rerun the full conversion (or use `--mode compress` with
+the retained raw `.nt.gz`). The disk-backed merge workflow supersedes this
+earlier pairwise guidance.
 
 When COTTAS is optional, `--representations hdt` avoids the COTTAS merge
 resource requirement while retaining a queryable representation.

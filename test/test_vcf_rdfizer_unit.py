@@ -273,6 +273,25 @@ class WrapperUnitTests(VerboseTestCase):
                 ["-e", "HDT_MERGE_MEMORY_LIMIT=768M"],
             )
 
+    def test_cottas_merge_limits_are_forwarded_to_docker(self):
+        """COTTAS merge memory and worker overrides reach Docker commands."""
+        with mock.patch.dict(
+            os.environ,
+            {
+                "COTTAS_MERGE_MEMORY_LIMIT": "384M",
+                "COTTAS_MERGE_THREADS": "1",
+            },
+        ):
+            self.assertEqual(
+                vcf_rdfizer.docker_cottas_merge_env_args(),
+                [
+                    "-e",
+                    "COTTAS_MERGE_MEMORY_LIMIT=384M",
+                    "-e",
+                    "COTTAS_MERGE_THREADS=1",
+                ],
+            )
+
     def test_validator_counts_plain_and_gzip_ntriples(self):
         """The Docker validator's fallback source count handles .nt and .nt.gz."""
         validator_path = Path(__file__).parents[1] / "src" / "validate_compression.py"

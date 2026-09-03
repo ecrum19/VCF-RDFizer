@@ -56,8 +56,8 @@ class PartitionedCompressionUnitTests(VerboseTestCase):
             self.assertNotIn("java", " ".join(command).lower())
             self.assertNotIn("hdtcat", " ".join(command).lower())
 
-    def test_cottas_merge_many_command_is_available_for_explicit_batching(self):
-        """The adapter retains an explicit multi-input COTTAS operation."""
+    def test_cottas_merge_many_command_uses_the_disk_backed_merge_adapter(self):
+        """Production COTTAS merging scans chunks through one spill-capable stage."""
         runner = load_runner_module()
         command = runner.cottas_merge_many_command(
             "/opt/pycottas-venv/bin/python",
@@ -80,8 +80,8 @@ class PartitionedCompressionUnitTests(VerboseTestCase):
             ],
         )
 
-    def test_cottas_merge_command_is_bounded_to_two_inputs(self):
-        """The production merge stage invokes pycottas.cat pairwise."""
+    def test_cottas_merge_command_remains_compatible_for_two_inputs(self):
+        """The adapter continues to expose a two-input disk-backed merge command."""
         runner = load_runner_module()
         command = runner.cottas_merge_command(
             "/opt/pycottas-venv/bin/python",

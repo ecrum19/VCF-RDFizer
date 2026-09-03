@@ -25,6 +25,8 @@ from pathlib import Path
 HDT_METHODS = {"hdt", "hdt_gzip", "hdt_brotli"}
 COTTAS_METHODS = {"cottas", "cottas_gzip", "cottas_brotli"}
 STDERR_TAIL_BYTES = 16 * 1024
+DEFAULT_COTTAS_MERGE_MEMORY_LIMIT = "512M"
+DEFAULT_COTTAS_MERGE_THREADS = "1"
 
 
 def is_triple_line(line: bytes) -> bool:
@@ -259,12 +261,12 @@ def cottas_merge_many_command(
     inputs: list[Path],
     merged: Path,
 ) -> list[str]:
-    """Build one multi-input COTTAS merge command.
+    """Build one disk-backed, multi-input COTTAS merge command.
 
-    ``pycottas.cat`` accepts a list of COTTAS paths and builds the requested
-    zonemap index once.  Calling it once for the complete chunk set avoids the
-    repeated re-indexing and temporary-file amplification caused by a
-    pairwise merge tree on large graphs.
+    The adapter performs the global distinct/order operation through a
+    dedicated DuckDB database with a bounded memory budget and `/work` spill
+    directory. Unlike ``pycottas.cat``, it never routes the large merge through
+    DuckDB's process-global in-memory connection.
     """
     return [
         python_bin,
@@ -285,14 +287,11 @@ def cottas_merge_command(
     right: Path,
     merged: Path,
 ) -> list[str]:
-    """Build a memory-bounded two-input COTTAS merge command.
+    """Build a compatible two-input disk-backed COTTAS merge command.
 
-    ``pycottas.cat`` has no disk-budget argument for its merge operation.  A
-    single call over every partition can therefore hold too many Parquet
-    inputs and index buffers at once.  The production workflow deliberately
-    invokes the adapter with two inputs per stage instead; the merge tree
-    bounds the peak working set while preserving the same indexed COTTAS
-    semantics.
+    The normal partitioned workflow uses ``merge-many`` because its DuckDB
+    implementation is spill-capable. This command remains available for
+    explicit callers that need a two-input merge.
     """
     return [
         python_bin,
@@ -543,6 +542,8 @@ def main() -> int:
                 "workspace_free_bytes_after",
                 "workspace_total_bytes",
                 "max_rss_kb",
+                "cottas_merge_memory_limit",
+                "cottas_merge_threads",
             ):
                 if key in stage_result:
                     warning[key] = stage_result[key]
@@ -837,30 +838,42 @@ def main() -> int:
             }
 
         if cottas_paths and not cottas_failed:
-            # Keep each pycottas.cat invocation to two inputs.  The adapter's
-            # conversion path supports disk-backed parsing, but its merge API
-            # has no equivalent memory-budget argument.  A one-shot merge of
-            # every partition can consequently be killed by the kernel/Docker
-            # OOM killer (reported by subprocess as exit_code=-9).  Pairwise
-            # merging bounds the number of simultaneously indexed inputs and
-            # still produces one semantically equivalent indexed COTTAS file.
-            final_cottas, cottas_rounds = merge_pairwise(
-                cottas_paths,
-                prefix="cottas",
-                runner=runner,
-                merge_command=lambda left, right, merged: cottas_merge_command(
-                    cottas_python,
-                    left,
-                    right,
-                    merged,
-                ),
-                total=cottas_total,
-            )
-            cottas_stage = (
-                runner.stages[-1]
-                if final_cottas is None and runner.stages
-                else None
-            )
+            # pycottas.cat performs its global DISTINCT/ORDER BY through an
+            # unbounded process-global in-memory DuckDB connection.  That is
+            # what made both the one-shot and the final pairwise COTTAS merge
+            # susceptible to SIGKILL on large condensed cohorts. The adapter's
+            # merge-many command instead opens a dedicated disk-backed DuckDB
+            # database with a bounded memory limit and /work spill files, so a
+            # single global indexed merge is safe and avoids duplicate work.
+            cottas_stage = None
+            cottas_rounds = 0
+            if len(cottas_paths) == 1:
+                final_cottas = cottas_paths[0]
+            else:
+                cottas_merged_path = work_dir / "cottas-merge-final.cottas"
+                cottas_stage = runner.run(
+                    "cottas-merge-disk",
+                    cottas_merge_many_command(
+                        cottas_python,
+                        cottas_paths,
+                        cottas_merged_path,
+                    ),
+                    cottas_merged_path,
+                )
+                cottas_stage["cottas_merge_memory_limit"] = os.environ.get(
+                    "COTTAS_MERGE_MEMORY_LIMIT", DEFAULT_COTTAS_MERGE_MEMORY_LIMIT
+                )
+                cottas_stage["cottas_merge_threads"] = os.environ.get(
+                    "COTTAS_MERGE_THREADS", DEFAULT_COTTAS_MERGE_THREADS
+                )
+                runner.stages[-1].update(cottas_stage)
+                add_totals(cottas_total, cottas_stage)
+                cottas_rounds = 1
+                final_cottas = (
+                    cottas_merged_path
+                    if cottas_stage["exit_code"] == 0 and cottas_merged_path.is_file()
+                    else None
+                )
             if final_cottas is None:
                 if not args.allow_index_failures:
                     raise RuntimeError(
@@ -908,6 +921,14 @@ def main() -> int:
                         "details": {
                             **plan,
                             "merge_rounds": cottas_rounds,
+                            "merge_strategy": "duckdb_disk_backed",
+                            "merge_memory_limit": os.environ.get(
+                                "COTTAS_MERGE_MEMORY_LIMIT",
+                                DEFAULT_COTTAS_MERGE_MEMORY_LIMIT,
+                            ),
+                            "merge_threads": os.environ.get(
+                                "COTTAS_MERGE_THREADS", DEFAULT_COTTAS_MERGE_THREADS
+                            ),
                             "index": "spo",
                             "validation": cottas_validation,
                         },

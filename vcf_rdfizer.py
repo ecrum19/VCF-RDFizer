@@ -441,6 +441,18 @@ def docker_hdt_merge_env_args() -> list[str]:
     return ["-e", f"HDT_MERGE_MEMORY_LIMIT={memory_limit}"]
 
 
+def docker_cottas_merge_env_args() -> list[str]:
+    """Forward optional bounded-memory COTTAS merge settings into Docker."""
+    options: list[str] = []
+    memory_limit = os.environ.get("COTTAS_MERGE_MEMORY_LIMIT", "").strip()
+    if memory_limit:
+        options.extend(["-e", f"COTTAS_MERGE_MEMORY_LIMIT={memory_limit}"])
+    threads = os.environ.get("COTTAS_MERGE_THREADS", "").strip()
+    if threads:
+        options.extend(["-e", f"COTTAS_MERGE_THREADS={threads}"])
+    return options
+
+
 def _can_write_dir(path: Path) -> bool:
     """Best-effort write probe for directories."""
     try:
@@ -3943,6 +3955,7 @@ def run_containerized_partitioned_representation_methods(
             *docker_run_base(),
             *docker_hdt_index_env_args(),
             *docker_hdt_merge_env_args(),
+            *docker_cottas_merge_env_args(),
             "--mount",
             f"type=volume,source={volume_name},target=/work",
         ]
@@ -5089,6 +5102,7 @@ def run_index_mode(
     cmd = [
         *docker_run_base(),
         *docker_hdt_index_env_args(),
+        *docker_cottas_merge_env_args(),
         "-v",
         f"{str(index_path.parent)}:/data/{mount_name}",
         image_ref,
