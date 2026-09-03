@@ -24,12 +24,13 @@ The VCF-RDFizer vocabulary is available at [https://w3id.org/vcf-rdfizer/vocab#]
 - Docker (installed and running)
 
 When VCF-RDFizer is connected to an interactive terminal, it shows a
-lightweight Rich spinner/progress display. The display is disabled
-automatically for redirected/CI output and can be disabled explicitly with
-`--no-progress`. RMLStreamer progress reports the bytes and output parts
-already written; partitioned HDT/COTTAS runs report source triples, chunks,
-and the currently active merge/index stage. These updates are best-effort and
-do not scan RDF content a second time or retain progress history in memory.
+lightweight Rich spinner/progress display. With redirected output or without
+Rich installed, it instead prints compact status lines; CI output remains
+quiet. Either display can be disabled explicitly with `--no-progress`.
+RMLStreamer progress reports the bytes and output parts already written;
+partitioned HDT/COTTAS runs report source triples, chunks, and the currently
+active merge/index stage. These updates are best-effort and do not scan RDF
+content a second time or retain progress history in memory.
 
 Install options:
 
@@ -95,7 +96,7 @@ In `full` mode with multiple VCF inputs, failures are isolated per input:
 - `-v, --image-version` Docker tag/version
 - `-b, --build` force Docker build
 - `-B, --no-build` fail if image not found
-- `--no-progress` disable interactive spinners and progress bars
+- `--no-progress` disable terminal progress updates
 - `-h, --help` show full usage
 
 ## Compression Plan
@@ -462,13 +463,13 @@ and are removed after the attempt.
 COTTAS uses the same out-of-core principle for its global `DISTINCT` and
 external-sort, adjacent-row deduplication merge. The image pins DuckDB to
 1.5.5, the version tested with this merge SQL, and defaults
-`COTTAS_MERGE_MEMORY_LIMIT` to `512M` and
+`COTTAS_MERGE_MEMORY_LIMIT` to `4G` and
 `COTTAS_MERGE_THREADS` to `1`; DuckDB spills merge state to `/work` instead of
 allowing one large condensed graph to consume all container memory. Override
 them from the host only when appropriate for the available RAM, for example:
 
 ```bash
-COTTAS_MERGE_MEMORY_LIMIT=1G COTTAS_MERGE_THREADS=2 vcf-rdfizer \
+COTTAS_MERGE_MEMORY_LIMIT=4G COTTAS_MERGE_THREADS=1 vcf-rdfizer \
   --mode compress \
   --rdf ./results/cohort/cohort.nt.gz \
   --rdf-compression none \
@@ -667,7 +668,11 @@ which is normally the kernel/Docker OOM killer; a shell wrapper may report the
 same event as `137`. The warning's `stderr_tail`, `max_rss_kb`, and workspace
 samples distinguish memory pressure from a DuckDB/COTTAS or disk-space error.
 The disk-backed merge defaults to 512 MiB and one worker. Lower
-`COTTAS_MERGE_MEMORY_LIMIT` if the container has a stricter memory cap, or
+`COTTAS_MERGE_MEMORY_LIMIT` if the container has a stricter memory cap. The
+external-sort merge still needs enough headroom for DuckDB's sort blocks; use
+at least `1G` for large multi-sample inputs, and the default `4G` when the
+Docker host can provide it. If you lower this value and see an allocation error,
+raise it rather than lowering it further. Also verify
 raise it only when RAM is available; in all cases ensure Docker's data volume
 has enough free space for DuckDB spill files and the final Parquet rewrite.
 Rebuild the image after upgrading so the bounded disk-backed merge workflow is

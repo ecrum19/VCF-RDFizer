@@ -339,6 +339,21 @@ def progress_ui_enabled() -> bool:
     return bool(callable(isatty) and isatty())
 
 
+def progress_events_enabled() -> bool:
+    """Return whether progress sidecars should be consumed at all.
+
+    Rich needs a TTY to redraw a spinner, but compression is often launched
+    through ``tee``, a scheduler, or a remote shell with redirected stderr.
+    Keep collecting the same low-volume events in those cases so
+    ``ProgressSession`` can render readable line-based status instead.
+    """
+    if not _PROGRESS_ALLOWED:
+        return False
+    if os.environ.get("VCF_RDFIZER_NO_PROGRESS"):
+        return False
+    return not os.environ.get("CI")
+
+
 class ProgressSession:
     """Render low-volume progress events from one Docker operation with Rich.
 
@@ -350,23 +365,28 @@ class ProgressSession:
     def __init__(self, path: Path | None, label: str):
         self.path = path
         self.label = label
-        self.enabled = progress_ui_enabled()
+        self.enabled = progress_events_enabled()
+        self.rich_enabled = self.enabled and progress_ui_enabled()
         self._offset = 0
         self._progress = None
         self._starter_task = None
         self._tasks: dict[str, int] = {}
         self._previous = None
+        self._plain_event_states: dict[str, tuple[str, object, object]] = {}
 
     def __enter__(self):
         global _ACTIVE_PROGRESS
         self._previous = _ACTIVE_PROGRESS
         _ACTIVE_PROGRESS = self
-        if not self.enabled:
-            return self
-
         if self.path is not None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.path.unlink(missing_ok=True)
+
+        if not self.enabled:
+            return self
+        if not self.rich_enabled:
+            eprint(f"{self.label}: started")
+            return self
 
         console = Console(stderr=True, highlight=False)
         self._progress = Progress(
@@ -429,10 +449,21 @@ class ProgressSession:
         return detail
 
     def _update_event(self, event: dict):
-        if self._progress is None:
-            return
         stage = str(event.get("stage") or "work")
         phase = str(event.get("phase") or "working")
+        if self._progress is None:
+            # A redirected terminal cannot host a redrawable Rich spinner.
+            # Emit compact, state-changing lines instead so lengthy
+            # compression still visibly advances in a terminal or log.
+            completed = event.get("completed")
+            total = event.get("total")
+            state = (phase, completed, total)
+            if self._plain_event_states.get(stage) != state:
+                self._plain_event_states[stage] = state
+                detail = self._detail(event)
+                suffix = f" — {detail}" if detail else ""
+                eprint(f"  {self.label}: {stage} {phase}{suffix}")
+            return
         task_id = self._tasks.get(stage)
         if task_id is None:
             if self._starter_task is not None:
@@ -500,6 +531,8 @@ class ProgressSession:
         self.poll_events()
         if self._progress is not None:
             self._progress.stop()
+        elif self.enabled:
+            eprint(f"{self.label}: finished")
         if self.path is not None:
             try:
                 self.path.unlink()
@@ -4179,7 +4212,7 @@ def run_containerized_partitioned_representation_methods(
     result_path = out_dir / f".{safe_output_name}.partitioned-results.json"
     progress_host_path = (
         progress_event_path(metrics_dir, "partitioned", safe_output_name)
-        if progress_ui_enabled()
+        if progress_events_enabled()
         else None
     )
     progress_container_ref = container_progress_path(progress_host_path, metrics_dir)
@@ -4624,7 +4657,7 @@ def run_full_mode(
         container_generated_rules = f"/data/rules/{generated_rules.name}"
         progress_host_path = (
             progress_event_path(metrics_dir, "rmlstreamer", safe_prefix)
-            if progress_ui_enabled()
+            if progress_events_enabled()
             else None
         )
         progress_container_ref = container_progress_path(progress_host_path, metrics_dir)
@@ -5769,7 +5802,7 @@ def main():
     parser.add_argument(
         "--no-progress",
         action="store_true",
-        help="Disable interactive Rich spinners and progress bars",
+        help="Disable terminal compression/conversion progress updates",
     )
     rdf_output_group = parser.add_mutually_exclusive_group()
     rdf_output_group.add_argument(

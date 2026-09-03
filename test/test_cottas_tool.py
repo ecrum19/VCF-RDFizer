@@ -132,7 +132,7 @@ class CottasToolTests(unittest.TestCase):
             self.assertTrue(fake_duckdb.closed)
             self.assertEqual(len(fake_duckdb.database_paths), 1)
             self.assertEqual(fake_duckdb.database_paths[0].parent.parent, scratch_root)
-            self.assertIn("SET memory_limit = '512M'", fake_duckdb.queries)
+            self.assertIn("SET memory_limit = '4G'", fake_duckdb.queries)
             self.assertIn("SET threads = 1", fake_duckdb.queries)
             copy_query = next(query for query in fake_duckdb.queries if query.startswith("COPY"))
             self.assertIn("LAG(s) OVER (ORDER BY s, p, o)", copy_query)
@@ -185,7 +185,7 @@ class CottasToolTests(unittest.TestCase):
             for path in inputs:
                 self.assertIn(str(path.resolve()), copy_query)
                 self.assertFalse(path.exists())
-            self.assertIn("SET memory_limit = '512M'", fake_duckdb.queries)
+            self.assertIn("SET memory_limit = '4G'", fake_duckdb.queries)
             self.assertIn("SET threads = 1", fake_duckdb.queries)
             self.assertTrue(fake_duckdb.closed)
             self.assertFalse(any(scratch_root.iterdir()))

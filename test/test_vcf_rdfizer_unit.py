@@ -292,6 +292,43 @@ class WrapperUnitTests(VerboseTestCase):
                 ],
             )
 
+    def test_plain_progress_is_shown_when_rich_or_a_tty_is_unavailable(self):
+        """Long compression work remains visible through redirected terminals."""
+        previous_progress_setting = vcf_rdfizer._PROGRESS_ALLOWED
+        try:
+            vcf_rdfizer._PROGRESS_ALLOWED = True
+            with tempfile.TemporaryDirectory() as td, mock.patch.dict(
+                os.environ,
+                {"VCF_RDFIZER_NO_PROGRESS": "", "CI": ""},
+                clear=False,
+            ), mock.patch.object(vcf_rdfizer, "Progress", None), mock.patch.object(
+                vcf_rdfizer, "Console", None
+            ):
+                progress_path = Path(td) / "partitioned.jsonl"
+                terminal = StringIO()
+                with redirect_stderr(terminal), vcf_rdfizer.ProgressSession(
+                    progress_path, "Partitioned compression: cohort"
+                ) as session:
+                    progress_path.write_text(
+                        json.dumps(
+                            {
+                                "stage": "cottas-merge",
+                                "phase": "started",
+                                "unit": "stage",
+                                "detail": "cottas-merge-disk",
+                            }
+                        )
+                        + "\n"
+                    )
+                    session.poll_events()
+
+                displayed = terminal.getvalue()
+                self.assertIn("Partitioned compression: cohort: started", displayed)
+                self.assertIn("cottas-merge started", displayed)
+                self.assertIn("cottas-merge-disk", displayed)
+        finally:
+            vcf_rdfizer._PROGRESS_ALLOWED = previous_progress_setting
+
     def test_validator_counts_plain_and_gzip_ntriples(self):
         """The Docker validator's fallback source count handles .nt and .nt.gz."""
         validator_path = Path(__file__).parents[1] / "src" / "validate_compression.py"

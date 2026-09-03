@@ -25,7 +25,7 @@ from pathlib import Path
 HDT_METHODS = {"hdt", "hdt_gzip", "hdt_brotli"}
 COTTAS_METHODS = {"cottas", "cottas_gzip", "cottas_brotli"}
 STDERR_TAIL_BYTES = 16 * 1024
-DEFAULT_COTTAS_MERGE_MEMORY_LIMIT = "512M"
+DEFAULT_COTTAS_MERGE_MEMORY_LIMIT = "4G"
 DEFAULT_COTTAS_MERGE_THREADS = "1"
 PROGRESS_HEARTBEAT_BYTES = 64 * 1024 * 1024
 

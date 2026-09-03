@@ -2,6 +2,14 @@
 
 ## 2026-09-03 — Disk-backed COTTAS merge for condensed cohorts
 
+- Raised the default COTTAS DuckDB merge budget from `512M` to `4G`. DuckDB's
+  external sort spills data to disk, but it still requires an in-memory sort
+  block; a 52-chunk cohort merge requested a 128 MiB block after reaching the
+  old 512 MiB cap. The `4G` value is a cap, not an eager allocation.
+- Made compression progress visible even when Rich cannot redraw a terminal
+  spinner (for example, with redirected stderr or a scheduler). Those runs now
+  emit compact source-scan, chunk-build, merge, and validation status lines.
+
 - Pinned the image to DuckDB 1.5.5 so COTTAS merge behavior cannot vary with
   Docker build-cache state or the newest dependency accepted by pycottas.
 - Included the bounded DuckDB stderr tail in code-1 merge failures. The error
@@ -20,7 +28,7 @@
   `SIGKILL` on the 36-million-triple condensed cohort.
 - The new merge preserves the same global RDF set semantics and `spo` Parquet
   ordering, but configures DuckDB with a dedicated `.duckdb` database,
-  `COTTAS_MERGE_MEMORY_LIMIT=512M`, `COTTAS_MERGE_THREADS=1`, and a disposable
+  `COTTAS_MERGE_MEMORY_LIMIT=4G`, `COTTAS_MERGE_THREADS=1`, and a disposable
   `/work` spill directory. The final merge can therefore externalize sort and
   distinct state instead of exhausting container memory.
 - Forwarded explicit host-side `COTTAS_MERGE_MEMORY_LIMIT` and
@@ -33,7 +41,8 @@
 
 Build an image from this revision before retrying. Start with the default
 512 MiB/one-worker merge budget; if the Docker cgroup cap is below that,
-lower it (for example `COTTAS_MERGE_MEMORY_LIMIT=256M`). Ensure Docker has
+lower it only when necessary (but keep it at least `1G` for a large cohort).
+Ensure Docker has
 substantial free disk space for temporary DuckDB spill files. The preserved
 raw `.nt.gz` can be retried with `--mode compress`, avoiding another RDF run.
 

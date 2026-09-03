@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 
-DEFAULT_COTTAS_MERGE_MEMORY_LIMIT = "512M"
+DEFAULT_COTTAS_MERGE_MEMORY_LIMIT = "4G"
 DEFAULT_COTTAS_MERGE_THREADS = 1
 MEMORY_LIMIT_PATTERN = re.compile(
     r"^\d+(?:\.\d+)?\s*(?:B|K|M|G|T|KB|MB|GB|TB|KIB|MIB|GIB|TIB)$",
@@ -49,7 +49,7 @@ def cottas_merge_memory_limit() -> str:
     if not MEMORY_LIMIT_PATTERN.fullmatch(memory_limit):
         raise ValueError(
             "COTTAS_MERGE_MEMORY_LIMIT must be a positive DuckDB byte value "
-            "such as 512M or 1G"
+            "such as 1G or 4G"
         )
     return memory_limit
 
