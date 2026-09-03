@@ -703,15 +703,9 @@ def docker_hdt_merge_env_args() -> list[str]:
 
 
 def docker_cottas_merge_env_args() -> list[str]:
-    """Forward optional bounded-memory COTTAS merge settings into Docker."""
-    options: list[str] = []
-    memory_limit = os.environ.get("COTTAS_MERGE_MEMORY_LIMIT", "").strip()
-    if memory_limit:
-        options.extend(["-e", f"COTTAS_MERGE_MEMORY_LIMIT={memory_limit}"])
-    threads = os.environ.get("COTTAS_MERGE_THREADS", "").strip()
-    if threads:
-        options.extend(["-e", f"COTTAS_MERGE_THREADS={threads}"])
-    return options
+    """Forward an optional bounded COTTAS streaming-merge batch size."""
+    batch_rows = os.environ.get("COTTAS_MERGE_BATCH_ROWS", "").strip()
+    return ["-e", f"COTTAS_MERGE_BATCH_ROWS={batch_rows}"] if batch_rows else []
 
 
 def _can_write_dir(path: Path) -> bool:

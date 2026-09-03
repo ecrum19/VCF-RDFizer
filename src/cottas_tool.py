@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
-"""Docker-side adapter for disk-backed COTTAS conversion and merge operations."""
+"""Docker-side adapter for bounded-memory COTTAS conversion and merging."""
 
 import argparse
+import heapq
+import json
 import os
-import re
 import sys
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
 
-DEFAULT_COTTAS_MERGE_MEMORY_LIMIT = "4G"
-DEFAULT_COTTAS_MERGE_THREADS = 1
-MEMORY_LIMIT_PATTERN = re.compile(
-    r"^\d+(?:\.\d+)?\s*(?:B|K|M|G|T|KB|MB|GB|TB|KIB|MIB|GIB|TIB)$",
-    re.IGNORECASE,
-)
+DEFAULT_COTTAS_MERGE_BATCH_ROWS = 2048
+COTTAS_OUTPUT_BATCH_ROWS = 16 * 1024
+COTTAS_MERGE_PROGRESS_ROWS = 250_000
 
 
 @contextmanager
@@ -36,56 +34,151 @@ def cottas_scratch_workspace():
             os.chdir(original_working_directory)
 
 
-def sql_literal(value: str | Path) -> str:
-    """Quote one filesystem value for the DuckDB SQL emitted by this adapter."""
-    return "'" + str(value).replace("'", "''") + "'"
-
-
-def cottas_merge_memory_limit() -> str:
-    """Return a validated DuckDB budget for COTTAS merge/reindex operations."""
-    memory_limit = os.environ.get(
-        "COTTAS_MERGE_MEMORY_LIMIT", DEFAULT_COTTAS_MERGE_MEMORY_LIMIT
-    ).strip()
-    if not MEMORY_LIMIT_PATTERN.fullmatch(memory_limit):
-        raise ValueError(
-            "COTTAS_MERGE_MEMORY_LIMIT must be a positive DuckDB byte value "
-            "such as 1G or 4G"
-        )
-    return memory_limit
-
-
-def cottas_merge_threads() -> int:
-    """Return a bounded DuckDB worker count for deterministic merge memory use."""
-    raw_threads = os.environ.get(
-        "COTTAS_MERGE_THREADS", str(DEFAULT_COTTAS_MERGE_THREADS)
+def cottas_merge_batch_rows() -> int:
+    """Return a small, bounded Parquet batch size for the streaming merge."""
+    raw_rows = os.environ.get(
+        "COTTAS_MERGE_BATCH_ROWS", str(DEFAULT_COTTAS_MERGE_BATCH_ROWS)
     ).strip()
     try:
-        threads = int(raw_threads)
+        batch_rows = int(raw_rows)
     except ValueError as exc:
-        raise ValueError("COTTAS_MERGE_THREADS must be a positive integer") from exc
-    if threads <= 0:
-        raise ValueError("COTTAS_MERGE_THREADS must be a positive integer")
-    return threads
+        raise ValueError("COTTAS_MERGE_BATCH_ROWS must be a positive integer") from exc
+    if batch_rows <= 0:
+        raise ValueError("COTTAS_MERGE_BATCH_ROWS must be a positive integer")
+    return batch_rows
 
 
-def disk_backed_cottas_merge(
+def emit_merge_progress(
+    progress_path: Path | None,
+    phase: str,
+    *,
+    completed: int,
+    total: int,
+    detail: str,
+) -> None:
+    """Append a best-effort COTTAS merge heartbeat for the host progress UI."""
+    if progress_path is None:
+        return
+    payload = {
+        "stage": "cottas-merge",
+        "phase": phase,
+        "completed": completed,
+        "total": total,
+        "unit": "triples",
+        "detail": detail,
+    }
+    try:
+        with progress_path.open("a", encoding="utf-8") as handle:
+            json.dump(payload, handle, separators=(",", ":"))
+            handle.write("\n")
+    except OSError:
+        # A missing/unwritable optional sidecar must not invalidate an index.
+        pass
+
+
+def cottas_file_index(parquet_file) -> str | None:
+    """Read COTTAS's embedded Parquet sort-index metadata when available."""
+    metadata = getattr(parquet_file.metadata, "metadata", None) or {}
+    value = metadata.get(b"index") or metadata.get("index")
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    return str(value).lower()
+
+
+class CottasTripleStream:
+    """Read one sorted COTTAS Parquet file in a bounded number of rows."""
+
+    def __init__(self, parquet_module, path: Path, index: str, batch_rows: int):
+        self.path = path
+        self.index = index
+        self.parquet_file = parquet_module.ParquetFile(path)
+        self.schema = self.parquet_file.schema_arrow
+        missing_columns = {"s", "p", "o"} - set(self.schema.names)
+        if missing_columns:
+            raise RuntimeError(
+                f"COTTAS input {path.name} is missing columns: {', '.join(sorted(missing_columns))}"
+            )
+        source_index = cottas_file_index(self.parquet_file)
+        if source_index != index:
+            found = source_index or "missing"
+            raise RuntimeError(
+                f"COTTAS input {path.name} is indexed as {found!r}, not {index!r}; "
+                "a streaming merge requires every input to use the requested index"
+            )
+        self.fields = tuple(self.schema.field(name) for name in ("s", "p", "o"))
+        positions = {"s": 0, "p": 1, "o": 2}
+        self._sort_positions = tuple(positions[column] for column in index)
+        self._batches = self.parquet_file.iter_batches(
+            batch_size=batch_rows,
+            columns=["s", "p", "o"],
+            use_threads=False,
+        )
+        self._values: tuple[list, list, list] | None = None
+        self._row = 0
+        self.current: tuple | None = None
+        self.sort_key: tuple | None = None
+        self._previous_sort_key: tuple | None = None
+        self.exhausted = False
+        self.advance()
+
+    @property
+    def row_count(self) -> int:
+        return int(self.parquet_file.metadata.num_rows)
+
+    def advance(self) -> None:
+        """Move to one next triple, validating the COTTAS sort-order contract."""
+        while self._values is None or self._row >= len(self._values[0]):
+            try:
+                batch = next(self._batches)
+            except StopIteration:
+                self.current = None
+                self.sort_key = None
+                self.exhausted = True
+                return
+            values = tuple(column.to_pylist() for column in batch.columns)
+            if not values[0]:
+                continue
+            self._values = values
+            self._row = 0
+
+        triple = (self._values[0][self._row], self._values[1][self._row], self._values[2][self._row])
+        self._row += 1
+        if any(value is None for value in triple):
+            raise RuntimeError(f"COTTAS input {self.path.name} contains a null RDF term")
+        sort_key = tuple(triple[position] for position in self._sort_positions)
+        if self._previous_sort_key is not None and sort_key < self._previous_sort_key:
+            raise RuntimeError(
+                f"COTTAS input {self.path.name} is not sorted by its declared {self.index!r} index"
+            )
+        self._previous_sort_key = sort_key
+        self.current = triple
+        self.sort_key = sort_key
+
+    def close(self) -> None:
+        """Release a Parquet file handle before the surrounding workspace exits."""
+        close = getattr(self.parquet_file, "close", None)
+        if callable(close):
+            close()
+
+
+def streaming_cottas_merge(
     input_paths: list[str],
     output_path: str,
     *,
     index: str,
     remove_input_files: bool,
+    progress_path: Path | None = None,
 ) -> None:
-    """Merge COTTAS Parquet inputs with DuckDB spill files rather than pycottas.cat.
+    """Merge already-indexed COTTAS files without a global sort or spill area.
 
-    ``pycottas.cat`` uses DuckDB's process-global in-memory connection. Its
-    hash-based global ``DISTINCT`` plus ``ORDER BY`` can therefore be SIGKILLed
-    on a large condensed VCF even when every disk-backed chunk conversion
-    succeeds. This adapter opens a dedicated on-disk database, caps its
-    memory, restricts merge parallelism, and directs external-sort spill files
-    to the disposable COTTAS scratch directory. It sorts all triples, removes
-    only adjacent equal triples with a streaming ``LAG`` window, then writes
-    the requested COTTAS index order. That retains RDF set semantics without
-    materializing one global hash table of every triple.
+    Chunk conversion writes every COTTAS input in the requested lexical index
+    order. A k-way heap therefore needs only one small Parquet batch from each
+    input; equal triples meet at the heap head and are written once. This
+    preserves the RDF set and COTTAS index semantics while avoiding DuckDB's
+    full-data external sort, whose temporary files can exceed the original RDF
+    size for large multi-sample VCFs.
     """
     if not input_paths:
         raise ValueError("at least one COTTAS input is required for a merge")
@@ -93,77 +186,139 @@ def disk_backed_cottas_merge(
         raise ValueError("COTTAS merge index must be a permutation of spo")
 
     try:
-        import duckdb
+        import pyarrow as pa
+        import pyarrow.parquet as pq
     except ImportError as exc:
-        raise RuntimeError(f"DuckDB dependency is unavailable: {exc}") from exc
-
-    scratch_dir = Path.cwd()
-    temporary_directory = scratch_dir / "duckdb-merge-tmp"
-    temporary_directory.mkdir(parents=True, exist_ok=True)
-    database_path = scratch_dir / "pycottas-merge.duckdb"
-    memory_limit = cottas_merge_memory_limit()
-    threads = cottas_merge_threads()
-    quoted_inputs = ", ".join(sql_literal(path) for path in input_paths)
-    parquet_scan = f"PARQUET_SCAN([{quoted_inputs}], union_by_name = true)"
-
-    connection = None
-    try:
-        connection = duckdb.connect(str(database_path))
-        # Apply limits before DuckDB plans the DISTINCT/ORDER BY operation.
-        # One worker makes the memory budget predictable on hosts with many
-        # CPUs and still permits DuckDB's external sort/hash operators to
-        # spill to the named Docker volume.
-        connection.execute("SET preserve_insertion_order = false")
-        connection.execute("SET enable_progress_bar = false")
-        connection.execute(f"SET temp_directory = {sql_literal(temporary_directory)}")
-        connection.execute(f"SET memory_limit = {sql_literal(memory_limit)}")
-        connection.execute(f"SET threads = {threads}")
-
-        columns = {
-            str(row[0])
-            for row in connection.execute(
-                f"DESCRIBE SELECT * FROM {parquet_scan} LIMIT 1"
-            ).fetchall()
-        }
-        if not {"s", "p", "o"}.issubset(columns):
-            raise RuntimeError("COTTAS inputs do not contain the required s, p, o columns")
-        # COTTAS's own cat operation writes RDF triples, rather than retaining
-        # an optional Parquet graph column. Match that contract when deciding
-        # whether two input records are semantically equal.
-        selected_columns_sql = "s, p, o"
-        order_columns_sql = ", ".join(index.lower())
-        copy_query = (
-            "COPY (WITH ordered_rows AS ("
-            f"SELECT {selected_columns_sql}, "
-            "LAG(s) OVER (ORDER BY s, p, o) AS prior_s, "
-            "LAG(p) OVER (ORDER BY s, p, o) AS prior_p, "
-            "LAG(o) OVER (ORDER BY s, p, o) AS prior_o "
-            f"FROM {parquet_scan}"
-            ") SELECT s, p, o FROM ordered_rows "
-            "WHERE s IS DISTINCT FROM prior_s OR p IS DISTINCT FROM prior_p "
-            f"OR o IS DISTINCT FROM prior_o ORDER BY {order_columns_sql}) "
-            f"TO {sql_literal(output_path)} "
-            "(FORMAT PARQUET, COMPRESSION ZSTD, COMPRESSION_LEVEL 22, "
-            "PARQUET_VERSION v2, "
-            f"KV_METADATA {{index: {sql_literal(index.lower())}}})"
-        )
-        connection.execute(copy_query)
-    except Exception as exc:
-        # This context is intentionally included in stderr. The host wrapper
-        # records it in the result JSON and surfaces it in the final error,
-        # so storage, permissions, Parquet, and DuckDB SQL errors are not
-        # collapsed into an unhelpful generic non-zero exit code.
-        duckdb_version = getattr(duckdb, "__version__", "unknown")
         raise RuntimeError(
-            "disk-backed COTTAS merge failed "
-            f"(duckdb={duckdb_version}; inputs={len(input_paths)}; "
-            f"memory_limit={memory_limit}; threads={threads}; "
-            f"scratch={scratch_dir}; temp_directory={temporary_directory}; "
+            "PyArrow is required for bounded-memory COTTAS merging: "
+            f"{exc}"
+        ) from exc
+
+    normalized_index = index.lower()
+    batch_rows = cottas_merge_batch_rows()
+    streams: list[CottasTripleStream] = []
+    temporary_path: Path | None = None
+    writer = None
+    try:
+        streams = [
+            CottasTripleStream(pq, Path(path), normalized_index, batch_rows)
+            for path in input_paths
+        ]
+        fields = streams[0].fields
+        expected_types = tuple(field.type for field in fields)
+        for stream in streams[1:]:
+            if tuple(field.type for field in stream.fields) != expected_types:
+                raise RuntimeError(
+                    "COTTAS inputs do not share the same RDF term column types"
+                )
+
+        output = Path(output_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{output.name}.merge-",
+            suffix=".cottas",
+            dir=str(output.parent),
+        )
+        os.close(descriptor)
+        temporary_path = Path(temporary_name)
+        temporary_path.unlink()
+        output_schema = pa.schema(
+            list(fields), metadata={b"index": normalized_index.encode("utf-8")}
+        )
+        writer = pq.ParquetWriter(
+            temporary_path,
+            output_schema,
+            compression="zstd",
+            compression_level=22,
+            version="2.6",
+        )
+        total_rows = sum(stream.row_count for stream in streams)
+        emit_merge_progress(
+            progress_path,
+            "started",
+            completed=0,
+            total=total_rows,
+            detail=f"{len(streams):,} sorted COTTAS chunks",
+        )
+        heap = [
+            (stream.sort_key, stream_number, stream.current)
+            for stream_number, stream in enumerate(streams)
+            if not stream.exhausted
+        ]
+        heapq.heapify(heap)
+        output_rows: list[tuple] = []
+        previous_triple = None
+        processed_rows = 0
+        written_rows = 0
+        last_progress_rows = 0
+        while heap:
+            _, stream_number, triple = heapq.heappop(heap)
+            processed_rows += 1
+            if triple != previous_triple:
+                output_rows.append(triple)
+                previous_triple = triple
+            # Keep Parquet row groups substantially larger than the per-input
+            # read batch. That avoids creating tens of thousands of tiny row
+            # groups for a cohort-sized graph without changing input memory.
+            if len(output_rows) >= COTTAS_OUTPUT_BATCH_ROWS:
+                arrays = [
+                    pa.array([row[column] for row in output_rows], type=fields[column].type)
+                    for column in range(3)
+                ]
+                writer.write_batch(pa.RecordBatch.from_arrays(arrays, schema=output_schema))
+                written_rows += len(output_rows)
+                output_rows.clear()
+
+            stream = streams[stream_number]
+            stream.advance()
+            if not stream.exhausted:
+                heapq.heappush(heap, (stream.sort_key, stream_number, stream.current))
+            if processed_rows - last_progress_rows >= COTTAS_MERGE_PROGRESS_ROWS:
+                emit_merge_progress(
+                    progress_path,
+                    "merging",
+                    completed=processed_rows,
+                    total=total_rows,
+                    detail=f"{written_rows + len(output_rows):,} distinct triples written",
+                )
+                last_progress_rows = processed_rows
+
+        if output_rows:
+            arrays = [
+                pa.array([row[column] for row in output_rows], type=fields[column].type)
+                for column in range(3)
+            ]
+            writer.write_batch(pa.RecordBatch.from_arrays(arrays, schema=output_schema))
+            written_rows += len(output_rows)
+        writer.close()
+        writer = None
+        os.replace(temporary_path, output)
+        temporary_path = None
+        emit_merge_progress(
+            progress_path,
+            "complete",
+            completed=processed_rows,
+            total=total_rows,
+            detail=f"{written_rows:,} distinct triples written",
+        )
+    except Exception as exc:
+        # This context is surfaced by the host wrapper after its ephemeral
+        # Docker volume is removed, so a malformed or unexpectedly indexed
+        # input does not become a generic non-zero exit code.
+        pyarrow_version = getattr(pa, "__version__", "unknown")
+        raise RuntimeError(
+            "streaming COTTAS merge failed "
+            f"(pyarrow={pyarrow_version}; inputs={len(input_paths)}; "
+            f"index={normalized_index}; batch_rows={batch_rows}; "
             f"output={output_path}): {exc}"
         ) from exc
     finally:
-        if connection is not None:
-            connection.close()
+        if writer is not None:
+            writer.close()
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        for stream in streams:
+            stream.close()
 
     if remove_input_files:
         for input_path in input_paths:
@@ -197,6 +352,10 @@ def main() -> int:
     )
     merge_many.add_argument("--output-cottas-file", required=True)
     merge_many.add_argument("--index", default="spo")
+    merge_many.add_argument(
+        "--progress-path",
+        help="optional JSONL sidecar for bounded streaming-merge progress",
+    )
 
     reindex = subparsers.add_parser(
         "reindex",
@@ -247,7 +406,7 @@ def main() -> int:
 
         # COTTAS indexes are part of the Parquet artifact rather than sibling
         # files. Rebuild into a temporary file in the same directory, then
-        # replace the original only after the disk-backed DuckDB rewrite
+        # replace the original only after the streaming Parquet rewrite
         # completes successfully.
         temporary_path = None
         try:
@@ -260,7 +419,7 @@ def main() -> int:
             temporary_path = Path(temporary_name)
             temporary_path.unlink()
             with cottas_scratch_workspace():
-                disk_backed_cottas_merge(
+                streaming_cottas_merge(
                     [str(cottas_path)],
                     str(temporary_path),
                     index=args.index,
@@ -282,11 +441,12 @@ def main() -> int:
             print("merge-many requires at least two input COTTAS files", file=sys.stderr)
             return 2
         with cottas_scratch_workspace():
-            disk_backed_cottas_merge(
+            streaming_cottas_merge(
                 input_paths,
                 cottas_path,
                 index=args.index,
                 remove_input_files=True,
+                progress_path=(Path(args.progress_path) if args.progress_path else None),
             )
         return 0
 
@@ -294,7 +454,7 @@ def main() -> int:
     right_path = str(Path(args.right_path).resolve())
     cottas_path = str(Path(args.cottas_path).resolve())
     with cottas_scratch_workspace():
-        disk_backed_cottas_merge(
+        streaming_cottas_merge(
             [left_path, right_path],
             cottas_path,
             index=args.index,

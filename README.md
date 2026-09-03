@@ -437,9 +437,10 @@ vcf-rdfizer \
 only the directory containing the selected artifact and writes metrics under
 `<out>/run_metrics/<RUN_ID>/index_metrics.json`. HDT indexing creates a
 versioned sidecar beside the input. COTTAS indexing rewrites the existing
-`.cottas` file through a disk-backed DuckDB rewrite, keeping the data in the
-same artifact while rebuilding its embedded index. If the operation fails, the
-original COTTAS file is left in place; HDT's previous sidecars are restored.
+`.cottas` file through a bounded streaming Parquet rewrite, keeping the data
+in the same artifact while rebuilding its embedded index. If the operation
+fails, the original COTTAS file is left in place; HDT's previous sidecars are
+restored.
 
 HDT merging and indexing do not start a Java HDT tool. They use native `hdtc`:
 `hdtc create` merges partitioned HDTs and `hdtc index` streams an HDT through
@@ -460,16 +461,16 @@ buffers and may increase temporary I/O; higher values can improve performance
 when memory is available. Temporary files live in the container's `/work` area
 and are removed after the attempt.
 
-COTTAS uses the same out-of-core principle for its global `DISTINCT` and
-external-sort, adjacent-row deduplication merge. The image pins DuckDB to
-1.5.5, the version tested with this merge SQL, and defaults
-`COTTAS_MERGE_MEMORY_LIMIT` to `4G` and
-`COTTAS_MERGE_THREADS` to `1`; DuckDB spills merge state to `/work` instead of
-allowing one large condensed graph to consume all container memory. Override
-them from the host only when appropriate for the available RAM, for example:
+COTTAS avoids both a global in-memory `DISTINCT` and a global external sort.
+Each chunk is already written in `spo` order, so the final stage performs a
+bounded k-way Parquet merge: it holds one small batch from each chunk, writes
+one copy of each adjacent equal triple, and preserves the `spo` index. Its
+memory use is controlled by `COTTAS_MERGE_BATCH_ROWS` (default `2048`), not by
+the total RDF graph size or a temporary DuckDB sort area. Override it only to
+tune the memory/throughput tradeoff, for example:
 
 ```bash
-COTTAS_MERGE_MEMORY_LIMIT=4G COTTAS_MERGE_THREADS=1 vcf-rdfizer \
+COTTAS_MERGE_BATCH_ROWS=4096 vcf-rdfizer \
   --mode compress \
   --rdf ./results/cohort/cohort.nt.gz \
   --rdf-compression none \
@@ -587,13 +588,14 @@ COTTAS chunk conversion uses `pycottas.rdf2cottas(..., disk=True)`. The final
 COTTAS merge deliberately does **not** call `pycottas.cat`: version 1.1.0 runs
 its global `DISTINCT` plus `ORDER BY` through an unbounded in-memory DuckDB
 connection, which can be killed on large condensed graphs. VCF-RDFizer instead
-executes the equivalent global merge in a dedicated on-disk DuckDB database,
-with a 512 MiB memory budget, one worker, and `/work` as the external spill
-directory. This preserves global RDF set semantics and `spo` ordering while
-making the memory requirement bounded by configuration. If the stage fails in
-full mode, the warning contains the failing exit code and, when available, a
-`stderr_tail`, maximum resident set size, and Docker-workspace free-space
-samples; the raw RDF remains available for a retry.
+uses a PyArrow k-way merge of the already `spo`-sorted Parquet chunks. It keeps
+only a configurable batch from each input, drops adjacent duplicate triples,
+and writes the final COTTAS file incrementally—no graph-wide DuckDB hash table
+or external-sort spill directory is created. The merge emits processed-source
+and distinct-written triple counts in the terminal progress display. If the
+stage fails in full mode, the warning contains the failing exit code and, when
+available, a `stderr_tail`, maximum resident set size, and Docker-workspace
+free-space samples; the raw RDF remains available for a retry.
 
 After each final HDT/COTTAS base artifact is produced, VCF-RDFizer performs a
 streaming decode/count check. This verifies both readability and that the
@@ -602,13 +604,13 @@ performed before `.hdt.gz`, `.hdt.br`, `.cottas.gz`, or `.cottas.br` packaging,
 and before raw RDF cleanup.
 
 Partitioned HDT/COTTAS compression runs in an ephemeral Docker-managed
-workspace. Temporary RDF chunks, COTTAS/DuckDB scratch data, intermediate
+workspace. Temporary RDF chunks, COTTAS conversion scratch data, intermediate
 representations, and merge files are not written to the output directory.
 After a successful or failed run, the temporary workspace is removed; only
 the selected final artifacts and normal run metrics remain on the host.
-Each COTTAS conversion and merge also receives a fresh container-local DuckDB
-workspace, which is removed as soon as that operation completes. This prevents
-state from one chunk being reused by another and requires no user configuration.
+Each COTTAS conversion receives a fresh container-local DuckDB workspace,
+which is removed as soon as that operation completes. The final streaming
+merge does not need a DuckDB workspace or a full-data temporary sort file.
 
 HDT merging and index generation use the pinned Rust `hdtc` 1.1.0 executable,
 not `hdtCat`, `hdtSearch.sh`, or another Java HDT process. `hdtc create`
@@ -631,11 +633,10 @@ host value of either variable into the relevant Docker command.
 COTTAS does not expose a separate index sidecar. Its index is part of the
 Parquet artifact and is selected when the artifact is written. Standalone
 COTTAS index mode writes a new temporary COTTAS file through the same
-memory-bounded, disk-backed DuckDB operation with the default `spo` index,
-then atomically replaces the original. This is still index-only from the
-pipeline's point of view: it does not rerun VCF-to-RDF conversion or create an
-RDF output, but it may require temporary disk space and time comparable to
-rewriting the COTTAS file.
+bounded streaming rewrite with the default `spo` index, then atomically
+replaces the original. This is still index-only from the pipeline's point of
+view: it does not rerun VCF-to-RDF conversion or create an RDF output, but it
+rewrites the artifact once.
 
 The record-safe chunk plan and per-stage timings are retained in the raw
 partitioned-compression metrics JSON for diagnostics. The temporary chunk
@@ -662,27 +663,24 @@ finishes.
 If Docker permission issues occur, rerun with a Docker-allowed user (or configure Docker group/sudo access on your system).
 
 If COTTAS indexing/merging fails on a very large RDF file, first inspect the
-`cottas-merge-disk` stage in the raw partitioned-compression metrics JSON and the
+`cottas-merge-stream` stage in the raw partitioned-compression metrics JSON and the
 run wrapper log. An `exit_code=-9` means the child was killed by `SIGKILL`,
 which is normally the kernel/Docker OOM killer; a shell wrapper may report the
 same event as `137`. The warning's `stderr_tail`, `max_rss_kb`, and workspace
-samples distinguish memory pressure from a DuckDB/COTTAS or disk-space error.
-The disk-backed merge defaults to 512 MiB and one worker. Lower
-`COTTAS_MERGE_MEMORY_LIMIT` if the container has a stricter memory cap. The
-external-sort merge still needs enough headroom for DuckDB's sort blocks; use
-at least `1G` for large multi-sample inputs, and the default `4G` when the
-Docker host can provide it. If you lower this value and see an allocation error,
-raise it rather than lowering it further. Also verify
-raise it only when RAM is available; in all cases ensure Docker's data volume
-has enough free space for DuckDB spill files and the final Parquet rewrite.
-Rebuild the image after upgrading so the bounded disk-backed merge workflow is
-installed.
+samples distinguish COTTAS data/schema problems from Docker disk-space errors.
+The streaming merge has no graph-wide DuckDB spill area: it reads at most
+`COTTAS_MERGE_BATCH_ROWS` rows per input at a time (default `2048`) and writes
+the result incrementally. If the host is especially memory-constrained, lower
+that value; if the merge is CPU-bound and RAM is available, raise it gradually.
+The final COTTAS artifact still needs ordinary output disk space. Rebuild the
+image after upgrading so the streaming merge workflow is installed.
 
 If COTTAS is optional for the experiment, rerun with
 `--representations hdt`; the HDT path is independent and can remain the
 queryable artifact even when COTTAS cannot fit the available memory. If COTTAS
-is required and the disk-backed merge still receives `-9`, lower
-`COTTAS_MERGE_MEMORY_LIMIT`, verify that the Docker memory cap exceeds it, and
+is required and the streaming merge still receives `-9`, lower
+`COTTAS_MERGE_BATCH_ROWS`, verify that Docker has enough RAM for the selected
+batch size, and
 check the host kernel log for an external kill; this is a resource limit, not a
 vocabulary or RDF-validity problem.
 

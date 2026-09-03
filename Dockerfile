@@ -81,14 +81,14 @@ RUN apt-get update \
     time \
   && rm -rf /var/lib/apt/lists/*
 
-# Keep the DuckDB SQL dialect used by the disk-backed COTTAS merge stable.
-# pycottas 1.1.0 accepts DuckDB >=1.2.2,<2, but leaving it unpinned makes a
-# rebuild (or a cached layer) silently select a different Parquet COPY
-# implementation.  The adapter is exercised against 1.5.5.
+# Keep the COTTAS conversion runtime and Parquet streaming-writer dialect
+# stable. pycottas performs the per-chunk conversion; PyArrow performs the
+# bounded-memory k-way merge of those already sorted chunks.
 RUN python3 -m venv /opt/pycottas-venv \
   && /opt/pycottas-venv/bin/pip install --no-cache-dir \
     pycottas==1.1.0 \
-    duckdb==1.5.5
+    duckdb==1.5.5 \
+    pyarrow==22.0.0
 
 RUN mkdir -p /opt/rmlstreamer \
   && curl -fsSL \
@@ -116,8 +116,7 @@ ENV JAR=/opt/rmlstreamer/RMLStreamer-v${RMLSTREAMER_VERSION}-standalone.jar
 ENV HDTC_BIN=/usr/local/bin/hdtc
 ENV HDT_INDEX_MEMORY_LIMIT=512M
 ENV HDT_MERGE_MEMORY_LIMIT=512M
-ENV COTTAS_MERGE_MEMORY_LIMIT=4G
-ENV COTTAS_MERGE_THREADS=1
+ENV COTTAS_MERGE_BATCH_ROWS=2048
 ENV RDF2HDT_BIN=/usr/local/bin/rdf2hdt
 ENV HDT2RDF_BIN=/usr/local/bin/hdt2rdf
 ENV COTTAS_PYTHON_BIN=/opt/pycottas-venv/bin/python

@@ -57,8 +57,8 @@ class PartitionedCompressionUnitTests(VerboseTestCase):
             self.assertNotIn("java", " ".join(command).lower())
             self.assertNotIn("hdtcat", " ".join(command).lower())
 
-    def test_cottas_merge_many_command_uses_the_disk_backed_merge_adapter(self):
-        """Production COTTAS merging scans chunks through one spill-capable stage."""
+    def test_cottas_merge_many_command_uses_the_streaming_merge_adapter(self):
+        """Production COTTAS merging scans sorted chunks in one bounded pass."""
         runner = load_runner_module()
         command = runner.cottas_merge_many_command(
             "/opt/pycottas-venv/bin/python",
@@ -79,6 +79,20 @@ class PartitionedCompressionUnitTests(VerboseTestCase):
                 "--index",
                 "spo",
             ],
+        )
+
+    def test_cottas_merge_many_command_forwards_the_progress_sidecar(self):
+        """The long-running streaming merge can update the terminal display."""
+        runner = load_runner_module()
+        command = runner.cottas_merge_many_command(
+            "/opt/pycottas-venv/bin/python",
+            [Path("/work/chunk-00000.cottas"), Path("/work/chunk-00001.cottas")],
+            Path("/work/cottas-merge-final.cottas"),
+            progress_path=Path("/data/metrics/.progress/partitioned.jsonl"),
+        )
+        self.assertEqual(
+            command[-2:],
+            ["--progress-path", "/data/metrics/.progress/partitioned.jsonl"],
         )
 
     def test_cottas_merge_command_remains_compatible_for_two_inputs(self):

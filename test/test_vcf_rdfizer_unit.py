@@ -273,22 +273,19 @@ class WrapperUnitTests(VerboseTestCase):
                 ["-e", "HDT_MERGE_MEMORY_LIMIT=768M"],
             )
 
-    def test_cottas_merge_limits_are_forwarded_to_docker(self):
-        """COTTAS merge memory and worker overrides reach Docker commands."""
+    def test_cottas_merge_batch_rows_are_forwarded_to_docker(self):
+        """The bounded COTTAS streaming-merge batch size reaches Docker."""
         with mock.patch.dict(
             os.environ,
             {
-                "COTTAS_MERGE_MEMORY_LIMIT": "384M",
-                "COTTAS_MERGE_THREADS": "1",
+                "COTTAS_MERGE_BATCH_ROWS": "1024",
             },
         ):
             self.assertEqual(
                 vcf_rdfizer.docker_cottas_merge_env_args(),
                 [
                     "-e",
-                    "COTTAS_MERGE_MEMORY_LIMIT=384M",
-                    "-e",
-                    "COTTAS_MERGE_THREADS=1",
+                    "COTTAS_MERGE_BATCH_ROWS=1024",
                 ],
             )
 

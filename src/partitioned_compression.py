@@ -25,8 +25,7 @@ from pathlib import Path
 HDT_METHODS = {"hdt", "hdt_gzip", "hdt_brotli"}
 COTTAS_METHODS = {"cottas", "cottas_gzip", "cottas_brotli"}
 STDERR_TAIL_BYTES = 16 * 1024
-DEFAULT_COTTAS_MERGE_MEMORY_LIMIT = "4G"
-DEFAULT_COTTAS_MERGE_THREADS = "1"
+DEFAULT_COTTAS_MERGE_BATCH_ROWS = "2048"
 PROGRESS_HEARTBEAT_BYTES = 64 * 1024 * 1024
 
 
@@ -356,13 +355,15 @@ def cottas_merge_many_command(
     python_bin: str,
     inputs: list[Path],
     merged: Path,
+    *,
+    progress_path: Path | None = None,
 ) -> list[str]:
-    """Build one disk-backed, multi-input COTTAS merge command.
+    """Build one bounded-memory, multi-input COTTAS merge command.
 
-    The adapter performs the global distinct/order operation through a
-    dedicated DuckDB database with a bounded memory budget and `/work` spill
-    directory. Unlike ``pycottas.cat``, it never routes the large merge through
-    DuckDB's process-global in-memory connection.
+    The adapter performs a streaming k-way merge of the already indexed chunk
+    files. Unlike ``pycottas.cat`` and an external-sort query, it does not
+    construct a global in-memory hash table or a full-data temporary spill
+    area.
     """
     return [
         python_bin,
@@ -374,6 +375,7 @@ def cottas_merge_many_command(
         str(merged),
         "--index",
         "spo",
+        *(["--progress-path", str(progress_path)] if progress_path else []),
     ]
 
 
@@ -383,11 +385,11 @@ def cottas_merge_command(
     right: Path,
     merged: Path,
 ) -> list[str]:
-    """Build a compatible two-input disk-backed COTTAS merge command.
+    """Build a compatible two-input bounded-memory COTTAS merge command.
 
-    The normal partitioned workflow uses ``merge-many`` because its DuckDB
-    implementation is spill-capable. This command remains available for
-    explicit callers that need a two-input merge.
+    The normal partitioned workflow uses ``merge-many`` to merge all sorted
+    chunks in one pass. This command remains available for explicit callers
+    that need a two-input merge.
     """
     return [
         python_bin,
@@ -697,8 +699,7 @@ def main() -> int:
                 "workspace_free_bytes_after",
                 "workspace_total_bytes",
                 "max_rss_kb",
-                "cottas_merge_memory_limit",
-                "cottas_merge_threads",
+                "cottas_merge_batch_rows",
             ):
                 if key in stage_result:
                     warning[key] = stage_result[key]
@@ -1008,13 +1009,11 @@ def main() -> int:
             }
 
         if cottas_paths and not cottas_failed:
-            # pycottas.cat performs its global DISTINCT/ORDER BY through an
-            # unbounded process-global in-memory DuckDB connection.  That is
-            # what made both the one-shot and the final pairwise COTTAS merge
-            # susceptible to SIGKILL on large condensed cohorts. The adapter's
-            # merge-many command instead opens a dedicated disk-backed DuckDB
-            # database with a bounded memory limit and /work spill files, so a
-            # single global indexed merge is safe and avoids duplicate work.
+            # Each COTTAS chunk is already sorted by the `spo` index. The
+            # adapter k-way merges those ordered Parquet streams with one small
+            # batch per input, avoiding both pycottas.cat's global hash table
+            # and DuckDB external-sort spill files that exceeded 41 GiB for a
+            # 52-chunk condensed cohort.
             cottas_stage = None
             cottas_rounds = 0
             if len(cottas_paths) == 1:
@@ -1022,19 +1021,17 @@ def main() -> int:
             else:
                 cottas_merged_path = work_dir / "cottas-merge-final.cottas"
                 cottas_stage = runner.run(
-                    "cottas-merge-disk",
+                    "cottas-merge-stream",
                     cottas_merge_many_command(
                         cottas_python,
                         cottas_paths,
                         cottas_merged_path,
+                        progress_path=progress_path,
                     ),
                     cottas_merged_path,
                 )
-                cottas_stage["cottas_merge_memory_limit"] = os.environ.get(
-                    "COTTAS_MERGE_MEMORY_LIMIT", DEFAULT_COTTAS_MERGE_MEMORY_LIMIT
-                )
-                cottas_stage["cottas_merge_threads"] = os.environ.get(
-                    "COTTAS_MERGE_THREADS", DEFAULT_COTTAS_MERGE_THREADS
+                cottas_stage["cottas_merge_batch_rows"] = os.environ.get(
+                    "COTTAS_MERGE_BATCH_ROWS", DEFAULT_COTTAS_MERGE_BATCH_ROWS
                 )
                 runner.stages[-1].update(cottas_stage)
                 add_totals(cottas_total, cottas_stage)
@@ -1091,13 +1088,10 @@ def main() -> int:
                         "details": {
                             **plan,
                             "merge_rounds": cottas_rounds,
-                            "merge_strategy": "duckdb_disk_backed",
-                            "merge_memory_limit": os.environ.get(
-                                "COTTAS_MERGE_MEMORY_LIMIT",
-                                DEFAULT_COTTAS_MERGE_MEMORY_LIMIT,
-                            ),
-                            "merge_threads": os.environ.get(
-                                "COTTAS_MERGE_THREADS", DEFAULT_COTTAS_MERGE_THREADS
+                            "merge_strategy": "pyarrow_streaming_k_way",
+                            "merge_batch_rows": os.environ.get(
+                                "COTTAS_MERGE_BATCH_ROWS",
+                                DEFAULT_COTTAS_MERGE_BATCH_ROWS,
                             ),
                             "index": "spo",
                             "validation": cottas_validation,

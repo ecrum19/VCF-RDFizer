@@ -1,50 +1,31 @@
 # Changelog
 
-## 2026-09-03 — Disk-backed COTTAS merge for condensed cohorts
+## 2026-09-03 — Streaming COTTAS merge for condensed cohorts
 
-- Raised the default COTTAS DuckDB merge budget from `512M` to `4G`. DuckDB's
-  external sort spills data to disk, but it still requires an in-memory sort
-  block; a 52-chunk cohort merge requested a 128 MiB block after reaching the
-  old 512 MiB cap. The `4G` value is a cap, not an eager allocation.
-- Made compression progress visible even when Rich cannot redraw a terminal
-  spinner (for example, with redirected stderr or a scheduler). Those runs now
-  emit compact source-scan, chunk-build, merge, and validation status lines.
-
-- Pinned the image to DuckDB 1.5.5 so COTTAS merge behavior cannot vary with
-  Docker build-cache state or the newest dependency accepted by pycottas.
-- Included the bounded DuckDB stderr tail in code-1 merge failures. The error
-  now identifies the real cause (such as unavailable spill storage, permission
-  problems, a malformed chunk, or a DuckDB exception) instead of reporting
-  only `exit_code=1`.
-- Replaced the final merge's hash-backed `SELECT DISTINCT` with an external
-  lexical sort and `LAG`-based adjacent-row deduplication. This produces the
-  same RDF triple set and requested COTTAS ordering without requiring a global
-  in-memory hash table for every distinct triple.
-
-- Replaced the final COTTAS merge/reindex implementation with a dedicated
-  disk-backed DuckDB connection. `pycottas.cat` in version 1.1.0 performs its
-  global `DISTINCT` and `ORDER BY` through the process-global in-memory
-  connection, so both all-input and final pairwise merges could receive
-  `SIGKILL` on the 36-million-triple condensed cohort.
-- The new merge preserves the same global RDF set semantics and `spo` Parquet
-  ordering, but configures DuckDB with a dedicated `.duckdb` database,
-  `COTTAS_MERGE_MEMORY_LIMIT=4G`, `COTTAS_MERGE_THREADS=1`, and a disposable
-  `/work` spill directory. The final merge can therefore externalize sort and
-  distinct state instead of exhausting container memory.
-- Forwarded explicit host-side `COTTAS_MERGE_MEMORY_LIMIT` and
-  `COTTAS_MERGE_THREADS` values into partitioned full/compress runs and
-  standalone COTTAS index mode.
-- Updated diagnostics, README troubleshooting, and regression tests to target
-  `cottas-merge-disk` rather than the obsolete pairwise merge path.
+- Replaced the final COTTAS merge/reindex implementation with a PyArrow k-way
+  merge of the already `spo`-sorted Parquet chunks. It keeps one configurable
+  batch per input (`COTTAS_MERGE_BATCH_ROWS`, default `2048`), deduplicates
+  adjacent equal triples, and writes the final COTTAS artifact incrementally.
+  It preserves RDF set semantics and the embedded COTTAS index without a
+  graph-wide DuckDB hash table or external-sort spill area.
+- This supersedes the prior DuckDB merge variants. A 52-chunk, 36-million-triple
+  cohort exhausted 41.4 GiB of Docker workspace while DuckDB attempted an
+  external sort; the streaming merge has no proportional temporary-sort file.
+- Added PyArrow 22.0.0 to the image and third-party notices for deterministic
+  Parquet reader/writer support.
+- COTTAS merge progress now reports source triples processed and distinct
+  triples written. Rich interactive displays remain available, and redirected
+  terminals receive compact line-based progress updates.
+- Retained the bounded stderr tail in failures so malformed COTTAS input,
+  incompatible index metadata, output disk errors, and other code-1 failures
+  remain actionable after the ephemeral workspace is removed.
 
 ### Rerun guidance
 
-Build an image from this revision before retrying. Start with the default
-512 MiB/one-worker merge budget; if the Docker cgroup cap is below that,
-lower it only when necessary (but keep it at least `1G` for a large cohort).
-Ensure Docker has
-substantial free disk space for temporary DuckDB spill files. The preserved
-raw `.nt.gz` can be retried with `--mode compress`, avoiding another RDF run.
+Build an image from this revision before retrying. The preserved raw `.nt.gz`
+can be retried with `--mode compress`, avoiding another RDF run. The merge
+requires normal space for the COTTAS chunks and final artifact, but no longer
+requires a large DuckDB spill directory.
 
 ## 2026-09-03 — COTTAS SIGKILL/OOM handling
 
@@ -63,7 +44,7 @@ raw `.nt.gz` can be retried with `--mode compress`, avoiding another RDF run.
 ### Rerun guidance
 
 Rebuild the image and rerun the full conversion (or use `--mode compress` with
-the retained raw `.nt.gz`). The disk-backed merge workflow supersedes this
+the retained raw `.nt.gz`). The current streaming k-way merge supersedes this
 earlier pairwise guidance.
 
 When COTTAS is optional, `--representations hdt` avoids the COTTAS merge

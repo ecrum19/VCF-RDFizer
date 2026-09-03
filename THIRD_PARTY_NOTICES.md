@@ -35,7 +35,15 @@ their respective authors and apply to those components.
 - Version bundled by the Docker image: `1.1.0`
 - Installed in the image's `/opt/pycottas-venv` environment
 
-4. `hdtc`
+4. `PyArrow`
+- Repository: <https://github.com/apache/arrow>
+- Usage in this project: bounded-memory Parquet reads and writes for the final
+  COTTAS k-way merge
+- Upstream license: Apache License 2.0
+- Version bundled by the Docker image: `22.0.0`
+- Installed in the image's `/opt/pycottas-venv` environment
+
+5. `hdtc`
 - Repository: <https://github.com/frink-okn/hdtc>
 - Usage in this project: Java-free, disk-backed merging of HDT chunks and
   index generation for existing HDT files
