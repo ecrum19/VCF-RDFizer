@@ -27,6 +27,69 @@ COTTAS_METHODS = {"cottas", "cottas_gzip", "cottas_brotli"}
 STDERR_TAIL_BYTES = 16 * 1024
 DEFAULT_COTTAS_MERGE_MEMORY_LIMIT = "512M"
 DEFAULT_COTTAS_MERGE_THREADS = "1"
+PROGRESS_HEARTBEAT_BYTES = 64 * 1024 * 1024
+
+
+def prepare_progress_path(path: Path | None) -> None:
+    """Best-effort setup for the optional host-mounted progress sidecar."""
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+
+def emit_progress(
+    path: Path | None,
+    stage: str,
+    phase: str,
+    *,
+    completed: int | float | None = None,
+    total: int | float | None = None,
+    unit: str | None = None,
+    detail: str | None = None,
+) -> None:
+    """Append one small JSONL event; progress must never break conversion."""
+    if path is None:
+        return
+    payload = {"stage": stage, "phase": phase}
+    for key, value in (
+        ("completed", completed),
+        ("total", total),
+        ("unit", unit),
+        ("detail", detail),
+    ):
+        if value is not None:
+            payload[key] = value
+    try:
+        with path.open("a", encoding="utf-8") as handle:
+            json.dump(payload, handle, separators=(",", ":"))
+            handle.write("\n")
+    except OSError:
+        pass
+
+
+def progress_descriptor(name: str) -> tuple[str, str, int | None]:
+    """Map internal stage names to a small set of terminal progress tasks."""
+    for prefix, stage in (
+        ("hdt-build-", "hdt-chunks"),
+        ("cottas-build-", "cottas-chunks"),
+    ):
+        if name.startswith(prefix):
+            try:
+                return stage, "chunks", int(name[len(prefix) :])
+            except ValueError:
+                break
+    if name.startswith("hdt-merge-"):
+        return "hdt-merge", "stage", None
+    if name.startswith("cottas-merge"):
+        return "cottas-merge", "stage", None
+    if name.startswith("hdt-"):
+        return "hdt", "stage", None
+    if name.startswith("cottas-"):
+        return "cottas", "stage", None
+    return name, "stage", None
 
 
 def is_triple_line(line: bytes) -> bool:
@@ -46,6 +109,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-chunk-bytes", required=True, type=int)
     parser.add_argument("--expected-triples", type=int)
     parser.add_argument("--result-path", required=True)
+    parser.add_argument(
+        "--progress-path",
+        help="optional JSONL sidecar for host-side terminal progress",
+    )
     parser.add_argument(
         "--allow-index-failures",
         action="store_true",
@@ -68,6 +135,8 @@ def stream_chunks(
     target_bytes: int,
     min_bytes: int,
     max_bytes: int,
+    progress_path: Path | None = None,
+    progress_total: int | None = None,
 ) -> tuple[object, dict]:
     """Yield complete-record chunks while building a mutable chunk plan.
 
@@ -84,6 +153,7 @@ def stream_chunks(
         raise ValueError("RDF chunk sizes must satisfy min <= target <= max")
 
     chunk_dir.mkdir(parents=True, exist_ok=True)
+    prepare_progress_path(progress_path)
     plan = {
         "source_file_count": 1,
         "source_paths": [str(source)],
@@ -105,6 +175,7 @@ def stream_chunks(
         logical_offset = 0
         record_count = 0
         chunk_index = 0
+        last_progress_offset = 0
 
         def open_chunk():
             nonlocal handle, chunk_path, chunk_size, chunk_start_offset, chunk_start_record, chunk_index
@@ -132,6 +203,18 @@ def stream_chunks(
             }
             plan["chunks"].append(metadata)
             plan["chunk_count"] = len(plan["chunks"])
+            emit_progress(
+                progress_path,
+                "rdf-scan",
+                "chunk",
+                completed=record_count,
+                total=progress_total,
+                unit="triples",
+                detail=(
+                    f"{plan['chunk_count']:,} chunks · "
+                    f"{logical_offset:,} bytes read"
+                ),
+            )
             completed_path = chunk_path
             handle = None
             chunk_path = None
@@ -161,6 +244,19 @@ def stream_chunks(
                     record_count += 1
                 plan["chunk_input_bytes"] = logical_offset
                 plan["record_count"] = record_count
+                if (
+                    logical_offset - last_progress_offset >= PROGRESS_HEARTBEAT_BYTES
+                ):
+                    emit_progress(
+                        progress_path,
+                        "rdf-scan",
+                        "heartbeat",
+                        completed=record_count,
+                        total=progress_total,
+                        unit="triples",
+                        detail=f"{logical_offset:,} bytes read",
+                    )
+                    last_progress_offset = logical_offset
 
             completed_chunk = close_chunk()
             if completed_chunk is not None:
@@ -330,8 +426,10 @@ def parse_time_log(path: Path) -> dict:
 class StageRunner:
     """Execute stages and accumulate both detailed and method-level metrics."""
 
-    def __init__(self, work_dir: Path):
+    def __init__(self, work_dir: Path, progress_path: Path | None = None):
         self.work_dir = work_dir
+        self.progress_path = progress_path
+        prepare_progress_path(progress_path)
         self.stages: list[dict] = []
 
     def run(
@@ -343,6 +441,15 @@ class StageRunner:
     ) -> dict:
         time_path = self.work_dir / f".{name}.time"
         stderr_path = self.work_dir / f".{name}.stderr"
+        progress_stage, progress_unit, progress_ordinal = progress_descriptor(name)
+        emit_progress(
+            self.progress_path,
+            progress_stage,
+            "started",
+            completed=progress_ordinal,
+            unit=progress_unit,
+            detail=name,
+        )
         if time_path.exists():
             time_path.unlink()
         if stderr_path.exists():
@@ -390,6 +497,18 @@ class StageRunner:
                 stdout_handle.close()
             if stderr_handle is not None:
                 stderr_handle.close()
+        emit_progress(
+            self.progress_path,
+            progress_stage,
+            "complete" if completed.returncode == 0 else "failed",
+            completed=(
+                progress_ordinal + 1
+                if progress_ordinal is not None and completed.returncode == 0
+                else progress_ordinal
+            ),
+            unit=progress_unit,
+            detail=name,
+        )
         stderr_tail = ""
         if stderr_path.exists():
             try:
@@ -533,7 +652,8 @@ def main() -> int:
     methods = [method.strip() for method in args.methods.split(",") if method.strip()]
     work_dir = Path("/work")
     chunk_dir = work_dir / "rdf_chunks"
-    runner = StageRunner(work_dir)
+    progress_path = Path(args.progress_path) if args.progress_path else None
+    runner = StageRunner(work_dir, progress_path=progress_path)
     results: dict[str, dict] = {}
     index_warnings: list[dict] = []
 
@@ -659,12 +779,22 @@ def main() -> int:
         cottas_python = os.environ.get("COTTAS_PYTHON_BIN") or shutil.which("python3")
         if any(method in COTTAS_METHODS for method in methods) and not cottas_python:
             raise RuntimeError("Missing Python runtime for COTTAS")
+        emit_progress(
+            progress_path,
+            "rdf-scan",
+            "started",
+            completed=0,
+            total=args.expected_triples,
+            unit="triples",
+        )
         chunk_stream, plan = stream_chunks(
             source,
             chunk_dir,
             target_bytes=args.target_chunk_bytes,
             min_bytes=args.min_chunk_bytes,
             max_bytes=args.max_chunk_bytes,
+            progress_path=progress_path,
+            progress_total=args.expected_triples,
         )
 
         def validate_artifact(
@@ -772,6 +902,33 @@ def main() -> int:
             finally:
                 chunk.unlink(missing_ok=True)
 
+        emit_progress(
+            progress_path,
+            "rdf-scan",
+            "complete",
+            completed=plan["record_count"],
+            total=args.expected_triples,
+            unit="triples",
+            detail=f"{plan['chunk_count']:,} chunks",
+        )
+        if needs_hdt:
+            emit_progress(
+                progress_path,
+                "hdt-chunks",
+                "complete",
+                completed=len(hdt_paths),
+                total=plan["chunk_count"],
+                unit="chunks",
+            )
+        if any(method in COTTAS_METHODS for method in methods):
+            emit_progress(
+                progress_path,
+                "cottas-chunks",
+                "failed" if cottas_failed else "complete",
+                completed=len(cottas_paths),
+                total=plan["chunk_count"],
+                unit="chunks",
+            )
         if not plan["chunks"]:
             raise ValueError("RDF source contains no complete records")
         source_triples = int(plan["record_count"])

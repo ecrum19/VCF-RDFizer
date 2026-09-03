@@ -23,6 +23,14 @@ The VCF-RDFizer vocabulary is available at [https://w3id.org/vcf-rdfizer/vocab#]
 - Python 3.10+
 - Docker (installed and running)
 
+When VCF-RDFizer is connected to an interactive terminal, it shows a
+lightweight Rich spinner/progress display. The display is disabled
+automatically for redirected/CI output and can be disabled explicitly with
+`--no-progress`. RMLStreamer progress reports the bytes and output parts
+already written; partitioned HDT/COTTAS runs report source triples, chunks,
+and the currently active merge/index stage. These updates are best-effort and
+do not scan RDF content a second time or retain progress history in memory.
+
 Install options:
 
 ```bash
@@ -87,6 +95,7 @@ In `full` mode with multiple VCF inputs, failures are isolated per input:
 - `-v, --image-version` Docker tag/version
 - `-b, --build` force Docker build
 - `-B, --no-build` fail if image not found
+- `--no-progress` disable interactive spinners and progress bars
 - `-h, --help` show full usage
 
 ## Compression Plan
@@ -451,8 +460,9 @@ when memory is available. Temporary files live in the container's `/work` area
 and are removed after the attempt.
 
 COTTAS uses the same out-of-core principle for its global `DISTINCT` and
-`ORDER BY` merge. The image pins DuckDB to 1.5.5, the version tested with this
-merge SQL, and defaults `COTTAS_MERGE_MEMORY_LIMIT` to `512M` and
+external-sort, adjacent-row deduplication merge. The image pins DuckDB to
+1.5.5, the version tested with this merge SQL, and defaults
+`COTTAS_MERGE_MEMORY_LIMIT` to `512M` and
 `COTTAS_MERGE_THREADS` to `1`; DuckDB spills merge state to `/work` instead of
 allowing one large condensed graph to consume all container memory. Override
 them from the host only when appropriate for the available RAM, for example:

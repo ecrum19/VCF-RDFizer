@@ -24,7 +24,9 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
   "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
-dependencies = []
+dependencies = [
+  "rich>=13.7.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/ecrum19/VCF-RDFizer"

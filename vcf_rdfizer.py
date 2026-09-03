@@ -31,10 +31,34 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote_plus
 
+try:
+    from rich.console import Console
+    from rich.progress import (
+        BarColumn,
+        Progress,
+        SpinnerColumn,
+        TaskProgressColumn,
+        TextColumn,
+        TimeElapsedColumn,
+        TimeRemainingColumn,
+    )
+except ImportError:  # pragma: no cover - package metadata installs Rich
+    Console = None
+    Progress = None
+    BarColumn = None
+    SpinnerColumn = None
+    TaskProgressColumn = None
+    TextColumn = None
+    TimeElapsedColumn = None
+    TimeRemainingColumn = None
+
 
 RMLSTREAMER_JAR_CONTAINER = "/opt/rmlstreamer/RMLStreamer-v2.5.0-standalone.jar"
 _COMMAND_LOGGER = None
 _DOCKER_USE_SUDO = False
+_ACTIVE_PROGRESS = None
+_PROGRESS_ALLOWED = True
+PROGRESS_POLL_INTERVAL_SECONDS = 0.25
 
 COMPRESSED_VCF_EXPANSION_FACTOR = 5.0
 TSV_OVERHEAD_FACTOR = 1.10
@@ -252,17 +276,29 @@ class CommandLogger:
             self._handle.write(f"cwd={cwd}\n")
         self._handle.flush()
 
-        result = subprocess.run(
-            cmd,
-            cwd=cwd,
-            env=env,
-            stdout=self._handle,
-            stderr=self._handle,
-            text=True,
-        )
-        self._handle.write(f"[exit {result.returncode}]\n")
+        if _ACTIVE_PROGRESS is not None and _ACTIVE_PROGRESS.enabled:
+            process = subprocess.Popen(
+                cmd,
+                cwd=cwd,
+                env=env,
+                stdout=self._handle,
+                stderr=self._handle,
+                text=True,
+            )
+            exit_code = _ACTIVE_PROGRESS.wait_for_process(process)
+        else:
+            result = subprocess.run(
+                cmd,
+                cwd=cwd,
+                env=env,
+                stdout=self._handle,
+                stderr=self._handle,
+                text=True,
+            )
+            exit_code = result.returncode
+        self._handle.write(f"[exit {exit_code}]\n")
         self._handle.flush()
-        return result.returncode
+        return exit_code
 
     def close(self):
         if not self._handle.closed:
@@ -288,6 +324,189 @@ def ui_symbol(symbol: str, fallback: str) -> str:
 def success_symbol() -> str:
     """Unicode checkmark with ASCII fallback for Windows cp1252 consoles."""
     return ui_symbol("✅", "[ok]")
+
+
+def progress_ui_enabled() -> bool:
+    """Return whether transient Rich progress output should be displayed."""
+    if not _PROGRESS_ALLOWED or Progress is None or Console is None:
+        return False
+    if os.environ.get("VCF_RDFIZER_NO_PROGRESS"):
+        return False
+    if os.environ.get("CI"):
+        return False
+    stream = getattr(sys, "stderr", None)
+    isatty = getattr(stream, "isatty", None)
+    return bool(callable(isatty) and isatty())
+
+
+class ProgressSession:
+    """Render low-volume progress events from one Docker operation with Rich.
+
+    The container writes newline-delimited JSON to ``path``. The host polls the
+    small sidecar while the Docker process runs, keeping command logs and
+    binary subprocess stdout separate from terminal UI output.
+    """
+
+    def __init__(self, path: Path | None, label: str):
+        self.path = path
+        self.label = label
+        self.enabled = progress_ui_enabled()
+        self._offset = 0
+        self._progress = None
+        self._starter_task = None
+        self._tasks: dict[str, int] = {}
+        self._previous = None
+
+    def __enter__(self):
+        global _ACTIVE_PROGRESS
+        self._previous = _ACTIVE_PROGRESS
+        _ACTIVE_PROGRESS = self
+        if not self.enabled:
+            return self
+
+        if self.path is not None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.unlink(missing_ok=True)
+
+        console = Console(stderr=True, highlight=False)
+        self._progress = Progress(
+            SpinnerColumn(),
+            TextColumn("{task.description}", style="progress.description", markup=False),
+            BarColumn(),
+            TaskProgressColumn(),
+            TextColumn("{task.fields[detail]}", markup=False),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+            refresh_per_second=8,
+            transient=True,
+            auto_refresh=False,
+        )
+        self._starter_task = self._progress.add_task(
+            self.label,
+            total=None,
+            detail="starting",
+        )
+        self._progress.start()
+        return self
+
+    @staticmethod
+    def _number(value):
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float)):
+            return value
+        if isinstance(value, str):
+            try:
+                return int(value)
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _detail(event: dict) -> str:
+        completed = ProgressSession._number(event.get("completed"))
+        unit = event.get("unit")
+        if completed is None:
+            detail = ""
+        elif unit == "bytes":
+            detail = f"{format_bytes(int(completed))}"
+        elif unit == "triples":
+            detail = f"{int(completed):,} triples"
+        elif unit == "chunks":
+            detail = f"{int(completed):,} chunks"
+        elif unit == "parts":
+            detail = f"{int(completed):,} parts"
+        else:
+            detail = f"{int(completed):,}"
+
+        parts = ProgressSession._number(event.get("parts"))
+        if parts is not None and unit != "parts":
+            detail = f"{detail} · {int(parts):,} parts" if detail else f"{int(parts):,} parts"
+        extra = event.get("detail")
+        if extra:
+            detail = f"{detail} · {extra}" if detail else str(extra)
+        return detail
+
+    def _update_event(self, event: dict):
+        if self._progress is None:
+            return
+        stage = str(event.get("stage") or "work")
+        phase = str(event.get("phase") or "working")
+        task_id = self._tasks.get(stage)
+        if task_id is None:
+            if self._starter_task is not None:
+                self._progress.remove_task(self._starter_task)
+                self._starter_task = None
+            total = self._number(event.get("total"))
+            task_id = self._progress.add_task(
+                f"{stage}: {phase}",
+                total=total if total is not None else None,
+                detail=self._detail(event),
+            )
+            self._tasks[stage] = task_id
+            return
+
+        update = {
+            "description": f"{stage}: {phase}",
+            "detail": self._detail(event),
+        }
+        if "total" in event:
+            total = self._number(event.get("total"))
+            update["total"] = total if total is not None else None
+        completed = self._number(event.get("completed"))
+        if completed is not None:
+            update["completed"] = completed
+        self._progress.update(task_id, **update)
+
+    def poll_events(self):
+        """Consume complete JSONL events without retaining the event stream."""
+        if not self.enabled or self.path is None or not self.path.exists():
+            return
+        try:
+            with self.path.open("rb") as handle:
+                handle.seek(self._offset)
+                data = handle.read()
+        except OSError:
+            return
+
+        consumed = 0
+        for raw_line in data.splitlines(keepends=True):
+            if not raw_line.endswith(b"\n"):
+                break
+            consumed += len(raw_line)
+            try:
+                event = json.loads(raw_line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if isinstance(event, dict):
+                self._update_event(event)
+        self._offset += consumed
+
+    def wait_for_process(self, process):
+        """Wait while polling progress, without a second monitor thread."""
+        while process.poll() is None:
+            self.poll_events()
+            if self._progress is not None:
+                self._progress.refresh()
+            time.sleep(PROGRESS_POLL_INTERVAL_SECONDS)
+        self.poll_events()
+        if self._progress is not None:
+            self._progress.refresh()
+        return process.returncode
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        global _ACTIVE_PROGRESS
+        self.poll_events()
+        if self._progress is not None:
+            self._progress.stop()
+        if self.path is not None:
+            try:
+                self.path.unlink()
+            except OSError:
+                pass
+        _ACTIVE_PROGRESS = self._previous
+        return False
 
 
 class RunTracker:
@@ -400,6 +619,15 @@ def run(cmd, cwd=None, env=None):
     """
     if _COMMAND_LOGGER is not None:
         return _COMMAND_LOGGER.run(cmd, cwd=cwd, env=env)
+    if _ACTIVE_PROGRESS is not None and _ACTIVE_PROGRESS.enabled:
+        process = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return _ACTIVE_PROGRESS.wait_for_process(process)
     return subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True).returncode
 
 
@@ -2495,6 +2723,26 @@ def safe_metrics_name(value: str) -> str:
     return safe or "rdf"
 
 
+def progress_event_path(metrics_dir: Path | None, *components: str) -> Path | None:
+    """Return a hidden, per-operation progress sidecar path."""
+    if metrics_dir is None:
+        return None
+    safe_components = [safe_metrics_name(component) for component in components]
+    filename = "-".join(safe_components or ["run"]) + ".jsonl"
+    return metrics_dir / ".progress" / filename
+
+
+def container_progress_path(path: Path | None, metrics_dir: Path | None) -> str | None:
+    """Translate a host progress sidecar into its mounted container path."""
+    if path is None or metrics_dir is None:
+        return None
+    try:
+        relative = path.resolve().relative_to(metrics_dir.resolve())
+    except ValueError:
+        return None
+    return f"/data/metrics/{relative.as_posix()}"
+
+
 def metrics_header_for_methods(selected_methods: list[str]) -> list[str]:
     """Build a run-specific metrics.csv header with only relevant columns."""
     methods = list(selected_methods or [])
@@ -3037,7 +3285,8 @@ def run_tsv_conversion_with_metrics(
     ]
 
     started = time.perf_counter()
-    exit_code = run(cmd)
+    with ProgressSession(None, f"TSV conversion: {prefix}"):
+        exit_code = run(cmd)
     elapsed = time.perf_counter() - started
 
     timing = parse_time_log_metrics(time_log_host)
@@ -3256,7 +3505,9 @@ def ensure_image_available(
             return 2
         print(f"{step_label}: Ensuring Docker image is available")
         print("  - Building Docker image")
-        if docker_build_image(image_ref, repo_root) != 0:
+        with ProgressSession(None, "Building Docker image"):
+            image_exit_code = docker_build_image(image_ref, repo_root)
+        if image_exit_code != 0:
             eprint(f"Error: docker build failed. See log: {wrapper_log_path}")
             return 1
         print(f"{step_label}: Ensuring Docker image is available {success_symbol()}")
@@ -3269,7 +3520,9 @@ def ensure_image_available(
     if version_requested:
         print(f"{step_label}: Ensuring Docker image is available")
         print(f"  - Pulling image: {image_ref}")
-        if docker_pull_image(image_ref) != 0:
+        with ProgressSession(None, "Pulling Docker image"):
+            image_exit_code = docker_pull_image(image_ref)
+        if image_exit_code != 0:
             eprint(f"Error: image version '{image_ref}' not found. See log: {wrapper_log_path}")
             return 2
         print(f"{step_label}: Ensuring Docker image is available {success_symbol()}")
@@ -3282,12 +3535,16 @@ def ensure_image_available(
     print(f"{step_label}: Ensuring Docker image is available")
     if has_local_dockerfile:
         print("  - Image missing locally, building")
-        if docker_build_image(image_ref, repo_root) != 0:
+        with ProgressSession(None, "Building Docker image"):
+            image_exit_code = docker_build_image(image_ref, repo_root)
+        if image_exit_code != 0:
             eprint(f"Error: docker build failed. See log: {wrapper_log_path}")
             return 1
     else:
         print(f"  - Image missing locally, pulling: {image_ref}")
-        if docker_pull_image(image_ref) != 0:
+        with ProgressSession(None, "Pulling Docker image"):
+            image_exit_code = docker_pull_image(image_ref)
+        if image_exit_code != 0:
             eprint(f"Error: image '{image_ref}' could not be pulled. See log: {wrapper_log_path}")
             return 2
     print(f"{step_label}: Ensuring Docker image is available {success_symbol()}")
@@ -3386,13 +3643,12 @@ def run_compression_methods_for_rdf(
             f"{str(in_dir)}:/data/in:ro",
             "-v",
             f"{str(out_dir)}:/data/out",
-            image_ref,
-            "bash",
-            "-lc",
-            wrapped_command,
         ]
+        cmd.extend([image_ref, "bash", "-lc", wrapped_command])
         started = time.perf_counter()
-        exit_code = run(cmd)
+        progress_label = f"{method.replace('_', ' ').title()}: {input_stem}"
+        with ProgressSession(None, progress_label):
+            exit_code = run(cmd)
         elapsed = time.perf_counter() - started
         timing = parse_time_log_metrics(timing_host)
         output_path = target_out_dir / artifact_name
@@ -3904,9 +4160,10 @@ def run_containerized_partitioned_representation_methods(
 ):
     """Run partitioned compression in an ephemeral Docker-managed volume.
 
-    The source and final outputs are the only bind mounts. Chunks, DuckDB
-    scratch data, HDT/COTTAS merge intermediates, and stage timing files stay
-    in a named volume that is removed in ``finally`` on both success and
+    The source and final outputs are the primary bind mounts. When interactive
+    progress is enabled, a small metrics sidecar is mounted as well. Chunks,
+    DuckDB scratch data, HDT/COTTAS merge intermediates, and stage timing files
+    stay in a named volume that is removed in ``finally`` on both success and
     failure. A short JSON handoff carries the container-side metrics back to
     the host without exposing the temporary workspace.
     """
@@ -3920,6 +4177,12 @@ def run_containerized_partitioned_representation_methods(
         f"vcf-rdfizer-{safe_output_name[:40]}-{os.getpid()}-{time.time_ns()}"
     )
     result_path = out_dir / f".{safe_output_name}.partitioned-results.json"
+    progress_host_path = (
+        progress_event_path(metrics_dir, "partitioned", safe_output_name)
+        if progress_ui_enabled()
+        else None
+    )
+    progress_container_ref = container_progress_path(progress_host_path, metrics_dir)
     method_results: dict[str, dict] = {}
     volume_created = False
 
@@ -3965,6 +4228,11 @@ def run_containerized_partitioned_representation_methods(
             [
                 "-v",
                 f"{out_resolved}:/data/out",
+                *(
+                    ["-v", f"{metrics_dir.resolve()}:/data/metrics"]
+                    if metrics_dir is not None and progress_container_ref is not None
+                    else []
+                ),
                 image_ref,
                 "python3",
                 PARTITIONED_COMPRESSION_RUNNER_CONTAINER,
@@ -3985,11 +4253,17 @@ def run_containerized_partitioned_representation_methods(
                 *(["--expected-triples", str(expected_triples)] if expected_triples is not None else []),
                 "--result-path",
                 f"/data/out/{result_path.name}",
+                *(
+                    ["--progress-path", progress_container_ref]
+                    if progress_container_ref is not None
+                    else []
+                ),
             ]
         )
         if index_warnings is not None:
             command.append("--allow-index-failures")
-        run_exit_code = run(command)
+        with ProgressSession(progress_host_path, f"Partitioned compression: {output_name}"):
+            run_exit_code = run(command)
         payload = None
         if result_path.is_file():
             try:
@@ -4348,6 +4622,12 @@ def run_full_mode(
             )
             continue
         container_generated_rules = f"/data/rules/{generated_rules.name}"
+        progress_host_path = (
+            progress_event_path(metrics_dir, "rmlstreamer", safe_prefix)
+            if progress_ui_enabled()
+            else None
+        )
+        progress_container_ref = container_progress_path(progress_host_path, metrics_dir)
 
         run_cmd = [
             *docker_run_base(),
@@ -4434,11 +4714,13 @@ def run_full_mode(
             f"IN_VCF={container_input}",
             "-e",
             "LOGDIR=/data/metrics",
-            image_ref,
-            "bash",
-            "/opt/vcf-rdfizer/run_conversion.sh",
         ]
-        if run(run_cmd) != 0:
+        if progress_container_ref is not None:
+            run_cmd.extend(["-e", f"PROGRESS_FILE={progress_container_ref}"])
+        run_cmd.extend([image_ref, "bash", "/opt/vcf-rdfizer/run_conversion.sh"])
+        with ProgressSession(progress_host_path, f"RMLStreamer: {prefix}"):
+            rdf_exit_code = run(run_cmd)
+        if rdf_exit_code != 0:
             fail_current(
                 "rdf-conversion",
                 f"RMLStreamer step failed for '{prefix}'. See log: {wrapper_log_path}",
@@ -5484,6 +5766,11 @@ def main():
         action="store_true",
         help="Print a rough storage estimate before running conversion",
     )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable interactive Rich spinners and progress bars",
+    )
     rdf_output_group = parser.add_mutually_exclusive_group()
     rdf_output_group.add_argument(
         "-R",
@@ -5498,6 +5785,9 @@ def main():
         help="Explicitly remove the aggregate .nt/.nt.gz output after successful compression",
     )
     args = parser.parse_args()
+
+    global _PROGRESS_ALLOWED
+    _PROGRESS_ALLOWED = not args.no_progress
 
     if args.build and args.no_build:
         eprint("Error: --build and --no-build are mutually exclusive.")

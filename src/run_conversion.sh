@@ -57,6 +57,8 @@ cleanup_parts_dir() {
   rm -rf "$PARTS_DIR"
 }
 trap cleanup_parts_dir EXIT
+PROGRESS_FILE=${PROGRESS_FILE:-}
+PROGRESS_READY=0
 TIME_LOG_DIR="$LOGDIR/conversion_time/${SAFE_OUT_NAME}"
 METRICS_JSON_DIR="$LOGDIR/conversion_metrics/${SAFE_OUT_NAME}"
 mkdir -p "$TIME_LOG_DIR" "$METRICS_JSON_DIR"
@@ -109,6 +111,58 @@ stat_size() {
   fi
 
   echo 0
+}
+
+# Write sparse machine-readable progress events for the host-side Rich display.
+# Progress is deliberately best-effort: a UI sidecar must never make a data
+# conversion fail.
+progress_emit() {
+  local stage="$1"
+  local phase="$2"
+  local completed="${3:-null}"
+  local total="${4:-null}"
+  local unit="${5:-}"
+  local parts="${6:-null}"
+  if [[ -z "$PROGRESS_FILE" ]]; then
+    return 0
+  fi
+  if (( PROGRESS_READY == 0 )); then
+    mkdir -p "$(dirname "$PROGRESS_FILE")" >/dev/null 2>&1 || return 0
+    PROGRESS_READY=1
+  fi
+  printf '{"stage":"%s","phase":"%s","completed":%s,"total":%s,"unit":"%s","parts":%s}\n' \
+    "$stage" "$phase" "$completed" "$total" "$unit" "$parts" \
+    >> "$PROGRESS_FILE" 2>/dev/null || true
+}
+
+# RMLStreamer writes part files while it runs. Summing their metadata once per
+# second gives useful throughput feedback without reading or counting RDF.
+part_bytes() {
+  local total=0
+  local file size
+  shopt -s nullglob
+  for file in "$PARTS_DIR"/*; do
+    if [[ ! -f "$file" || "$(basename "$file")" == .* ]]; then
+      continue
+    fi
+    size=$(stat_size "$file")
+    total=$((total + size))
+  done
+  shopt -u nullglob
+  echo "$total"
+}
+
+part_count() {
+  local total=0
+  local file
+  shopt -s nullglob
+  for file in "$PARTS_DIR"/*; do
+    if [[ -f "$file" && "$(basename "$file")" != .* ]]; then
+      total=$((total + 1))
+    fi
+  done
+  shopt -u nullglob
+  echo "$total"
 }
 
 # Report comparable input VCF bytes.
@@ -254,10 +308,30 @@ VCF_SIZE=$(normalized_vcf_size "$IN_VCF")
 
 # ---------- Run RMLStreamer with timing ----------
 EXIT_CODE=0
-if have_gnu_time; then
-  /usr/bin/time -v -o "$TIME_LOG" -- "${JAVA_CMD[@]}" || EXIT_CODE=$?
+run_rmlstreamer() {
+  if have_gnu_time; then
+    /usr/bin/time -v -o "$TIME_LOG" -- "${JAVA_CMD[@]}"
+  else
+    { time -p "${JAVA_CMD[@]}"; } >"$TIME_LOG" 2>&1
+  fi
+}
+
+if [[ -n "$PROGRESS_FILE" ]]; then
+  progress_emit "rmlstreamer" "started" 0 null bytes 0
+  run_rmlstreamer &
+  RMLSTREAMER_PID=$!
+  while kill -0 "$RMLSTREAMER_PID" >/dev/null 2>&1; do
+    progress_emit "rmlstreamer" "heartbeat" "$(part_bytes)" null bytes "$(part_count)"
+    sleep 1
+  done
+  wait "$RMLSTREAMER_PID" || EXIT_CODE=$?
+  if (( EXIT_CODE == 0 )); then
+    progress_emit "rmlstreamer" "complete" "$(part_bytes)" null bytes "$(part_count)"
+  else
+    progress_emit "rmlstreamer" "failed" "$(part_bytes)" null bytes "$(part_count)"
+  fi
 else
-  { time -p "${JAVA_CMD[@]}"; } >"$TIME_LOG" 2>&1 || EXIT_CODE=$?
+  run_rmlstreamer || EXIT_CODE=$?
 fi
 
 # Normalize output files to .nt for downstream line-oriented processing. The
@@ -278,6 +352,11 @@ done
 # disk spikes.
 shopt -s nullglob
 PART_FILES=("$PARTS_DIR"/*.nt)
+PART_TOTAL=${#PART_FILES[@]}
+PART_INDEX=0
+if (( PART_TOTAL > 0 )); then
+  progress_emit "rdf-aggregate" "started" 0 "$PART_TOTAL" parts 0
+fi
 if [[ "$RDF_STORAGE_MODE" == "space-optimized" ]]; then
     MERGED_RDF="${MERGED_NT}.gz"
     MERGED_TMP="${MERGED_RDF}.partial.$$"
@@ -296,6 +375,8 @@ if [[ "$RDF_STORAGE_MODE" == "space-optimized" ]]; then
         FIRST_SEEN=$(awk -F'\t' -v hash="$PART_HASH" '$1 == hash { print $2; exit }' "$SEEN_MAP_FILE")
         echo "WARNING: skipping duplicate RDF part '$PART_NT' (same content as '$FIRST_SEEN')." >&2
         rm -f "$PART_NT"
+        PART_INDEX=$((PART_INDEX + 1))
+        progress_emit "rdf-aggregate" "part" "$PART_INDEX" "$PART_TOTAL" parts "$PART_INDEX"
         continue
       fi
       printf "%s\n" "$PART_HASH" >> "$SEEN_HASH_FILE"
@@ -305,6 +386,8 @@ if [[ "$RDF_STORAGE_MODE" == "space-optimized" ]]; then
       # allowing each completed RMLStreamer part to be deleted immediately.
       gzip -c "$PART_NT" >> "$MERGED_TMP"
       rm -f "$PART_NT"
+      PART_INDEX=$((PART_INDEX + 1))
+      progress_emit "rdf-aggregate" "part" "$PART_INDEX" "$PART_TOTAL" parts "$PART_INDEX"
     done
     rm -f "$SEEN_HASH_FILE" "$SEEN_MAP_FILE"
     mv "$MERGED_TMP" "$MERGED_RDF"
@@ -327,22 +410,29 @@ if [[ "$RDF_STORAGE_MODE" == "space-optimized" ]]; then
         FIRST_SEEN=$(awk -F'\t' -v hash="$PART_HASH" '$1 == hash { print $2; exit }' "$SEEN_MAP_FILE")
         echo "WARNING: skipping duplicate RDF part '$PART_NT' (same content as '$FIRST_SEEN')." >&2
         rm -f "$PART_NT"
+        PART_INDEX=$((PART_INDEX + 1))
+        progress_emit "rdf-aggregate" "part" "$PART_INDEX" "$PART_TOTAL" parts "$PART_INDEX"
         continue
       fi
       printf "%s\n" "$PART_HASH" >> "$SEEN_HASH_FILE"
       printf "%s\t%s\n" "$PART_HASH" "$PART_NT" >> "$SEEN_MAP_FILE"
       cat "$PART_NT" >> "$MERGED_NT"
       rm -f "$PART_NT"
+      PART_INDEX=$((PART_INDEX + 1))
+      progress_emit "rdf-aggregate" "part" "$PART_INDEX" "$PART_TOTAL" parts "$PART_INDEX"
     done
     rm -f "$SEEN_HASH_FILE" "$SEEN_MAP_FILE"
   else
     : > "$MERGED_NT"
     OUTPUT_PATH="$MERGED_NT"
-fi
-  shopt -u nullglob
-  if [[ "$RDF_STORAGE_MODE" != "space-optimized" ]]; then
-    OUTPUT_PATH="$MERGED_NT"
   fi
+shopt -u nullglob
+if [[ "$RDF_STORAGE_MODE" != "space-optimized" ]]; then
+  OUTPUT_PATH="$MERGED_NT"
+fi
+if (( PART_TOTAL > 0 )); then
+  progress_emit "rdf-aggregate" "complete" "$PART_INDEX" "$PART_TOTAL" parts "$PART_INDEX"
+fi
 
 rm -rf "$PARTS_DIR"
 trap - EXIT

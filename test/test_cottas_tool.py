@@ -134,13 +134,11 @@ class CottasToolTests(unittest.TestCase):
             self.assertEqual(fake_duckdb.database_paths[0].parent.parent, scratch_root)
             self.assertIn("SET memory_limit = '512M'", fake_duckdb.queries)
             self.assertIn("SET threads = 1", fake_duckdb.queries)
-            self.assertTrue(
-                any(
-                    "SELECT DISTINCT s, p, o" in query
-                    and "ORDER BY s, p, o" in query
-                    for query in fake_duckdb.queries
-                )
-            )
+            copy_query = next(query for query in fake_duckdb.queries if query.startswith("COPY"))
+            self.assertIn("LAG(s) OVER (ORDER BY s, p, o)", copy_query)
+            self.assertIn("s IS DISTINCT FROM prior_s", copy_query)
+            self.assertIn("ORDER BY s, p, o", copy_query)
+            self.assertNotIn("SELECT DISTINCT", copy_query)
             self.assertFalse(left.exists())
             self.assertFalse(right.exists())
             self.assertFalse(any(scratch_root.iterdir()))

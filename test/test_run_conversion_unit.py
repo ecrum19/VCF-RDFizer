@@ -60,6 +60,7 @@ printf '<s> <p> <o> .\\n' > "$out/part-000"
                     "LOGDIR": str(metrics_dir),
                     "RUN_ID": "run123",
                     "TIMESTAMP": "2026-01-01T00:00:00",
+                    "PROGRESS_FILE": str(metrics_dir / ".progress" / "rml.jsonl"),
                 }
             )
 
@@ -82,6 +83,15 @@ printf '<s> <p> <o> .\\n' > "$out/part-000"
             self.assertEqual(row["run_id"], "run123")
             self.assertEqual(row["output_name"], "rdf")
             self.assertEqual(row["exit_code_java"], "0")
+
+            progress_path = metrics_dir / ".progress" / "rml.jsonl"
+            progress_events = [
+                json.loads(line) for line in progress_path.read_text().splitlines()
+            ]
+            self.assertEqual(progress_events[0]["stage"], "rmlstreamer")
+            self.assertEqual(progress_events[0]["phase"], "started")
+            self.assertEqual(progress_events[-1]["stage"], "rdf-aggregate")
+            self.assertEqual(progress_events[-1]["phase"], "complete")
 
     def test_run_conversion_preserves_unrelated_files_in_existing_output_directory(self):
         """RMLStreamer parts do not require deleting the sample output directory."""

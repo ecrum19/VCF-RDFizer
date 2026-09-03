@@ -78,12 +78,14 @@ def disk_backed_cottas_merge(
     """Merge COTTAS Parquet inputs with DuckDB spill files rather than pycottas.cat.
 
     ``pycottas.cat`` uses DuckDB's process-global in-memory connection. Its
-    global ``DISTINCT`` plus ``ORDER BY`` can therefore be SIGKILLed on a
-    large condensed VCF even when every disk-backed chunk conversion succeeds.
-    This adapter opens a dedicated on-disk database, caps its memory, restricts
-    merge parallelism, and directs external sort/hash spill files to the
-    disposable COTTAS scratch directory. The query retains COTTAS's global RDF
-    set semantics and the requested Parquet sort/index order.
+    hash-based global ``DISTINCT`` plus ``ORDER BY`` can therefore be SIGKILLed
+    on a large condensed VCF even when every disk-backed chunk conversion
+    succeeds. This adapter opens a dedicated on-disk database, caps its
+    memory, restricts merge parallelism, and directs external-sort spill files
+    to the disposable COTTAS scratch directory. It sorts all triples, removes
+    only adjacent equal triples with a streaming ``LAG`` window, then writes
+    the requested COTTAS index order. That retains RDF set semantics without
+    materializing one global hash table of every triple.
     """
     if not input_paths:
         raise ValueError("at least one COTTAS input is required for a merge")
@@ -125,14 +127,22 @@ def disk_backed_cottas_merge(
         }
         if not {"s", "p", "o"}.issubset(columns):
             raise RuntimeError("COTTAS inputs do not contain the required s, p, o columns")
-        selected_columns = ["s", "p", "o"]
-        if "g" in columns:
-            selected_columns.append("g")
-        selected_columns_sql = ", ".join(selected_columns)
+        # COTTAS's own cat operation writes RDF triples, rather than retaining
+        # an optional Parquet graph column. Match that contract when deciding
+        # whether two input records are semantically equal.
+        selected_columns_sql = "s, p, o"
         order_columns_sql = ", ".join(index.lower())
         copy_query = (
-            f"COPY (SELECT DISTINCT {selected_columns_sql} FROM {parquet_scan} "
-            f"ORDER BY {order_columns_sql}) TO {sql_literal(output_path)} "
+            "COPY (WITH ordered_rows AS ("
+            f"SELECT {selected_columns_sql}, "
+            "LAG(s) OVER (ORDER BY s, p, o) AS prior_s, "
+            "LAG(p) OVER (ORDER BY s, p, o) AS prior_p, "
+            "LAG(o) OVER (ORDER BY s, p, o) AS prior_o "
+            f"FROM {parquet_scan}"
+            ") SELECT s, p, o FROM ordered_rows "
+            "WHERE s IS DISTINCT FROM prior_s OR p IS DISTINCT FROM prior_p "
+            f"OR o IS DISTINCT FROM prior_o ORDER BY {order_columns_sql}) "
+            f"TO {sql_literal(output_path)} "
             "(FORMAT PARQUET, COMPRESSION ZSTD, COMPRESSION_LEVEL 22, "
             "PARQUET_VERSION v2, "
             f"KV_METADATA {{index: {sql_literal(index.lower())}}})"

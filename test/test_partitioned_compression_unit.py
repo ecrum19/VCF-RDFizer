@@ -1,5 +1,6 @@
 import gzip
 import importlib.util
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -117,6 +118,26 @@ class PartitionedCompressionUnitTests(VerboseTestCase):
             self.assertIn("No space left on device", result["stderr_tail"])
             self.assertFalse((work_dir / ".cottas-merge-r01-00000.stderr").exists())
 
+    def test_stage_runner_emits_compact_progress_events(self):
+        """Stage progress reuses one task for chunk builds."""
+        runner_module = load_runner_module()
+        with tempfile.TemporaryDirectory() as td:
+            work_dir = Path(td) / "work"
+            work_dir.mkdir()
+            progress_path = work_dir / ".progress" / "partitioned.jsonl"
+            stage_runner = runner_module.StageRunner(work_dir, progress_path=progress_path)
+            result = stage_runner.run(
+                "hdt-build-00000",
+                ["sh", "-c", "exit 0"],
+            )
+            events = [json.loads(line) for line in progress_path.read_text().splitlines()]
+            self.assertEqual(result["exit_code"], 0)
+            self.assertEqual(events[0]["stage"], "hdt-chunks")
+            self.assertEqual(events[0]["phase"], "started")
+            self.assertEqual(events[-1]["phase"], "complete")
+            self.assertEqual(events[-1]["completed"], 1)
+            self.assertEqual(events[-1]["unit"], "chunks")
+
     def test_failure_message_includes_a_bounded_stderr_tail(self):
         """A code-1 COTTAS failure reports DuckDB's actual error to the user."""
         runner = load_runner_module()
@@ -146,12 +167,15 @@ class PartitionedCompressionUnitTests(VerboseTestCase):
                 handle.write(source_bytes)
 
             chunk_dir = tmp_path / "chunks"
+            progress_path = tmp_path / ".progress" / "partitioned.jsonl"
             stream, plan = runner.stream_chunks(
                 source,
                 chunk_dir,
                 target_bytes=40,
                 min_bytes=20,
                 max_bytes=60,
+                progress_path=progress_path,
+                progress_total=12,
             )
             emitted = []
             for chunk, metadata in stream:
@@ -166,6 +190,12 @@ class PartitionedCompressionUnitTests(VerboseTestCase):
             self.assertEqual(plan["chunk_count"], len(plan["chunks"]))
             self.assertGreater(plan["chunk_count"], 1)
             self.assertEqual(list(chunk_dir.glob("*.nt")), [])
+            progress_events = [
+                json.loads(line) for line in progress_path.read_text().splitlines()
+            ]
+            self.assertTrue(all(event["stage"] == "rdf-scan" for event in progress_events))
+            self.assertEqual(progress_events[-1]["completed"], 12)
+            self.assertEqual(progress_events[-1]["total"], 12)
 
 
 if __name__ == "__main__":

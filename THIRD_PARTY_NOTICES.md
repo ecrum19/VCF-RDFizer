@@ -5,6 +5,13 @@ VCF-RDFizer (this repository) is released under the MIT License (see `LICENSE`).
 The Docker image also includes third-party software. Their licenses remain with
 their respective authors and apply to those components.
 
+## Python package dependency
+
+1. `Rich`
+- Repository: <https://github.com/Textualize/rich>
+- Usage in this project: terminal spinners and progress bars
+- License: MIT
+
 ## Included in Docker image
 
 1. `HDT-cpp`

@@ -8,6 +8,10 @@
   now identifies the real cause (such as unavailable spill storage, permission
   problems, a malformed chunk, or a DuckDB exception) instead of reporting
   only `exit_code=1`.
+- Replaced the final merge's hash-backed `SELECT DISTINCT` with an external
+  lexical sort and `LAG`-based adjacent-row deduplication. This produces the
+  same RDF triple set and requested COTTAS ordering without requiring a global
+  in-memory hash table for every distinct triple.
 
 - Replaced the final COTTAS merge/reindex implementation with a dedicated
   disk-backed DuckDB connection. `pycottas.cat` in version 1.1.0 performs its
