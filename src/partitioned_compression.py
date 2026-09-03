@@ -279,6 +279,32 @@ def cottas_merge_many_command(
     ]
 
 
+def cottas_merge_command(
+    python_bin: str,
+    left: Path,
+    right: Path,
+    merged: Path,
+) -> list[str]:
+    """Build a memory-bounded two-input COTTAS merge command.
+
+    ``pycottas.cat`` has no disk-budget argument for its merge operation.  A
+    single call over every partition can therefore hold too many Parquet
+    inputs and index buffers at once.  The production workflow deliberately
+    invokes the adapter with two inputs per stage instead; the merge tree
+    bounds the peak working set while preserving the same indexed COTTAS
+    semantics.
+    """
+    return [
+        python_bin,
+        "/opt/vcf-rdfizer/cottas_tool.py",
+        "merge",
+        str(left),
+        str(right),
+        str(merged),
+        "spo",
+    ]
+
+
 def parse_time_log(path: Path) -> dict:
     if not path.exists():
         return {"user_seconds": None, "sys_seconds": None, "max_rss_kb": None}
@@ -516,6 +542,7 @@ def main() -> int:
                 "workspace_free_bytes_before",
                 "workspace_free_bytes_after",
                 "workspace_total_bytes",
+                "max_rss_kb",
             ):
                 if key in stage_result:
                     warning[key] = stage_result[key]
@@ -538,9 +565,17 @@ def main() -> int:
         diagnostics = []
         if exit_code is not None:
             diagnostics.append(f"exit_code={exit_code}")
-            if int(exit_code) == 137:
+            try:
+                numeric_exit_code = int(exit_code)
+            except (TypeError, ValueError):
+                numeric_exit_code = None
+            if numeric_exit_code == -9:
+                diagnostics.append(
+                    "the process was killed by SIGKILL (usually the kernel/Docker OOM killer)"
+                )
+            elif numeric_exit_code == 137:
                 diagnostics.append("the process was killed (often Docker memory/OOM pressure)")
-            elif int(exit_code) == 143:
+            elif numeric_exit_code == 143:
                 diagnostics.append("the process was terminated (SIGTERM)")
         return f"{fallback} ({'; '.join(diagnostics)})" if diagnostics else fallback
 
@@ -802,27 +837,30 @@ def main() -> int:
             }
 
         if cottas_paths and not cottas_failed:
-            # pycottas.cat supports a list of inputs. Use one indexed pass so
-            # a large multi-sample run does not repeatedly materialize and
-            # re-index the growing COTTAS graph at every pairwise round.
-            cottas_stage = None
-            cottas_rounds = 0
-            if len(cottas_paths) == 1:
-                final_cottas = cottas_paths[0]
-            else:
-                cottas_merged_path = work_dir / "cottas-merge-final.cottas"
-                cottas_stage = runner.run(
-                    "cottas-merge-all",
-                    cottas_merge_many_command(cottas_python, cottas_paths, cottas_merged_path),
-                    cottas_merged_path,
-                )
-                add_totals(cottas_total, cottas_stage)
-                cottas_rounds = 1
-                final_cottas = (
-                    cottas_merged_path
-                    if cottas_stage["exit_code"] == 0 and cottas_merged_path.is_file()
-                    else None
-                )
+            # Keep each pycottas.cat invocation to two inputs.  The adapter's
+            # conversion path supports disk-backed parsing, but its merge API
+            # has no equivalent memory-budget argument.  A one-shot merge of
+            # every partition can consequently be killed by the kernel/Docker
+            # OOM killer (reported by subprocess as exit_code=-9).  Pairwise
+            # merging bounds the number of simultaneously indexed inputs and
+            # still produces one semantically equivalent indexed COTTAS file.
+            final_cottas, cottas_rounds = merge_pairwise(
+                cottas_paths,
+                prefix="cottas",
+                runner=runner,
+                merge_command=lambda left, right, merged: cottas_merge_command(
+                    cottas_python,
+                    left,
+                    right,
+                    merged,
+                ),
+                total=cottas_total,
+            )
+            cottas_stage = (
+                runner.stages[-1]
+                if final_cottas is None and runner.stages
+                else None
+            )
             if final_cottas is None:
                 if not args.allow_index_failures:
                     raise RuntimeError(

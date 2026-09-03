@@ -44,7 +44,7 @@ def main() -> int:
 
     merge_many = subparsers.add_parser(
         "merge-many",
-        help="merge multiple COTTAS files in one indexed pass",
+        help="merge multiple COTTAS files in one indexed pass (explicit use)",
     )
     merge_many.add_argument(
         "--input-cottas-files",
@@ -139,8 +139,9 @@ def main() -> int:
             return 2
         with cottas_scratch_workspace():
             # pycottas.cat accepts a list of inputs and computes the requested
-            # index once.  This is materially cheaper for large partitioned
-            # graphs than repeatedly re-indexing pairwise intermediate files.
+            # index once.  This adapter is retained for explicit callers; the
+            # production partitioned workflow uses the two-input ``merge``
+            # command because a very large input list can exceed memory.
             pycottas.cat(
                 input_paths,
                 cottas_path,

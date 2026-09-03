@@ -56,8 +56,8 @@ class PartitionedCompressionUnitTests(VerboseTestCase):
             self.assertNotIn("java", " ".join(command).lower())
             self.assertNotIn("hdtcat", " ".join(command).lower())
 
-    def test_cottas_merge_many_command_uses_one_indexed_pass(self):
-        """Large COTTAS partitions are merged through pycottas.cat once."""
+    def test_cottas_merge_many_command_is_available_for_explicit_batching(self):
+        """The adapter retains an explicit multi-input COTTAS operation."""
         runner = load_runner_module()
         command = runner.cottas_merge_many_command(
             "/opt/pycottas-venv/bin/python",
@@ -80,6 +80,28 @@ class PartitionedCompressionUnitTests(VerboseTestCase):
             ],
         )
 
+    def test_cottas_merge_command_is_bounded_to_two_inputs(self):
+        """The production merge stage invokes pycottas.cat pairwise."""
+        runner = load_runner_module()
+        command = runner.cottas_merge_command(
+            "/opt/pycottas-venv/bin/python",
+            Path("/work/chunk-00000.cottas"),
+            Path("/work/chunk-00001.cottas"),
+            Path("/work/cottas-merge-r01-00000.cottas"),
+        )
+        self.assertEqual(
+            command,
+            [
+                "/opt/pycottas-venv/bin/python",
+                "/opt/vcf-rdfizer/cottas_tool.py",
+                "merge",
+                "/work/chunk-00000.cottas",
+                "/work/chunk-00001.cottas",
+                "/work/cottas-merge-r01-00000.cottas",
+                "spo",
+            ],
+        )
+
     def test_stage_runner_keeps_failed_stderr_tail(self):
         """Index warnings retain the subprocess diagnostic instead of hiding it."""
         runner_module = load_runner_module()
@@ -88,12 +110,12 @@ class PartitionedCompressionUnitTests(VerboseTestCase):
             work_dir.mkdir()
             stage_runner = runner_module.StageRunner(work_dir)
             result = stage_runner.run(
-                "cottas-merge-all",
+                "cottas-merge-r01-00000",
                 ["sh", "-c", "echo 'No space left on device' >&2; exit 1"],
             )
             self.assertEqual(result["exit_code"], 1)
             self.assertIn("No space left on device", result["stderr_tail"])
-            self.assertFalse((work_dir / ".cottas-merge-all.stderr").exists())
+            self.assertFalse((work_dir / ".cottas-merge-r01-00000.stderr").exists())
 
     def test_stream_chunks_only_retains_the_chunk_being_consumed(self):
         """Gzip chunking does not stage a second full uncompressed aggregate."""
