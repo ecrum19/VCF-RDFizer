@@ -450,6 +450,41 @@ def finalize_totals(total: dict) -> dict:
     }
 
 
+def failure_message(stage_result: dict | None, fallback: str) -> str:
+    """Turn a failed subprocess result into an actionable pipeline error.
+
+    ``StageRunner`` intentionally stores a bounded stderr tail in the result
+    payload.  The outer CLI has no access to the ephemeral Docker volume once
+    the container exits, so omitting that text here turns a concrete DuckDB
+    error (for example an unwritable spill directory) into a useless
+    ``exit_code=1`` report.
+    """
+    if not stage_result:
+        return fallback
+    exit_code = stage_result.get("exit_code")
+    diagnostics = []
+    if exit_code is not None:
+        diagnostics.append(f"exit_code={exit_code}")
+        try:
+            numeric_exit_code = int(exit_code)
+        except (TypeError, ValueError):
+            numeric_exit_code = None
+        if numeric_exit_code == -9:
+            diagnostics.append(
+                "the process was killed by SIGKILL (usually the kernel/Docker OOM killer)"
+            )
+        elif numeric_exit_code == 137:
+            diagnostics.append("the process was killed (often Docker memory/OOM pressure)")
+        elif numeric_exit_code == 143:
+            diagnostics.append("the process was terminated (SIGTERM)")
+    stderr_tail = " ".join(str(stage_result.get("stderr_tail") or "").split())
+    if stderr_tail:
+        # Preserve the end of a traceback, which contains the concrete
+        # exception, without making top-level CLI output unbounded.
+        diagnostics.append(f"stderr={stderr_tail[-2048:]}")
+    return f"{fallback} ({'; '.join(diagnostics)})" if diagnostics else fallback
+
+
 def merge_pairwise(
     paths: list[Path],
     *,
@@ -557,28 +592,6 @@ def main() -> int:
             file=sys.stderr,
         )
         return warning
-
-    def failure_message(stage_result: dict | None, fallback: str) -> str:
-        """Turn a failed subprocess result into an actionable warning."""
-        if not stage_result:
-            return fallback
-        exit_code = stage_result.get("exit_code")
-        diagnostics = []
-        if exit_code is not None:
-            diagnostics.append(f"exit_code={exit_code}")
-            try:
-                numeric_exit_code = int(exit_code)
-            except (TypeError, ValueError):
-                numeric_exit_code = None
-            if numeric_exit_code == -9:
-                diagnostics.append(
-                    "the process was killed by SIGKILL (usually the kernel/Docker OOM killer)"
-                )
-            elif numeric_exit_code == 137:
-                diagnostics.append("the process was killed (often Docker memory/OOM pressure)")
-            elif numeric_exit_code == 143:
-                diagnostics.append("the process was terminated (SIGTERM)")
-        return f"{fallback} ({'; '.join(diagnostics)})" if diagnostics else fallback
 
     def skipped_cottas_result(method: str) -> dict:
         artifact = {

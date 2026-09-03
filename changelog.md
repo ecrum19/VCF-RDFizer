@@ -2,6 +2,13 @@
 
 ## 2026-09-03 — Disk-backed COTTAS merge for condensed cohorts
 
+- Pinned the image to DuckDB 1.5.5 so COTTAS merge behavior cannot vary with
+  Docker build-cache state or the newest dependency accepted by pycottas.
+- Included the bounded DuckDB stderr tail in code-1 merge failures. The error
+  now identifies the real cause (such as unavailable spill storage, permission
+  problems, a malformed chunk, or a DuckDB exception) instead of reporting
+  only `exit_code=1`.
+
 - Replaced the final COTTAS merge/reindex implementation with a dedicated
   disk-backed DuckDB connection. `pycottas.cat` in version 1.1.0 performs its
   global `DISTINCT` and `ORDER BY` through the process-global in-memory

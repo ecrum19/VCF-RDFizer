@@ -451,7 +451,8 @@ when memory is available. Temporary files live in the container's `/work` area
 and are removed after the attempt.
 
 COTTAS uses the same out-of-core principle for its global `DISTINCT` and
-`ORDER BY` merge. The image defaults `COTTAS_MERGE_MEMORY_LIMIT` to `512M` and
+`ORDER BY` merge. The image pins DuckDB to 1.5.5, the version tested with this
+merge SQL, and defaults `COTTAS_MERGE_MEMORY_LIMIT` to `512M` and
 `COTTAS_MERGE_THREADS` to `1`; DuckDB spills merge state to `/work` instead of
 allowing one large condensed graph to consume all container memory. Override
 them from the host only when appropriate for the available RAM, for example:

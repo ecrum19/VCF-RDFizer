@@ -104,8 +104,9 @@ def disk_backed_cottas_merge(
     quoted_inputs = ", ".join(sql_literal(path) for path in input_paths)
     parquet_scan = f"PARQUET_SCAN([{quoted_inputs}], union_by_name = true)"
 
-    connection = duckdb.connect(str(database_path))
+    connection = None
     try:
+        connection = duckdb.connect(str(database_path))
         # Apply limits before DuckDB plans the DISTINCT/ORDER BY operation.
         # One worker makes the memory budget predictable on hosts with many
         # CPUs and still permits DuckDB's external sort/hash operators to
@@ -137,8 +138,22 @@ def disk_backed_cottas_merge(
             f"KV_METADATA {{index: {sql_literal(index.lower())}}})"
         )
         connection.execute(copy_query)
+    except Exception as exc:
+        # This context is intentionally included in stderr. The host wrapper
+        # records it in the result JSON and surfaces it in the final error,
+        # so storage, permissions, Parquet, and DuckDB SQL errors are not
+        # collapsed into an unhelpful generic non-zero exit code.
+        duckdb_version = getattr(duckdb, "__version__", "unknown")
+        raise RuntimeError(
+            "disk-backed COTTAS merge failed "
+            f"(duckdb={duckdb_version}; inputs={len(input_paths)}; "
+            f"memory_limit={memory_limit}; threads={threads}; "
+            f"scratch={scratch_dir}; temp_directory={temporary_directory}; "
+            f"output={output_path}): {exc}"
+        ) from exc
     finally:
-        connection.close()
+        if connection is not None:
+            connection.close()
 
     if remove_input_files:
         for input_path in input_paths:

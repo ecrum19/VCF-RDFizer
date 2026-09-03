@@ -81,8 +81,14 @@ RUN apt-get update \
     time \
   && rm -rf /var/lib/apt/lists/*
 
+# Keep the DuckDB SQL dialect used by the disk-backed COTTAS merge stable.
+# pycottas 1.1.0 accepts DuckDB >=1.2.2,<2, but leaving it unpinned makes a
+# rebuild (or a cached layer) silently select a different Parquet COPY
+# implementation.  The adapter is exercised against 1.5.5.
 RUN python3 -m venv /opt/pycottas-venv \
-  && /opt/pycottas-venv/bin/pip install --no-cache-dir pycottas==1.1.0
+  && /opt/pycottas-venv/bin/pip install --no-cache-dir \
+    pycottas==1.1.0 \
+    duckdb==1.5.5
 
 RUN mkdir -p /opt/rmlstreamer \
   && curl -fsSL \

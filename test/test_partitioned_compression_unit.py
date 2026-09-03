@@ -117,6 +117,21 @@ class PartitionedCompressionUnitTests(VerboseTestCase):
             self.assertIn("No space left on device", result["stderr_tail"])
             self.assertFalse((work_dir / ".cottas-merge-r01-00000.stderr").exists())
 
+    def test_failure_message_includes_a_bounded_stderr_tail(self):
+        """A code-1 COTTAS failure reports DuckDB's actual error to the user."""
+        runner = load_runner_module()
+        message = runner.failure_message(
+            {
+                "exit_code": 1,
+                "stderr_tail": "Traceback\n"
+                "RuntimeError: disk-backed COTTAS merge failed: "
+                "IO Error: No space left on device",
+            },
+            "COTTAS merge/index creation failed",
+        )
+        self.assertIn("exit_code=1", message)
+        self.assertIn("No space left on device", message)
+
     def test_stream_chunks_only_retains_the_chunk_being_consumed(self):
         """Gzip chunking does not stage a second full uncompressed aggregate."""
         runner = load_runner_module()
