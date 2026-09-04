@@ -467,8 +467,15 @@ class WrapperUnitTests(VerboseTestCase):
                 progress_path=progress_path,
                 quiet=True,
                 scratch_dir=scratch_dir,
-                rdf_gz=None,
-                rdf_nt=rdf_path,
+                rdf=rdf_path,
+                rdf_format="nt",
+                engine="comunica",
+                query_timeout=60,
+                qlever_memory_gb=4,
+                qlever_port=7019,
+                qlever_startup_timeout=60,
+                qlever_index_arg=[],
+                qlever_server_arg=[],
                 vcf=vcf_path,
                 filter_oracle="cyvcf2",
                 dataset_id="sample",
@@ -480,12 +487,15 @@ class WrapperUnitTests(VerboseTestCase):
                 "sampleCount": 0,
                 "gtRecordCount": 0,
             }
+            failing_engine = mock.MagicMock()
+            failing_engine.describe.return_value = {"engine": "comunica"}
+            failing_engine.execute.return_value = {"status": "FAILED"}
             with mock.patch.object(validator, "query_path", return_value=query_file), mock.patch.object(
                 validator, "parse_vcf", return_value=parser
             ), mock.patch.object(
                 validator, "validate_ntriples", return_value={"status": "PASS"}
             ), mock.patch.object(validator, "build_manifest", return_value={}), mock.patch.object(
-                validator, "execute_query", return_value={"status": "FAILED"}
+                validator, "build_engine", return_value=failing_engine
             ), redirect_stdout(StringIO()) as output:
                 rc = validator.run_validation(args)
 
@@ -2697,7 +2707,9 @@ class WrapperUnitTests(VerboseTestCase):
 
             self.assertEqual(rc, 0)
             self.assertEqual(len(commands), 1)
-            self.assertIn("--rdf-nt", commands[0])
+            self.assertIn("--rdf", commands[0])
+            self.assertIn("--rdf-format", commands[0])
+            self.assertIn("nt", commands[0])
             self.assertIn("/data/rdf/sample.nt", commands[0])
             self.assertEqual(stage_result["rdf_format"], "nt")
             self.assertFalse(stage_result["temporary_rdf"]["decompressed_inside_container"])

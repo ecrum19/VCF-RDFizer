@@ -315,6 +315,29 @@ SAMPLE_RDF_BUFFER_BYTES = 8 * 1024 * 1024
 # line starting with one of these bytes and ending in " ." is a statement.
 _NTRIPLES_SUBJECT_STARTS = (b"<", b"_")
 SAMPLE_REPRESENTATION_CHOICES = {"expanded", "condensed"}
+# How the INFO column is represented. "raw" is the historical behaviour (an
+# opaque vcfr:infoRaw string). "structured" additionally emits one
+# vcfr:InfoFieldValue per record and key, which is what makes INFO queryable.
+INFO_REPRESENTATION_CHOICES = ("raw", "structured")
+DEFAULT_INFO_REPRESENTATION = "structured"
+# Semantic validation accepts any artifact the pipeline can produce. Anything
+# that is not already plain N-Triples is decoded inside the container first.
+VALIDATION_RDF_SUFFIXES = (
+    (".nt.gz", "nt.gz"),
+    (".nt.br", "nt.br"),
+    (".nt", "nt"),
+    (".cottas.gz", "cottas.gz"),
+    (".cottas.br", "cottas.br"),
+    (".cottas", "cottas"),
+    (".hdt", "hdt"),
+)
+VALIDATION_ENGINE_CHOICES = ("comunica", "qlever")
+DEFAULT_VALIDATION_ENGINE = "comunica"
+# Which produced artifacts a full run should semantically validate. "aggregate"
+# is the .nt/.nt.gz RMLStreamer output; the others are the selected
+# representations, each decoded back to N-Triples before it is checked.
+VALIDATION_TARGET_CHOICES = ("aggregate", "hdt", "cottas")
+DEFAULT_VALIDATION_TARGETS = "aggregate"
 # This is an internal rules-compatibility value, not a third public
 # representation. It means that custom helper TSV rows must be materialized.
 SAMPLE_HELPER_STRATEGY_MATERIALIZED = "expanded"
@@ -1870,6 +1893,9 @@ class ParsedSampleRecord:
 
     source_file: str
     row_id: str
+    #: Raw QUAL and INFO columns, needed by the record-detail emitter.
+    qual: str
+    info: str
     format_keys: tuple[str, ...]
     sample_payloads: tuple[str, ...]
     sample_values: tuple[tuple[str, ...], ...]
@@ -1958,6 +1984,8 @@ class SampleRecordStream:
                 f"'{source_file}'"
             )
         row_id = row[1] if len(row) > 1 else ""
+        qual_raw = row[7] if len(row) > 7 else ""
+        info_raw = row[9] if len(row) > 9 else ""
         format_raw = row[10] if len(row) > 10 else ""
         samples_raw = row[-1] if len(row) >= 12 else ""
         declared_format_keys = format_raw.split(":") if format_raw else []
@@ -1999,6 +2027,8 @@ class SampleRecordStream:
         return ParsedSampleRecord(
             source_file=source_file,
             row_id=row_id,
+            qual=qual_raw,
+            info=info_raw,
             format_keys=format_keys,
             sample_payloads=tuple(sample_payloads),
             sample_values=sample_values,
@@ -2165,6 +2195,9 @@ class FormatDefinition:
     uri: str
     field_number: str
     description: str
+    #: The declared VCF Type (Integer/Float/Flag/Character/String). Defaults to
+    #: String so an undeclared field still has a usable value type.
+    value_type: str = "String"
 
 
 def _parse_structured_header_fields(value: str) -> dict[str, str]:
@@ -2207,34 +2240,444 @@ def _parse_structured_header_fields(value: str) -> dict[str, str]:
     return fields
 
 
-def _load_format_definitions(header_lines_tsv: Path) -> dict[str, FormatDefinition]:
-    """Map FORMAT IDs to structured definitions backed by emitted HeaderLine IRIs."""
+def _load_field_definitions(
+    header_lines_tsv: Path, header_key: str
+) -> dict[str, FormatDefinition]:
+    """Map declared field IDs to structured definitions backed by HeaderLine IRIs.
+
+    Serves both ``##FORMAT`` and ``##INFO`` declarations, which share the
+    ``<ID=,Number=,Type=,Description=>`` syntax and the same vocabulary shape
+    (``vcfr:FieldDefinition`` with ``fieldId``/``fieldNumber``/``fieldType``).
+    """
     definitions: dict[str, FormatDefinition] = {}
     if not header_lines_tsv.is_file():
         return definitions
+    wanted = header_key.upper()
     _set_max_csv_field_size()
     with header_lines_tsv.open(newline="", encoding="utf-8") as handle:
         for row in csv.DictReader(handle, delimiter="\t"):
-            if (row.get("HEADER_KEY") or "").upper() != "FORMAT":
+            if (row.get("HEADER_KEY") or "").upper() != wanted:
                 continue
             fields = _parse_structured_header_fields(row.get("HEADER_VALUE") or "")
-            format_id = fields.get("ID", "").strip()
-            if not format_id:
+            field_id = fields.get("ID", "").strip()
+            if not field_id:
                 continue
             source_component = _rml_uri_component(row.get("SOURCE_FILE") or "")
             index_component = _rml_uri_component(row.get("HEADER_INDEX") or "")
             definitions.setdefault(
-                format_id,
+                field_id,
                 FormatDefinition(
                     uri=f"file://{source_component}#header/line/{index_component}",
                     field_number=fields.get("Number") or ".",
                     description=(
                         fields.get("Description")
-                        or f"FORMAT field {format_id} (source declaration has no Description)"
+                        or f"{wanted} field {field_id} (source declaration has no Description)"
                     ),
+                    value_type=fields.get("Type") or "String",
                 ),
             )
     return definitions
+
+
+def _load_format_definitions(header_lines_tsv: Path) -> dict[str, FormatDefinition]:
+    """Backward-compatible accessor for the FORMAT declarations."""
+    return _load_field_definitions(header_lines_tsv, "FORMAT")
+
+
+#: Maps a declared VCF INFO/FORMAT Type to its vocabulary value-type class.
+VCF_VALUE_TYPE_CLASSES = {
+    "Integer": "IntegerType",
+    "Float": "FloatType",
+    "Flag": "FlagType",
+    "Character": "CharacterType",
+    "String": "StringType",
+}
+#: Typed value predicates used when a single-valued field declares a numeric or
+#: flag type. Multi-valued fields (Number=A/R/G/.) keep only the lexical value,
+#: because the vocabulary gives one InfoFieldValue node per key.
+XSD_INTEGER_URI = "http://www.w3.org/2001/XMLSchema#integer"
+XSD_DECIMAL_URI = "http://www.w3.org/2001/XMLSchema#decimal"
+XSD_BOOLEAN_URI = "http://www.w3.org/2001/XMLSchema#boolean"
+
+
+def parse_info_entries(info: str) -> list[tuple[str, str | None]]:
+    """Split an INFO column into ``(key, value)`` pairs.
+
+    An entry without ``=`` is a Flag: a presence assertion with no value, which
+    the vocabulary models as ``vcfr:fieldValueBoolean true``.
+    """
+    if info in ("", "."):
+        return []
+    entries: list[tuple[str, str | None]] = []
+    for item in info.split(";"):
+        if not item:
+            continue
+        key, separator, value = item.partition("=")
+        entries.append((key, value if separator else None))
+    return entries
+
+
+def _typed_info_object(value: str, declared_type: str) -> tuple[str, str] | None:
+    """Return ``(predicate_local_name, literal)`` for a typed single value."""
+    if "," in value or value == ".":
+        return None
+    try:
+        if declared_type == "Integer":
+            return "fieldValueInteger", f'"{int(value)}"^^<{XSD_INTEGER_URI}>'
+        if declared_type == "Float":
+            # Serialize the source lexical form rather than a reparsed float, so
+            # the graph never gains or loses precision relative to the VCF.
+            float(value)
+            return "fieldValueDecimal", f'"{value}"^^<{XSD_DECIMAL_URI}>'
+    except ValueError:
+        # A value that contradicts its declared type is kept as a plain literal
+        # rather than dropped; the conversion must not silently lose data.
+        return None
+    return None
+
+
+# How the VCF meta-information block is represented. "basic" is the historical
+# behaviour: every '##' line becomes an untyped vcfr:HeaderLine carrying its raw
+# key and value. "structured" additionally types each line with the vocabulary's
+# subclass and lifts the attributes of FILTER, ALT and contig declarations into
+# their own properties, so the header becomes queryable rather than just present.
+HEADER_REPRESENTATION_CHOICES = ("basic", "structured")
+DEFAULT_HEADER_REPRESENTATION = "structured"
+
+#: '##' key (lower-cased) -> the vocabulary subclass for that line.
+HEADER_LINE_CLASSES = {
+    "fileformat": "FileFormatHeaderLine",
+    "filedate": "FileDateHeaderLine",
+    "source": "SourceHeaderLine",
+    "reference": "ReferenceHeaderLine",
+    "info": "INFOHeaderLine",
+    "format": "FORMATHeaderLine",
+    "filter": "FILTERHeaderLine",
+    "alt": "ALTHeaderLine",
+    "contig": "ContigHeaderLine",
+}
+#: contig attribute -> vocabulary predicate.
+CONTIG_ATTRIBUTES = {
+    "length": "contigLength",
+    "md5": "contigMd5",
+    "assembly": "contigAssembly",
+}
+
+
+XSD_DATE_URI = "http://www.w3.org/2001/XMLSchema#date"
+#: ##fileDate has no mandated format. These are the two forms seen in practice
+#: that map unambiguously onto xsd:date, which the SHACL shape requires.
+FILE_DATE_PATTERNS = (
+    (re.compile(r"^(\d{4})(\d{2})(\d{2})$"), "{0}-{1}-{2}"),
+    (re.compile(r"^(\d{4})-(\d{2})-(\d{2})$"), "{0}-{1}-{2}"),
+)
+
+
+def file_date_object(value: str) -> str | None:
+    """Serialize ##fileDate as xsd:date when its form allows, else lexically.
+
+    Returns None for an absent value so no triple is emitted, matching RML's
+    behaviour for an empty reference.
+    """
+    value = (value or "").strip()
+    if not value or value == ".":
+        return None
+    for pattern, template in FILE_DATE_PATTERNS:
+        match = pattern.match(value)
+        if match:
+            return f'"{template.format(*match.groups())}"^^<{XSD_DATE_URI}>'
+    # An unrecognized form is preserved verbatim rather than dropped; the SHACL
+    # layer reports it as non-conformant.
+    return _ntriples_string_literal(value)
+
+
+def append_header_representation_rdf(
+    header_lines_tsv: Path,
+    rdf_path: Path,
+) -> dict:
+    """Append typed header lines and structured FILTER/ALT/contig declarations.
+
+    The default mapping emits every '##' line as an untyped ``vcfr:HeaderLine``
+    with a raw key and value. The vocabulary already defines a subclass per line
+    type and dedicated properties for the FILTER, ALT and contig attributes;
+    this emits them, which is what makes the meta-information block queryable.
+
+    Emitted directly rather than through RML because the attributes live inside
+    a single ``<ID=...,length=...>`` value that RML cannot decompose.
+    """
+    stats = {
+        "representation": "header",
+        "header_lines": 0,
+        "typed_lines": 0,
+        "filter_definitions": 0,
+        "alt_definitions": 0,
+        "contigs": 0,
+        "file_dates": 0,
+        "triples": 0,
+        "appended_bytes": 0,
+    }
+    if not header_lines_tsv.is_file():
+        return stats
+    if not rdf_path.is_file():
+        raise FileNotFoundError(f"RDF aggregate not found for header streaming: {rdf_path}")
+
+    _set_max_csv_field_size()
+    with header_lines_tsv.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle, delimiter="\t"))
+
+    def produce(emit):
+        source_file = rows[0].get("SOURCE_FILE", "") if rows else ""
+        file_uri = f"file://{_rml_uri_component(source_file)}"
+        contig_count = 0
+        for row in rows:
+            key = (row.get("HEADER_KEY") or "").strip()
+            value = row.get("HEADER_VALUE") or ""
+            index_component = _rml_uri_component(row.get("HEADER_INDEX") or "")
+            line_uri = f"file://{_rml_uri_component(row.get('SOURCE_FILE') or '')}" \
+                       f"#header/line/{index_component}"
+            stats["header_lines"] += 1
+
+            line_class = HEADER_LINE_CLASSES.get(key.lower())
+            if line_class is None:
+                # An unrecognized '##' key keeps only the base HeaderLine type
+                # the mapping already emitted; inventing a subclass for it would
+                # put a term in the graph that the vocabulary does not define.
+                continue
+            emit(f"<{line_uri}> <{RDF_TYPE_URI}> <{VCFR_NAMESPACE}{line_class}> .\n")
+            stats["typed_lines"] += 1
+
+            if key.lower() not in {"filter", "alt", "contig"}:
+                continue
+            fields = _parse_structured_header_fields(value)
+            identifier = (fields.get("ID") or "").strip()
+            if not identifier:
+                continue
+            description = fields.get("Description")
+
+            if key.lower() == "filter":
+                emit(f"<{line_uri}> <{RDF_TYPE_URI}> <{VCFR_NAMESPACE}FilterDefinition> .\n")
+                emit(
+                    f"<{line_uri}> <{VCFR_NAMESPACE}filterId> "
+                    f"{_ntriples_string_literal(identifier)} .\n"
+                )
+                stats["filter_definitions"] += 1
+            elif key.lower() == "alt":
+                emit(f"<{line_uri}> <{RDF_TYPE_URI}> <{VCFR_NAMESPACE}AltDefinition> .\n")
+                emit(
+                    f"<{line_uri}> <{VCFR_NAMESPACE}altId> "
+                    f"{_ntriples_string_literal(identifier)} .\n"
+                )
+                stats["alt_definitions"] += 1
+            else:
+                contig_count += 1
+                stats["contigs"] += 1
+                emit(
+                    f"<{line_uri}> <{VCFR_NAMESPACE}contigId> "
+                    f"{_ntriples_string_literal(identifier)} .\n"
+                )
+                for attribute, predicate in CONTIG_ATTRIBUTES.items():
+                    attribute_value = fields.get(attribute)
+                    if attribute_value:
+                        emit(
+                            f"<{line_uri}> <{VCFR_NAMESPACE}{predicate}> "
+                            f"{_ntriples_string_literal(attribute_value)} .\n"
+                        )
+                continue
+
+            if description:
+                emit(
+                    f"<{line_uri}> <{VCFR_NAMESPACE}fieldDescription> "
+                    f"{_ntriples_string_literal(description)} .\n"
+                )
+
+        for row in rows:
+            if (row.get("HEADER_KEY") or "").strip().lower() != "filedate":
+                continue
+            date_object = file_date_object(row.get("HEADER_VALUE") or "")
+            if date_object is not None:
+                emit(f"<{file_uri}> <{VCFR_NAMESPACE}fileDate> {date_object} .\n")
+                stats["file_dates"] += 1
+            break
+
+        if contig_count:
+            emit(
+                f"<{file_uri}> <{VCFR_NAMESPACE}contigCount> "
+                f'"{contig_count}"^^<{XSD_INTEGER_URI}> .\n'
+            )
+
+    return _append_rdf_atomically(rdf_path, stats, produce)
+
+
+def _qual_object(value: str) -> str:
+    """Serialize QUAL as the SHACL shape requires: xsd:decimal, or vcfr:Null.
+
+    The shape is ``sh:or([sh:datatype xsd:decimal] [sh:datatype vcfr:Null])``,
+    which RML cannot satisfy because the datatype depends on the row. A value
+    that is neither numeric nor the missing token is kept as a plain literal
+    rather than dropped: a non-conformant graph is more useful than a lossy one,
+    and the SHACL layer reports it.
+    """
+    if value in ("", "."):
+        return f'"."^^<{VCFR_NAMESPACE}Null>'
+    try:
+        float(value)
+    except ValueError:
+        return _ntriples_string_literal(value)
+    # Serialize the source lexical form so no precision is gained or lost.
+    return f'"{value}"^^<{XSD_DECIMAL_URI}>'
+
+
+def append_record_detail_rdf(
+    records_tsv: Path,
+    header_lines_tsv: Path,
+    rdf_path: Path,
+    *,
+    emit_qual: bool = True,
+    emit_info: bool = True,
+    progress_interval_records: int = 10_000,
+) -> dict:
+    """Append per-record detail the RML mapping cannot express.
+
+    Covers QUAL (whose datatype depends on the value) and the structured INFO
+    representation (which would otherwise need a materialized helper table of
+    variants x INFO keys). Both are per-record, so they share one pass over
+    ``records.tsv``.
+
+    The default mapping emits INFO only as an opaque ``vcfr:infoRaw`` string.
+    This adds the structured form the vocabulary already defines - one
+    ``vcfr:InfoFieldValue`` per record and key, at the IRI template the
+    vocabulary declares - so INFO becomes queryable rather than just present.
+
+    Emitted directly rather than through RML for the same reason the genotype
+    representations are: RML would need a materialized helper table of
+    variants x INFO keys, and it cannot switch value datatype on a declared
+    ``Type``.
+    """
+    stats = {
+        "representation": "record-detail",
+        "records": 0,
+        "qual_values": 0,
+        "info_values": 0,
+        "info_definitions": 0,
+        "triples": 0,
+        "appended_bytes": 0,
+    }
+    if not records_tsv.is_file():
+        return stats
+    if not rdf_path.is_file():
+        raise FileNotFoundError(f"RDF aggregate not found for INFO streaming: {rdf_path}")
+
+    definitions = _load_field_definitions(header_lines_tsv, "INFO")
+
+    with SampleRecordStream(records_tsv) as record_stream:
+        if not record_stream.source_file:
+            return stats
+
+        def produce(emit):
+            source_component = _rml_uri_component(record_stream.source_file)
+            file_uri = f"file://{source_component}"
+            emitted_definitions: set[str] = set()
+            key_components: dict[str, str] = {}
+            value_count = 0
+            definition_count = 0
+
+            qual_count = 0
+            for record in record_stream:
+                row_component = _rml_uri_component(record.row_id)
+                call_uri = f"{file_uri}#call/{row_component}"
+                if emit_qual:
+                    emit(
+                        f"<{call_uri}> <{VCFR_NAMESPACE}qual> "
+                        f"{_qual_object(record.qual)} .\n"
+                    )
+                    qual_count += 1
+                for key, value in (parse_info_entries(record.info) if emit_info else ()):
+                    key_component = key_components.get(key)
+                    if key_component is None:
+                        key_component = _rml_uri_component(key)
+                        key_components[key] = key_component
+                    info_uri = f"{call_uri}/info/{key_component}"
+
+                    definition = definitions.get(key)
+                    if definition is None:
+                        definition = FormatDefinition(
+                            uri=f"{file_uri}#header/info/{key_component}",
+                            field_number=".",
+                            description=(
+                                f"Synthesized definition for undeclared INFO key {key}"
+                            ),
+                            value_type="Flag" if value is None else "String",
+                        )
+                    if definition.uri not in emitted_definitions:
+                        emitted_definitions.add(definition.uri)
+                        definition_count += 1
+                        type_class = VCF_VALUE_TYPE_CLASSES.get(
+                            definition.value_type, "StringType"
+                        )
+                        emit(
+                            f"<{definition.uri}> <{RDF_TYPE_URI}> "
+                            f"<{VCFR_NAMESPACE}InfoFieldDefinition> .\n"
+                        )
+                        emit(
+                            f"<{definition.uri}> <{VCFR_NAMESPACE}fieldId> "
+                            f"{_ntriples_string_literal(key)} .\n"
+                        )
+                        emit(
+                            f"<{definition.uri}> <{VCFR_NAMESPACE}fieldNumber> "
+                            f"{_ntriples_string_literal(definition.field_number)} .\n"
+                        )
+                        emit(
+                            f"<{definition.uri}> <{VCFR_NAMESPACE}fieldDescription> "
+                            f"{_ntriples_string_literal(definition.description)} .\n"
+                        )
+                        emit(
+                            f"<{definition.uri}> <{VCFR_NAMESPACE}fieldType> "
+                            f"<{VCFR_NAMESPACE}{type_class}> .\n"
+                        )
+
+                    emit(f"<{call_uri}> <{VCFR_NAMESPACE}hasInfoValue> <{info_uri}> .\n")
+                    emit(
+                        f"<{info_uri}> <{RDF_TYPE_URI}> "
+                        f"<{VCFR_NAMESPACE}InfoFieldValue> .\n"
+                    )
+                    emit(
+                        f"<{info_uri}> <{VCFR_NAMESPACE}declaredBy> "
+                        f"<{definition.uri}> .\n"
+                    )
+                    if value is None:
+                        emit(
+                            f"<{info_uri}> <{VCFR_NAMESPACE}fieldValueBoolean> "
+                            f'"true"^^<{XSD_BOOLEAN_URI}> .\n'
+                        )
+                    else:
+                        emit(
+                            f"<{info_uri}> <{VCFR_NAMESPACE}fieldValue> "
+                            f"{_ntriples_literal(value)} .\n"
+                        )
+                        typed = _typed_info_object(value, definition.value_type)
+                        if typed is not None:
+                            predicate, literal = typed
+                            emit(
+                                f"<{info_uri}> <{VCFR_NAMESPACE}{predicate}> "
+                                f"{literal} .\n"
+                            )
+                    value_count += 1
+
+                stats["records"] += 1
+                stats["qual_values"] = qual_count
+                stats["info_values"] = value_count
+                stats["info_definitions"] = definition_count
+                if (
+                    progress_interval_records > 0
+                    and stats["records"] % progress_interval_records == 0
+                ):
+                    print(
+                        f"    * INFO RDF streaming: {stats['records']:,} variants, "
+                        f"{value_count:,} values",
+                        flush=True,
+                    )
+
+        return _append_rdf_atomically(rdf_path, stats, produce)
 
 
 def append_condensed_sample_rdf(
@@ -2376,6 +2819,26 @@ def append_condensed_sample_rdf(
                     )
 
         return _append_rdf_atomically(rdf_path, stats, produce)
+
+
+def emit_record_detail(
+    info_representation: str,
+    *,
+    records_tsv: Path,
+    header_lines_tsv: Path,
+    rdf_path: Path,
+) -> dict | None:
+    """Append QUAL and, when selected, the structured INFO representation.
+
+    QUAL is always emitted: the RML mapping cannot type it per row, so this is
+    the only place it can come from.
+    """
+    if info_representation not in INFO_REPRESENTATION_CHOICES:
+        raise ValueError(f"unknown INFO representation: {info_representation}")
+    return append_record_detail_rdf(
+        records_tsv, header_lines_tsv, rdf_path,
+        emit_qual=True, emit_info=info_representation == "structured",
+    )
 
 
 def emit_sample_representation(
@@ -4663,7 +5126,14 @@ def run_full_mode(
     image_ref: str,
     out_name: str,
     sample_workflow: SampleWorkflow,
+    info_representation: str = DEFAULT_INFO_REPRESENTATION,
+    header_representation: str = DEFAULT_HEADER_REPRESENTATION,
     run_validation: bool = False,
+    validation_artifacts: list[str] | None = None,
+    validation_engine: str = DEFAULT_VALIDATION_ENGINE,
+    validation_engine_options: dict | None = None,
+    validation_strict_conformance: bool = False,
+    validation_shacl_shapes: Path | None = None,
     filter_oracle: str = "auto",
     rdf_storage_mode: str,
     methods: list[str],
@@ -4688,6 +5158,13 @@ def run_full_mode(
     if spark_partitions is not None:
         print(f"  Spark partition hint: {spark_partitions}")
     print(f"  Sample representation: {sample_workflow.representation}")
+    print(f"  INFO representation: {info_representation}")
+    print(f"  Header representation: {header_representation}")
+    validation_artifacts = list(validation_artifacts or ["aggregate"])
+    if run_validation:
+        print(
+            f"  Validation: {', '.join(validation_artifacts)} via {validation_engine}"
+        )
     intermediate_dir = tsv_dir.parent
     ensure_dir(tsv_dir)
     ensure_dir(out_dir)
@@ -5041,8 +5518,59 @@ def run_full_mode(
                     f"{sample_stats['samples']:,}"
                 )
 
+        header_stats = None
+        if header_representation != "basic":
+            print(f"    * Streaming {header_representation} header RDF")
+            try:
+                header_stats = append_header_representation_rdf(
+                    triplet["headers"], raw_rdf_files[0]
+                )
+            except Exception as exc:
+                fail_current(
+                    "header-rdf-streaming",
+                    f"failed streaming {header_representation} header RDF for "
+                    f"'{prefix}': {exc}. See log: {wrapper_log_path}",
+                )
+                continue
+            if triples_produced is not None:
+                triples_produced += int(header_stats["triples"])
+            print(
+                f"    * Header lines typed: {header_stats['typed_lines']:,}; "
+                f"contigs: {header_stats['contigs']:,}"
+            )
+
+        info_stats = None
+        if True:
+            print(f"    * Streaming QUAL and {info_representation} INFO RDF")
+            try:
+                info_stats = emit_record_detail(
+                    info_representation,
+                    records_tsv=triplet["records"],
+                    header_lines_tsv=triplet["headers"],
+                    rdf_path=raw_rdf_files[0],
+                )
+            except Exception as exc:
+                fail_current(
+                    "record-detail-rdf-streaming",
+                    f"failed streaming QUAL/{info_representation} INFO RDF for "
+                    f"'{prefix}': {exc}. See log: {wrapper_log_path}",
+                )
+                continue
+            if info_stats is not None:
+                if triples_produced is not None:
+                    triples_produced += int(info_stats["triples"])
+                print(
+                    f"    * QUAL values streamed: {info_stats['qual_values']:,}; "
+                    f"INFO values: {info_stats['info_values']:,}; "
+                    f"declarations: {info_stats['info_definitions']:,}"
+                )
+
         if triples_produced is None:
             triples_produced = count_triples_in_nt_files(raw_rdf_files)
+        if header_stats is not None:
+            sample_stats = {**(sample_stats or {}), "header": header_stats}
+        if info_stats is not None:
+            sample_stats = {**(sample_stats or {}), "info": info_stats}
         if sample_stats is not None and triples_produced is not None:
             update_conversion_metrics_after_sample_stream(
                 metrics_dir=metrics_dir,
@@ -5133,67 +5661,108 @@ def run_full_mode(
             run_tracker.mark(f"Input {idx}: compression completed for {output_name}")
 
         if run_validation:
-            validation_rdf_path = raw_rdf_files[0]
-            validation_results_dir = (
-                metrics_dir / "reports" / "validation" / safe_metrics_name(output_name)
+            # Each requested target is validated independently, so a run can
+            # prove that the aggregate, the HDT, and the COTTAS artifact all
+            # reproduce the same VCF summaries. `validation_result` keeps the
+            # aggregate's report in the metrics row for backward compatibility;
+            # every target also gets its own stage report and results tree.
+            validation_targets = resolve_validation_targets(
+                requested=validation_artifacts,
+                output_dir=out_dir / output_name,
+                output_name=output_name,
+                aggregate_path=raw_rdf_files[0],
+                selected_methods=selected_methods,
             )
-            print(f"    * Semantic validation: {output_name}")
-            validation_result = {
-                "run_id": run_id,
-                "timestamp": timestamp,
-                "stage": "validation",
-                "validation_id": output_name,
-                "vcf_path": str(input_vcf),
-                "rdf_path": str(validation_rdf_path),
-                "rdf_format": "nt.gz" if validation_rdf_path.name.endswith(".nt.gz") else "nt",
-                "representation": sample_workflow.representation,
-                "results_dir": str(validation_results_dir),
-                "summary_path": str(validation_results_dir / "summary.json"),
-                "input_rdf_size_bytes": int(file_size_bytes(validation_rdf_path) or 0),
-                "exit_code": 1,
-                "status": "EXECUTION_FAILED",
-                "timing": {
-                    "wall_seconds": None,
-                    "user_seconds": None,
-                    "sys_seconds": None,
-                    "max_rss_kb": None,
-                },
-                "temporary_rdf": {
-                    "decompressed_inside_container": validation_rdf_path.name.endswith(".nt.gz"),
-                    "persisted_on_host": False,
-                    "cleanup_confirmed_by_runner": False,
-                },
-            }
-            try:
-                validation_exit_code = run_validation_mode(
-                    vcf_path=Path(input_vcf),
-                    rdf_path=validation_rdf_path,
-                    representation=sample_workflow.representation,
-                    validation_id=output_name,
-                    results_dir=validation_results_dir,
-                    metrics_dir=metrics_dir,
-                    run_id=run_id,
-                    timestamp=timestamp,
-                    image_ref=image_ref,
-                    filter_oracle=filter_oracle,
-                    wrapper_log_path=wrapper_log_path,
-                    run_tracker=run_tracker,
-                    stage_result=validation_result,
+            validation_failures: list[str] = []
+            for target in validation_targets:
+                target_id = (
+                    output_name
+                    if target["name"] == "aggregate"
+                    else f"{output_name}__{target['name']}"
                 )
-            except Exception as exc:
-                validation_result["error"] = str(exc)
+                safe_target_id = safe_metrics_name(target_id)
+                target_results_dir = (
+                    metrics_dir / "reports" / "validation" / safe_target_id
+                )
+                print(
+                    f"    * Semantic validation ({target['name']}, {validation_engine}): "
+                    f"{target['path'].name}"
+                )
+                target_result = {
+                    "run_id": run_id,
+                    "timestamp": timestamp,
+                    "stage": "validation",
+                    "validation_id": target_id,
+                    "validation_target": target["name"],
+                    "vcf_path": str(input_vcf),
+                    "rdf_path": str(target["path"]),
+                    "rdf_format": target["format"],
+                    "engine": validation_engine,
+                    "representation": sample_workflow.representation,
+                    "results_dir": str(target_results_dir),
+                    "summary_path": str(target_results_dir / "summary.json"),
+                    "input_rdf_size_bytes": int(file_size_bytes(target["path"]) or 0),
+                    "exit_code": 1,
+                    "status": "EXECUTION_FAILED",
+                    "timing": {
+                        "wall_seconds": None,
+                        "user_seconds": None,
+                        "sys_seconds": None,
+                        "max_rss_kb": None,
+                    },
+                    "temporary_rdf": {
+                        "decompressed_inside_container": target["format"] != "nt",
+                        "persisted_on_host": False,
+                        "cleanup_confirmed_by_runner": False,
+                    },
+                }
                 try:
-                    stage_path = metrics_dir / "stages" / "validation" / f"{safe_metrics_name(output_name)}.json"
-                    stage_path.parent.mkdir(parents=True, exist_ok=True)
-                    stage_path.write_text(json.dumps(validation_result, indent=2) + "\n", encoding="utf-8")
-                except OSError:
-                    pass
-                eprint(
-                    f"Error: semantic validation could not be completed for '{output_name}': "
-                    f"{exc}. See log: {wrapper_log_path}"
-                )
-                validation_exit_code = 1
-            validation_failed = int(validation_exit_code) != 0
+                    target_exit_code = run_validation_mode(
+                        vcf_path=Path(input_vcf),
+                        rdf_path=target["path"],
+                        rdf_format=target["format"],
+                        representation=sample_workflow.representation,
+                        validation_id=target_id,
+                        results_dir=target_results_dir,
+                        metrics_dir=metrics_dir,
+                        run_id=run_id,
+                        timestamp=timestamp,
+                        image_ref=image_ref,
+                        filter_oracle=filter_oracle,
+                        engine=validation_engine,
+                        engine_options=validation_engine_options,
+                        strict_conformance=validation_strict_conformance,
+                        shacl_shapes=validation_shacl_shapes,
+                        wrapper_log_path=wrapper_log_path,
+                        run_tracker=run_tracker,
+                        stage_result=target_result,
+                    )
+                except Exception as exc:
+                    target_result["error"] = str(exc)
+                    try:
+                        stage_path = (
+                            metrics_dir / "stages" / "validation" / f"{safe_target_id}.json"
+                        )
+                        stage_path.parent.mkdir(parents=True, exist_ok=True)
+                        stage_path.write_text(
+                            json.dumps(target_result, indent=2) + "\n", encoding="utf-8"
+                        )
+                    except OSError:
+                        pass
+                    eprint(
+                        f"Error: semantic validation could not be completed for "
+                        f"'{target_id}': {exc}. See log: {wrapper_log_path}"
+                    )
+                    target_exit_code = 1
+                if target["name"] == "aggregate":
+                    validation_result = target_result
+                if int(target_exit_code) != 0:
+                    validation_failures.append(target["name"])
+            if validation_result is None and validation_targets:
+                # Only non-aggregate targets ran; keep the first for the row.
+                validation_result = target_result
+            validation_failed = bool(validation_failures)
+            validation_exit_code = 1 if validation_failed else 0
 
         raw_size_before_cleanup_by_file = {
             raw_rdf_path.name: int(file_size_bytes(raw_rdf_path) or 0) for raw_rdf_path in raw_rdf_files
@@ -5242,8 +5811,9 @@ def run_full_mode(
         if validation_failed:
             fail_current(
                 "validation",
-                f"semantic VCF/RDF validation failed for '{output_name}'. "
-                f"See results: {validation_result.get('results_dir') if validation_result else metrics_dir / 'reports' / 'validation' / safe_metrics_name(output_name)}",
+                "semantic VCF/RDF validation failed for "
+                f"'{output_name}' ({', '.join(validation_failures)}). "
+                f"See results: {metrics_dir / 'reports' / 'validation'}",
             )
 
         rdf_storage_removed = False
@@ -5633,6 +6203,69 @@ def run_compress_mode(
     return 0
 
 
+def detect_validation_rdf_format(path: Path) -> str | None:
+    """Infer the validator's artifact format from a filename, or None."""
+    for suffix, fmt in VALIDATION_RDF_SUFFIXES:
+        if path.name.endswith(suffix):
+            return fmt
+    return None
+
+
+def resolve_validation_targets(
+    *,
+    requested: list[str],
+    output_dir: Path,
+    output_name: str,
+    aggregate_path: Path,
+    selected_methods: list[str],
+) -> list[dict]:
+    """Map requested validation targets onto artifacts that actually exist.
+
+    A representation that was not selected, or whose artifact is missing after
+    a recoverable index warning, is skipped rather than reported as a failure:
+    the run already recorded why it is absent.
+    """
+    targets: list[dict] = []
+    for name in requested:
+        if name == "aggregate":
+            fmt = detect_validation_rdf_format(aggregate_path)
+            if aggregate_path.is_file() and fmt is not None:
+                targets.append({"name": name, "path": aggregate_path, "format": fmt})
+            continue
+        method_group = (
+            HDT_COMPRESSION_METHODS if name == "hdt" else COTTAS_COMPRESSION_METHODS
+        )
+        if not any(method in method_group for method in selected_methods):
+            continue
+        candidate = output_dir / f"{output_name}.{name}"
+        if candidate.is_file():
+            targets.append({"name": name, "path": candidate, "format": name})
+    return targets
+
+
+def parse_validation_targets(raw: str) -> list[str]:
+    """Parse --validate-artifacts into an ordered, de-duplicated target list."""
+    value = (raw or "").strip()
+    if value == "" or value == "none":
+        return []
+    if value == "all":
+        return list(VALIDATION_TARGET_CHOICES)
+    targets: list[str] = []
+    for token in value.split(","):
+        target = token.strip()
+        if not target:
+            continue
+        if target not in VALIDATION_TARGET_CHOICES:
+            allowed = ",".join(VALIDATION_TARGET_CHOICES)
+            raise ValueError(
+                f"Unsupported value '{target}' for --validate-artifacts. "
+                f"Use {allowed}, all, or none."
+            )
+        if target not in targets:
+            targets.append(target)
+    return targets
+
+
 def detect_compressed_format(path: Path):
     """Infer compressed RDF format from filename/extension."""
     if (
@@ -5958,15 +6591,25 @@ def run_validation_mode(
     image_ref: str,
     filter_oracle: str,
     wrapper_log_path: Path,
+    engine: str = DEFAULT_VALIDATION_ENGINE,
+    engine_options: dict | None = None,
+    rdf_format: str | None = None,
+    strict_conformance: bool = False,
+    shacl_shapes: Path | None = None,
     run_tracker: RunTracker | None = None,
     stage_result: dict | None = None,
     write_metrics_csv: bool = False,
 ):
     """Run VCF/RDF semantic queries with container-local temporary state.
 
-    Gzip RDF inputs are inflated under the container's ``/work`` temporary
-    filesystem. Plain N-Triples inputs are read directly from their read-only
-    mount. In both cases, no validation scratch RDF is persisted on the host.
+    Accepts any artifact the pipeline produces (``.nt``, ``.nt.gz``, ``.nt.br``,
+    ``.hdt``, ``.cottas``, ``.cottas[.gz|.br]``). Anything other than plain
+    N-Triples is decoded under the container's ``/work`` filesystem, so
+    validating an ``.hdt`` proves it decodes to a graph that still satisfies
+    every semantic check. No validation scratch RDF is persisted on the host.
+
+    ``engine`` selects the SPARQL backend (``comunica`` or ``qlever``); both
+    answer the same queries, so it is a scale decision, not a semantic one.
     """
     # An empty directory may be left behind if Docker itself fails before the
     # runner starts. Reuse only that empty shell; never overwrite reports.
@@ -5981,7 +6624,38 @@ def run_validation_mode(
         else None
     )
     progress_container_ref = container_progress_path(progress_host_path, metrics_dir)
-    rdf_flag = "--rdf-gz" if rdf_path.name.endswith(".nt.gz") else "--rdf-nt"
+    resolved_format = rdf_format or detect_validation_rdf_format(rdf_path)
+    if resolved_format is None:
+        raise ValueError(
+            f"Unsupported RDF artifact for validation: {rdf_path.name}. "
+            "Expected one of .nt, .nt.gz, .nt.br, .hdt, .cottas, .cottas.gz, .cottas.br"
+        )
+    options = dict(engine_options or {})
+    engine_args: list[str] = ["--engine", engine]
+    for flag, key in (
+        ("--query-timeout", "query_timeout"),
+        ("--qlever-memory-gb", "qlever_memory_gb"),
+        ("--qlever-port", "qlever_port"),
+        ("--qlever-startup-timeout", "qlever_startup_timeout"),
+    ):
+        value = options.get(key)
+        if value is not None:
+            engine_args.extend([flag, str(value)])
+    for flag, key in (
+        ("--qlever-index-arg", "qlever_index_args"),
+        ("--qlever-server-arg", "qlever_server_args"),
+    ):
+        for value in options.get(key) or []:
+            engine_args.extend([flag, str(value)])
+    if strict_conformance:
+        engine_args.append("--strict-conformance")
+    shacl_mount: list[str] = []
+    if shacl_shapes is not None:
+        # Mounted read-only in its own directory so the shapes file can live
+        # anywhere on the host without exposing its parent tree for writing.
+        shacl_mount = ["-v", f"{shacl_shapes.parent.resolve()}:/data/shacl:ro"]
+        engine_args.extend(["--shacl-shapes", f"/data/shacl/{shacl_shapes.name}"])
+
     cmd = [
         *docker_run_base(),
         "--init",
@@ -5993,6 +6667,7 @@ def run_validation_mode(
         f"{str(results_dir)}:/data/validation",
         "-v",
         f"{str(metrics_dir.resolve())}:/data/metrics",
+        *shacl_mount,
         image_ref,
         "/usr/bin/time",
         "-v",
@@ -6003,8 +6678,11 @@ def run_validation_mode(
         "/opt/vcf-rdfizer/validation/validation_runner.py",
         "--vcf",
         f"/data/vcf/{vcf_path.name}",
-        rdf_flag,
+        "--rdf",
         f"/data/rdf/{rdf_path.name}",
+        "--rdf-format",
+        resolved_format,
+        *engine_args,
         "--representation",
         representation,
         "--results-dir",
@@ -6052,7 +6730,9 @@ def run_validation_mode(
         "validation_id": validation_id,
         "vcf_path": str(vcf_path),
         "rdf_path": str(rdf_path),
-        "rdf_format": "nt.gz" if rdf_path.name.endswith(".nt.gz") else "nt",
+        "rdf_format": resolved_format,
+        "engine": engine,
+        "strict_conformance": bool(strict_conformance),
         "representation": representation,
         "results_dir": str(results_dir),
         "summary_path": str(summary_path),
@@ -6068,7 +6748,7 @@ def run_validation_mode(
         "temporary_rdf": {
             "decompressed_inside_container": bool(
                 summary_temporary_rdf.get(
-                    "decompressedInsideContainer", rdf_path.name.endswith(".nt.gz")
+                    "decompressedInsideContainer", resolved_format != "nt"
                 )
             ),
             "persisted_on_host": bool(summary_temporary_rdf.get("persisted", False)),
@@ -6077,7 +6757,7 @@ def run_validation_mode(
             ),
         },
     }
-    if rdf_path.name.endswith(".nt.gz"):
+    if resolved_format == "nt.gz":
         # Compatibility alias for consumers of the original standalone report
         # schema; ``rdf_path`` is the canonical format-neutral field.
         payload["rdf_gzip_path"] = str(rdf_path)
@@ -6227,6 +6907,28 @@ def main():
         ),
     )
     parser.add_argument(
+        "--header-representation",
+        choices=HEADER_REPRESENTATION_CHOICES,
+        default=DEFAULT_HEADER_REPRESENTATION,
+        help=(
+            "VCF meta-information representation: structured types each '##' line "
+            "with its vocabulary subclass and lifts FILTER/ALT/contig attributes "
+            "into their own properties; basic keeps only untyped header lines "
+            f"(default: {DEFAULT_HEADER_REPRESENTATION})"
+        ),
+    )
+    parser.add_argument(
+        "--info-representation",
+        choices=INFO_REPRESENTATION_CHOICES,
+        default=DEFAULT_INFO_REPRESENTATION,
+        help=(
+            "INFO column representation: structured also emits one "
+            "vcfr:InfoFieldValue per record and key alongside the raw string, "
+            "making INFO queryable; raw keeps only vcfr:infoRaw "
+            f"(default: {DEFAULT_INFO_REPRESENTATION})"
+        ),
+    )
+    parser.add_argument(
         "--validate",
         "--run-validation",
         dest="run_validation",
@@ -6371,6 +7073,78 @@ def main():
         default="auto",
         help="FILTER oracle for full-mode validation and standalone validation (default: auto)",
     )
+    parser.add_argument(
+        "--shacl-shapes",
+        default=None,
+        help=(
+            "Validate each graph against a SHACL shapes file as an independent "
+            "structural layer (for example the vocabulary's published shapes). "
+            "Off by default: it loads the whole graph into memory, so it does "
+            "not scale to a cohort-sized aggregate"
+        ),
+    )
+    parser.add_argument(
+        "--strict-conformance",
+        action="store_true",
+        help=(
+            "Fail validation when a missing token is serialized as a plain '.' "
+            "literal instead of '.'^^vcfr:Null (reported but non-fatal by default)"
+        ),
+    )
+    parser.add_argument(
+        "--validation-engine",
+        choices=VALIDATION_ENGINE_CHOICES,
+        default=DEFAULT_VALIDATION_ENGINE,
+        help=(
+            "SPARQL engine used for validation: comunica queries the graph in "
+            "memory; qlever builds an on-disk index inside the container and "
+            f"serves it (default: {DEFAULT_VALIDATION_ENGINE})"
+        ),
+    )
+    parser.add_argument(
+        "--validate-artifacts",
+        default=DEFAULT_VALIDATION_TARGETS,
+        help=(
+            "Which produced artifacts full-mode --validate should check "
+            "(comma-separated): aggregate,hdt,cottas, or all "
+            f"(default: {DEFAULT_VALIDATION_TARGETS}). A representation that was "
+            "not produced is skipped."
+        ),
+    )
+    parser.add_argument(
+        "--validation-query-timeout",
+        default=None,
+        help="Per-query timeout in seconds for validation (default: engine default)",
+    )
+    parser.add_argument(
+        "--qlever-memory-gb",
+        default=None,
+        help="QLever index/server memory budget in GiB (default: 4)",
+    )
+    parser.add_argument(
+        "--qlever-port",
+        default=None,
+        help="Container-local port for the QLever server (default: 7019)",
+    )
+    parser.add_argument(
+        "--qlever-startup-timeout",
+        default=None,
+        help="Seconds to wait for the QLever server to answer after indexing (default: 900)",
+    )
+    parser.add_argument(
+        "--qlever-index-arg",
+        action="append",
+        default=[],
+        metavar="ARG",
+        help="Extra argument for QLever's index builder (repeatable)",
+    )
+    parser.add_argument(
+        "--qlever-server-arg",
+        action="append",
+        default=[],
+        metavar="ARG",
+        help="Extra argument for QLever's server (repeatable)",
+    )
     rdf_output_group = parser.add_mutually_exclusive_group()
     rdf_output_group.add_argument(
         "-R",
@@ -6414,7 +7188,33 @@ def main():
 
     step1_label = "Step 1/5" if mode == "full" else "Step 1/3"
 
+    validation_artifacts: list[str] = []
+    validation_engine_options: dict = {}
+    shacl_shapes_path: Path | None = None
     try:
+        for option_name, key in (
+            ("--validation-query-timeout", "query_timeout"),
+            ("--qlever-memory-gb", "qlever_memory_gb"),
+            ("--qlever-port", "qlever_port"),
+            ("--qlever-startup-timeout", "qlever_startup_timeout"),
+        ):
+            raw_value = getattr(args, option_name.lstrip("-").replace("-", "_"))
+            if raw_value is not None:
+                validation_engine_options[key] = parse_positive_int(
+                    raw_value, name=option_name
+                )
+        if args.qlever_index_arg:
+            validation_engine_options["qlever_index_args"] = list(args.qlever_index_arg)
+        if args.qlever_server_arg:
+            validation_engine_options["qlever_server_args"] = list(args.qlever_server_arg)
+        if validation_engine_options.get("qlever_port", 1) > 65535:
+            raise ValueError("--qlever-port must be between 1 and 65535")
+        validation_artifacts = parse_validation_targets(args.validate_artifacts)
+        if args.shacl_shapes is not None:
+            shacl_shapes_path = Path(args.shacl_shapes).expanduser().resolve()
+            if not shacl_shapes_path.is_file():
+                raise ValueError(f"SHACL shapes file not found: {shacl_shapes_path}")
+
         chunk_target_bytes = parse_positive_int(
             args.chunk_target_bytes, name="--chunk-target-bytes"
         )
@@ -6452,6 +7252,13 @@ def main():
                 args.sample_representation,
                 rules_path,
             )
+            if args.validate_artifacts != DEFAULT_VALIDATION_TARGETS and not args.run_validation:
+                raise ValueError("--validate-artifacts requires --validate")
+            if not validation_artifacts and args.run_validation:
+                raise ValueError(
+                    "--validate-artifacts resolved to no targets; choose at least one of "
+                    + ", ".join(VALIDATION_TARGET_CHOICES)
+                )
             validate_mode_dirs([out_root, out_dir, tsv_dir, metrics_root])
             if args.legacy_compression is not None:
                 if (
@@ -6532,8 +7339,19 @@ def main():
             if not args.rdf:
                 raise ValueError("--rdf is required in --mode validation")
             validation_rdf_gzip_path = Path(args.rdf).expanduser().resolve()
-            if not validation_rdf_gzip_path.is_file() or not validation_rdf_gzip_path.name.endswith(".nt.gz"):
-                raise ValueError("Validation RDF input must be an existing .nt.gz file")
+            if not validation_rdf_gzip_path.is_file():
+                raise ValueError(f"Validation RDF input not found: {validation_rdf_gzip_path}")
+            validation_rdf_format = detect_validation_rdf_format(validation_rdf_gzip_path)
+            if validation_rdf_format is None:
+                supported = ", ".join(fmt for _suffix, fmt in VALIDATION_RDF_SUFFIXES)
+                raise ValueError(
+                    "Validation RDF input must be one of: " + supported
+                )
+            if args.validate_artifacts != DEFAULT_VALIDATION_TARGETS:
+                raise ValueError(
+                    "--validate-artifacts is only valid in --mode full; in validation "
+                    "mode pass the artifact directly with --rdf"
+                )
             validation_id = args.validation_id or vcf_output_prefix(validation_vcf_path)
             if not re.fullmatch(r"[A-Za-z0-9._-]+", validation_id):
                 raise ValueError("--validation-id may contain only letters, digits, dot, underscore, and hyphen")
@@ -6698,6 +7516,8 @@ def main():
         "requested_image": args.image,
         "requested_image_version": args.image_version,
         "sample_representation": args.sample_representation if mode == "full" else None,
+        "info_representation": args.info_representation if mode == "full" else None,
+        "header_representation": args.header_representation if mode == "full" else None,
         "rdf_storage_mode": args.rdf_storage_mode if mode == "full" else None,
         "compression_methods": (
             full_methods if mode == "full" else methods if mode == "compress" else []
@@ -6708,6 +7528,11 @@ def main():
         "chunk_max_bytes": chunk_max_bytes if mode in {"full", "compress"} else None,
         "spark_partitions": spark_partitions if mode == "full" else None,
         "run_validation": bool(args.run_validation) if mode == "full" else False,
+        "validation_artifacts": validation_artifacts if mode == "full" and args.run_validation else None,
+        "validation_engine": args.validation_engine if mode in {"full", "validation"} else None,
+        "validation_strict_conformance": bool(args.strict_conformance) if mode in {"full", "validation"} else None,
+        "validation_shacl_shapes": str(shacl_shapes_path) if shacl_shapes_path else None,
+        "validation_engine_options": validation_engine_options or None,
         "filter_oracle": args.filter_oracle if mode in {"full", "validation"} else None,
         "quiet": bool(args.quiet),
         "no_progress": bool(args.no_progress),
@@ -6895,7 +7720,14 @@ def main():
                 image_ref=image_ref,
                 out_name=args.out_name,
                 sample_workflow=sample_workflow,
+                info_representation=args.info_representation,
+                header_representation=args.header_representation,
                 run_validation=args.run_validation,
+                validation_artifacts=validation_artifacts,
+                validation_engine=args.validation_engine,
+                validation_engine_options=validation_engine_options,
+                validation_strict_conformance=args.strict_conformance,
+                validation_shacl_shapes=shacl_shapes_path,
                 filter_oracle=args.filter_oracle,
                 rdf_storage_mode=args.rdf_storage_mode,
                 methods=full_methods,
@@ -6946,6 +7778,7 @@ def main():
             return run_validation_mode(
                 vcf_path=validation_vcf_path,
                 rdf_path=validation_rdf_gzip_path,
+                rdf_format=validation_rdf_format,
                 representation=args.sample_representation,
                 validation_id=validation_id,
                 results_dir=validation_results_dir,
@@ -6954,6 +7787,10 @@ def main():
                 timestamp=timestamp,
                 image_ref=image_ref,
                 filter_oracle=args.filter_oracle,
+                engine=args.validation_engine,
+                engine_options=validation_engine_options,
+                strict_conformance=args.strict_conformance,
+                shacl_shapes=shacl_shapes_path,
                 wrapper_log_path=wrapper_log_path,
                 write_metrics_csv=True,
             )

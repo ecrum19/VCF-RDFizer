@@ -40,6 +40,9 @@ vcf-rdfizer-rules = "vcf_rdfizer_rules:main"
 dev = [
   "build>=1.2.2",
   "twine>=5.1.1",
+  # Test-only: an in-process SPARQL engine for the validation mutation harness,
+  # so it needs no Docker. The suite skips those tests when it is absent.
+  "rdflib>=7.0.0",
 ]
 
 [tool.setuptools]

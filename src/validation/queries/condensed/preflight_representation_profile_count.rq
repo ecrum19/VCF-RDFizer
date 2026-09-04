@@ -1,0 +1,9 @@
+PREFIX vcfr: <https://w3id.org/vcf-rdfizer/vocab#>
+
+# Exact number of VCFFile resources not declaring the condensed profile.
+SELECT (COUNT(*) AS ?anomalyCount)
+WHERE {
+  ?file a vcfr:VCFFile .
+  OPTIONAL { ?file vcfr:representationProfile ?profile }
+  FILTER(!BOUND(?profile) || ?profile != vcfr:CondensedRepresentation)
+}

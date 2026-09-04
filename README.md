@@ -19,6 +19,12 @@ VCF-RDFizer is a Docker-first CLI wrapper for:
 
 The VCF-RDFizer vocabulary is available at [https://w3id.org/vcf-rdfizer/vocab#](https://w3id.org/vcf-rdfizer/vocab#).
 
+This README is the task-oriented reference. For how the tool works, why it is
+built that way, and where it stops working, see the documentation set in
+**[`docs/`](docs/README.md)** - starting with
+[Architecture](docs/architecture.md) and, before you rely on the output,
+[Limitations](docs/limitations.md).
+
 ## Requirements
 
 - Python 3.10+
@@ -134,6 +140,59 @@ stage summary at `stages/validation/<dataset-id>.json`. See [Semantic VCF/RDF
 validation](docs/validation.md) for query definitions, preflight checks, result
 statuses, and cleanup evidence.
 
+
+### Artifacts and engines
+
+`--rdf` accepts any artifact the pipeline produces - `.nt`, `.nt.gz`, `.nt.br`,
+`.hdt`, `.cottas`, `.cottas.gz`, `.cottas.br`. A compressed or indexed artifact
+is decoded back to N-Triples **inside the container** and then put through the
+full semantic suite, which proves it decodes to a graph that still reproduces
+every VCF summary - stronger than the triple-count round-trip that runs during
+compression.
+
+In full mode, `--validate-artifacts {aggregate,hdt,cottas,all}` chooses which
+produced artifacts to check; each is validated independently with its own
+report:
+
+```bash
+vcf-rdfizer --mode full -i ./cohort.vcf.gz \
+  --rdf-storage-mode space-optimized --representations hdt,cottas \
+  --validate --validate-artifacts all -o ./results
+```
+
+`--validation-engine {comunica,qlever}` selects the SPARQL backend. Comunica
+(default) queries the file in memory; [QLever](https://github.com/ad-freiburg/qlever)
+builds an on-disk index inside the container and serves it, which is what makes
+cohort-scale graphs queryable. Both answer identical queries, so the choice is
+never semantic, and every report records which engine ran.
+
+```bash
+vcf-rdfizer --mode validation -i ./cohort.vcf.gz --rdf ./results/cohort/cohort.hdt \
+  --validation-engine qlever --qlever-memory-gb 32 -o ./validation-results
+```
+
+Tuning: `--qlever-memory-gb`, `--qlever-port`, `--qlever-startup-timeout`,
+`--validation-query-timeout`, and repeatable `--qlever-index-arg` /
+`--qlever-server-arg` escape hatches.
+
+Validation runs three independent layers: exact aggregate comparison against
+the VCF, a predicate/class census plus per-record and per-value identity
+digests, and — with `--shacl-shapes` — SHACL conformance against the
+vocabulary's published shapes.
+
+```bash
+vcf-rdfizer --mode validation -i ./cohort.vcf.gz --rdf ./results/cohort/cohort.nt.gz \
+  --shacl-shapes ./vocabulary/shacl/vcf-rdfizer-vocabulary.shacl.ttl \
+  --strict-conformance -o ./validation-results
+```
+
+> **What a PASS means.** Coverage is measured, not asserted: a mutation harness
+> corrupts a correct graph in 36 named ways and records which are detected
+> (currently **64/66**). See [`docs/vcf-coverage.md`](docs/vcf-coverage.md) for
+> the element-by-element matrix and the remaining gaps, and
+> [`docs/validation-methodology.md`](docs/validation-methodology.md) for how the
+> number is produced.
+
 ## Compression Plan
 
 Compression is configured as three independent decisions:
@@ -203,6 +262,23 @@ host filesystem.
 - `-R, --keep-rmlstreamer-rdf-output` keep the aggregate RDF output produced by RMLStreamer
 - `--remove-rdf-storage-output` explicitly remove the aggregate `.nt`/`.nt.gz` after successful compression
 - `-e, --estimate-size` preflight size estimate
+
+## VCF Coverage
+
+Full-mode conversion covers every VCF column. Three options control how much
+structure is emitted; all default to the richer form.
+
+| Option | Effect |
+| --- | --- |
+| `--sample-representation {expanded,condensed}` | Genotype shape (see below) |
+| `--info-representation {structured,raw}` | `structured` adds one `vcfr:InfoFieldValue` per record and key, with typed values, alongside `vcfr:infoRaw` |
+| `--header-representation {structured,basic}` | `structured` types each `##` line with its vocabulary subclass and lifts FILTER/ALT/contig attributes into their own properties |
+
+QUAL is always emitted, typed `xsd:decimal` or `vcfr:Null`, because the
+published SHACL shape requires a datatype that depends on the value.
+
+[`docs/vcf-coverage.md`](docs/vcf-coverage.md) maps every VCF element to its RDF
+terms and to the validation check that covers it.
 
 ## Sample Representation Modes
 
@@ -853,10 +929,25 @@ in `vcf_rdfizer.py` append it directly to the aggregate, because the equivalent
 RML maps would first have to materialize variants x samples (x FORMAT keys)
 helper TSV rows. See [`docs/sample-representation-guide.md`](docs/sample-representation-guide.md).
 
-Further reading:
+Further reading: **[`docs/`](docs/README.md) is the in-depth documentation set** -
+how each part of the tool works, why, and where it stops working.
 
-- [`docs/validation.md`](docs/validation.md) - semantic validation design and query set
-- [`docs/sample-representation-guide.md`](docs/sample-representation-guide.md) - emitted genotype shapes
+| Document | Covers |
+| --- | --- |
+| [Architecture](docs/architecture.md) | Host/container split, failure policy, pinned toolchain |
+| [Conversion](docs/conversion.md) | VCF -> TSV -> RDF, stage by stage |
+| [Representations](docs/representations.md) | Compression, HDT/COTTAS, chunking, round-trip checks |
+| [Output and metrics](docs/output-and-metrics.md) | Run layout, reports, progress, exit codes |
+| [Custom RML mappings](docs/rml-mappings.md) | The `--rules` contract in full |
+| [Sample representations](docs/sample-representation-guide.md) | Expanded vs condensed genotype shapes |
+| [Validation](docs/validation.md) | The semantic suite, and what it does not test |
+| [Validation methodology](docs/validation-methodology.md) | How coverage is measured, not asserted |
+| [VCF coverage matrix](docs/vcf-coverage.md) | Element by element, with the mutation that proves each row |
+| [CLI reference](docs/cli-reference.md) | Every flag, with constraints and interactions |
+| [Limitations](docs/limitations.md) | Everything the tool cannot do, in one place |
+| [Roadmap](docs/roadmap.md) | Planned work, known defects, and rejected options |
+| [Data linking design](docs/datalinking-design.md) | Proposal: a plug-in system for external links |
+
 - [`changelog.md`](changelog.md) - dated change history
 - [`ACKNOWLEDGEMENTS.md`](ACKNOWLEDGEMENTS.md) - funding and attribution
 

@@ -47,6 +47,9 @@
     rr:predicate vcfr:fileFormat ;
     rr:objectMap [ rml:reference "FILE_FORMAT" ]
   ] ;
+  # fileDate is emitted by the wrapper: the published shape requires xsd:date,
+  # but ##fileDate has no mandated format in the VCF specification, so the
+  # value has to be inspected before it can be typed.
   rr:predicateObjectMap [
     rr:predicate vcfr:sourceSoftware ;
     rr:objectMap [ rml:reference "SOURCE_SOFTWARE" ]
@@ -215,6 +218,9 @@
     rr:template "file://{SOURCE_FILE}#call/{ROW_ID}" ;
     rr:class vcfr:VariantCall
   ] ;
+  # QUAL is emitted by the wrapper, not here: the published SHACL shape
+  # requires xsd:decimal or vcfr:Null depending on whether the value is
+  # present, and RML cannot choose a datatype per row.
   rr:predicateObjectMap [
     rr:predicate vcfr:filter ;
     rr:objectMap [ rml:reference "FILTER" ]

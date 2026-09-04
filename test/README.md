@@ -33,6 +33,34 @@ This repository uses `unittest` (Python standard library) to isolate orchestrati
   - Pins the documented TSV column lists to the headers `src/vcf_as_tsv.sh`
     actually writes, so the two cannot drift apart.
 
+- `test/test_validation_mutation_unit.py` (+ `validation_fixtures.py`,
+  `validation_mutations.py`)
+  - Mutation testing for the semantic validation suite: corrupts a correct
+    graph in ~25 named ways and asserts which corruptions the validator
+    detects, producing a reproducible mutation score.
+  - Requires `rdflib` (test-only, in the `dev` extra); the tests skip cleanly
+    without it. See `docs/validation-methodology.md`.
+  - The fixture derives the VCF, the RDF graph and the parser oracle from one
+    declarative spec, and builds its graph with the project's own emitters, so
+    the two halves cannot drift apart.
+
+- `test/cross_engine_agreement.py`
+  - Not a unittest module: run inside the image to assert every validation
+    query returns identical values under Comunica and QLever.
+
+- `test/test_validation_logic_unit.py`
+  - Mutation tests over the validator's pure comparison layer, run on the host
+    without cyvcf2 or Docker.
+  - Records both what a validation `PASS` detects and the coverage gaps it does
+    not, so closing a gap fails a test rather than passing unnoticed.
+
+- `test/test_validation_engines_unit.py`
+  - Verifies artifact format detection and decode paths (`.nt`, `.nt.gz`,
+    `.nt.br`, `.hdt`, `.cottas[.gz|.br]`) with the container tools faked.
+  - Verifies Comunica and QLever engine construction, QLever's
+    index/serve/teardown lifecycle and overridable command lines, and the
+    wrapper's validation-target resolution.
+
 - `test/test_gzip_size_unit.py`
   - Verifies uncompressed-size measurement for BGZF, single-member gzip, and
     concatenated members, each against a full-inflate ground truth.

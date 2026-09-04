@@ -1,6 +1,11 @@
 ARG RMLSTREAMER_VERSION=2.5.0
 ARG HDTC_VERSION=1.1.0
 ARG COMUNICA_VERSION=5.3.0
+# QLever is an optional second SPARQL engine for validation. Its binaries are
+# copied from the upstream published image rather than built here: compiling
+# QLever needs a large C++ toolchain and would dominate this image's build.
+# Pin a digest or release tag here to make validation runs reproducible.
+ARG QLEVER_IMAGE=adfreiburg/qlever:latest
 
 FROM eclipse-temurin:11-jre AS build-hdt-cpp
 
@@ -59,6 +64,10 @@ RUN cargo build --locked --release \
   && cp LICENSE /opt/third_party_licenses/HDTC.LICENSE
 
 
+# Named stage so the runtime image can COPY QLever's binaries out of it.
+FROM ${QLEVER_IMAGE} AS qlever
+
+
 FROM eclipse-temurin:11-jre
 
 ARG RMLSTREAMER_VERSION
@@ -94,7 +103,8 @@ RUN python3 -m venv /opt/pycottas-venv \
     duckdb==1.5.5 \
     pyarrow==22.0.0 \
     numpy==2.4.6 \
-    cyvcf2==0.34.0
+    cyvcf2==0.34.0 \
+    pyshacl==0.30.1
 
 RUN npm install --global "@comunica/query-sparql-file@${COMUNICA_VERSION}"
 
@@ -110,6 +120,33 @@ COPY --from=build-hdt-cpp /usr/local/lib/libhdt* /usr/local/lib/
 COPY --from=build-hdt-cpp /opt/third_party_licenses/ /usr/share/licenses/vcf-rdfizer/
 COPY --from=build-hdtc /opt/hdtc/target/release/hdtc /usr/local/bin/hdtc
 COPY --from=build-hdtc /opt/third_party_licenses/ /usr/share/licenses/vcf-rdfizer/
+
+# Optional QLever SPARQL engine (--validation-engine qlever). Comunica remains
+# the default, so an image whose QLever binaries turn out to be unusable is
+# still fully functional; the validator reports the reason instead of failing
+# obscurely. Pin a different tag or digest with
+# --build-arg QLEVER_IMAGE=adfreiburg/qlever:<tag>.
+#
+# QLever's image is built on a different Ubuntu release than this one, so the
+# binaries alone are not enough: their Boost, ICU, jemalloc and io_uring
+# sonames are release-specific and absent here. Those libraries travel with the
+# binaries into a private directory that only QLever's own processes are
+# pointed at, so they cannot shadow anything the rest of the image links
+# against. (glibc itself is not copied - it is backward compatible, and this
+# base is newer than QLever's.)
+COPY --from=qlever /qlever/qlever-index /opt/qlever/bin/qlever-index
+COPY --from=qlever /qlever/qlever-server /opt/qlever/bin/qlever-server
+COPY --from=qlever \
+  /lib/x86_64-linux-gnu/libboost_iostreams.so.1.83.0 \
+  /lib/x86_64-linux-gnu/libboost_program_options.so.1.83.0 \
+  /lib/x86_64-linux-gnu/libboost_url.so.1.83.0 \
+  /lib/x86_64-linux-gnu/libgomp.so.1 \
+  /lib/x86_64-linux-gnu/libicudata.so.74 \
+  /lib/x86_64-linux-gnu/libicui18n.so.74 \
+  /lib/x86_64-linux-gnu/libicuuc.so.74 \
+  /lib/x86_64-linux-gnu/libjemalloc.so.2 \
+  /lib/x86_64-linux-gnu/liburing.so.2 \
+  /opt/qlever/lib/
 COPY THIRD_PARTY_NOTICES.md /usr/share/licenses/vcf-rdfizer/THIRD_PARTY_NOTICES.md
 COPY src/*.sh /opt/vcf-rdfizer/
 COPY src/*.py /opt/vcf-rdfizer/
@@ -121,7 +158,22 @@ COPY vcf_rdfizer_gzip.py /opt/vcf-rdfizer/
 RUN chmod +x /opt/vcf-rdfizer/*.sh \
   && chmod +x /usr/local/bin/rdf2hdt \
   && chmod +x /usr/local/bin/hdt2rdf \
-  && chmod +x /usr/local/bin/hdtc
+  && chmod +x /usr/local/bin/hdtc \
+  && chmod +x /opt/qlever/bin/qlever-index /opt/qlever/bin/qlever-server
+
+# QLever's binaries come from a different base image, so record at build time
+# whether they actually link here. The validator reads this marker to explain
+# an unavailable engine instead of surfacing a bare "not found".
+RUN set -eu; \
+  status="ok"; \
+  for binary in qlever-index qlever-server; do \
+    missing="$(LD_LIBRARY_PATH=/opt/qlever/lib ldd "/opt/qlever/bin/$binary" 2>&1 | grep 'not found' || true)"; \
+    if [ -n "$missing" ]; then \
+      status="QLever binary $binary has unresolved shared libraries in this base image: $missing"; \
+      echo "WARNING: $status" >&2; \
+    fi; \
+  done; \
+  printf '%s\n' "$status" > /opt/vcf-rdfizer/qlever-status.txt
 
 ENV RMLSTREAMER_JAR=/opt/rmlstreamer/RMLStreamer-v${RMLSTREAMER_VERSION}-standalone.jar
 ENV JAR=/opt/rmlstreamer/RMLStreamer-v${RMLSTREAMER_VERSION}-standalone.jar
@@ -132,6 +184,8 @@ ENV COTTAS_MERGE_BATCH_ROWS=2048
 ENV RDF2HDT_BIN=/usr/local/bin/rdf2hdt
 ENV HDT2RDF_BIN=/usr/local/bin/hdt2rdf
 ENV COTTAS_PYTHON_BIN=/opt/pycottas-venv/bin/python
+ENV QLEVER_INDEX_BUILDER_BIN=/opt/qlever/bin/qlever-index
+ENV QLEVER_SERVER_BIN=/opt/qlever/bin/qlever-server
 ENV LD_LIBRARY_PATH=/usr/local/lib
 
 # COTTAS creates a temporary DuckDB database in the container working

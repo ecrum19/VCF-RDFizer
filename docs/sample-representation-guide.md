@@ -1,5 +1,9 @@
 # Expanded and Condensed Knowledge Representations
 
+*Part of the [VCF-RDFizer documentation](README.md). How these triples are emitted:
+[`conversion.md`](conversion.md). Where section 7's assessment leads:
+[`roadmap.md`](roadmap.md#6-query-time-decoding-for-condensed-graphs).*
+
 This guide explains the two ways VCF-RDFizer can represent sample genotype
 information in RDF:
 
@@ -535,3 +539,13 @@ as individual resources or as ordered vectors.
   as one tab-separated `VCFTextVector` literal in `sampleIndex` order.
 - **Graph shape**: which resources and relationships are present, independent
   of the underlying biological values.
+
+
+---
+
+## See also
+
+- [Conversion](conversion.md) — how these triples are emitted, and why not through RML
+- [VCF coverage matrix](vcf-coverage.md) — which genotype elements are validated
+- [Representations](representations.md) — why condensed matters at cohort scale
+- [Roadmap](roadmap.md#6-query-time-decoding-for-condensed-graphs) — where section 7 leads

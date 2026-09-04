@@ -1,5 +1,426 @@
 # Changelog
 
+## 2026-09-04 — Documentation set, and a data-linking design proposal
+
+`docs/` becomes an in-depth explanation of the whole tool rather than four
+validation-focused documents. Every part of the pipeline is now described, with
+its limitations stated next to its capabilities rather than in a footnote.
+
+### Added
+
+- [`docs/README.md`](docs/README.md) — index, reading paths per audience, and
+  the conventions the documentation set follows.
+- [`docs/architecture.md`](docs/architecture.md) — the host/container split,
+  what runs where, the **three places that split deliberately leaks** (genotype,
+  header and QUAL/INFO emission happen on the host because RML cannot choose a
+  datatype or class per row), the three-way failure policy, and the pinned
+  toolchain versions.
+- [`docs/conversion.md`](docs/conversion.md) — VCF -> TSV -> RDF stage by stage,
+  including what the single-`awk`-pass parser can and cannot see, the complete
+  IRI template table, and the datatype and missing-value decisions.
+- [`docs/representations.md`](docs/representations.md) — the compression plan's
+  three independent decisions, record-safe chunking, the `hdtc` and PyArrow
+  rationales, and what the round-trip check does *not* prove.
+- [`docs/output-and-metrics.md`](docs/output-and-metrics.md) — output layout,
+  the `run_metrics/` tree, input size accounting, progress, interrupts, exit
+  codes.
+- [`docs/rml-mappings.md`](docs/rml-mappings.md) — the `--rules` contract in
+  full, plus what a custom mapping does *not* control and what it costs in
+  validation.
+- [`docs/cli-reference.md`](docs/cli-reference.md) — every flag, grouped, with
+  enforced constraints, environment variables, and exit codes.
+- [`docs/limitations.md`](docs/limitations.md) — one consolidated, honest
+  account: operational, input handling, modelling, extension points,
+  compression, validation, vocabulary, and scope.
+- [`docs/roadmap.md`](docs/roadmap.md) — planned work, known defects, and
+  options that were assessed and deliberately rejected.
+- [`docs/datalinking-design.md`](docs/datalinking-design.md) — **design
+  proposal, not implemented.** A plug-in architecture for linking the graph to
+  external resources, built on the observation that rsID, gene and clinical
+  linking are all one of three joins (`token`, `interval`, `allele`). Three
+  plugin tiers (declarative template, local reference bundle, live service),
+  enforced network safeguards, side-graph output with provenance, and a build
+  order that freezes the extension contract before capability is added.
+
+### Fixed
+
+- **Documented behaviour that did not match the code.** `README.md` and
+  `docs/validation.md` both stated that the wrapper switches `q09`-`q13` to
+  report-only under a custom `--rules`. It does not: `--mapping-policy` exists
+  in `validation_runner.py` but `vcf_rdfizer.py` never forwards it, so the
+  runner always executes `strict` and a *correct* custom-mapping conversion is
+  reported as `MISMATCH`. The claim is corrected in both places, recorded in
+  [`docs/limitations.md`](docs/limitations.md), and tracked as a defect in
+  [`docs/roadmap.md`](docs/roadmap.md). No code change yet.
+
+### Changed
+
+- Existing documents gained consistent navigation headers and "See also"
+  footers, and `README.md` now points at `docs/README.md` as the documentation
+  entry point rather than listing two files.
+
+## 2026-09-04 — Graph integrity: blank nodes, empty terms, duplicate statements
+
+Three checks that verify the N-Triples graph itself, independently of what the
+VCF contains. Mutation score **64/66 -> 76/78**, catalogue 36 -> 42 mutations.
+
+### Added
+
+- `preflight_blank_nodes` — any blank node, in subject or object position. Every
+  class in the vocabulary declares an `vcfr:iriTemplate`, so a blank node means
+  a term map produced no IRI; the record and value digests could not address
+  such a node, and neither could anything that later merges the graph. A
+  predicate cannot be blank in RDF, so it is not examined.
+- `preflight_empty_values` — empty or whitespace-only literals and IRIs, each
+  labelled `EMPTY_LITERAL` or `EMPTY_IRI` in the sample. An empty literal means
+  a value was lost rather than marked missing (the pipeline writes
+  `"."^^vcfr:Null` for a genuine missing token); an empty IRI means a template
+  substitution collapsed. Whitespace-only counts as empty: it carries no more
+  information and is just as certainly a defect.
+- `preflight_duplicate_triples` — the same statement emitted more than once.
+
+Both anomaly checks have exact-count companions, so severity is measured rather
+than saturating at the 100-row diagnostic sample.
+
+### How duplicates are detected, and why it could not be a query
+
+A SPARQL store holds a **set**. A repeated line is collapsed on load, so it is
+invisible to every other check here — `COUNT(*)` over `?s ?p ?o` returns the
+distinct total on Comunica, QLever and rdflib alike. Verified before building
+anything: a three-line file with one repeat reports 2.
+
+The detector compares the statements the parser read against the distinct
+triples the store holds. Raptor supplies the first (`rapper -c` counts parsed
+statements including repeats — confirmed in the image: it reports 3 where the
+store reports 2), `preflight_distinct_triple_count` the second, and the
+difference is exactly the number of redundant statements. Duplicating the whole
+fixture graph reports `parsed=624, distinct=312, duplicates=312`.
+
+This is worth having because duplicated RDF parts are a known failure mode of
+the conversion — `run_conversion.sh` already carries a defensive dedupe for it —
+and a duplicated aggregate costs twice the storage for no added information.
+
+### Behaviour
+
+- All three are blocking: a graph that fails one is not worth comparing.
+- When an input a check needs is unavailable, it reports `NOT_EVALUATED` rather
+  than `PASS`, and `NOT_EVALUATED` never fails a run. A check that could not run
+  must not be mistaken for a clean result in either direction.
+
+### Verified
+
+- All 22 queries (13 core, 9 preflight/count) return identical values under
+  Comunica and QLever for both representations, and both engines produce `PASS`
+  against the Python oracle — including the new `ISBLANK`, `ISIRI` and
+  `REGEX`-based checks.
+- 317 tests pass. Six new mutations (`introduce_blank_node`,
+  `blank_node_object`, `empty_literal`, `whitespace_only_literal`,
+  `duplicate_triple`, `duplicate_whole_graph`) are all detected.
+
+### Documentation
+
+- `docs/validation.md` gained a "Graph integrity" section explaining why
+  duplicates cannot be found by a query.
+- `docs/vcf-coverage.md` lists the three under graph-level properties.
+- `docs/validation-methodology.md` now describes four independent layers rather
+  than three.
+
+## 2026-09-04 — Full VCF coverage: census, identity digests, INFO, headers, SHACL
+
+Phases 2-6 of the validation-coverage plan. Mutation score **29/45 -> 64/66**
+(64% -> 97%), across a catalogue that grew from 21 to 36 distinct mutations.
+
+### Fixed — silent data loss
+
+- **QUAL was extracted from every VCF and never mapped into RDF.** It is now
+  emitted, typed `xsd:decimal` or `"."^^vcfr:Null` as the published SHACL shape
+  requires. RML cannot choose a datatype per row, so it comes from a new
+  record-detail emitter rather than `default_rules.ttl`.
+- **`##fileDate` was never mapped.** Now emitted as `vcfr:fileDate`, typed
+  `xsd:date` when the value's form allows and lexically otherwise.
+
+### Added — completeness (Phase 2)
+
+- `q09_predicate_census` and `q10_class_census` compare the graph's predicate
+  and class inventory against counts derived from the VCF. One comparison
+  catches three things: a predicate missing, one with the wrong cardinality, and
+  one that should not be in the graph at all. Expectations are derived from the
+  VCF and the emitters' documented shapes, never from `default_rules.ttl` -
+  deriving them from the mapping is how QUAL stayed invisible.
+- `--mapping-policy {strict,report-only}`: a custom `--rules` changes the
+  inventory and IRI templates by design, so these checks become report-only.
+
+### Added — record and value identity (Phases 3-4)
+
+- `q11_record_digest`, `q12_info_value_digest`, `q13_format_value_digest` hash
+  each record, INFO value and FORMAT value **together with its own IRI** and
+  bucket the result. Binding identity into the hash is what catches a
+  permutation; bucketing keeps the result at most 256 rows for any graph size
+  and needs no ordering guarantee, which `GROUP_CONCAT` could not have given
+  portably. Fields are separated by U+001F, which cannot occur in a VCF field.
+- These close the two largest gaps: values permuted between records, and non-GT
+  FORMAT values (a mangled DP, GQ or AD previously passed).
+
+### Added — structured INFO (Phase 4)
+
+- `--info-representation {structured,raw}`, default `structured`: one
+  `vcfr:InfoFieldValue` per record and key at the vocabulary's declared IRI
+  template, linked by `vcfr:declaredBy` to an `InfoFieldDefinition` carrying
+  `fieldId`/`fieldNumber`/`fieldType`/`fieldDescription`. Single-valued
+  Integer/Float fields also get `fieldValueInteger`/`fieldValueDecimal`; a Flag
+  gets `fieldValueBoolean true`. `vcfr:infoRaw` is retained.
+- The model was already fully defined in the vocabulary and simply unused.
+
+### Added — header section (Phase 5)
+
+- `--header-representation {structured,basic}`, default `structured`: each `##`
+  line is typed with its vocabulary subclass, and FILTER, ALT and contig
+  declarations get `filterId`, `altId`, `contigId`, `contigLength`,
+  `contigMd5`, `contigAssembly` and `contigCount`. An unrecognized key keeps
+  only the base `HeaderLine` type rather than inventing an undefined term.
+
+### Added — SHACL (Phase 6)
+
+- `--shacl-shapes PATH` validates the graph against a SHACL shapes file with
+  `pyshacl`, inside the container, as a layer independent of the VCF entirely.
+  Off by default because `pyshacl` loads the graph into memory. A violation
+  blocks the run; a missing `pyshacl` is reported as `EXECUTION_FAILED`, never
+  as a conformance failure.
+- It found three violations the other layers could not see. Two are fixed above.
+  The third is a **contradiction inside the published vocabulary**:
+  `vcfr:missingValuePolicy` says a missing token SHOULD be `"."^^vcfr:Null`,
+  while `VCFRecordShape` constrains `vcfr:alt` to `xsd:string`, so a record with
+  `ALT=.` cannot satisfy both. Recorded in `docs/vcf-coverage.md` for a decision
+  in the vocabulary repository.
+
+### Changed
+
+- `evaluate_validation()` is the single place the PASS/MISMATCH/BLOCKED decision
+  is made, used by real runs and the mutation harness alike.
+- `test_validation_logic_unit.py` now shares the canonical fixture instead of
+  maintaining a second description of the same data.
+
+### Verified
+
+- All 13 core queries plus 4 exact-count preflights return **identical values
+  under Comunica and QLever**, for both representations, and both engines
+  produce `PASS` against the Python oracle end to end. The agreement script now
+  checks that last part too: engines agreeing with each other is not enough when
+  the digests are compared against values Python computes.
+- 297 tests pass; the suite still passes without `rdflib` (those tests skip).
+
+### Documentation
+
+- `docs/vcf-coverage.md` rewritten: every VCF element with separate
+  "represented" and "validated" columns, each validated claim backed by a named
+  mutation, the remaining gaps, and the vocabulary alignment problem.
+- `docs/validation-methodology.md`: the three independent layers, why identity
+  digests are histograms, and how to reproduce the score.
+- README gained a "VCF Coverage" section for the three representation options.
+
+## 2026-09-04 — Validation mutation harness, and the first coverage gaps closed
+
+### Added — measurement (Phase 0)
+
+- A mutation-testing harness for the semantic validation suite. A correct graph
+  is corrupted in ~25 named ways and the validator is asked for a verdict; the
+  proportion detected is a reproducible **mutation score**. Before this, the
+  suite's coverage was prose, and that prose was wrong: `QUAL` is extracted from
+  every VCF and then never mapped into RDF, and no check could have noticed.
+  - `test/validation_fixtures.py` derives the VCF, the RDF graph and the parser
+    oracle from one declarative specification, so they cannot drift apart. The
+    genotype triples come from the project's own emitters.
+  - `test/validation_mutations.py` is the catalogue: each entry names the VCF
+    element it targets, the check expected to catch it, and — for a recorded
+    gap — why it is not caught.
+  - `test/test_validation_mutation_unit.py` evaluates queries in-process with
+    rdflib (test-only dependency, tests skip without it) and routes every
+    verdict through the shipped `evaluate_validation()`, so the harness measures
+    real code rather than a reimplementation.
+  - **Known gaps are assertions.** A mutation marked `known_undetected` is
+    asserted to still be undetected, so closing a gap fails a test and forces
+    the catalogue and `docs/vcf-coverage.md` to be updated.
+- `test/cross_engine_agreement.py` plus a CI job asserting every validation
+  query returns identical values under Comunica and QLever. Verified: all 34
+  executions across both representations agree.
+- `.github/workflows/validation-mutation.yml` publishes `mutation-score.json`
+  as a build artifact.
+
+### Added — coverage (Phase 1)
+
+- **Exact anomaly counts.** Each structural anomaly preflight now has a
+  companion aggregate returning the true count alongside the `LIMIT 100`
+  diagnostic sample. Reports carry `anomalyCount`, `anomalyCountReturned` and
+  `sampleTruncated`, so ten million anomalies is no longer indistinguishable
+  from a hundred. Verified against a graph with 250 anomalies: exact count 250,
+  sample 100, truncated true.
+- **`--strict-conformance`** (runner and wrapper) promotes a missing-token
+  conformance failure from a report-only observation to a validation failure.
+- **File metadata and header coverage.** New `q07_file_metadata` compares the
+  `##fileformat` / `##reference` / `##source` declarations, and
+  `q08_header_line_census` compares how many `##` lines carry each header key.
+  `parse_vcf` gained `parse_header_metadata` to compute the oracle side. These
+  close the two entirely uncovered triples maps.
+
+Mutation score: **23/45 → 29/45 (51% → 64%)**.
+
+### Changed
+
+- The PASS / MISMATCH / BLOCKED_BY_PREFLIGHT decision is extracted into
+  `evaluate_validation()`, the single place real runs and the mutation harness
+  both use.
+- `normalize()` generalises its single-row handling beyond `q03_titv` via
+  `SINGLE_ROW_QUERIES`.
+- `rdflib>=7.0.0` added to the `dev` extra. It is not a runtime dependency and
+  the test suite passes without it.
+
+### Documentation
+
+- **`docs/vcf-coverage.md`** — the coverage matrix: one row per VCF element,
+  with separate "represented" and "validated" columns, each validated claim
+  backed by a named mutation. Includes the vocabulary alignment gap (17 emitted
+  terms the vocabulary does not define, all condensed-representation) and the
+  open gaps in priority order. This is the table intended for publication.
+- **`docs/validation-methodology.md`** — the mutation-testing method, why
+  self-reported coverage failed, the two-engine two-layer design, and how to
+  reproduce the score.
+- `docs/validation.md` — Q7/Q8 documented, the exact-count behaviour and
+  `--strict-conformance` described, and the "What is *not* tested" section
+  narrowed to what is still true.
+
+## 2026-09-04 — QLever integration verified against a live container
+
+Everything below came out of actually running the integration, and each item
+was wrong or missing beforehand.
+
+### Fixed
+
+- **`preflight_position_datatype` would have failed every QLever run.** QLever
+  canonicalises numeric literals at index time, so `"100"^^xsd:integer` is
+  reported by `DATATYPE()` as `xsd:int`. The query required exactly
+  `xsd:integer`, so on QLever it flagged every record and the run ended as
+  `BLOCKED_BY_PREFLIGHT`, while passing on Comunica. It now accepts the XSD
+  integer family, which is what the check means; a plain-string or
+  `xsd:decimal` POS is still reported as an anomaly on both engines (verified).
+- **QLever's binaries are not called `IndexBuilderMain`/`ServerMain`, and are
+  not in `/usr/bin`.** They are `/qlever/qlever-index` and
+  `/qlever/qlever-server`. The Dockerfile COPY paths and the default argv were
+  both wrong and would have failed the build.
+- **Copying the binaries alone does not work.** The upstream image is Ubuntu
+  24.04 and this base is Ubuntu 26.04; the binaries need Boost 1.83, ICU 74,
+  jemalloc and io_uring sonames that do not exist here and cannot be
+  apt-installed (the sonames are release-pinned). Those nine libraries are now
+  copied into `/opt/qlever/lib`, and `LD_LIBRARY_PATH` is set for QLever's own
+  processes only, so they cannot shadow anything else in the image. glibc is
+  deliberately not copied - it is backward compatible and this base is newer.
+- **`qlever-server` defaults to a 30-second query timeout**, far below what the
+  aggregate queries need. The server is now started with `-s` matching
+  `--validation-query-timeout`.
+- Index/server flags corrected against the real CLI: `-m` is `--stxxl-memory`
+  for the indexer and `--memory-max-size` for the server (`--stxxl-memory` is
+  not a server flag).
+
+### Verified
+
+- Both binaries link and run in the target image (`qlever-index --version`
+  reports build `bfd5741`).
+- A real index build, server start, readiness poll, HTTP query, SPARQL Results
+  JSON parse and `normalize()` round-trip, driven through the shipped
+  `QleverEngine` code rather than a reimplementation.
+- **Engine equivalence**: all eleven validation queries run under both Comunica
+  and QLever against the same expanded and condensed graphs — graphs built with
+  the project's own sample emitters — produce identical normalized results, and
+  the values are independently correct.
+
+### Tests
+
+- `QleverEnvironmentTests`: the private library path is prepended for QLever
+  only, and the POS datatype preflight accepts the integer family while still
+  rejecting string/decimal/double.
+- The QLever lifecycle test now asserts the verified binary names and flags,
+  including the explicit server-side query timeout.
+
+### Still unverified
+
+- The HDT and COTTAS decode paths, and a full `docker build .` of the real
+  image. Those need hdt-cpp and the pycottas venv; the QLever work above was
+  done against a minimal probe image that isolates the integration.
+
+## 2026-09-04 — Validation: QLever engine, HDT/COTTAS artifacts, coverage audit
+
+### Added
+
+- `--validation-engine {comunica,qlever}`. Comunica remains the default and
+  queries the graph in memory; [QLever](https://github.com/ad-freiburg/qlever)
+  builds an on-disk index inside the container, serves it on a container-local
+  port, answers the queries over HTTP, and tears both down. Both engines answer
+  identical queries and feed the same comparison layer, so the choice is a scale
+  decision, never a semantic one, and every report records which engine ran.
+  Tunable with `--qlever-memory-gb`, `--qlever-port`,
+  `--qlever-startup-timeout`, and `--validation-query-timeout`.
+- QLever binaries are copied into the image from the upstream
+  `adfreiburg/qlever` image; pin a version with
+  `--build-arg QLEVER_IMAGE=adfreiburg/qlever:<tag>`. A build-time linkage
+  check records whether they resolve against this base, and the validator
+  surfaces that note if the engine cannot start.
+- QLever's CLI has changed across releases, so both command lines are
+  overridable without code changes: repeatable `--qlever-index-arg` /
+  `--qlever-server-arg`, or full replacement via `QLEVER_INDEX_COMMAND` /
+  `QLEVER_SERVER_COMMAND` with `{index}`, `{input}`, `{memory}`, `{port}`
+  placeholders. The exact argv that ran is recorded in `manifest.json`.
+- Validation of compressed and indexed artifacts. `--rdf` now accepts `.nt`,
+  `.nt.gz`, `.nt.br`, `.hdt`, `.cottas`, `.cottas.gz`, and `.cottas.br`;
+  `--rdf-format` overrides filename detection. Anything that is not already
+  plain N-Triples is decoded in container scratch (`hdt2rdf`,
+  `cottas_tool.py decompress`, gzip/brotli) and then put through the full
+  semantic suite. That is strictly stronger than the triple-count round-trip
+  `validate_compression.py` performs during compression: it proves the artifact
+  decodes to a graph that still reproduces every VCF summary. Nothing decoded
+  is written beneath `--out`.
+- `--validate-artifacts {aggregate,hdt,cottas,all}` for full mode. Each
+  requested artifact is validated independently with its own report directory
+  (`<id>`, `<id>__hdt`, `<id>__cottas`), so one run can prove the aggregate and
+  both representations agree with the VCF. A representation that was not
+  selected, or whose artifact is missing after a recoverable index warning, is
+  skipped rather than reported as a failure. Default is `aggregate`, which
+  preserves the previous behaviour.
+- `materialization.json` per validation run, recording how the artifact was
+  decoded and how many triples that yielded; `manifest.json` gained `engine`
+  and a format-tagged `sourceRdf`. Rapper's parsed triple count is now captured
+  rather than discarded.
+
+### Changed
+
+- The validator's cyvcf2 import is lazy, so the pure normalization/comparison
+  layer is importable and testable on the host without the container.
+- `--mode validation` no longer requires `.nt.gz`; any supported artifact works.
+  `--rdf-nt` / `--rdf-gz` remain accepted as aliases.
+
+### Tests
+
+- `test/test_validation_logic_unit.py` (16 tests): mutation tests that drive the
+  comparison layer directly and record what it detects — dropped records,
+  misclassified shapes, flipped genotypes, corrupted FILTER lexicals, Ti/Tv
+  swaps, allele-count errors, spurious records, impossible AC/AN — **and** what
+  it does not: record permutation, and the entirely unvalidated `ID`, `QUAL`,
+  `INFO`, non-`GT` `FORMAT`, and header/metadata columns. The blind-spot tests
+  are deliberate, so closing a gap fails a test instead of passing unnoticed.
+- `test/test_validation_engines_unit.py` (25 tests): artifact format detection
+  and host/container agreement, each decode path, decode-failure reporting,
+  engine registry, Comunica command construction, QLever index/serve/teardown,
+  crashed-server diagnostics, command-line overrides, CLI argument validation,
+  and the wrapper's target resolution and docker argv.
+
+### Documentation
+
+- `docs/validation.md`: new "Which artifact is validated", "Which SPARQL engine
+  runs the queries", and — importantly — "What is *not* tested", which states
+  the coverage limits plainly: aggregate-only comparison with no per-record
+  identity, unvalidated VCF columns, no completeness bound, saturating preflight
+  anomaly counts.
+- README: validation artifacts/engines subsection with a short note on what a
+  `PASS` does and does not mean.
+
 ## 2026-09-04 — Custom-mapping tooling, cheap gzip sizing, dead-script removal
 
 ### Added
