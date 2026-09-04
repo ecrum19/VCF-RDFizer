@@ -1,5 +1,151 @@
 # Changelog
 
+## 2026-09-04 — Multi-engine validation, native HDT/COTTAS querying, and benchmarking
+
+Validation was one engine against one N-Triples file. It is now up to four
+engines against the artifact each of them reads best, in a single run, timed
+and cross-checked.
+
+### Added
+
+- **Several SPARQL engines in one run.** `--validation-engine` accepts a
+  comma-separated list or `all`. Every requested engine answers the whole query
+  set; the first is the primary and keeps the existing single-engine report
+  layout, while each engine additionally gets `engines/<name>/` with its own
+  preflight, SPARQL, comparison and execution reports. The run's `status` is
+  `PASS` only if every engine passed, and `summary.json` carries
+  `engineStatuses`.
+- **Cross-engine agreement on the real graph.** Every engine's normalized
+  results are compared against each other and written to
+  `engine-agreement.json`, naming the queries that differ. This is not
+  theoretical: QLever's literal canonicalisation had already been caught this
+  way in the test harness.
+- **Native HDT and COTTAS querying** (`--validation-engine hdt` / `cottas`).
+  `--validation-target hdt,cottas` validates those artifacts by *decoding* them
+  first, which proves the decode is faithful and says nothing about querying
+  them — and measures the wrong thing entirely in a performance comparison. The
+  new engines query the artifact in place: HDT through `comunica-sparql-hdt`,
+  COTTAS in-process through `pycottas.COTTASStore`, an rdflib `Store` over the
+  Parquet artifact. When the run's own artifact is already in the engine's
+  format it is used directly; otherwise one is built in container scratch and
+  that build is timed as **setup**, kept out of the query total. Each report
+  records which happened, in `artifactOrigin`.
+- **`@comunica/query-sparql-hdt` in the image**, installed alongside
+  `build-essential` (needed for its native bindings) which is purged in the same
+  layer.
+- **Timings for everything, and a comparison against the parser.** Every run
+  writes `benchmark.json` and a long-format `benchmark.csv` — one row per engine
+  and query, ready to plot without reshaping. `benchmark.json` adds per-engine
+  setup and query totals, the slowest query per engine, materialization and
+  SHACL time, and the **oracle**: what it costs to compute the same answers
+  directly from the VCF with cyvcf2, split into parse and census. The suite
+  already computes every expected value twice, once by parsing and once by
+  querying, so those two costs are for identical work on identical input — the
+  performance comparison the reports were missing.
+- **Benchmark columns in the run's `metrics.csv`**: `validation_engines`,
+  `validation_oracle_seconds`, `validation_engine_query_seconds` and
+  `validation_engine_setup_seconds`, the last two as `engine=seconds` pairs.
+
+### Fixed
+
+- **Comunica could not query an HDT file by path.** A bare path is treated as a
+  link to dereference and failed with "Could not dereference". The source is now
+  addressed as `hdt@<path>`. Found by the first real four-engine run, not by
+  inspection.
+- **The parser oracle was reading htslib's header, not the file's.** cyvcf2's
+  `raw_header` is normalised: htslib injects
+  `##FILTER=<ID=PASS,Description="All filters passed">` into files that never
+  declared it. The oracle therefore expected a `FilterDefinition` resource the
+  graph could not contain, and every header check failed. `read_vcf_header_text`
+  now reads the header block from the file itself — the same text the conversion
+  reads — for both plain and gzipped VCFs.
+
+### Verified
+
+- A four-engine run over the fixture: all four `PASS`, all four agree, and the
+  benchmark records per-query timings for each.
+- `test/cross_engine_agreement.py` extended from two engines to all four,
+  across both representations, with per-run scratch so the native engines cannot
+  read each other's artifacts. All queries agree and every engine agrees with
+  the Python oracle.
+- 347 host tests pass (24 new); mutation score unchanged at **76/78**.
+
+### Documentation
+
+- [`docs/validation.md`](docs/validation.md) — rewritten engine section covering
+  all four engines, multi-engine runs, native artifact querying, and the
+  benchmark report. Its "What is *not* tested" section was stale — it predated
+  the census, the identity digests, and the QUAL/INFO coverage work, and
+  contradicted [`docs/vcf-coverage.md`](docs/vcf-coverage.md) — and now states
+  the gaps that actually remain.
+- [`docs/validation-methodology.md`](docs/validation-methodology.md) — "Two
+  engines" became "Four engines", with the two new cross-engine findings and a
+  section on why a multi-engine run is a controlled benchmark rather than an
+  incidental one.
+- [`README.md`](README.md), [`docs/cli-reference.md`](docs/cli-reference.md),
+  [`test/README.md`](test/README.md) updated; the README's stale mutation score
+  (36 mutations, 64/66) corrected to 42 and 76/78.
+
+## 2026-09-04 — Design proposal: granular privacy policies over the VCF graph
+
+[`docs/privacy-policy-design.md`](docs/privacy-policy-design.md) — **design
+proposal, not implemented.** A system for governed, partial release of a VCF
+graph: which participants, which regions, which fields, at what resolution, to
+whom, for what purpose — declared in ODRL and enforced by the pipeline.
+
+### Added
+
+- **An ODRL profile whose assets are graph selectors.** ODRL's `odrl:target`
+  addresses an Asset IRI and has no notion of "these triples", so the profile
+  supplies `ClassSelector`, `PredicateSelector`, `SampleSelector`,
+  `RegionSelector`, `FieldSelector`, `HeaderSelector` and a SPARQL
+  `PatternSelector` escape hatch. It also pins the conflict semantics ODRL
+  leaves informative: deny-overrides, default-deny, most-restrictive-first
+  composition.
+- **Effects beyond permit/prohibit**, because the useful answer for genomic data
+  is usually less resolution rather than nothing: `drop`, `pseudonymize`,
+  `generalize`, `threshold`, `aggregateOnly`, and `maskVectorPositions`.
+- **Three enforcement tiers derived from the existing pipeline** — TSV
+  pre-filtering before RMLStreamer (cheapest, covers RML-produced triples),
+  emitter-time filtering inside `_append_rdf_atomically` (full record context,
+  no second pass), and a post-hoc `--mode redact` (needs two passes for region
+  rules, since an N-Triples stream has no ordering guarantee). The compiler
+  assigns each rule to the cheapest tier that can express it, and **aborts** on
+  any rule no tier can enforce rather than warning.
+- **GA4GH DUO consent codes as `odrl:purpose` right operands**, so a policy is
+  reviewable by the data access committees that already speak DUO.
+- **Release manifests and policy conformance verification**: prohibitions
+  compile to `ASK` preflights that must return zero, with mutation-catalogue
+  entries that break the redactor and assert the checks catch it — the same
+  "measured, not asserted" standard as
+  [`validation-methodology.md`](docs/validation-methodology.md).
+
+### Findings that affect work outside the proposal
+
+- **`ParsedSampleRecord` carries no `CHROM` or `POS`.** `_parse_row` reads
+  columns 0, 1, 7, 9, 10 and −1, skipping 2 and 3. Any region-scoped feature
+  evaluated at emission time needs both; adding them is two dataclass fields and
+  two index reads.
+- **Condensed mode cannot express per-sample protection by triple filtering.**
+  One `FormatValueVector` literal holds every participant's value for a FORMAT
+  key, so the unit of protection is finer than the unit of storage. Redaction
+  must rewrite the literal in place (replacing a position with `.` to preserve
+  `sampleIndex` alignment), and a single masked position is itself disclosive.
+- **IRIs and header lines leak independently of genotypes.** Sample names, the
+  source filename and a monotonic row counter are all embedded in IRIs, and
+  `##source` / `##SAMPLE` / `##PEDIGREE` / free-text `Description` fields are
+  transcribed verbatim. Recorded in
+  [`docs/limitations.md`](docs/limitations.md).
+
+### Framing kept throughout
+
+The document is explicit that this is **governed release, not anonymization**.
+Genotypes are identifiers — a few dozen independent common variants single out
+an individual — so an access-control layer governs who receives what and creates
+an audit trail; it does not make released data non-identifying. Differential
+privacy is discussed and explicitly **not** proposed, because without a
+persistent per-recipient budget ledger it provides no protection.
+
 ## 2026-09-04 — Documentation set, and a data-linking design proposal
 
 `docs/` becomes an in-depth explanation of the whole tool rather than four

@@ -11,6 +11,7 @@ passing unnoticed.
 """
 
 import copy
+import gzip
 import importlib.util
 import json
 import tempfile
@@ -389,6 +390,55 @@ class ShaclLayerTests(VerboseTestCase):
         self.assertEqual(result["status"], "EXECUTION_FAILED")
         self.assertIn("pyshacl", result["error"])
         self.assertNotIn("conforms", result)
+
+
+class HeaderSourceTests(VerboseTestCase):
+    """The oracle reads the VCF's own header text, not htslib's version of it."""
+
+    def test_the_header_block_is_read_verbatim_and_stops_at_the_first_record(self):
+        """Every '##' line in order, then '#CHROM', and nothing after it."""
+        with tempfile.TemporaryDirectory() as td:
+            vcf_path = fixtures.write_vcf(Path(td) / "fixture.vcf")
+            lines = V.read_vcf_header_text(vcf_path).splitlines()
+        meta = [f"##{key}={value}" for key, value in fixtures.HEADER_LINES]
+        self.assertEqual(lines[:len(meta)], meta)
+        self.assertEqual(len(lines), len(meta) + 1)
+        self.assertTrue(lines[-1].startswith("#CHROM\t"))
+
+    def test_htslibs_injected_declarations_are_not_treated_as_header_lines(self):
+        """cyvcf2's raw_header is normalised; the conversion's input is not.
+
+        htslib injects '##FILTER=<ID=PASS,Description="All filters passed">'
+        into the header it exposes even when the file never declared it. Taking
+        the oracle's header from there makes it expect a FilterDefinition the
+        graph could not contain, and every header check fails. Reading the file
+        keeps the oracle and the conversion looking at the same bytes.
+        """
+        injected = '##FILTER=<ID=PASS,Description="All filters passed">'
+        with tempfile.TemporaryDirectory() as td:
+            vcf_path = fixtures.write_vcf(Path(td) / "fixture.vcf")
+            file_lines = {
+                line for line in V.read_vcf_header_text(vcf_path).splitlines()
+                if line.startswith("##")
+            }
+            source_lines = {
+                line for line in vcf_path.read_text(encoding="utf-8").splitlines()
+                if line.startswith("##")
+            }
+        self.assertEqual(file_lines, source_lines)
+        self.assertNotIn(injected, file_lines)
+
+    def test_a_gzipped_vcf_header_reads_the_same_as_a_plain_one(self):
+        """Aggregates arrive compressed, so the oracle must handle both."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            vcf_path = fixtures.write_vcf(tmp_path / "fixture.vcf")
+            gz_path = tmp_path / "fixture.vcf.gz"
+            with gzip.open(gz_path, "wt", encoding="utf-8") as handle:
+                handle.write(vcf_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                V.read_vcf_header_text(gz_path), V.read_vcf_header_text(vcf_path)
+            )
 
 
 class GraphIntegrityTests(VerboseTestCase):

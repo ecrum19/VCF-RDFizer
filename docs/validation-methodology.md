@@ -117,27 +117,53 @@ own IRI**, then bucket on the first byte of the hash. Two properties matter:
 Fields are separated by U+001F, which cannot occur in a VCF field, so no shift
 of a field boundary can forge a match.
 
-## Two engines, two layers
+## Four engines, two layers
 
 The host layer runs queries under **rdflib**, in process, needing no Docker, so
-the whole catalogue runs in the normal test loop. rdflib is also a third
+the whole mutation catalogue runs in the normal test loop. rdflib is also an
 independent SPARQL implementation, which incidentally guards against queries
 that only work on one engine.
 
 The container layer is the authority:
 [`test/cross_engine_agreement.py`](../test/cross_engine_agreement.py) runs every
-validation query under **Comunica and QLever** inside the image and asserts they
-return identical values.
+validation query under **Comunica, QLever, native HDT and native COTTAS** inside
+the image, across both representations, and asserts they return identical
+values. It then runs the shipped validation decision under each engine
+separately, because engines agreeing with each other while all being wrong is a
+real failure mode that only the Python oracle rules out.
 
 That second layer is not ceremony. QLever canonicalises numeric literals at
 index time, reporting `"100"^^xsd:integer` as `xsd:int`. The POS datatype
 preflight originally required exactly `xsd:integer`, so it flagged every record
-under QLever while passing under Comunica — every QLever run would have ended
+under QLever while passing under Comunica - every QLever run would have ended
 `BLOCKED_BY_PREFLIGHT`. Only cross-engine execution surfaces that class of bug.
+
+It has since caught two more. Comunica's HDT engine treats a bare filesystem
+path as a link to dereference, so the source must be addressed as
+`hdt@<path>`; and cyvcf2's `raw_header` is htslib's *normalised* header, which
+injects `##FILTER=<ID=PASS,Description="All filters passed">` into files that
+never declared it - making the oracle expect a `FilterDefinition` the graph
+could not contain. The oracle now reads the header block from the file itself,
+which is the same text the conversion reads.
 
 **When adding a query**, prefer datatype-*family* checks and lexical
 comparisons over anything that assumes a store's internal representation, and
 run the agreement script before trusting it.
+
+### Measuring, not just comparing
+
+Because every engine answers the same query set against the same graph in the
+same container, a multi-engine run is also a controlled benchmark, and the
+suite records it: per-query wall time for each engine, setup time (a QLever
+index build, or an HDT/COTTAS artifact build) kept separate from query time,
+and the **oracle** - what it costs to compute the same answers directly from
+the VCF with cyvcf2.
+
+That last figure makes the comparison meaningful rather than merely internal.
+The suite computes every expected value twice, once by parsing and once by
+querying, so the two costs are for identical work on identical input. The
+report is written as `benchmark.json` plus a long-format `benchmark.csv`, one
+row per engine and query. See [`validation.md`](validation.md#timings-and-comparing-sparql-against-the-parser).
 
 ## Reproducing the score
 
@@ -158,6 +184,9 @@ docker build -t vcf-rdfizer:local .
 docker run --rm -v "$PWD:/repo:ro" vcf-rdfizer:local \
   /opt/pycottas-venv/bin/python /repo/test/cross_engine_agreement.py
 ```
+
+All four engines are compared by default; pass a comma-separated subset as the
+first argument to narrow it.
 
 Both run in CI via
 [`.github/workflows/validation-mutation.yml`](../.github/workflows/validation-mutation.yml).

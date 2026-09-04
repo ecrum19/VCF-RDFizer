@@ -24,6 +24,7 @@ queryable. Both answer identical queries, so the choice is never semantic.
 from __future__ import annotations
 
 import argparse
+import csv
 import gzip
 import hashlib
 import json
@@ -607,6 +608,29 @@ def info_declared_types(raw_header: str) -> dict[str, str]:
     return types
 
 
+def read_vcf_header_text(vcf_path: Path) -> str:
+    """Read the header block straight from the VCF file.
+
+    Returns the leading ``#`` lines verbatim - the ``##`` meta-information
+    lines and the ``#CHROM`` column line - which is the same span cyvcf2's
+    ``raw_header`` covers, so callers of either see the same shape.
+
+    Deliberately not cyvcf2's ``raw_header``: htslib normalises the header it
+    exposes, injecting declarations the file does not contain - notably
+    ``##FILTER=<ID=PASS,Description="All filters passed">``. The conversion
+    reads the file's own text, so the oracle must too, or it expects header
+    resources the graph could never contain.
+    """
+    opener = gzip.open if vcf_path.name.endswith(".gz") else open
+    lines: list[str] = []
+    with opener(vcf_path, "rt", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if not line.startswith("#"):
+                break
+            lines.append(line.rstrip("\n"))
+    return "\n".join(lines)
+
+
 def parse_header_metadata(raw_header: str) -> dict[str, Any]:
     """Summarise the '##' meta-information block of a VCF.
 
@@ -709,7 +733,7 @@ def parse_vcf(vcf_path: Path, *, filter_oracle: str) -> dict[str, Any]:
     filters = filters_with_bcftools(vcf_path) if use_bcftools else Counter()
     reader = VCF(str(vcf_path), strict_gt=True)
     samples = list(reader.samples)
-    header_metadata = parse_header_metadata(reader.raw_header)
+    header_metadata = parse_header_metadata(read_vcf_header_text(vcf_path))
     density: Counter[tuple[str, int]] = Counter()
     shapes: Counter[str] = Counter()
     genotypes: Counter[tuple[str, str]] = Counter()
@@ -723,7 +747,7 @@ def parse_vcf(vcf_path: Path, *, filter_oracle: str) -> dict[str, Any]:
     expanded_format_digest: Counter[str] = Counter()
     condensed_format_digest: Counter[str] = Counter()
     sample_components = [rml_uri_component(uri_id) for uri_id in sample_uri_ids(samples)]
-    declared_info_types = info_declared_types(reader.raw_header)
+    declared_info_types = info_declared_types(read_vcf_header_text(vcf_path))
     info_definitions: set[str] = set()
     info_values = info_flags = info_typed_integers = info_typed_decimals = 0
     source_component = rml_uri_component(vcf_path.name)
@@ -1208,7 +1232,18 @@ def validate_ntriples(source: Path, results_dir: Path) -> dict[str, Any]:
 # qlever:   builds an on-disk index, then answers over HTTP. Slower to start,
 #           but the only option once a graph stops fitting in memory.
 
-SPARQL_ENGINES = ("comunica", "qlever")
+#: Every backend that can answer the validation queries. `comunica` and
+#: `qlever` read the materialized N-Triples; `hdt` and `cottas` query the
+#: compressed representation *directly*, without decoding it first, which is
+#: the property those formats exist for. Several may be requested in one run:
+#: they all answer the same queries, so the comparison is meaningful and the
+#: recorded timings are directly comparable.
+SPARQL_ENGINES = ("comunica", "qlever", "hdt", "cottas")
+#: Engines that query a compressed artifact natively, and the artifact format
+#: each one needs. When the run's source is a different format, the artifact is
+#: built in scratch first and the build is timed separately from the queries,
+#: so an index build is never mistaken for query cost.
+NATIVE_ENGINE_FORMATS = {"hdt": "hdt", "cottas": "cottas"}
 # QLever's binaries are copied out of the upstream image, which is built on a
 # different Ubuntu release, so their Boost/ICU/jemalloc sonames come with them
 # in a private directory. Pointing only QLever's own processes at it keeps
@@ -1249,9 +1284,19 @@ class QueryEngine:
         self.scratch = scratch
         self.options = options
         self.query_timeout = int(options.get("query_timeout") or DEFAULT_QUERY_TIMEOUT)
+        #: Seconds spent preparing the backend (index build, format conversion,
+        #: server startup) before any query ran. Reported separately from query
+        #: time so a benchmark can attribute cost correctly.
+        self.setup_seconds: float | None = None
+
+    def prepare(self) -> None:
+        """Time ``start`` so setup cost is recorded for every engine alike."""
+        started = time.monotonic()
+        self.start()
+        self.setup_seconds = time.monotonic() - started
 
     def __enter__(self) -> "QueryEngine":
-        self.start()
+        self.prepare()
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
@@ -1265,7 +1310,7 @@ class QueryEngine:
         """Release anything ``start`` acquired. Must be safe to call twice."""
 
     def describe(self) -> dict[str, Any]:
-        return {"engine": self.name}
+        return {"engine": self.name, "setupSeconds": self.setup_seconds}
 
     def execute(self, query_id: str, query_path: Path) -> dict[str, Any]:
         raise NotImplementedError
@@ -1313,6 +1358,7 @@ class ComunicaEngine(QueryEngine):
     def describe(self) -> dict[str, Any]:
         return {
             "engine": self.name,
+            "setupSeconds": self.setup_seconds,
             "version": tool_version(
                 ["comunica-sparql-file", "--version"], table_label="Comunica Engine"
             ),
@@ -1515,6 +1561,7 @@ class QleverEngine(QueryEngine):
     def describe(self) -> dict[str, Any]:
         return {
             "engine": self.name,
+            "setupSeconds": self.setup_seconds,
             "version": tool_version([self.server_binary, "--help"]) if self.server_binary else None,
             "mode": "on-disk index served over HTTP",
             "indexDirectory": str(self.index_dir),
@@ -1563,7 +1610,176 @@ class QleverEngine(QueryEngine):
         shutil.rmtree(self.index_dir, ignore_errors=True)
 
 
-ENGINE_CLASSES = {"comunica": ComunicaEngine, "qlever": QleverEngine}
+class NativeArtifactEngine(QueryEngine):
+    """Base for engines that query a compressed artifact without decoding it.
+
+    The point of HDT and COTTAS is that they are queryable in place. Validating
+    them by decoding to N-Triples first proves the decode is faithful but says
+    nothing about querying them, and measures the wrong thing entirely for a
+    performance comparison.
+
+    When the run's own artifact is already in this engine's format it is used
+    directly, which is the honest measurement. Otherwise one is built in scratch
+    from the materialized N-Triples, and that build is timed as setup rather
+    than as query cost.
+    """
+
+    #: Artifact format this engine reads, e.g. "hdt".
+    artifact_format = ""
+
+    def __init__(self, source: Path, *, raw_dir: Path, scratch: Path, options: dict[str, Any]):
+        super().__init__(source, raw_dir=raw_dir, scratch=scratch, options=options)
+        self.artifact: Path | None = None
+        self.artifact_origin = "unknown"
+        self.log_dir = raw_dir / "engine"
+
+    def _resolve_artifact(self) -> Path:
+        """Use the run's own artifact when it matches, else build one."""
+        supplied = self.options.get("artifact_path")
+        if supplied is not None and self.options.get("artifact_format") == self.artifact_format:
+            self.artifact_origin = "run artifact"
+            return Path(supplied)
+        self.artifact_origin = "built from N-Triples for this engine"
+        target = self.scratch / f"{self.name}-engine.{self.artifact_format}"
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.build_artifact(target)
+        return target
+
+    def build_artifact(self, target: Path) -> None:
+        raise NotImplementedError
+
+    def start(self) -> None:
+        self.artifact = self._resolve_artifact()
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            "engine": self.name,
+            "setupSeconds": self.setup_seconds,
+            "mode": f"native {self.artifact_format} query, no decode",
+            "artifact": str(self.artifact) if self.artifact else None,
+            "artifactOrigin": self.artifact_origin,
+            "artifactSizeBytes": (
+                self.artifact.stat().st_size
+                if self.artifact and self.artifact.is_file() else None
+            ),
+        }
+
+
+class HdtEngine(NativeArtifactEngine):
+    """Query a .hdt artifact in place with Comunica's HDT engine."""
+
+    name = "hdt"
+    artifact_format = "hdt"
+
+    def build_artifact(self, target: Path) -> None:
+        rdf2hdt = _resolve_binary("RDF2HDT_BIN", "rdf2hdt", "/usr/local/bin/rdf2hdt")
+        _run_step(
+            [rdf2hdt, str(self.source), str(target)],
+            label="hdt-engine-build", log_dir=self.log_dir,
+        )
+
+    def start(self) -> None:
+        self.executable = shutil.which("comunica-sparql-hdt")
+        if not self.executable:
+            raise RuntimeError(
+                "comunica-sparql-hdt is not installed in this image, so HDT cannot "
+                "be queried natively. Rebuild the image, or validate the HDT "
+                "artifact by decoding it (--rdf file.hdt --engine comunica)"
+            )
+        super().start()
+
+    def execute(self, query_id: str, query_path: Path) -> dict[str, Any]:
+        raw_path = self.raw_dir / f"{query_id}.sparql.json"
+        stderr_path = self.raw_dir / f"{query_id}.stderr.txt"
+        command = [
+            self.executable,
+            # Comunica needs the source type declared: a bare path is treated
+            # as a link to dereference and fails with "could not dereference".
+            f"hdt@{self.artifact}",
+            "-f", str(query_path),
+            "-t", "application/sparql-results+json",
+        ]
+        started = time.monotonic()
+        try:
+            with raw_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+                result = subprocess.run(
+                    command, check=False, stdout=stdout, stderr=stderr,
+                    timeout=self.query_timeout,
+                )
+            returncode, error = result.returncode, None
+        except subprocess.TimeoutExpired:
+            returncode, error = 124, f"query exceeded {self.query_timeout}s"
+        return self._envelope(
+            query_id, query_path, returncode=returncode, started=started,
+            raw_path=raw_path, stderr_path=stderr_path, error=error,
+        )
+
+
+class CottasEngine(NativeArtifactEngine):
+    """Query a .cottas artifact in place through pycottas's rdflib store.
+
+    pycottas exposes ``COTTASStore``, an rdflib Store backed by the Parquet
+    artifact, so this runs in-process rather than shelling out. The validator
+    already runs under the interpreter that owns pycottas.
+    """
+
+    name = "cottas"
+    artifact_format = "cottas"
+
+    def build_artifact(self, target: Path) -> None:
+        import pycottas
+
+        pycottas.rdf2cottas(str(self.source), str(target))
+
+    def start(self) -> None:
+        try:
+            import pycottas  # noqa: F401
+            import rdflib  # noqa: F401
+        except ImportError as error:
+            raise RuntimeError(
+                f"pycottas and rdflib are required to query COTTAS natively: {error}"
+            ) from error
+        super().start()
+
+        import pycottas
+        import rdflib
+
+        self.graph = rdflib.Graph(store=pycottas.COTTASStore(str(self.artifact)))
+
+    def execute(self, query_id: str, query_path: Path) -> dict[str, Any]:
+        raw_path = self.raw_dir / f"{query_id}.sparql.json"
+        stderr_path = self.raw_dir / f"{query_id}.stderr.txt"
+        started = time.monotonic()
+        try:
+            result = self.graph.query(query_path.read_text(encoding="utf-8"))
+            raw_path.write_bytes(result.serialize(format="json"))
+            stderr_path.write_bytes(b"")
+            returncode, error = 0, None
+        except Exception as failure:  # noqa: BLE001 - reported as EXECUTION_FAILED
+            raw_path.write_text("{}", encoding="utf-8")
+            stderr_path.write_text(str(failure), encoding="utf-8")
+            returncode, error = 1, str(failure)
+        return self._envelope(
+            query_id, query_path, returncode=returncode, started=started,
+            raw_path=raw_path, stderr_path=stderr_path, error=error,
+        )
+
+    def stop(self) -> None:
+        graph = getattr(self, "graph", None)
+        if graph is not None:
+            try:
+                graph.close()
+            except Exception:  # noqa: BLE001 - teardown must not mask a result
+                pass
+            self.graph = None
+
+
+ENGINE_CLASSES = {
+    "comunica": ComunicaEngine,
+    "qlever": QleverEngine,
+    "hdt": HdtEngine,
+    "cottas": CottasEngine,
+}
 
 
 def build_engine(
@@ -1928,6 +2144,154 @@ def evaluate_validation(
     }
 
 
+# ---------------------------------------------------------------------------
+# Benchmarking
+# ---------------------------------------------------------------------------
+# A validation run already measures everything a performance comparison needs:
+# it computes the answers twice, once from the VCF with a conventional parser
+# and once from RDF with a SPARQL engine, over the same data and to the same
+# result. Recording those timings turns each run into a directly comparable
+# oracle-versus-SPARQL measurement, and a multi-engine run into a comparison
+# between the engines as well.
+
+BENCHMARK_CSV_HEADER = [
+    "engine",
+    "query_id",
+    "status",
+    "wall_seconds",
+    "oracle_wall_seconds",
+    "engine_setup_seconds",
+    "artifact_origin",
+]
+
+
+def build_benchmark(
+    per_engine: dict[str, dict[str, Any]],
+    engine_descriptions: dict[str, Any],
+    *,
+    oracle_seconds: dict[str, float] | None,
+    materialization_seconds: float | None,
+    shacl_seconds: float | None,
+    query_ids: tuple[str, ...],
+) -> dict[str, Any]:
+    """Assemble per-query and per-engine timings into one report."""
+    oracle_seconds = oracle_seconds or {}
+    engines: dict[str, Any] = {}
+    for name, verdict in per_engine.items():
+        executions = verdict.get("executions") or verdict.get("queryExecutions") or {}
+        queries = {
+            query_id: {
+                "status": execution.get("status"),
+                "wallSeconds": execution.get("wallSeconds"),
+            }
+            for query_id, execution in executions.items()
+        }
+        timed = [
+            entry["wallSeconds"] for entry in queries.values()
+            if isinstance(entry["wallSeconds"], (int, float))
+        ]
+        description = engine_descriptions.get(name, {})
+        engines[name] = {
+            "status": verdict.get("status"),
+            "setupSeconds": description.get("setupSeconds"),
+            "artifactOrigin": description.get("artifactOrigin"),
+            "artifactSizeBytes": description.get("artifactSizeBytes"),
+            "querySeconds": sum(timed) if timed else None,
+            "slowestQuery": (
+                max(queries.items(), key=lambda item: item[1]["wallSeconds"] or 0)[0]
+                if timed else None
+            ),
+            "queries": queries,
+        }
+
+    return {
+        "oracle": {
+            # The parser side of the comparison: what it costs to compute the
+            # same answers from the VCF directly.
+            "totalSeconds": oracle_seconds.get("total"),
+            "vcfParseSeconds": oracle_seconds.get("parse"),
+            "censusSeconds": oracle_seconds.get("census"),
+        },
+        "preparation": {
+            "materializationSeconds": materialization_seconds,
+            "shaclSeconds": shacl_seconds,
+        },
+        "engines": engines,
+        "totals": {
+            "oracleSeconds": oracle_seconds.get("total"),
+            "engineQuerySeconds": {
+                name: value["querySeconds"] for name, value in engines.items()
+            },
+            "engineSetupSeconds": {
+                name: value["setupSeconds"] for name, value in engines.items()
+            },
+        },
+        "queryIds": list(query_ids),
+    }
+
+
+def write_benchmark_csv(path: Path, benchmark: dict[str, Any]) -> Path:
+    """Write one row per engine and query, for direct analysis."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    oracle_total = benchmark["oracle"]["totalSeconds"]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=BENCHMARK_CSV_HEADER)
+        writer.writeheader()
+        for name, engine in benchmark["engines"].items():
+            for query_id, entry in engine["queries"].items():
+                writer.writerow({
+                    "engine": name,
+                    "query_id": query_id,
+                    "status": entry["status"],
+                    "wall_seconds": entry["wallSeconds"],
+                    # Repeated on each row so the CSV is usable without a join.
+                    "oracle_wall_seconds": oracle_total,
+                    "engine_setup_seconds": engine["setupSeconds"],
+                    "artifact_origin": engine["artifactOrigin"] or "",
+                })
+    return path
+
+
+def compare_engines(per_engine: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Check that every engine that ran produced the same normalized results.
+
+    Engines disagreeing is a finding in its own right: the graph may be correct
+    and one engine wrong, as when QLever's literal canonicalisation made a
+    datatype preflight fail on it alone. A multi-engine run is the cheapest
+    place to notice that, so it is checked rather than assumed.
+    """
+    usable = {
+        name: verdict["sparql"]
+        for name, verdict in per_engine.items()
+        if verdict.get("status") != "EXECUTION_FAILED" and verdict.get("sparql")
+    }
+    if len(usable) < 2:
+        return {
+            "agree": True,
+            "comparedEngines": sorted(usable),
+            "note": "fewer than two engines produced results, so there is nothing to compare",
+            "differences": {},
+        }
+    reference_name = sorted(usable)[0]
+    reference = usable[reference_name]
+    differences: dict[str, Any] = {}
+    for name in sorted(usable):
+        if name == reference_name:
+            continue
+        differing = [
+            query_id for query_id in reference
+            if usable[name].get(query_id) != reference[query_id]
+        ]
+        if differing:
+            differences[name] = differing
+    return {
+        "agree": not differences,
+        "comparedEngines": sorted(usable),
+        "referenceEngine": reference_name,
+        "differences": differences,
+    }
+
+
 def build_manifest(
     args: argparse.Namespace,
     query_dir: Path,
@@ -2003,21 +2367,31 @@ def run_validation(args: argparse.Namespace) -> int:
                 completed=0,
                 detail=f"materializing {args.rdf_format} artifact inside container",
             )
+            materialize_started = time.monotonic()
             decoded, materialization = materialize_ntriples(
                 args.rdf,
                 args.rdf_format,
                 scratch_path,
                 log_dir=raw_dir / "materialization",
             )
+            materialization["wallSeconds"] = time.monotonic() - materialize_started
             materialization["ntriplesPath"] = str(decoded)
             progress.emit(
                 "progress",
                 completed=0,
                 detail="parsing source VCF",
             )
-            parser = attach_census_expectations(
-                parse_vcf(args.vcf, filter_oracle=args.filter_oracle), args.representation
-            )
+            oracle_started = time.monotonic()
+            parser = parse_vcf(args.vcf, filter_oracle=args.filter_oracle)
+            parse_seconds = time.monotonic() - oracle_started
+            census_started = time.monotonic()
+            parser = attach_census_expectations(parser, args.representation)
+            oracle_seconds = {
+                "parse": parse_seconds,
+                "census": time.monotonic() - census_started,
+                "total": time.monotonic() - oracle_started,
+            }
+            parser["oracleSeconds"] = oracle_seconds
             write_json(results_dir / "parser.json", parser)
             progress.emit(
                 "progress",
@@ -2040,13 +2414,11 @@ def run_validation(args: argparse.Namespace) -> int:
                 "extra_index_args": list(args.qlever_index_arg),
                 "extra_server_args": list(args.qlever_server_arg),
             }
-            engine = build_engine(
-                args.engine, decoded, raw_dir=raw_dir, scratch=scratch_path,
-                options=engine_options,
-            )
+            engine_options["artifact_path"] = str(args.rdf)
+            engine_options["artifact_format"] = args.rdf_format
             manifest = build_manifest(
                 args, query_dir, parser,
-                engine_description={"engine": args.engine, "options": engine_options},
+                engine_description={"engines": list(args.engines), "options": engine_options},
                 materialization=materialization,
             )
             write_json(results_dir / "manifest.json", manifest)
@@ -2061,83 +2433,138 @@ def run_validation(args: argparse.Namespace) -> int:
                     "status": "BLOCKED_BY_PREFLIGHT", "shacl": shacl_result,
                 }
                 return 1
-            executions: dict[str, dict[str, Any]] = {}
-            progress.emit("progress", completed=0, detail=f"preparing {args.engine} engine")
-            if not quiet:
-                print(f"[{args.dataset_id}] preparing {args.engine} engine", flush=True)
-            try:
-                engine.start()
-            except (RuntimeError, OSError) as error:
-                summary = {
-                    "datasetId": args.dataset_id, "representation": args.representation,
-                    "status": "EXECUTION_FAILED",
-                    "error": f"{args.engine} engine could not be prepared: {error}",
-                }
-                return 1
-            try:
-                engine_description = engine.describe()
-                manifest["engine"] = engine_description
-                write_json(results_dir / "manifest.json", manifest)
-                for completed, query_id in enumerate(query_ids, start=1):
-                    progress.emit(
-                        "progress",
-                        completed=completed - 1,
-                        query_id=query_id,
-                        detail=f"running {args.representation}/{query_id}",
-                    )
-                    if not quiet:
-                        print(
-                            f"[{args.dataset_id}] running {args.representation}/{query_id}"
-                            f" ({args.engine})",
-                            flush=True,
+
+            # Each requested engine answers the whole query set independently.
+            # They are compared against the same oracle and against each other,
+            # and every engine's timings are recorded, which is what makes a
+            # multi-engine run usable as a benchmark.
+            per_engine: dict[str, dict[str, Any]] = {}
+            engine_descriptions: dict[str, Any] = {}
+            for engine_name in args.engines:
+                engine_raw_dir = raw_dir / engine_name
+                engine_raw_dir.mkdir(parents=True, exist_ok=True)
+                engine = build_engine(
+                    engine_name, decoded, raw_dir=engine_raw_dir, scratch=scratch_path,
+                    options=engine_options,
+                )
+                progress.emit("progress", completed=0, detail=f"preparing {engine_name} engine")
+                if not quiet:
+                    print(f"[{args.dataset_id}] preparing {engine_name} engine", flush=True)
+                try:
+                    engine.prepare()
+                except (RuntimeError, OSError) as error:
+                    per_engine[engine_name] = {
+                        "status": "EXECUTION_FAILED",
+                        "error": f"{engine_name} engine could not be prepared: {error}",
+                    }
+                    engine_descriptions[engine_name] = {"engine": engine_name, "error": str(error)}
+                    continue
+
+                executions: dict[str, dict[str, Any]] = {}
+                try:
+                    engine_descriptions[engine_name] = engine.describe()
+                    for completed, query_id in enumerate(query_ids, start=1):
+                        progress.emit(
+                            "progress", completed=completed - 1, query_id=query_id,
+                            detail=f"{engine_name}: {args.representation}/{query_id}",
                         )
-                    executions[query_id] = engine.execute(
-                        query_id, query_path(query_dir, query_id)
-                    )
-                    progress.emit(
-                        "progress",
-                        completed=completed,
-                        query_id=query_id,
-                        detail=f"completed {args.representation}/{query_id}",
-                    )
-            finally:
-                engine.stop()
-            write_json(results_dir / "query-executions.json", executions)
-            if any(item["status"] != "PASS" for item in executions.values()):
-                summary = {"datasetId": args.dataset_id, "representation": args.representation, "status": "EXECUTION_FAILED", "queryExecutions": executions}
-                return 1
-            verdict = evaluate_validation(
-                executions, parser, args.representation,
-                strict_conformance=args.strict_conformance,
-                mapping_policy=args.mapping_policy,
-                parsed_triple_count=rdf_validation.get("tripleCount"),
+                        if not quiet:
+                            print(
+                                f"[{args.dataset_id}] running {args.representation}/{query_id}"
+                                f" ({engine_name})",
+                                flush=True,
+                            )
+                        executions[query_id] = engine.execute(
+                            query_id, query_path(query_dir, query_id)
+                        )
+                        progress.emit(
+                            "progress", completed=completed, query_id=query_id,
+                            detail=f"{engine_name}: completed {query_id}",
+                        )
+                finally:
+                    engine.stop()
+
+                engine_dir = results_dir / "engines" / engine_name
+                engine_dir.mkdir(parents=True, exist_ok=True)
+                write_json(engine_dir / "query-executions.json", executions)
+                if any(item["status"] != "PASS" for item in executions.values()):
+                    per_engine[engine_name] = {
+                        "status": "EXECUTION_FAILED", "queryExecutions": executions,
+                    }
+                    continue
+
+                verdict = evaluate_validation(
+                    executions, parser, args.representation,
+                    strict_conformance=args.strict_conformance,
+                    mapping_policy=args.mapping_policy,
+                    parsed_triple_count=rdf_validation.get("tripleCount"),
+                )
+                write_json(engine_dir / "preflight.json", verdict["preflight"])
+                if verdict["status"] != "EXECUTION_FAILED":
+                    write_json(engine_dir / "sparql.json", verdict["sparql"])
+                    write_json(engine_dir / "comparison.json", verdict["comparison"])
+                verdict["executions"] = executions
+                per_engine[engine_name] = verdict
+
+            benchmark = build_benchmark(
+                per_engine, engine_descriptions,
+                oracle_seconds=oracle_seconds,
+                materialization_seconds=materialization.get("wallSeconds"),
+                shacl_seconds=(shacl_result or {}).get("wallSeconds"),
+                query_ids=query_ids,
             )
-            report = verdict["preflight"]
+            write_json(results_dir / "benchmark.json", benchmark)
+            write_benchmark_csv(results_dir / "benchmark.csv", benchmark)
+
+            agreement = compare_engines(per_engine)
+            write_json(results_dir / "engine-agreement.json", agreement)
+
+            # The primary engine's artifacts keep their historical locations so
+            # existing single-engine consumers are unaffected.
+            primary = args.engines[0]
+            primary_verdict = per_engine[primary]
+            report = primary_verdict.get("preflight", {})
             write_json(results_dir / "preflight.json", report)
-            if verdict["status"] == "EXECUTION_FAILED":
+            if primary_verdict["status"] == "EXECUTION_FAILED":
                 summary = {
                     "datasetId": args.dataset_id, "representation": args.representation,
                     "status": "EXECUTION_FAILED",
-                    "normalizationFailures": verdict["normalizationFailures"],
-                    "preflight": report,
+                    "engine": primary, "engines": list(args.engines),
+                    "normalizationFailures": primary_verdict.get("normalizationFailures", {}),
+                    "queryExecutions": primary_verdict.get("queryExecutions"),
+                    "error": primary_verdict.get("error"),
+                    "preflight": report, "benchmark": benchmark["totals"],
                 }
                 return 1
-            sparql = verdict["sparql"]
+            sparql = primary_verdict["sparql"]
             for query_id, rows in sparql.items():
                 write_json(normalized_dir / f"{query_id}.json", rows)
             write_json(results_dir / "sparql.json", sparql)
-            comparison = verdict["comparison"]
+            comparison = primary_verdict["comparison"]
             write_json(results_dir / "comparison.json", comparison)
-            status = verdict["status"]
+
+            statuses = {name: value["status"] for name, value in per_engine.items()}
+            failed_engines = [name for name, value in statuses.items() if value != "PASS"]
+            status = statuses[primary]
+            if not failed_engines and not agreement["agree"]:
+                # Every engine validated, but they disagree with each other. The
+                # graph may be fine and an engine wrong; either way the run
+                # cannot be called a pass.
+                status = "ENGINE_DISAGREEMENT"
+            elif failed_engines:
+                status = statuses[primary] if statuses[primary] != "PASS" else "MISMATCH"
             summary = {
                 "datasetId": args.dataset_id, "representation": args.representation, "status": status,
-                "engine": args.engine, "sourceFormat": args.rdf_format,
+                "engine": primary, "engines": list(args.engines),
+                "engineStatuses": statuses, "engineAgreement": agreement["agree"],
+                "sourceFormat": args.rdf_format,
                 "strictConformance": bool(args.strict_conformance),
                 "shacl": shacl_result,
                 "mappingPolicy": args.mapping_policy,
                 "recordCount": parser["totalRecords"], "sampleCount": parser["sampleCount"], "gtRecordCount": parser["gtRecordCount"],
                 "preflight": report, "comparisonStatus": comparison["status"],
-                "results": {"manifest": str(results_dir / "manifest.json"), "parser": str(results_dir / "parser.json"), "sparql": str(results_dir / "sparql.json"), "comparison": str(results_dir / "comparison.json")},
+                "benchmark": benchmark["totals"],
+                "results": {"manifest": str(results_dir / "manifest.json"), "parser": str(results_dir / "parser.json"), "sparql": str(results_dir / "sparql.json"), "comparison": str(results_dir / "comparison.json"), "benchmark": str(results_dir / "benchmark.csv")},
             }
             return 0 if status == "PASS" else 1
     except Exception as error:
@@ -2146,7 +2573,8 @@ def run_validation(args: argparse.Namespace) -> int:
     finally:
         if summary is None:
             summary = {"datasetId": args.dataset_id, "representation": args.representation, "status": "EXECUTION_FAILED", "error": "validation ended without a result"}
-        summary.setdefault("engine", args.engine)
+        summary.setdefault("engine", args.engines[0])
+        summary.setdefault("engines", list(args.engines))
         summary.setdefault("sourceFormat", args.rdf_format)
         summary["temporaryRdf"] = {
             "decompressedInsideContainer": args.rdf_format not in DIRECT_FORMATS,
@@ -2195,11 +2623,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scratch-dir", type=Path, default=Path("/work"))
     parser.add_argument(
         "--engine",
-        choices=SPARQL_ENGINES,
         default="comunica",
         help=(
-            "SPARQL engine: comunica queries the file in memory; qlever builds "
-            "an on-disk index and serves it (default: comunica)"
+            "SPARQL engine(s), comma-separated, or 'all'. comunica queries the "
+            "N-Triples in memory; qlever builds an on-disk index and serves it; "
+            "hdt and cottas query those compressed artifacts natively, without "
+            "decoding them. Several may be given: each answers the whole query "
+            "set, results are compared across engines, and every engine's "
+            "timings are recorded for benchmarking. The first is the primary, "
+            "whose reports keep the single-engine layout "
+            f"(choices: {', '.join(SPARQL_ENGINES)}; default: comunica)"
         ),
     )
     parser.add_argument(
@@ -2292,9 +2725,41 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def parse_engine_list(raw: str) -> list[str]:
+    """Parse a comma-separated engine list, preserving order and de-duplicating.
+
+    Order matters: the first engine is the primary, whose reports keep the
+    single-engine layout that existing consumers read.
+    """
+    value = (raw or "").strip()
+    if value == "all":
+        return list(SPARQL_ENGINES)
+    engines: list[str] = []
+    for token in value.split(","):
+        engine = token.strip()
+        if not engine:
+            continue
+        if engine not in SPARQL_ENGINES:
+            raise ValueError(
+                f"unknown SPARQL engine '{engine}'; choose from "
+                f"{', '.join(SPARQL_ENGINES)}, or 'all'"
+            )
+        if engine not in engines:
+            engines.append(engine)
+    if not engines:
+        raise ValueError("--engine requires at least one engine")
+    return engines
+
+
 def resolve_args(parser: argparse.ArgumentParser, argv: list[str] | None = None) -> argparse.Namespace:
     """Parse and normalise arguments, collapsing the RDF aliases into --rdf."""
     args = parser.parse_args(argv)
+    try:
+        args.engines = parse_engine_list(args.engine)
+    except ValueError as error:
+        parser.error(str(error))
+    # Retained as the primary engine's name for reports and callers that read it.
+    args.engine = args.engines[0]
     args.vcf = args.vcf.resolve()
 
     supplied = args.rdf or args.rdf_gz or args.rdf_nt

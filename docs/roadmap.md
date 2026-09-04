@@ -107,6 +107,34 @@ every vector in a cohort-wide query produces millions of bindings before
 filtering. A targeted single-position extractor is the right primitive; a
 whole-graph expansion is not.
 
+### 7. Granular privacy policies over the graph
+
+Today the tool has exactly one disclosure setting: convert everything. There is
+no way to release a cohort graph with some participants withheld, some regions
+degraded, or some fields suppressed, and no machine-readable record of what a
+given artifact was permitted to contain.
+
+The proposal is an ODRL profile whose assets are **graph selectors** (by class,
+predicate, sample, genomic region, declared field or pattern), compiled to a
+release plan and enforced at the cheapest available point in the existing
+pipeline — TSV pre-filtering, emitter-time filtering, or a post-hoc pass.
+Full design in [`privacy-policy-design.md`](privacy-policy-design.md).
+
+Two findings from that design are worth surfacing here because they affect work
+outside it:
+
+- **`ParsedSampleRecord` does not carry `CHROM` or `POS`.** `_parse_row` reads
+  columns 0, 1, 7, 9, 10 and −1. Any region-scoped feature evaluated at emission
+  time needs both, and adding them is two fields and two index reads.
+- **Condensed mode is not per-sample enforceable by triple filtering.** One
+  `FormatValueVector` literal holds every participant's value for a FORMAT key,
+  so the unit of protection is finer than the unit of storage. Redaction has to
+  rewrite the literal, and a single masked position is itself disclosive.
+
+The honest framing, which the design keeps throughout: this is *governed
+release*, not anonymization. Genotypes identify people, and no access-control
+layer changes that.
+
 ## Deliberately not planned
 
 Stated so the absence reads as a decision rather than an oversight.
@@ -118,6 +146,8 @@ Stated so the absence reads as a decision rather than an oversight.
 | Distributed or multi-node execution | Out of scope; chunking already bounds memory on one machine |
 | Incremental graph update | Would require identity and provenance machinery the current model does not have |
 | Clinical interpretation or pathogenicity assertion | The tool transcribes; it is not a clinical authority |
+| Differential privacy on aggregate queries | Formal guarantees need a persistent per-recipient budget ledger; without one it is decoration. See [`privacy-policy-design.md` §9](privacy-policy-design.md#9-beyond-access-control-disclosure-limitation) |
+| Deciding whether a release is legally compliant | A tool can implement and evidence a policy; it cannot make a data-protection determination |
 | `.bcf` input | Would pull `htslib` into the parsing path; convert with `bcftools` first |
 
 ---
@@ -126,5 +156,6 @@ Stated so the absence reads as a decision rather than an oversight.
 
 - [Limitations](limitations.md) — the current state, honestly
 - [Data linking design](datalinking-design.md) — the largest planned addition
+- [Privacy policy design](privacy-policy-design.md) — governed release over parts of the graph
 - [Validation methodology](validation-methodology.md) — how coverage is measured, so gaps stay falsifiable
 - [`changelog.md`](../changelog.md) — what has actually shipped

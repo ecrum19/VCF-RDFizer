@@ -49,6 +49,11 @@ deciding whether the tool fits your problem, read
   implemented.* A plug-in architecture for connecting the graph to external
   resources (rsIDs, genes, clinical assertions) with declarative linkers,
   reference bundles, live-API safeguards, and provenance.
+- **[Privacy policy design](privacy-policy-design.md)** — *proposal, not
+  implemented.* Granular, machine-readable disclosure control over parts of the
+  graph: an ODRL profile with graph selectors, three enforcement tiers, and
+  verification — plus a candid account of why access control is not
+  anonymization when the genotypes are themselves identifiers.
 
 ### What the graph looks like
 
@@ -95,6 +100,12 @@ deciding whether the tool fits your problem, read
 **"I want to add my own domain's links."**
 [Data linking design](datalinking-design.md) →
 [Custom RML mappings](rml-mappings.md) →
+[Validation methodology](validation-methodology.md)
+
+**"I need to release only part of this cohort."**
+[Privacy policy design](privacy-policy-design.md) →
+[Sample representations](sample-representation-guide.md) →
+[Conversion §6](conversion.md#6-iri-templates) →
 [Validation methodology](validation-methodology.md)
 
 **"A cohort-scale run just failed."**

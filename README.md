@@ -160,15 +160,28 @@ vcf-rdfizer --mode full -i ./cohort.vcf.gz \
   --validate --validate-artifacts all -o ./results
 ```
 
-`--validation-engine {comunica,qlever}` selects the SPARQL backend. Comunica
-(default) queries the file in memory; [QLever](https://github.com/ad-freiburg/qlever)
-builds an on-disk index inside the container and serves it, which is what makes
-cohort-scale graphs queryable. Both answer identical queries, so the choice is
+`--validation-engine` selects the SPARQL backend. Comunica (default) queries the
+file in memory; [QLever](https://github.com/ad-freiburg/qlever) builds an
+on-disk index inside the container and serves it, which is what makes
+cohort-scale graphs queryable; `hdt` and `cottas` query the **compressed
+artifact in place**, without decoding it, through `comunica-sparql-hdt` and
+`pycottas`'s rdflib store. All four answer identical queries, so the choice is
 never semantic, and every report records which engine ran.
 
 ```bash
 vcf-rdfizer --mode validation -i ./cohort.vcf.gz --rdf ./results/cohort/cohort.hdt \
   --validation-engine qlever --qlever-memory-gb 32 -o ./validation-results
+```
+
+Several engines can run in one pass - `--validation-engine comunica,qlever` or
+`all`. Each answers the whole query set, so the run cross-checks them against
+each other (`engine-agreement.json`) and times them against each other and
+against the cyvcf2 oracle computing the same answers, in `benchmark.json` and a
+long-format `benchmark.csv`.
+
+```bash
+vcf-rdfizer --mode validation -i ./cohort.vcf.gz --rdf ./results/cohort/cohort.nt.gz \
+  --validation-engine all -o ./validation-results
 ```
 
 Tuning: `--qlever-memory-gb`, `--qlever-port`, `--qlever-startup-timeout`,
@@ -187,8 +200,8 @@ vcf-rdfizer --mode validation -i ./cohort.vcf.gz --rdf ./results/cohort/cohort.n
 ```
 
 > **What a PASS means.** Coverage is measured, not asserted: a mutation harness
-> corrupts a correct graph in 36 named ways and records which are detected
-> (currently **64/66**). See [`docs/vcf-coverage.md`](docs/vcf-coverage.md) for
+> corrupts a correct graph in 42 named ways and records which are detected
+> (currently **76/78**). See [`docs/vcf-coverage.md`](docs/vcf-coverage.md) for
 > the element-by-element matrix and the remaining gaps, and
 > [`docs/validation-methodology.md`](docs/validation-methodology.md) for how the
 > number is produced.
@@ -947,6 +960,7 @@ how each part of the tool works, why, and where it stops working.
 | [Limitations](docs/limitations.md) | Everything the tool cannot do, in one place |
 | [Roadmap](docs/roadmap.md) | Planned work, known defects, and rejected options |
 | [Data linking design](docs/datalinking-design.md) | Proposal: a plug-in system for external links |
+| [Privacy policy design](docs/privacy-policy-design.md) | Proposal: ODRL-based granular disclosure control over the graph |
 
 - [`changelog.md`](changelog.md) - dated change history
 - [`ACKNOWLEDGEMENTS.md`](ACKNOWLEDGEMENTS.md) - funding and attribution

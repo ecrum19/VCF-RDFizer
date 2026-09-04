@@ -92,11 +92,11 @@ compatibility. Use the three explicit selectors.
 | `--validate` / `--run-validation` | — | off | Run validation once per input in full mode |
 | `--validate-artifacts` | `aggregate`, `hdt`, `cottas`, `all` | `aggregate` | Which produced artifacts to check, each in its own report directory |
 | `--validation-id` | name | source basename | Report directory name; existing directories are never overwritten |
-| `--validation-engine` | `comunica`, `qlever` | `comunica` | SPARQL backend; a scale decision, never a semantic one |
+| `--validation-engine` | `comunica`, `qlever`, `hdt`, `cottas`, `all`, or a comma-separated list | `comunica` | SPARQL backend(s); a scale and performance decision, never a semantic one. `hdt`/`cottas` query the compressed artifact in place. Several engines answer the whole query set, are cross-checked against each other, and are timed in `benchmark.csv` |
 | `--filter-oracle` | `auto`, `bcftools`, `cyvcf2` | `auto` | FILTER-field oracle |
 | `--shacl-shapes` | path | off | Independent structural layer via `pyshacl`; in-memory, so not for cohort scale |
 | `--strict-conformance` | — | off | Promote a missing-token conformance anomaly from report to failure |
-| `--validation-query-timeout` | seconds | 3600 | Per-query timeout, both engines |
+| `--validation-query-timeout` | seconds | 3600 | Per-query timeout, every engine |
 | `--qlever-memory-gb` | N | 4 | QLever index and server memory budget |
 | `--qlever-port` | N | 7019 | Container-local only; never published |
 | `--qlever-startup-timeout` | seconds | 900 | Wait for the server after indexing |

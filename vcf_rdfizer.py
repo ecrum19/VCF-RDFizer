@@ -166,6 +166,13 @@ VALIDATION_METRICS_COLUMNS = [
     "validation_max_rss_kb",
     "validation_results_path",
     "validation_rdf_path",
+    # Benchmark columns. The oracle and the engine compute the same answers
+    # from the same data, so these two are directly comparable; the engine
+    # column is a "|"-joined list when several engines ran.
+    "validation_engines",
+    "validation_oracle_seconds",
+    "validation_engine_query_seconds",
+    "validation_engine_setup_seconds",
 ]
 
 COMPRESSION_METHOD_COLUMNS = {
@@ -331,8 +338,37 @@ VALIDATION_RDF_SUFFIXES = (
     (".cottas", "cottas"),
     (".hdt", "hdt"),
 )
-VALIDATION_ENGINE_CHOICES = ("comunica", "qlever")
+VALIDATION_ENGINE_CHOICES = ("comunica", "qlever", "hdt", "cottas")
 DEFAULT_VALIDATION_ENGINE = "comunica"
+
+
+def parse_validation_engines(raw: str) -> list[str]:
+    """Parse --validation-engine into an ordered, de-duplicated engine list.
+
+    Several engines may be requested in one run. Each answers the whole query
+    set, so their results are cross-checked and their timings are directly
+    comparable. The first is the primary, whose reports keep the single-engine
+    layout that existing consumers read.
+    """
+    value = (raw or "").strip()
+    if value == "all":
+        return list(VALIDATION_ENGINE_CHOICES)
+    engines: list[str] = []
+    for token in value.split(","):
+        engine = token.strip()
+        if not engine:
+            continue
+        if engine not in VALIDATION_ENGINE_CHOICES:
+            allowed = ",".join(VALIDATION_ENGINE_CHOICES)
+            raise ValueError(
+                f"Unsupported value '{engine}' for --validation-engine. "
+                f"Use {allowed}, or all."
+            )
+        if engine not in engines:
+            engines.append(engine)
+    if not engines:
+        raise ValueError("--validation-engine requires at least one engine")
+    return engines
 # Which produced artifacts a full run should semantically validate. "aggregate"
 # is the .nt/.nt.gz RMLStreamer output; the others are the selected
 # representations, each decoded back to N-Triples before it is checked.
@@ -3512,6 +3548,10 @@ def update_metrics_csv_with_compression(
     if validation_result is not None:
         defaults.update(
             {
+                "validation_engines": "",
+                "validation_oracle_seconds": "null",
+                "validation_engine_query_seconds": "",
+                "validation_engine_setup_seconds": "",
                 "validation_status": "NOT_RUN",
                 "validation_exit_code": "null",
                 "validation_wall_seconds": "null",
@@ -3660,6 +3700,26 @@ def update_metrics_csv_with_compression(
                 or validation_result.get("rdf_gzip_path")
                 or ""
             )
+        benchmark = validation_result.get("benchmark") or {}
+        if "validation_engines" in row:
+            row["validation_engines"] = "|".join(validation_result.get("engines") or [])
+        if "validation_oracle_seconds" in row:
+            oracle = benchmark.get("oracleSeconds")
+            row["validation_oracle_seconds"] = (
+                "null" if oracle is None else f"{float(oracle):.6f}"
+            )
+        for column, key in (
+            ("validation_engine_query_seconds", "engineQuerySeconds"),
+            ("validation_engine_setup_seconds", "engineSetupSeconds"),
+        ):
+            if column in row:
+                # "engine=seconds" pairs, so one column holds every engine's
+                # figure without the header depending on which engines ran.
+                values = benchmark.get(key) or {}
+                row[column] = "|".join(
+                    f"{name}={float(value):.6f}"
+                    for name, value in values.items() if value is not None
+                )
 
     with metrics_csv.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=target_header)
@@ -5130,7 +5190,7 @@ def run_full_mode(
     header_representation: str = DEFAULT_HEADER_REPRESENTATION,
     run_validation: bool = False,
     validation_artifacts: list[str] | None = None,
-    validation_engine: str = DEFAULT_VALIDATION_ENGINE,
+    validation_engine: str | list[str] = DEFAULT_VALIDATION_ENGINE,
     validation_engine_options: dict | None = None,
     validation_strict_conformance: bool = False,
     validation_shacl_shapes: Path | None = None,
@@ -5162,8 +5222,12 @@ def run_full_mode(
     print(f"  Header representation: {header_representation}")
     validation_artifacts = list(validation_artifacts or ["aggregate"])
     if run_validation:
+        engine_label = (
+            validation_engine if isinstance(validation_engine, str)
+            else ", ".join(validation_engine)
+        )
         print(
-            f"  Validation: {', '.join(validation_artifacts)} via {validation_engine}"
+            f"  Validation: {', '.join(validation_artifacts)} via {engine_label}"
         )
     intermediate_dir = tsv_dir.parent
     ensure_dir(tsv_dir)
@@ -5685,7 +5749,7 @@ def run_full_mode(
                     metrics_dir / "reports" / "validation" / safe_target_id
                 )
                 print(
-                    f"    * Semantic validation ({target['name']}, {validation_engine}): "
+                    f"    * Semantic validation ({target['name']}, {engine_label}): "
                     f"{target['path'].name}"
                 )
                 target_result = {
@@ -5697,7 +5761,7 @@ def run_full_mode(
                     "vcf_path": str(input_vcf),
                     "rdf_path": str(target["path"]),
                     "rdf_format": target["format"],
-                    "engine": validation_engine,
+                    "engine": engine_label,
                     "representation": sample_workflow.representation,
                     "results_dir": str(target_results_dir),
                     "summary_path": str(target_results_dir / "summary.json"),
@@ -6591,7 +6655,7 @@ def run_validation_mode(
     image_ref: str,
     filter_oracle: str,
     wrapper_log_path: Path,
-    engine: str = DEFAULT_VALIDATION_ENGINE,
+    engine: str | list[str] = DEFAULT_VALIDATION_ENGINE,
     engine_options: dict | None = None,
     rdf_format: str | None = None,
     strict_conformance: bool = False,
@@ -6631,7 +6695,8 @@ def run_validation_mode(
             "Expected one of .nt, .nt.gz, .nt.br, .hdt, .cottas, .cottas.gz, .cottas.br"
         )
     options = dict(engine_options or {})
-    engine_args: list[str] = ["--engine", engine]
+    engine_list = [engine] if isinstance(engine, str) else list(engine)
+    engine_args: list[str] = ["--engine", ",".join(engine_list)]
     for flag, key in (
         ("--query-timeout", "query_timeout"),
         ("--qlever-memory-gb", "qlever_memory_gb"),
@@ -6731,11 +6796,19 @@ def run_validation_mode(
         "vcf_path": str(vcf_path),
         "rdf_path": str(rdf_path),
         "rdf_format": resolved_format,
-        "engine": engine,
+        "engine": engine_list[0],
+        "engines": engine_list,
         "strict_conformance": bool(strict_conformance),
         "representation": representation,
         "results_dir": str(results_dir),
         "summary_path": str(summary_path),
+        # Lift the oracle-versus-SPARQL timings into the stage report so a
+        # benchmark can be read from the run metrics without opening the
+        # detailed validation results.
+        "engine_statuses": summary.get("engineStatuses") if isinstance(summary, dict) else None,
+        "engine_agreement": summary.get("engineAgreement") if isinstance(summary, dict) else None,
+        "benchmark": summary.get("benchmark") if isinstance(summary, dict) else None,
+        "benchmark_csv_path": str(results_dir / "benchmark.csv"),
         "input_rdf_size_bytes": int(file_size_bytes(rdf_path) or 0),
         "exit_code": int(exit_code),
         "status": status,
@@ -7093,12 +7166,16 @@ def main():
     )
     parser.add_argument(
         "--validation-engine",
-        choices=VALIDATION_ENGINE_CHOICES,
         default=DEFAULT_VALIDATION_ENGINE,
         help=(
-            "SPARQL engine used for validation: comunica queries the graph in "
-            "memory; qlever builds an on-disk index inside the container and "
-            f"serves it (default: {DEFAULT_VALIDATION_ENGINE})"
+            "SPARQL engine(s) for validation, comma-separated, or 'all'. "
+            "comunica queries the graph in memory; qlever builds an on-disk "
+            "index and serves it; hdt and cottas query those compressed "
+            "artifacts natively without decoding them. Requesting several runs "
+            "the whole query set on each, cross-checks their answers, and "
+            "records comparable timings for benchmarking "
+            f"(choices: {', '.join(VALIDATION_ENGINE_CHOICES)}; "
+            f"default: {DEFAULT_VALIDATION_ENGINE})"
         ),
     )
     parser.add_argument(
@@ -7189,6 +7266,7 @@ def main():
     step1_label = "Step 1/5" if mode == "full" else "Step 1/3"
 
     validation_artifacts: list[str] = []
+    validation_engines: list[str] = [DEFAULT_VALIDATION_ENGINE]
     validation_engine_options: dict = {}
     shacl_shapes_path: Path | None = None
     try:
@@ -7209,6 +7287,7 @@ def main():
             validation_engine_options["qlever_server_args"] = list(args.qlever_server_arg)
         if validation_engine_options.get("qlever_port", 1) > 65535:
             raise ValueError("--qlever-port must be between 1 and 65535")
+        validation_engines = parse_validation_engines(args.validation_engine)
         validation_artifacts = parse_validation_targets(args.validate_artifacts)
         if args.shacl_shapes is not None:
             shacl_shapes_path = Path(args.shacl_shapes).expanduser().resolve()
@@ -7529,7 +7608,7 @@ def main():
         "spark_partitions": spark_partitions if mode == "full" else None,
         "run_validation": bool(args.run_validation) if mode == "full" else False,
         "validation_artifacts": validation_artifacts if mode == "full" and args.run_validation else None,
-        "validation_engine": args.validation_engine if mode in {"full", "validation"} else None,
+        "validation_engine": validation_engines if mode in {"full", "validation"} else None,
         "validation_strict_conformance": bool(args.strict_conformance) if mode in {"full", "validation"} else None,
         "validation_shacl_shapes": str(shacl_shapes_path) if shacl_shapes_path else None,
         "validation_engine_options": validation_engine_options or None,
@@ -7724,7 +7803,7 @@ def main():
                 header_representation=args.header_representation,
                 run_validation=args.run_validation,
                 validation_artifacts=validation_artifacts,
-                validation_engine=args.validation_engine,
+                validation_engine=validation_engines,
                 validation_engine_options=validation_engine_options,
                 validation_strict_conformance=args.strict_conformance,
                 validation_shacl_shapes=shacl_shapes_path,
@@ -7787,7 +7866,7 @@ def main():
                 timestamp=timestamp,
                 image_ref=image_ref,
                 filter_oracle=args.filter_oracle,
-                engine=args.validation_engine,
+                engine=validation_engines,
                 engine_options=validation_engine_options,
                 strict_conformance=args.strict_conformance,
                 shacl_shapes=shacl_shapes_path,

@@ -188,6 +188,24 @@ none is currently implemented.
 external. This is by design so far, and the plan to change it is
 [`datalinking-design.md`](datalinking-design.md).
 
+**No disclosure control.** Conversion is all-or-nothing: every sample, every
+genotype, every header line and every free-text `Description` goes into the
+graph, and there is no way to withhold a participant, degrade a region, or
+record what an artifact was permitted to contain. Three consequences today:
+
+- **IRIs carry identifiers.** `file://cohort.vcf#sample/1/NA12878` embeds the
+  sample name, `{SOURCE_FILE}` embeds the VCF's basename, and `#record/{ROW_ID}`
+  is a monotonic counter that discloses source ordering.
+- **Header lines are a leak surface.** `##source`, `##SAMPLE`, `##PEDIGREE` and
+  free-text `Description` fields are transcribed verbatim into
+  `vcfr:headerValue`.
+- **Even if that were fixed, genotypes identify people.** A few dozen
+  independent common variants are enough to single out an individual, so no
+  amount of label removal makes a released genotype graph non-identifying.
+
+The plan is [`privacy-policy-design.md`](privacy-policy-design.md), which is
+explicit that what it offers is *governed release*, not anonymization.
+
 **No clinical claims.** The tool transcribes a VCF. It does not interpret,
 annotate, prioritize, or assess pathogenicity, and its output should not be
 presented as if it did.
@@ -197,5 +215,6 @@ presented as if it did.
 ## See also
 
 - [Roadmap](roadmap.md) — which of these are being addressed
+- [Privacy policy design](privacy-policy-design.md) — the disclosure-control gap, and the proposal to close it
 - [VCF coverage matrix](vcf-coverage.md) — the element-by-element measurement
 - [Validation](validation.md) — the detailed "what is not tested"

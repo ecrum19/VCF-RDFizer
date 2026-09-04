@@ -12,8 +12,10 @@ using `cyvcf2` (and `bcftools` for exact FILTER strings when available), runs
 the equivalent SPARQL queries against the graph, then compares canonical
 integer results exactly. Two axes are configurable and independent: which
 artifact is validated (N-Triples, HDT, or COTTAS) and which SPARQL engine runs
-the queries (Comunica or QLever). Read "What is *not* tested" below before
-treating a `PASS` as a correctness proof.
+the queries (Comunica, QLever, native HDT, native COTTAS - or several at once,
+which cross-checks them and benchmarks them against each other and against the
+parser). Read "What is *not* tested" below before treating a `PASS` as a
+correctness proof.
 
 The source artifact is mounted read-only. Anything that is not already plain
 N-Triples is decoded under `/work` **inside the Docker container**; a plain
@@ -112,14 +114,110 @@ reported as a failure - the run already records why it is absent.
 
 ## Which SPARQL engine runs the queries
 
-`--validation-engine` selects the backend. Both answer identical queries and
-feed the same comparison layer, so the choice is a scale decision, never a
-semantic one; every report records which engine produced it.
+`--validation-engine` selects the backend. Every engine answers the same
+queries and feeds the same comparison layer, so the choice is a scale and
+performance decision, never a semantic one; every report records which engine
+produced it.
 
-| Engine | Behaviour | Use it when |
-|---|---|---|
-| `comunica` (default) | Queries the N-Triples file with no setup, holding the graph in the Node heap | The graph fits comfortably in RAM |
-| `qlever` | Builds an on-disk [QLever](https://github.com/ad-freiburg/qlever) index in container scratch, serves it on a container-local port, then tears both down | The graph no longer fits in memory, or the aggregate queries are too slow |
+| Engine | Queries | Setup | Use it when |
+|---|---|---|---|
+| `comunica` (default) | The N-Triples file directly | none | The graph fits comfortably in RAM |
+| `qlever` | An on-disk [QLever](https://github.com/ad-freiburg/qlever) index, served on a container-local port | index build | The graph no longer fits in memory, or the aggregate queries are too slow |
+| `hdt` | A `.hdt` artifact **in place**, through Comunica's HDT engine | reuses the run's HDT, or builds one | Checking that the compressed artifact is queryable, not just decodable |
+| `cottas` | A `.cottas` artifact **in place**, through `pycottas`'s rdflib store | reuses the run's COTTAS, or builds one | Same, for COTTAS |
+
+### Validating a compressed artifact without decoding it
+
+`--validation-target hdt,cottas` validates those artifacts by decoding them
+back to N-Triples first. That proves the decode is faithful; it says nothing
+about querying them, and it measures the wrong thing entirely in a performance
+comparison.
+
+`--validation-engine hdt` and `--validation-engine cottas` instead query the
+artifact where it lies. When the run's own artifact is already in the engine's
+format it is used directly - the honest measurement. Otherwise the engine
+builds one in container scratch from the materialized N-Triples, and that build
+is timed as **setup**, kept out of the query total. Each report records which
+of the two happened, in `artifactOrigin`.
+
+```bash
+vcf-rdfizer --mode validation \
+  --input ./cohort.vcf.gz --rdf ./results/cohort/cohort.hdt \
+  --validation-engine hdt \
+  --out ./validation-results
+```
+
+HDT is queried with `comunica-sparql-hdt`, installed in the image alongside
+Comunica; the source is addressed as `hdt@<path>`, because a bare path would be
+treated as a link to dereference. COTTAS is queried in-process through
+`pycottas.COTTASStore`, an rdflib `Store` over the Parquet artifact, under the
+same interpreter that already owns pycottas.
+
+### Several engines in one run
+
+`--validation-engine` accepts a comma-separated list, or `all`:
+
+```bash
+vcf-rdfizer --mode validation \
+  --input ./cohort.vcf.gz --rdf ./results/cohort/cohort.nt.gz \
+  --validation-engine all \
+  --out ./validation-results
+```
+
+Every requested engine answers the whole query set. Two things follow:
+
+- **Cross-checking.** The normalized results of every engine are compared
+  against each other and written to `engine-agreement.json`. Engines
+  disagreeing is a finding in its own right - see below.
+- **Benchmarking.** Every engine is timed identically, against the same graph,
+  in the same container, in one run.
+
+The first engine named is the **primary**. Its reports keep the single-engine
+layout at the top of the results directory, so existing consumers are
+unaffected; each engine additionally gets `engines/<name>/` with its own
+`preflight.json`, `sparql.json`, `comparison.json` and `query-executions.json`.
+The run's `status` is `PASS` only if every engine passed, and `summary.json`
+carries `engineStatuses` with the per-engine verdict.
+
+### Timings, and comparing SPARQL against the parser
+
+Every run writes `benchmark.json` and a long-format `benchmark.csv` - one row
+per engine and query, ready to plot without reshaping:
+
+```
+engine,query_id,status,wall_seconds,oracle_wall_seconds,engine_setup_seconds,artifact_origin
+```
+
+`benchmark.json` adds the breakdown: per-engine setup and total query time, the
+slowest query per engine, N-Triples materialization and SHACL time, and the
+**oracle** - what it costs to compute the same answers directly from the VCF
+with cyvcf2, split into parse and census. That last figure is the point of
+comparison: the validation suite computes every expected value twice, once by
+parsing and once by querying, so a run measures a SPARQL engine against a
+purpose-built parser on identical work.
+
+An engine that produced no timed query reports `null` rather than `0`, because
+zero seconds reads as "instant" rather than "never ran".
+
+The parent run's `metrics.csv` carries the summary columns
+`validation_engines`, `validation_oracle_seconds`,
+`validation_engine_query_seconds` and `validation_engine_setup_seconds`, the
+last two as `engine=seconds` pairs.
+
+An indicative single-container run over a small fixture (312 triples, expanded)
+gives the shape of the difference rather than a benchmark result:
+
+| Engine | Setup | 27 queries | Notes |
+|---|---|---|---|
+| oracle (cyvcf2) | - | 0.003 s | the parser computing the same answers |
+| qlever | 0.17 s | 0.31 s | index built once, then served |
+| cottas | 0.28 s | 0.97 s | in-process, no subprocess per query |
+| hdt | 0.003 s | 23.9 s | one Comunica process per query |
+| comunica | - | 25.1 s | one Comunica process per query |
+
+Comunica's cost here is almost entirely per-process startup, which a
+fixture-sized graph cannot amortize; the ordering says nothing about how these
+engines behave on a cohort-sized graph.
 
 ```bash
 vcf-rdfizer --mode validation \
@@ -135,7 +233,7 @@ QLever tuning, all optional:
 | `--qlever-memory-gb N` | Index and server memory budget (default 4) |
 | `--qlever-port N` | Container-local port (default 7019; never published) |
 | `--qlever-startup-timeout N` | Seconds to wait for the server after indexing (default 900) |
-| `--validation-query-timeout N` | Per-query timeout, both engines (default 3600) |
+| `--validation-query-timeout N` | Per-query timeout, every engine (default 3600) |
 | `--qlever-index-arg ARG` | Extra argument for the index builder (repeatable) |
 | `--qlever-server-arg ARG` | Extra argument for the server (repeatable) |
 
@@ -167,9 +265,16 @@ link still validates normally.
 
 ### Engine equivalence, and one place they differed
 
-Both engines are held to producing identical results. That is verified, not
-assumed: all eleven queries were run under both engines against the same
-expanded and condensed graphs, and every normalized result matched.
+Every engine is held to producing identical results. That is verified, not
+assumed: [`test/cross_engine_agreement.py`](../test/cross_engine_agreement.py)
+runs the full query set under all four engines, against the same expanded and
+condensed graphs, and additionally runs the shipped validation decision under
+each - so an engine must agree both with the other engines and with the Python
+oracle. Engines agreeing with each other and all being wrong is a real failure
+mode; only the oracle rules it out.
+
+A multi-engine production run performs the first half of that check on the
+real graph and records it in `engine-agreement.json`.
 
 One difference had to be fixed to make that true. QLever canonicalises numeric
 literals at index time, so `"100"^^xsd:integer` is reported by `DATATYPE()` as
@@ -303,53 +408,60 @@ back into per-sample value resources.
 
 ## What is *not* tested
 
-The suite is deliberately a set of exact aggregate comparisons. That makes it
-cheap, engine-independent, and free of a second RDF parser to disagree with -
-but it bounds what it can detect, and those bounds are worth stating plainly.
-`test/test_validation_logic_unit.py` encodes both the detections and the gaps
-below, so a change that closes one will fail a test rather than pass silently.
+The suite is three independent layers - exact aggregate comparisons, a
+predicate/class census with per-record and per-value identity digests, and
+graph-integrity checks - plus optional SHACL. That is a broad net, but it is
+still a net, and its holes are worth stating plainly. Every claim below is
+backed by a named mutation in
+[`test/validation_mutations.py`](../test/validation_mutations.py), so a change
+that closes a gap fails a test rather than passing silently.
 
-**No per-record identity.** Every core query is a `GROUP BY` count. A graph that
-swapped `POS` between two records on the same contig and in the same 1 Mb
-window - or `REF`/`ALT` between two records of the same shape class - produces
-byte-identical results and passes. The suite proves the *distributions* match,
-not that record *i* carries record *i*'s values. Detecting a permutation needs a
-per-record identity check, which the current query set does not have.
-
-**Whole VCF columns are unchecked.** Nothing compares `ID`, `QUAL`, or `INFO`,
-and no `FORMAT` field other than `GT` is validated. A conversion bug that
-mangled every `DP` value, dropped every rsID, or corrupted `INFO` would pass.
-The `header_lines` and `file_metadata` triples maps - the `HeaderLine`
-resources and the `VCFFile` attributes - are likewise never queried.
-
-**No completeness bound.** Nothing asserts a total triple count or the absence
-of extraneous triples. `preflight_record_cardinality` catches duplicated or
-missing per-record properties, but only for `VCFRecord` subjects.
+**`vcfr:contigCount` is counted, not read.** The census asserts the predicate is
+present the expected number of times; nothing compares its *value*. A derived
+contig total that is simply wrong passes. This is the one mutation in the
+catalogue that is still undetected.
 
 **Header line values are compared only through their structured form.** The
 attributes that matter - `filterId`, `altId`, `contigId`, contig length/md5/
 assembly, and the INFO/FORMAT declarations - are lifted into their own
-properties and counted. The raw `vcfr:headerValue` literal itself is counted but
-never read, and `vcfr:contigCount` is likewise checked for presence rather than
-value.
+properties and compared. The raw `vcfr:headerValue` literal itself is counted
+but never read.
 
-**The census assumes the shipped mapping.** Under a custom `--rules`, Q9-Q13
-are no longer meaningful and the run should rest on the aggregate comparisons
-alone - which is what `--mapping-policy report-only` is for, and which the
-wrapper does not yet enable (see the note above).
+**Multi-valued INFO fields keep only their lexical value.** A `Number=1` INFO
+value additionally carries a typed `fieldValueInteger`/`fieldValueDecimal`; a
+`Number=A/R/G/.` field does not, because the vocabulary's IRI template gives one
+node per key. The full lexical value is still digested, so corruption is caught
+- but no per-element typing is checked.
 
-In short: a `PASS` is strong evidence that the conversion preserved the VCF's
-*summary statistics* over the elements it covers, and it reliably catches
-dropped records, misclassified variants, flipped genotypes, corrupted FILTER
-strings, allele-count errors, missing header lines, and altered file metadata.
-It is not proof of a faithful record-by-record round-trip. Treat it as a
-regression gate, not a correctness proof.
+**The census assumes the shipped mapping.** A custom `--rules` changes the
+predicate inventory and the IRI templates by design, so `q09`-`q13` fall back to
+report-only and the run rests on the aggregate comparisons alone. That is
+correct behaviour, not a bug, but it means a custom mapping is validated more
+weakly than the default one.
 
-These limits are measured rather than asserted. Every claim above corresponds
-to a named mutation in the catalogue described in
-[`validation-methodology.md`](validation-methodology.md); the current score and
+**Condensed graphs are not ontology-backed.** The condensed representation uses
+17 terms the published vocabulary does not define, so SHACL cannot meaningfully
+check it and dereferencing those terms returns nothing. The list is in
+[`vcf-coverage.md`](vcf-coverage.md); closing it is work in the vocabulary
+repository.
+
+**A high mutation score is a lower bound on blindness, not a proof.** It says
+"almost every corruption we thought to write down is caught". Corruptions nobody
+wrote down are, by construction, not measured.
+
+In short: a `PASS` means the graph contains exactly the predicates and classes
+the VCF implies, that every record, INFO value and FORMAT value hashes to the
+same bucket as its counterpart in the source, that the summary statistics agree
+exactly, and that the graph carries no blank nodes, empty terms or duplicated
+statements. It reliably catches dropped records, misclassified variants, flipped
+genotypes, corrupted FILTER strings, allele-count errors, permuted record
+fields, missing header lines, and altered file metadata. It is still not proof
+of a faithful record-by-record round-trip. Treat it as a regression gate.
+
+These limits are measured rather than asserted. The current mutation score and
 the full element-by-element breakdown are in
-[`vcf-coverage.md`](vcf-coverage.md).
+[`vcf-coverage.md`](vcf-coverage.md); the method is described in
+[`validation-methodology.md`](validation-methodology.md).
 
 ## Results and cleanup evidence
 
@@ -364,12 +476,18 @@ the same `summary.json` used for conversion and compression metrics.
 
 Important files include `summary.json`, `manifest.json`, `parser.json`,
 `rdf-validation.json`, `materialization.json`, `preflight.json`, `sparql.json`,
-and `comparison.json`. Raw SPARQL Results JSON, stderr, and query resource logs
-are in `raw/`; normalized results are in `normalized/`. `manifest.json` records
-the engine that ran (including QLever's exact argv), the source artifact format
-and checksum, and every decode step; `materialization.json` records how a
-compressed or indexed artifact was turned into N-Triples and how many triples
-that yielded.
+`comparison.json`, `benchmark.json` and `benchmark.csv`. Raw SPARQL Results
+JSON, stderr, and query resource logs are in `raw/<engine>/`; normalized results
+are in `normalized/`. `manifest.json` records the engine that ran (including
+QLever's exact argv), the source artifact format and checksum, and every decode
+step; `materialization.json` records how a compressed or indexed artifact was
+turned into N-Triples and how many triples that yielded.
+
+A multi-engine run adds `engines/<name>/` - one `preflight.json`,
+`sparql.json`, `comparison.json` and `query-executions.json` per engine - and
+`engine-agreement.json`, which records whether every engine returned the same
+normalized results and, if not, which queries differed. The top-level reports
+remain those of the primary (first-named) engine.
 
 When several artifacts are validated in one full run, each gets its own
 directory: the aggregate keeps `<validation-id>/`, and the representations use

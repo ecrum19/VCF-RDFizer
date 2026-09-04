@@ -1,6 +1,10 @@
 ARG RMLSTREAMER_VERSION=2.5.0
 ARG HDTC_VERSION=1.1.0
 ARG COMUNICA_VERSION=5.3.0
+# Comunica's HDT engine is versioned separately from its file engine and lags
+# behind it. It provides native SPARQL over a .hdt artifact, so validation can
+# query the compressed representation directly instead of decoding it first.
+ARG COMUNICA_HDT_VERSION=5.0.1
 # QLever is an optional second SPARQL engine for validation. Its binaries are
 # copied from the upstream published image rather than built here: compiling
 # QLever needs a large C++ toolchain and would dominate this image's build.
@@ -106,7 +110,18 @@ RUN python3 -m venv /opt/pycottas-venv \
     cyvcf2==0.34.0 \
     pyshacl==0.30.1
 
-RUN npm install --global "@comunica/query-sparql-file@${COMUNICA_VERSION}"
+ARG COMUNICA_HDT_VERSION
+
+# The HDT engine compiles native bindings, so a toolchain is needed at install
+# time but not afterwards; it is purged in the same layer to keep it out of the
+# image. `python3` is already present and is what node-gyp needs.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends build-essential \
+  && npm install --global \
+    "@comunica/query-sparql-file@${COMUNICA_VERSION}" \
+    "@comunica/query-sparql-hdt@${COMUNICA_HDT_VERSION}" \
+  && apt-get purge -y --auto-remove build-essential \
+  && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /opt/rmlstreamer \
   && curl -fsSL \
