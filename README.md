@@ -27,7 +27,11 @@ The VCF-RDFizer vocabulary is available at [https://w3id.org/vcf-rdfizer/vocab#]
 When VCF-RDFizer is connected to an interactive terminal, it shows a
 lightweight Rich spinner/progress display. With redirected output or without
 Rich installed, it instead prints compact status lines; CI output remains
-quiet. Either display can be disabled explicitly with `--no-progress`.
+quiet. Validation uses the same display and reports each preflight/SPARQL
+query as it starts and completes. Use `--quiet` to suppress these terminal
+progress displays (and validation's per-query/summary chatter) while keeping
+the progress sidecar, command log, and metrics collection active. Use
+`--no-progress` when the sidecar and terminal progress should both be disabled.
 RMLStreamer progress reports the bytes and output parts already written;
 partitioned HDT/COTTAS runs report source triples, chunks, and the currently
 active merge/index stage. These updates are best-effort and do not scan RDF
@@ -73,11 +77,11 @@ inside this directory.
 
 ## Modes
 
-- `full`: VCF -> TSV -> RDF -> compression
+- `full`: VCF -> TSV -> RDF -> compression (and optional semantic validation with `--validate`)
 - `tsv`: VCF -> TSV only (benchmarking)
 - `compress`: compress an existing `.nt` or `.nt.gz`
 - `decompress`: decompress `.nt.gz`, `.nt.br`, `.hdt`, `.cottas`, `.cottas.gz`, or `.cottas.br`
-- `validation`: compare a source VCF with its `.nt.gz` RDF using six semantic SPARQL queries
+- `validation`: compare a source VCF with its `.nt` or `.nt.gz` RDF using six semantic SPARQL queries
 - `index`: only generate or regenerate the query index for an existing `.hdt` or `.cottas`
 
 In `full` mode with multiple VCF inputs, failures are isolated per input:
@@ -94,18 +98,25 @@ In `full` mode with multiple VCF inputs, failures are isolated per input:
 - `--hdt-strategy {auto,partitioned,single}` HDT generation policy
 - `--chunk-target-bytes`, `--chunk-min-bytes`, `--chunk-max-bytes` shared record-safe chunk sizing
 - `--sample-representation {expanded,condensed}` genotype graph shape (`expanded` by default)
+- `--validate` (or `--run-validation`) run semantic VCF/RDF validation for every input in a full run
+- `--filter-oracle {auto,bcftools,cyvcf2}` FILTER oracle used by validation (`auto` by default)
+- `--quiet` suppress terminal progress displays while retaining sidecar/log/metrics tracking
+- `--no-progress` disable terminal progress and progress sidecar creation
 - `-I, --image` Docker image repo (default `ecrum19/vcf-rdfizer`)
 - `-v, --image-version` Docker tag/version
 - `-b, --build` force Docker build
 - `-B, --no-build` fail if image not found
-- `--no-progress` disable terminal progress updates
 - `-h, --help` show full usage
 
 ## Validation Mode
 
-Validate one source VCF against the `.nt.gz` aggregate from the same
-conversion. The aggregate is decompressed, parsed, and queried only inside the
-Docker container; raw N-Triples are removed before the container exits.
+Validate one source VCF against the `.nt` or `.nt.gz` aggregate from the same
+conversion. Gzip input is decompressed, parsed, and queried only inside the
+Docker container; any temporary raw N-Triples are removed before the container
+exits. To run
+the same checks as part of a full conversion, add `--validate`; validation then
+runs once per input after RDF/compression and accepts either the generated
+`.nt` or `.nt.gz` aggregate.
 
 ```bash
 vcf-rdfizer --mode validation \
@@ -116,9 +127,12 @@ vcf-rdfizer --mode validation \
 ```
 
 Use `expanded` for the default graph shape and `condensed` for the vector-based
-cohort graph. Reports are written to `<out>/validation/<dataset-id>/`. See
-[Semantic VCF/RDF validation](docs/validation.md) for query definitions,
-preflight checks, result statuses, and cleanup evidence.
+cohort graph. Reports from standalone and full-run validation use the canonical
+metrics tree:
+`run_metrics/<input-label>__<run-id>/reports/validation/<dataset-id>/`, with a
+stage summary at `stages/validation/<dataset-id>.json`. See [Semantic VCF/RDF
+validation](docs/validation.md) for query definitions, preflight checks, result
+statuses, and cleanup evidence.
 
 ## Compression Plan
 
@@ -164,6 +178,11 @@ host filesystem.
 - `--sample-representation {expanded,condensed}` sample genotype representation
   - `expanded` (default): one `SampleCall` per record/sample and one `FormatFieldValue` per FORMAT key
   - `condensed`: reusable file-level samples plus one ordered value vector per record/FORMAT key
+- `--validate` run semantic VCF/RDF validation once per input after RDF/compression;
+  detailed results are stored beneath `run_metrics/.../reports/validation/`
+- `--filter-oracle {auto,bcftools,cyvcf2}` FILTER oracle for `--validate`
+- `--quiet` suppress terminal progress and validation query chatter while retaining logs/metrics
+- `--no-progress` disable progress sidecars and terminal progress displays
 - `--rdf-storage-mode {plain,space-optimized}` required full-mode aggregate storage policy
   - `plain`: merge RMLStreamer parts into one uncompressed `.nt`
   - `space-optimized`: gzip each part into one `.nt.gz` aggregate and delete the source part immediately
@@ -574,13 +593,17 @@ Within each run directory, VCF-RDFizer writes:
   Docker container
 - `stages/tsv/`, `stages/conversion/`, `stages/compression/`,
   `stages/compression_operations/`, `stages/decompression/`, and
-  `stages/index/`: structured stage results. `compression_operations/`
+  `stages/index/`, and `stages/validation/`: structured stage results.
+  `compression_operations/`
   preserves the underlying per-RDF operation and validation reports, while
   `compression/` provides the final output-level summary.
 - `stages/partitioned/`: the full result handoff from the temporary
   partitioned-compression container, including every chunk build, merge,
   validation, workspace free-space sample, exit code, CPU time, and peak RSS
 - `reports/index_warnings.json` and `reports/failed_inputs.csv` when applicable
+- `reports/validation/<dataset-id>/`: detailed semantic-validation reports
+  (`summary.json`, query results, preflight checks, and cleanup evidence) when
+  validation is requested
 
 Compression metrics now include per-method:
 
@@ -617,6 +640,11 @@ preserved even when the temporary Docker volume is deleted after a failure.
 Metrics may use internal stage names such as `hdt_gzip` and `cottas_brotli`.
 These correspond to the public combination of `--representations` and
 `--artifact-compression`; users do not need to pass those compound names.
+
+When `--validate` is used in full mode, the same `metrics.csv` row also carries
+`validation_status`, `validation_exit_code`, validation wall/CPU/RSS timings,
+the detailed report path, and the RDF path that was validated. The validation
+stage JSON retains the full status and temporary-RDF cleanup metadata.
 
 ## Chunked Compression
 

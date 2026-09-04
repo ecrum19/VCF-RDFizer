@@ -1,5 +1,26 @@
 # Changelog
 
+## 2026-09-04 — Validation progress and quiet mode
+
+- Integrated semantic validation with the existing JSONL progress sidecar and
+  host `ProgressSession`; validation now reports its preflight/core query
+  progress using the same terminal UI as conversion and compression.
+- Added `--quiet` to suppress terminal progress displays and validation query
+  chatter while retaining progress bookkeeping, command logs, and metrics.
+- Kept `--no-progress` as the stronger opt-out that disables sidecar creation
+  and progress rendering entirely.
+
+## 2026-09-04 — Full-run semantic validation
+
+- Added `--validate`/`--run-validation` to run the semantic VCF/RDF validator
+  once per input as the final stage of a `--mode full` run.
+- Full-mode validation accepts the generated plain `.nt` or gzip `.nt.gz`
+  aggregate, and retains the validator's container-local temporary-file
+  guarantees.
+- Validation timing, status, exit code, input RDF, and report paths are now
+  included in the run's `metrics.csv`, compression JSON, stage reports, and
+  recursive `summary.json` report index.
+
 ## 2026-09-04 — Expanded sample representation naming
 
 - Renamed the default per-sample genotype graph strategy to `expanded`, while

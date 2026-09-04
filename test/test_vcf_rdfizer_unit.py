@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
@@ -218,6 +219,20 @@ def prepare_inputs(base: Path):
     return input_dir, rules_path
 
 
+def load_validation_runner_module():
+    """Load the container validator without requiring cyvcf2 on the host."""
+    validator_path = Path(__file__).parents[1] / "src" / "validation" / "validation_runner.py"
+    fake_cyvcf2 = types.ModuleType("cyvcf2")
+    fake_cyvcf2.VCF = object
+    fake_cyvcf2.__version__ = "test"
+    spec = importlib.util.spec_from_file_location("validation_runner_test", validator_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    with mock.patch.dict(sys.modules, {"cyvcf2": fake_cyvcf2}):
+        spec.loader.exec_module(module)
+    return module
+
+
 def mocked_triplets():
     return [
         {
@@ -339,6 +354,151 @@ class WrapperUnitTests(VerboseTestCase):
                 self.assertIn("cottas-merge-disk", displayed)
         finally:
             vcf_rdfizer._PROGRESS_ALLOWED = previous_progress_setting
+
+    def test_quiet_progress_consumes_sidecar_without_terminal_output(self):
+        """Quiet mode keeps event handling active but renders no progress lines."""
+        previous_allowed = vcf_rdfizer._PROGRESS_ALLOWED
+        previous_events = vcf_rdfizer._PROGRESS_EVENTS_ALLOWED
+        previous_quiet = vcf_rdfizer._QUIET
+        try:
+            vcf_rdfizer._PROGRESS_ALLOWED = False
+            vcf_rdfizer._PROGRESS_EVENTS_ALLOWED = True
+            vcf_rdfizer._QUIET = True
+            with tempfile.TemporaryDirectory() as td, mock.patch.dict(
+                os.environ,
+                {"VCF_RDFIZER_NO_PROGRESS": "", "CI": ""},
+                clear=False,
+            ), mock.patch.object(vcf_rdfizer, "Progress", None), mock.patch.object(
+                vcf_rdfizer, "Console", None
+            ):
+                progress_path = Path(td) / "validation.jsonl"
+                terminal = StringIO()
+                with redirect_stderr(terminal), vcf_rdfizer.ProgressSession(
+                    progress_path, "Validation: cohort"
+                ) as session:
+                    progress_path.write_text(
+                        json.dumps(
+                            {
+                                "stage": "validation",
+                                "phase": "started",
+                                "completed": 0,
+                                "total": 2,
+                            }
+                        )
+                        + "\n"
+                    )
+                    session.poll_events()
+
+                self.assertEqual(terminal.getvalue(), "")
+        finally:
+            vcf_rdfizer._PROGRESS_ALLOWED = previous_allowed
+            vcf_rdfizer._PROGRESS_EVENTS_ALLOWED = previous_events
+            vcf_rdfizer._QUIET = previous_quiet
+
+    def test_validation_forwards_progress_sidecar_and_quiet_flag(self):
+        """Validation uses the shared sidecar protocol and propagates --quiet."""
+        previous_allowed = vcf_rdfizer._PROGRESS_ALLOWED
+        previous_events = vcf_rdfizer._PROGRESS_EVENTS_ALLOWED
+        previous_quiet = vcf_rdfizer._QUIET
+        try:
+            vcf_rdfizer._PROGRESS_ALLOWED = False
+            vcf_rdfizer._PROGRESS_EVENTS_ALLOWED = True
+            vcf_rdfizer._QUIET = True
+            with tempfile.TemporaryDirectory() as td:
+                tmp_path = Path(td)
+                vcf_path = tmp_path / "sample.vcf"
+                vcf_path.write_text("##fileformat=VCFv4.2\n#CHROM\tPOS\n")
+                rdf_path = tmp_path / "sample.nt"
+                rdf_path.write_text("<s> <p> <o> .\n")
+                metrics_dir = tmp_path / "metrics"
+                results_dir = metrics_dir / "reports" / "validation" / "sample"
+                commands = []
+
+                def fake_run(cmd, cwd=None, env=None):
+                    commands.append(cmd)
+                    return 0
+
+                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), redirect_stdout(
+                    StringIO()
+                ):
+                    rc = vcf_rdfizer.run_validation_mode(
+                        vcf_path=vcf_path,
+                        rdf_path=rdf_path,
+                        representation="expanded",
+                        validation_id="sample",
+                        results_dir=results_dir,
+                        metrics_dir=metrics_dir,
+                        run_id="20260904T123456",
+                        timestamp="2026-09-04T12:34:56",
+                        image_ref="example/vcf-rdfizer:latest",
+                        filter_oracle="auto",
+                        wrapper_log_path=tmp_path / "wrapper.log",
+                    )
+
+                self.assertEqual(rc, 0)
+                self.assertEqual(len(commands), 1)
+                command = commands[0]
+                self.assertIn("--progress-path", command)
+                self.assertIn(
+                    "/data/metrics/.progress/validation-sample.jsonl", command
+                )
+                self.assertIn("--quiet", command)
+        finally:
+            vcf_rdfizer._PROGRESS_ALLOWED = previous_allowed
+            vcf_rdfizer._PROGRESS_EVENTS_ALLOWED = previous_events
+            vcf_rdfizer._QUIET = previous_quiet
+
+    def test_validation_runner_emits_query_progress_in_quiet_mode(self):
+        """The container validator still writes lifecycle events when stdout is quiet."""
+        validator = load_validation_runner_module()
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            vcf_path = tmp_path / "sample.vcf"
+            vcf_path.write_text("##fileformat=VCFv4.2\n#CHROM\tPOS\n")
+            rdf_path = tmp_path / "sample.nt"
+            rdf_path.write_text("<s> <p> <o> .\n")
+            scratch_dir = tmp_path / "scratch"
+            scratch_dir.mkdir()
+            results_dir = tmp_path / "results"
+            progress_path = tmp_path / ".progress" / "validation.jsonl"
+            args = argparse.Namespace(
+                results_dir=results_dir,
+                representation="expanded",
+                progress_path=progress_path,
+                quiet=True,
+                scratch_dir=scratch_dir,
+                rdf_gz=None,
+                rdf_nt=rdf_path,
+                vcf=vcf_path,
+                filter_oracle="cyvcf2",
+                dataset_id="sample",
+            )
+            query_file = tmp_path / "query.rq"
+            query_file.write_text("SELECT * WHERE { ?s ?p ?o }\n")
+            parser = {
+                "totalRecords": 1,
+                "sampleCount": 0,
+                "gtRecordCount": 0,
+            }
+            with mock.patch.object(validator, "query_path", return_value=query_file), mock.patch.object(
+                validator, "parse_vcf", return_value=parser
+            ), mock.patch.object(
+                validator, "validate_ntriples", return_value={"status": "PASS"}
+            ), mock.patch.object(validator, "build_manifest", return_value={}), mock.patch.object(
+                validator, "execute_query", return_value={"status": "FAILED"}
+            ), redirect_stdout(StringIO()) as output:
+                rc = validator.run_validation(args)
+
+            self.assertEqual(rc, 1)
+            self.assertEqual(output.getvalue(), "")
+            events = [
+                json.loads(line) for line in progress_path.read_text().splitlines()
+            ]
+            self.assertEqual(events[0]["phase"], "started")
+            self.assertEqual(events[0]["unit"], "queries")
+            self.assertEqual(events[1]["phase"], "progress")
+            self.assertEqual(events[1]["completed"], 0)
+            self.assertEqual(events[-1]["phase"], "failed")
 
     def test_validator_counts_plain_and_gzip_ntriples(self):
         """The Docker validator's fallback source count handles .nt and .nt.gz."""
@@ -1406,6 +1566,103 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertIn("wall_seconds_tsv", row)
             self.assertNotEqual(row.get("tsv_output_size_bytes", ""), "")
 
+    def test_main_full_mode_runs_validation_and_harmonizes_reports_and_metrics(self):
+        """--validate adds one canonical validation stage and CSV row to a full run."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+            out_dir = tmp_path / "out"
+            validation_calls = []
+
+            def fake_run(cmd, cwd=None, env=None):
+                if "/opt/vcf-rdfizer/vcf_as_tsv.sh" in cmd:
+                    tsv_dir = out_dir / ".intermediate" / "tsv"
+                    tsv_dir.mkdir(parents=True, exist_ok=True)
+                    (tsv_dir / "sample.records.tsv").write_text("SOURCE_FILE\tROW_ID\nsample.vcf\t1\n")
+                    (tsv_dir / "sample.header_lines.tsv").write_text("SOURCE_FILE\tLINE\nsample.vcf\t##x\n")
+                    (tsv_dir / "sample.file_metadata.tsv").write_text("SOURCE_FILE\tKEY\tVALUE\nsample.vcf\tk\tv\n")
+                elif "/opt/vcf-rdfizer/run_conversion.sh" in cmd:
+                    sample_dir = out_dir / "sample"
+                    sample_dir.mkdir(parents=True, exist_ok=True)
+                    (sample_dir / "sample.nt").write_text("<s> <p> <o> .\n")
+                return 0
+
+            def fake_validation(**kwargs):
+                validation_calls.append(kwargs)
+                results_dir = kwargs["results_dir"]
+                results_dir.mkdir(parents=True, exist_ok=True)
+                summary_path = results_dir / "summary.json"
+                summary_path.write_text(json.dumps({"status": "PASS", "temporaryRdf": {"persisted": False}}))
+                payload = {
+                    "run_id": kwargs["run_id"],
+                    "timestamp": kwargs["timestamp"],
+                    "stage": "validation",
+                    "vcf_path": str(kwargs["vcf_path"]),
+                    "rdf_path": str(kwargs["rdf_path"]),
+                    "rdf_format": "nt",
+                    "representation": kwargs["representation"],
+                    "results_dir": str(results_dir),
+                    "summary_path": str(summary_path),
+                    "exit_code": 0,
+                    "status": "PASS",
+                    "timing": {"wall_seconds": 0.25, "user_seconds": 0.1, "sys_seconds": 0.02, "max_rss_kb": 512},
+                    "temporary_rdf": {"decompressed_inside_container": False, "persisted_on_host": False, "cleanup_confirmed_by_runner": True},
+                }
+                kwargs["stage_result"].update(payload)
+                stage_path = kwargs["metrics_dir"] / "stages" / "validation" / "sample.json"
+                stage_path.parent.mkdir(parents=True, exist_ok=True)
+                stage_path.write_text(json.dumps(payload))
+                return 0
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch.object(
+                    vcf_rdfizer, "check_docker", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "docker_image_exists", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "discover_tsv_triplets", return_value=mocked_triplets()
+                ), mock.patch.object(
+                    vcf_rdfizer, "run_validation_mode", side_effect=fake_validation
+                ):
+                    rc = invoke_main(
+                        [
+                            "--input",
+                            str(input_dir),
+                            "--rules",
+                            str(rules_path),
+                            "--rdf-storage-mode",
+                            "plain",
+                            "--compression",
+                            "none",
+                            "--validate",
+                            "--out",
+                            str(out_dir),
+                            "--keep-tsv",
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(validation_calls), 1)
+            self.assertEqual(validation_calls[0]["rdf_path"].name, "sample.nt")
+            run_metrics_dir = latest_metrics_run_dir(out_dir / "run_metrics")
+            report_dir = run_metrics_dir / "reports" / "validation" / "sample"
+            self.assertTrue((report_dir / "summary.json").exists())
+            self.assertTrue((run_metrics_dir / "stages" / "validation" / "sample.json").exists())
+            with (run_metrics_dir / "metrics.csv").open(newline="", encoding="utf-8") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(row["validation_status"], "PASS")
+            self.assertEqual(row["validation_exit_code"], "0")
+            self.assertEqual(
+                Path(row["validation_rdf_path"]).resolve(),
+                (out_dir / "sample" / "sample.nt").resolve(),
+            )
+            summary = json.loads((run_metrics_dir / "summary.json").read_text())
+            self.assertIn("reports/validation/sample/summary.json", summary["reports"])
+
     def test_build_sample_support_tsvs_expands_per_sample_and_per_format_rows(self):
         """records.tsv is expanded into helper tables for sample calls and format key/value pairs."""
         with tempfile.TemporaryDirectory() as td:
@@ -1816,6 +2073,7 @@ class WrapperUnitTests(VerboseTestCase):
         self.assertIn("--representations", text)
         self.assertIn("--artifact-compression", text)
         self.assertIn("--cottas", text)
+        self.assertIn("--quiet", text)
         self.assertNotIn("--keep-rdf", text)
         self.assertNotIn("--compression", text)
 
@@ -2421,12 +2679,58 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertIn("/opt/vcf-rdfizer/validation/validation_runner.py", command)
             self.assertIn("/data/rdf/sample.nt.gz", command)
             self.assertIn("condensed", command)
-            results_dir = out_dir / "validation" / "sample"
+            results_dir = next((out_dir / "run_metrics").glob("*/reports/validation/sample"))
             self.assertTrue(results_dir.is_dir())
             stage = next((out_dir / "run_metrics").glob("*/stages/validation/sample.json"))
             payload = json.loads(stage.read_text())
             self.assertTrue(payload["temporary_rdf"]["decompressed_inside_container"])
             self.assertFalse(payload["temporary_rdf"]["persisted_on_host"])
+            with stage.parent.parent.parent.joinpath("metrics.csv").open(
+                newline="", encoding="utf-8"
+            ) as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(row["validation_status"], "PASS")
+            self.assertEqual(row["validation_exit_code"], "0")
+
+    def test_run_validation_mode_accepts_plain_nt_for_full_runs(self):
+        """The shared validation runner selects --rdf-nt for a plain aggregate."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            vcf_path = tmp_path / "sample.vcf"
+            vcf_path.write_text("##fileformat=VCFv4.2\n#CHROM\tPOS\n")
+            rdf_path = tmp_path / "sample.nt"
+            rdf_path.write_text("<s> <p> <o> .\n")
+            metrics_dir = tmp_path / "metrics"
+            results_dir = metrics_dir / "reports" / "validation" / "sample"
+            commands = []
+
+            def fake_run(cmd, cwd=None, env=None):
+                commands.append(cmd)
+                return 0
+
+            stage_result = {}
+            with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run):
+                rc = vcf_rdfizer.run_validation_mode(
+                    vcf_path=vcf_path,
+                    rdf_path=rdf_path,
+                    representation="expanded",
+                    validation_id="sample",
+                    results_dir=results_dir,
+                    metrics_dir=metrics_dir,
+                    run_id="20260904T123456",
+                    timestamp="2026-09-04T12:34:56",
+                    image_ref="example/vcf-rdfizer:latest",
+                    filter_oracle="auto",
+                    wrapper_log_path=tmp_path / "wrapper.log",
+                    stage_result=stage_result,
+                )
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(commands), 1)
+            self.assertIn("--rdf-nt", commands[0])
+            self.assertIn("/data/rdf/sample.nt", commands[0])
+            self.assertEqual(stage_result["rdf_format"], "nt")
+            self.assertFalse(stage_result["temporary_rdf"]["decompressed_inside_container"])
 
     def test_main_rejects_spark_partitions_outside_full_mode(self):
         """--spark-partitions is rejected for non-full modes."""

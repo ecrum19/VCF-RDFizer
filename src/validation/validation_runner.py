@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Validate a VCF-RDFizer .nt.gz graph against its source VCF.
+"""Validate a VCF-RDFizer N-Triples graph against its source VCF.
 
-The compressed RDF input is expanded only to a container-local temporary file.
-It is parsed with Raptor, queried with Comunica, and removed in a finally-safe
-temporary directory before this process exits.
+When the input is compressed, it is expanded only to a container-local
+temporary file. It is parsed with Raptor, queried with Comunica, and removed in
+a finally-safe temporary directory before this process exits. Plain ``.nt``
+inputs are read directly and are never copied by the validator.
 """
 
 from __future__ import annotations
@@ -77,6 +78,56 @@ def sha256_file(path: Path) -> str:
 def write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+class ValidationProgress:
+    """Best-effort JSONL progress writer shared with the host progress UI.
+
+    Validation can spend most of its time inside a single SPARQL query. A
+    small event before and after each query gives the existing host-side
+    ``ProgressSession`` a useful total without retaining query output or RDF
+    data in memory. Failures to write the optional sidecar are deliberately
+    ignored so observability can never change validation semantics.
+    """
+
+    def __init__(self, path: Path | None, total: int):
+        self.path = path
+        self.total = total
+        if path is not None:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def emit(
+        self,
+        phase: str,
+        *,
+        completed: int | None = None,
+        query_id: str | None = None,
+        detail: str | None = None,
+    ) -> None:
+        if self.path is None:
+            return
+        payload: dict[str, Any] = {
+            "stage": "validation",
+            "phase": phase,
+            "total": self.total,
+            "unit": "queries",
+        }
+        if completed is not None:
+            payload["completed"] = completed
+        if query_id is not None:
+            payload["query"] = query_id
+        if detail is not None:
+            payload["detail"] = detail
+        try:
+            with self.path.open("a", encoding="utf-8") as handle:
+                json.dump(payload, handle, separators=(",", ":"))
+                handle.write("\n")
+        except OSError:
+            pass
 
 
 def read_json(path: Path) -> Any:
@@ -492,13 +543,24 @@ def compare(parser: dict[str, Any], sparql: dict[str, Any]) -> dict[str, Any]:
 
 def build_manifest(args: argparse.Namespace, query_dir: Path, parser: dict[str, Any]) -> dict[str, Any]:
     query_paths = sorted({query_path(query_dir, query_id) for query_id in PREFLIGHT_QUERIES + CORE_QUERIES})
-    return {
+    source_rdf = args.rdf_gz or args.rdf_nt
+    source_rdf_format = "nt.gz" if args.rdf_gz else "nt"
+    source_rdf_entry = {
+        "path": str(source_rdf),
+        "sha256": sha256_file(source_rdf),
+        "format": source_rdf_format,
+    }
+    manifest = {
         "datasetId": args.dataset_id,
         "representation": args.representation,
         "commandLine": sys.argv,
         "sourceVcf": {"path": str(args.vcf), "sha256": parser["sourceSha256"]},
-        "sourceRdfGzip": {"path": str(args.rdf_gz), "sha256": sha256_file(args.rdf_gz)},
-        "temporaryRdf": {"decompressedInsideContainer": True, "persisted": False, "cleanupConfirmed": True},
+        "sourceRdf": source_rdf_entry,
+        "temporaryRdf": {
+            "decompressedInsideContainer": bool(args.rdf_gz),
+            "persisted": False,
+            "cleanupConfirmed": True,
+        },
         "tools": {
             "python": platform.python_version(), "cyvcf2": cyvcf2.__version__,
             "bcftools": tool_version(["bcftools", "--version"]), "node": tool_version(["node", "--version"]),
@@ -507,6 +569,14 @@ def build_manifest(args: argparse.Namespace, query_dir: Path, parser: dict[str, 
         },
         "queries": {path.stem: {"path": str(path), "sha256": sha256_file(path)} for path in query_paths},
     }
+    # Preserve the original key for consumers of standalone gzip-validation
+    # manifests while exposing the format-neutral ``sourceRdf`` entry.
+    if args.rdf_gz:
+        manifest["sourceRdfGzip"] = {
+            "path": str(args.rdf_gz),
+            "sha256": sha256_file(args.rdf_gz),
+        }
+    return manifest
 
 
 def query_path(representation_dir: Path, query_id: str) -> Path:
@@ -521,18 +591,44 @@ def run_validation(args: argparse.Namespace) -> int:
     raw_dir.mkdir(parents=True, exist_ok=True)
     normalized_dir.mkdir(parents=True, exist_ok=True)
     query_dir = QUERY_ROOT / args.representation
-    missing = [name for name in PREFLIGHT_QUERIES + CORE_QUERIES if not query_path(query_dir, name).is_file()]
+    query_ids = PREFLIGHT_QUERIES + CORE_QUERIES
+    missing = [name for name in query_ids if not query_path(query_dir, name).is_file()]
     if missing:
         raise RuntimeError(f"Missing {args.representation} validation query files: {', '.join(missing)}")
-
+    progress = ValidationProgress(getattr(args, "progress_path", None), len(query_ids))
+    quiet = bool(getattr(args, "quiet", False))
+    progress.emit(
+        "started",
+        completed=0,
+        detail=f"{args.representation} validation started",
+    )
     summary: dict[str, Any] | None = None
     try:
         with tempfile.TemporaryDirectory(prefix="vcf-rdfizer-validation-", dir=args.scratch_dir) as scratch:
-            decoded = Path(scratch) / "input.nt"
-            with gzip.open(args.rdf_gz, "rb") as source, decoded.open("wb") as target:
-                shutil.copyfileobj(source, target, length=1024 * 1024)
+            temporary_rdf = bool(args.rdf_gz)
+            if temporary_rdf:
+                decoded = Path(scratch) / "input.nt"
+                progress.emit(
+                    "progress",
+                    completed=0,
+                    detail="decompressing RDF inside container",
+                )
+                with gzip.open(args.rdf_gz, "rb") as source, decoded.open("wb") as target:
+                    shutil.copyfileobj(source, target, length=1024 * 1024)
+            else:
+                decoded = args.rdf_nt
+            progress.emit(
+                "progress",
+                completed=0,
+                detail="parsing source VCF",
+            )
             parser = parse_vcf(args.vcf, filter_oracle=args.filter_oracle)
             write_json(results_dir / "parser.json", parser)
+            progress.emit(
+                "progress",
+                completed=0,
+                detail="validating RDF syntax and cardinality",
+            )
             rdf_validation = validate_ntriples(decoded, results_dir)
             write_json(results_dir / "rdf-validation.json", rdf_validation)
             manifest = build_manifest(args, query_dir, parser)
@@ -541,9 +637,27 @@ def run_validation(args: argparse.Namespace) -> int:
                 summary = {"datasetId": args.dataset_id, "representation": args.representation, "status": "BLOCKED_BY_PREFLIGHT", "rdfValidation": rdf_validation}
                 return 1
             executions: dict[str, dict[str, Any]] = {}
-            for query_id in PREFLIGHT_QUERIES + CORE_QUERIES:
-                print(f"[{args.dataset_id}] running {args.representation}/{query_id}", flush=True)
-                executions[query_id] = execute_query(query_id, decoded, query_path(query_dir, query_id), raw_dir)
+            for completed, query_id in enumerate(query_ids, start=1):
+                progress.emit(
+                    "progress",
+                    completed=completed - 1,
+                    query_id=query_id,
+                    detail=f"running {args.representation}/{query_id}",
+                )
+                if not quiet:
+                    print(
+                        f"[{args.dataset_id}] running {args.representation}/{query_id}",
+                        flush=True,
+                    )
+                executions[query_id] = execute_query(
+                    query_id, decoded, query_path(query_dir, query_id), raw_dir
+                )
+                progress.emit(
+                    "progress",
+                    completed=completed,
+                    query_id=query_id,
+                    detail=f"completed {args.representation}/{query_id}",
+                )
             write_json(results_dir / "query-executions.json", executions)
             if any(item["status"] != "PASS" for item in executions.values()):
                 summary = {"datasetId": args.dataset_id, "representation": args.representation, "status": "EXECUTION_FAILED", "queryExecutions": executions}
@@ -580,31 +694,64 @@ def run_validation(args: argparse.Namespace) -> int:
     finally:
         if summary is None:
             summary = {"datasetId": args.dataset_id, "representation": args.representation, "status": "EXECUTION_FAILED", "error": "validation ended without a result"}
-        summary["temporaryRdf"] = {"decompressedInsideContainer": True, "persisted": False, "cleanupConfirmed": True}
+        summary["temporaryRdf"] = {
+            "decompressedInsideContainer": bool(args.rdf_gz),
+            "persisted": False,
+            "cleanupConfirmed": True,
+        }
         write_json(results_dir / "summary.json", summary)
-        print(json.dumps(summary, indent=2), flush=True)
+        status = str(summary.get("status", "EXECUTION_FAILED"))
+        if status == "EXECUTION_FAILED":
+            progress.emit("failed", detail="validation execution failed")
+        else:
+            progress.emit(
+                "complete",
+                completed=progress.total if status in {"PASS", "MISMATCH"} else 0,
+                detail=f"validation {status.lower()}",
+            )
+        if not quiet:
+            print(json.dumps(summary, indent=2), flush=True)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--vcf", type=Path, required=True)
-    parser.add_argument("--rdf-gz", type=Path, required=True, help="N-Triples gzip input (.nt.gz)")
+    rdf_group = parser.add_mutually_exclusive_group(required=True)
+    rdf_group.add_argument("--rdf-gz", type=Path, help="N-Triples gzip input (.nt.gz)")
+    rdf_group.add_argument("--rdf-nt", type=Path, help="Uncompressed N-Triples input (.nt)")
     parser.add_argument("--representation", choices=("expanded", "condensed"), required=True)
     parser.add_argument("--results-dir", type=Path, required=True)
     parser.add_argument("--dataset-id", required=True)
     parser.add_argument("--filter-oracle", choices=("auto", "bcftools", "cyvcf2"), default="auto")
     parser.add_argument("--scratch-dir", type=Path, default=Path("/work"))
+    parser.add_argument(
+        "--progress-path",
+        type=Path,
+        help="optional JSONL sidecar consumed by the host progress display",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="suppress per-query and summary output on stdout",
+    )
     args = parser.parse_args()
     args.vcf = args.vcf.resolve()
-    args.rdf_gz = args.rdf_gz.resolve()
+    if args.rdf_gz is not None:
+        args.rdf_gz = args.rdf_gz.resolve()
+    if args.rdf_nt is not None:
+        args.rdf_nt = args.rdf_nt.resolve()
     if not args.vcf.is_file():
         parser.error(f"VCF does not exist: {args.vcf}")
-    if not args.rdf_gz.is_file() or not args.rdf_gz.name.endswith(".nt.gz"):
+    if args.rdf_gz is not None and (not args.rdf_gz.is_file() or not args.rdf_gz.name.endswith(".nt.gz")):
         parser.error("--rdf-gz must be an existing .nt.gz file")
+    if args.rdf_nt is not None and (not args.rdf_nt.is_file() or not args.rdf_nt.name.endswith(".nt")):
+        parser.error("--rdf-nt must be an existing .nt file")
     if not re.fullmatch(r"[A-Za-z0-9._-]+", args.dataset_id):
         parser.error("--dataset-id may contain only letters, digits, dot, underscore, and hyphen")
     if not args.scratch_dir.is_dir():
         parser.error(f"Scratch directory does not exist: {args.scratch_dir}")
+    if args.progress_path is not None:
+        args.progress_path = args.progress_path.resolve()
     return args
 
 

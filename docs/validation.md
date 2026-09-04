@@ -1,16 +1,20 @@
 # Semantic VCF/RDF validation
 
 `vcf-rdfizer --mode validation` checks that a converted RDF graph reproduces
-six deterministic VCF summaries. It computes one result from the source VCF
+six deterministic VCF summaries. The same validator can be added to a full run
+with `--validate`; in that case it runs once for each input after RDF creation
+and compression. It computes one result from the source VCF
 using `cyvcf2` (and `bcftools` for exact FILTER strings when available), runs
 the equivalent SPARQL queries with Comunica, then compares canonical integer
 results exactly.
 
-The mode consumes a single N-Triples gzip aggregate (`.nt.gz`). It mounts that
-file read-only, expands it under `/work` **inside the Docker container**, uses
-the temporary `.nt` for Raptor syntax validation and Comunica queries, then
-removes it before the container exits. No decompressed RDF is written beneath
-`--out`; only reports are retained.
+Standalone validation consumes a single N-Triples aggregate (`.nt` or
+`.nt.gz`). It mounts the source read-only; gzip input is expanded under
+`/work` **inside the Docker container**, while plain `.nt` input is read in
+place. The validator uses the resulting stream for Raptor syntax validation
+and Comunica queries, and removes any temporary expansion before the container
+exits. No decompressed RDF is written beneath `--out`; only reports are
+retained.
 
 ## Run it
 
@@ -32,15 +36,39 @@ vcf-rdfizer --mode validation \
   --out ./validation-results
 ```
 
-The input VCF and `.nt.gz` must originate from the same conversion. `--rdf`
-must name an existing `.nt.gz` file; validation deliberately does not accept an
-uncompressed `.nt`, HDT, or COTTAS artifact. Use full mode with
-`--rdf-storage-mode space-optimized` to produce the required gzip aggregate.
+To include validation in the conversion itself, use the full mode's opt-in
+stage. It runs after the aggregate and selected compression artifacts are
+available, once per VCF input:
+
+```bash
+vcf-rdfizer --mode full \
+  --input ./cohort.vcf.gz \
+  --sample-representation condensed \
+  --rdf-storage-mode space-optimized \
+  --rdf-compression none \
+  --representations hdt \
+  --validate \
+  --out ./results
+```
+
+For standalone validation, the input VCF and `.nt`/`.nt.gz` must originate from
+the same conversion. `--rdf` must name an existing `.nt` or `.nt.gz` file;
+standalone validation does not accept HDT or COTTAS artifacts. Use full mode
+with `--rdf-storage-mode space-optimized` for a gzip aggregate, or `plain` for
+an uncompressed aggregate.
 
 `--validation-id NAME` changes the report directory name. The default is the
 source VCF basename without `.vcf` or `.vcf.gz`. Existing result directories
 are never overwritten. `--filter-oracle {auto,bcftools,cyvcf2}` controls the
 FILTER-field oracle; `auto` uses `bcftools` when it is available in the image.
+
+Validation progress uses the same JSONL sidecar protocol as conversion and
+partitioned compression. It emits a `validation` task with a total of eleven
+preflight/core queries, then records each query start and completion under the
+run's temporary `.progress/` area while the host displays it through the
+normal Rich/plain progress session. `--quiet` suppresses that terminal display
+and the validator's per-query/summary stdout, but still writes command logs,
+stage reports, and metrics. `--no-progress` disables sidecar creation as well.
 
 ## What is tested
 
@@ -69,11 +97,17 @@ back into per-sample value resources.
 
 ## Results and cleanup evidence
 
-Results are written to:
+Results are written to the run's canonical metrics tree:
 
 ```text
-<out>/validation/<validation-id>/
+<out>/run_metrics/<input-label>__<run-id>/reports/validation/<validation-id>/
 ```
+
+Standalone validation consumes either `.nt` or `.nt.gz`. Full-mode validation
+uses the aggregate produced by that run and can read either `.nt` (plain
+storage) or `.nt.gz` (space-optimized storage). In both cases the detailed
+results live beneath `reports/validation/`, so they are indexed by the same
+`summary.json` used for conversion and compression metrics.
 
 Important files include `summary.json`, `manifest.json`, `parser.json`,
 `rdf-validation.json`, `preflight.json`, `sparql.json`, and `comparison.json`.
@@ -82,8 +116,9 @@ results are in `normalized/`.
 
 The parent VCF-RDFizer run metrics include
 `run_metrics/<input-label>__<run-id>/stages/validation/<validation-id>.json`.
-Both that report and `summary.json` record that the `.nt.gz` was decompressed
-inside the container and that no raw RDF was retained on the host.
+That stage report and the detailed `reports/validation/.../summary.json` record
+whether a gzip aggregate was decompressed inside the container and that no
+validation scratch RDF was retained on the host.
 
 `PASS` means every required query and invariant matched. `MISMATCH` means that
 both paths ran but differ. `BLOCKED_BY_PREFLIGHT` means RDF syntax or core graph

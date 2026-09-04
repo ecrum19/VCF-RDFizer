@@ -58,6 +58,8 @@ _COMMAND_LOGGER = None
 _DOCKER_USE_SUDO = False
 _ACTIVE_PROGRESS = None
 _PROGRESS_ALLOWED = True
+_PROGRESS_EVENTS_ALLOWED = True
+_QUIET = False
 PROGRESS_POLL_INTERVAL_SECONDS = 0.25
 
 COMPRESSED_VCF_EXPANSION_FACTOR = 5.0
@@ -110,6 +112,17 @@ TSV_BENCHMARK_HEADER = [
 ]
 
 COMPRESSION_COMMON_COLUMNS = ["combined_rdf_size_bytes", "compression_methods"]
+
+VALIDATION_METRICS_COLUMNS = [
+    "validation_status",
+    "validation_exit_code",
+    "validation_wall_seconds",
+    "validation_user_seconds",
+    "validation_sys_seconds",
+    "validation_max_rss_kb",
+    "validation_results_path",
+    "validation_rdf_path",
+]
 
 COMPRESSION_METHOD_COLUMNS = {
     "gzip": [
@@ -351,7 +364,7 @@ def progress_events_enabled() -> bool:
     Keep collecting the same low-volume events in those cases so
     ``ProgressSession`` can render readable line-based status instead.
     """
-    if not _PROGRESS_ALLOWED:
+    if not _PROGRESS_EVENTS_ALLOWED or (not _PROGRESS_ALLOWED and not _QUIET):
         return False
     if os.environ.get("VCF_RDFIZER_NO_PROGRESS"):
         return False
@@ -370,7 +383,11 @@ class ProgressSession:
         self.path = path
         self.label = label
         self.enabled = progress_events_enabled()
-        self.rich_enabled = self.enabled and progress_ui_enabled()
+        # ``--quiet`` keeps producing/consuming sidecar events so the normal
+        # progress bookkeeping remains available to logs and orchestration,
+        # but disables every terminal rendering path.
+        self.render_enabled = self.enabled and _PROGRESS_ALLOWED
+        self.rich_enabled = self.render_enabled and progress_ui_enabled()
         self._offset = 0
         self._progress = None
         self._starter_task = None
@@ -386,7 +403,7 @@ class ProgressSession:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.path.unlink(missing_ok=True)
 
-        if not self.enabled:
+        if not self.render_enabled:
             return self
         if not self.rich_enabled:
             eprint(f"{self.label}: started")
@@ -441,6 +458,8 @@ class ProgressSession:
             detail = f"{int(completed):,} chunks"
         elif unit == "parts":
             detail = f"{int(completed):,} parts"
+        elif unit == "queries":
+            detail = f"{int(completed):,} queries"
         else:
             detail = f"{int(completed):,}"
 
@@ -453,6 +472,8 @@ class ProgressSession:
         return detail
 
     def _update_event(self, event: dict):
+        if not self.render_enabled:
+            return
         stage = str(event.get("stage") or "work")
         phase = str(event.get("phase") or "working")
         if self._progress is None:
@@ -535,7 +556,7 @@ class ProgressSession:
         self.poll_events()
         if self._progress is not None:
             self._progress.stop()
-        elif self.enabled:
+        elif self.render_enabled:
             eprint(f"{self.label}: finished")
         if self.path is not None:
             try:
@@ -2881,7 +2902,7 @@ def write_run_summary(
     report_dir = metrics_dir / "reports"
     reports = [
         path.relative_to(metrics_dir).as_posix()
-        for path in sorted(report_dir.iterdir())
+        for path in sorted(report_dir.rglob("*"))
         if path.is_file()
     ] if report_dir.is_dir() else []
     payload = {
@@ -2935,36 +2956,40 @@ def container_progress_path(path: Path | None, metrics_dir: Path | None) -> str 
     return f"/data/metrics/{relative.as_posix()}"
 
 
-def metrics_header_for_methods(selected_methods: list[str]) -> list[str]:
+def metrics_header_for_methods(
+    selected_methods: list[str], *, include_validation: bool = False
+) -> list[str]:
     """Build a run-specific metrics.csv header with only relevant columns."""
     methods = list(selected_methods or [])
     header = list(CONVERSION_METRICS_HEADER)
-    if not methods:
+    if methods:
+        header.extend(COMPRESSION_COMMON_COLUMNS)
+        if "gzip" in methods:
+            header.extend(COMPRESSION_METHOD_COLUMNS["gzip"])
+        if "brotli" in methods:
+            header.extend(COMPRESSION_METHOD_COLUMNS["brotli"])
+
+        uses_cottas = any(method in COTTAS_COMPRESSION_METHODS for method in methods)
+        if uses_cottas:
+            header.extend(COMPRESSION_METHOD_COLUMNS["cottas"])
+
+        uses_hdt = any(method in HDT_COMPRESSION_METHODS for method in methods)
+        if uses_hdt:
+            header.extend(COMPRESSION_METHOD_COLUMNS["hdt"])
+            header.append(HDT_SOURCE_COLUMN)
+        if "hdt_gzip" in methods:
+            header.extend(COMPRESSION_METHOD_COLUMNS["hdt_gzip"])
+        if "hdt_brotli" in methods:
+            header.extend(COMPRESSION_METHOD_COLUMNS["hdt_brotli"])
+        if "cottas_gzip" in methods:
+            header.extend(COMPRESSION_METHOD_COLUMNS["cottas_gzip"])
+        if "cottas_brotli" in methods:
+            header.extend(COMPRESSION_METHOD_COLUMNS["cottas_brotli"])
+
+    if include_validation:
+        header.extend(VALIDATION_METRICS_COLUMNS)
+    if not methods and not include_validation:
         return header
-
-    header.extend(COMPRESSION_COMMON_COLUMNS)
-    if "gzip" in methods:
-        header.extend(COMPRESSION_METHOD_COLUMNS["gzip"])
-    if "brotli" in methods:
-        header.extend(COMPRESSION_METHOD_COLUMNS["brotli"])
-
-    uses_cottas = any(method in COTTAS_COMPRESSION_METHODS for method in methods)
-    if uses_cottas:
-        header.extend(COMPRESSION_METHOD_COLUMNS["cottas"])
-
-    uses_hdt = any(method in HDT_COMPRESSION_METHODS for method in methods)
-    if uses_hdt:
-        header.extend(COMPRESSION_METHOD_COLUMNS["hdt"])
-        header.append(HDT_SOURCE_COLUMN)
-    if "hdt_gzip" in methods:
-        header.extend(COMPRESSION_METHOD_COLUMNS["hdt_gzip"])
-    if "hdt_brotli" in methods:
-        header.extend(COMPRESSION_METHOD_COLUMNS["hdt_brotli"])
-    if "cottas_gzip" in methods:
-        header.extend(COMPRESSION_METHOD_COLUMNS["cottas_gzip"])
-    if "cottas_brotli" in methods:
-        header.extend(COMPRESSION_METHOD_COLUMNS["cottas_brotli"])
-
     return unique_in_order(header)
 
 
@@ -2982,6 +3007,7 @@ def update_metrics_csv_with_compression(
     selected_methods: list[str],
     method_results: dict[str, dict],
     tsv_metrics: dict | None = None,
+    validation_result: dict | None = None,
 ):
     """Upsert compression-related columns in `metrics.csv` for one output artifact.
 
@@ -2989,7 +3015,9 @@ def update_metrics_csv_with_compression(
     HDT-first metrics (gzip_on_hdt / brotli_on_hdt) to avoid ambiguity.
     """
     metrics_csv.parent.mkdir(parents=True, exist_ok=True)
-    target_header = metrics_header_for_methods(selected_methods)
+    target_header = metrics_header_for_methods(
+        selected_methods, include_validation=validation_result is not None
+    )
     rows = []
     existing_header = []
 
@@ -3027,7 +3055,6 @@ def update_metrics_csv_with_compression(
         row["combined_rdf_size_bytes"] = str(int(combined_size_bytes))
     if "compression_methods" in row:
         row["compression_methods"] = "|".join(selected_methods) if selected_methods else "none"
-
     defaults = {
         "exit_code_tsv": "0",
         "wall_seconds_tsv": "null",
@@ -3080,6 +3107,19 @@ def update_metrics_csv_with_compression(
         "sys_seconds_brotli_on_hdt": "null",
         "max_rss_kb_brotli_on_hdt": "null",
     }
+    if validation_result is not None:
+        defaults.update(
+            {
+                "validation_status": "NOT_RUN",
+                "validation_exit_code": "null",
+                "validation_wall_seconds": "null",
+                "validation_user_seconds": "null",
+                "validation_sys_seconds": "null",
+                "validation_max_rss_kb": "null",
+                "validation_results_path": "",
+                "validation_rdf_path": "",
+            }
+        )
     for key, value in defaults.items():
         if key in row:
             row[key] = value
@@ -3190,6 +3230,35 @@ def update_metrics_csv_with_compression(
             row["exit_code_brotli_on_cottas"] = str(int(cottas_brotli_result.get("exit_code") or 0))
         assign_timing("brotli_on_cottas", cottas_brotli_result)
 
+    if validation_result is not None:
+        validation_timing = validation_result.get("timing") or {}
+        if "validation_status" in row:
+            row["validation_status"] = str(
+                validation_result.get("status") or "EXECUTION_FAILED"
+            )
+        if "validation_exit_code" in row:
+            exit_code = validation_result.get("exit_code")
+            row["validation_exit_code"] = "null" if exit_code is None else str(int(exit_code))
+        for key, metric_key in (
+            ("validation_wall_seconds", "wall_seconds"),
+            ("validation_user_seconds", "user_seconds"),
+            ("validation_sys_seconds", "sys_seconds"),
+        ):
+            if key in row:
+                value = validation_timing.get(metric_key)
+                row[key] = "null" if value is None else f"{float(value):.6f}"
+        if "validation_max_rss_kb" in row:
+            rss = validation_timing.get("max_rss_kb")
+            row["validation_max_rss_kb"] = "null" if rss is None else str(int(rss))
+        if "validation_results_path" in row:
+            row["validation_results_path"] = str(validation_result.get("results_dir") or "")
+        if "validation_rdf_path" in row:
+            row["validation_rdf_path"] = str(
+                validation_result.get("rdf_path")
+                or validation_result.get("rdf_gzip_path")
+                or ""
+            )
+
     with metrics_csv.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=target_header)
         writer.writeheader()
@@ -3207,6 +3276,7 @@ def write_compression_metrics_artifacts(
     selected_methods: list[str],
     method_results: dict[str, dict],
     index_warnings: list[dict] | None = None,
+    validation_result: dict | None = None,
 ):
     """Write the final per-output compression summary and method timing files."""
     metrics_dir.mkdir(parents=True, exist_ok=True)
@@ -3322,6 +3392,8 @@ def write_compression_metrics_artifacts(
             "timing": timing_payload(cottas_brotli_result),
         },
     }
+    if validation_result is not None:
+        payload["semantic_validation"] = validation_result
 
     metrics_json_dir = metrics_dir / "stages" / "compression"
     metrics_json_dir.mkdir(parents=True, exist_ok=True)
@@ -4662,6 +4734,8 @@ def run_full_mode(
     image_ref: str,
     out_name: str,
     sample_workflow: SampleWorkflow,
+    run_validation: bool = False,
+    filter_oracle: str = "auto",
     rdf_storage_mode: str,
     methods: list[str],
     hdt_strategy: str,
@@ -4677,8 +4751,11 @@ def run_full_mode(
     wrapper_log_path: Path,
     run_tracker: RunTracker | None = None,
 ):
-    """Execute full pipeline: per-input TSV -> RDF -> compression -> metrics."""
-    print("Step 3/5: Processing per-input pipeline (TSV -> RDF -> compression)")
+    """Execute full pipeline: per-input TSV -> RDF -> compression -> validation."""
+    pipeline_label = "TSV -> RDF -> compression"
+    if run_validation:
+        pipeline_label += " -> validation"
+    print(f"Step 3/5: Processing per-input pipeline ({pipeline_label})")
     if spark_partitions is not None:
         print(f"  Spark partition hint: {spark_partitions}")
     print(f"  Sample representation: {sample_workflow.representation}")
@@ -4733,6 +4810,8 @@ def run_full_mode(
             input_vcf = container_input
         input_failed = False
         input_index_warnings: list[dict] = []
+        validation_failed = False
+        validation_result: dict | None = None
 
         def fail_current(stage: str, message: str):
             nonlocal input_failed
@@ -5124,6 +5203,69 @@ def run_full_mode(
         if run_tracker is not None:
             run_tracker.mark(f"Input {idx}: compression completed for {output_name}")
 
+        if run_validation:
+            validation_rdf_path = raw_rdf_files[0]
+            validation_results_dir = (
+                metrics_dir / "reports" / "validation" / safe_metrics_name(output_name)
+            )
+            print(f"    * Semantic validation: {output_name}")
+            validation_result = {
+                "run_id": run_id,
+                "timestamp": timestamp,
+                "stage": "validation",
+                "validation_id": output_name,
+                "vcf_path": str(input_vcf),
+                "rdf_path": str(validation_rdf_path),
+                "rdf_format": "nt.gz" if validation_rdf_path.name.endswith(".nt.gz") else "nt",
+                "representation": sample_workflow.representation,
+                "results_dir": str(validation_results_dir),
+                "summary_path": str(validation_results_dir / "summary.json"),
+                "input_rdf_size_bytes": int(file_size_bytes(validation_rdf_path) or 0),
+                "exit_code": 1,
+                "status": "EXECUTION_FAILED",
+                "timing": {
+                    "wall_seconds": None,
+                    "user_seconds": None,
+                    "sys_seconds": None,
+                    "max_rss_kb": None,
+                },
+                "temporary_rdf": {
+                    "decompressed_inside_container": validation_rdf_path.name.endswith(".nt.gz"),
+                    "persisted_on_host": False,
+                    "cleanup_confirmed_by_runner": False,
+                },
+            }
+            try:
+                validation_exit_code = run_validation_mode(
+                    vcf_path=Path(input_vcf),
+                    rdf_path=validation_rdf_path,
+                    representation=sample_workflow.representation,
+                    validation_id=output_name,
+                    results_dir=validation_results_dir,
+                    metrics_dir=metrics_dir,
+                    run_id=run_id,
+                    timestamp=timestamp,
+                    image_ref=image_ref,
+                    filter_oracle=filter_oracle,
+                    wrapper_log_path=wrapper_log_path,
+                    run_tracker=run_tracker,
+                    stage_result=validation_result,
+                )
+            except Exception as exc:
+                validation_result["error"] = str(exc)
+                try:
+                    stage_path = metrics_dir / "stages" / "validation" / f"{safe_metrics_name(output_name)}.json"
+                    stage_path.parent.mkdir(parents=True, exist_ok=True)
+                    stage_path.write_text(json.dumps(validation_result, indent=2) + "\n", encoding="utf-8")
+                except OSError:
+                    pass
+                eprint(
+                    f"Error: semantic validation could not be completed for '{output_name}': "
+                    f"{exc}. See log: {wrapper_log_path}"
+                )
+                validation_exit_code = 1
+            validation_failed = int(validation_exit_code) != 0
+
         raw_size_before_cleanup_by_file = {
             raw_rdf_path.name: int(file_size_bytes(raw_rdf_path) or 0) for raw_rdf_path in raw_rdf_files
         }
@@ -5144,6 +5286,7 @@ def run_full_mode(
                 selected_methods=selected_methods,
                 method_results=aggregated_results,
                 index_warnings=input_index_warnings,
+                validation_result=validation_result,
             )
             update_metrics_csv_with_compression(
                 metrics_csv=metrics_dir / "metrics.csv",
@@ -5155,6 +5298,7 @@ def run_full_mode(
                 selected_methods=selected_methods,
                 method_results=aggregated_results,
                 tsv_metrics=tsv_metrics,
+                validation_result=validation_result,
             )
         except PermissionError as exc:
             blocked_path = exc.filename or str(metrics_dir)
@@ -5166,8 +5310,15 @@ def run_full_mode(
             )
             return 1
 
+        if validation_failed:
+            fail_current(
+                "validation",
+                f"semantic VCF/RDF validation failed for '{output_name}'. "
+                f"See results: {validation_result.get('results_dir') if validation_result else metrics_dir / 'reports' / 'validation' / safe_metrics_name(output_name)}",
+            )
+
         rdf_storage_removed = False
-        if selected_methods and (
+        if not validation_failed and selected_methods and (
             remove_rdf_storage_output or not keep_rmlstreamer_rdf_output
         ):
             # Cleanup raw RDF only after every selected compression method has
@@ -5265,7 +5416,9 @@ def run_full_mode(
             output_root = out_dir / output_name
             raw_total_size = sum(raw_size_before_cleanup_by_file.values())
 
-            if keep_rmlstreamer_rdf_output:
+            if validation_failed:
+                raw_note = "retained after validation failure"
+            elif keep_rmlstreamer_rdf_output:
                 raw_note = "retained via --keep-rmlstreamer-rdf-output"
             elif rdf_storage_removed and remove_rdf_storage_output:
                 raw_note = "removed via --remove-rdf-storage-output"
@@ -5379,7 +5532,10 @@ def run_full_mode(
                 continue
 
         if run_tracker is not None:
-            run_tracker.mark(f"Input {idx}/{total_inputs} completed: {output_name}")
+            if input_failed:
+                run_tracker.mark(f"Input {idx}/{total_inputs} finished with failures: {output_name}")
+            else:
+                run_tracker.mark(f"Input {idx}/{total_inputs} completed: {output_name}")
 
     if not keep_tsv and intermediate_dir.exists():
         if not remove_path_with_docker_fallback(
@@ -5894,7 +6050,7 @@ def run_decompress_mode(
 def run_validation_mode(
     *,
     vcf_path: Path,
-    rdf_gzip_path: Path,
+    rdf_path: Path,
     representation: str,
     validation_id: str,
     results_dir: Path,
@@ -5904,33 +6060,53 @@ def run_validation_mode(
     image_ref: str,
     filter_oracle: str,
     wrapper_log_path: Path,
+    run_tracker: RunTracker | None = None,
+    stage_result: dict | None = None,
+    write_metrics_csv: bool = False,
 ):
-    """Run VCF/RDF semantic queries with ephemeral in-container RDF expansion.
+    """Run VCF/RDF semantic queries with container-local temporary state.
 
-    The only mounted RDF source is the input ``.nt.gz`` file. The validation
-    runner inflates it under the container's ``/work`` temporary filesystem and
-    removes that source before the container exits; no raw N-Triples are
-    materialized in the user-selected output directory.
+    Gzip RDF inputs are inflated under the container's ``/work`` temporary
+    filesystem. Plain N-Triples inputs are read directly from their read-only
+    mount. In both cases, no validation scratch RDF is persisted on the host.
     """
     # An empty directory may be left behind if Docker itself fails before the
     # runner starts. Reuse only that empty shell; never overwrite reports.
     results_dir.mkdir(parents=True, exist_ok=True)
+    safe_validation_id = safe_metrics_name(validation_id)
+    timing_host = metrics_dir / "timings" / "validation" / f"{safe_validation_id}.txt"
+    timing_host.parent.mkdir(parents=True, exist_ok=True)
+    timing_container = f"/data/metrics/timings/validation/{safe_validation_id}.txt"
+    progress_host_path = (
+        progress_event_path(metrics_dir, "validation", safe_validation_id)
+        if progress_events_enabled()
+        else None
+    )
+    progress_container_ref = container_progress_path(progress_host_path, metrics_dir)
+    rdf_flag = "--rdf-gz" if rdf_path.name.endswith(".nt.gz") else "--rdf-nt"
     cmd = [
         *docker_run_base(),
         "--init",
         "-v",
         f"{str(vcf_path.parent)}:/data/vcf:ro",
         "-v",
-        f"{str(rdf_gzip_path.parent)}:/data/rdf:ro",
+        f"{str(rdf_path.parent)}:/data/rdf:ro",
         "-v",
         f"{str(results_dir)}:/data/validation",
+        "-v",
+        f"{str(metrics_dir.resolve())}:/data/metrics",
         image_ref,
+        "/usr/bin/time",
+        "-v",
+        "-o",
+        timing_container,
+        "--",
         "/opt/pycottas-venv/bin/python",
         "/opt/vcf-rdfizer/validation/validation_runner.py",
         "--vcf",
         f"/data/vcf/{vcf_path.name}",
-        "--rdf-gz",
-        f"/data/rdf/{rdf_gzip_path.name}",
+        rdf_flag,
+        f"/data/rdf/{rdf_path.name}",
         "--representation",
         representation,
         "--results-dir",
@@ -5941,10 +6117,21 @@ def run_validation_mode(
         filter_oracle,
         "--scratch-dir",
         "/work",
+        *(
+            ["--progress-path", progress_container_ref]
+            if progress_container_ref is not None
+            else []
+        ),
+        *(["--quiet"] if _QUIET else []),
     ]
+    if run_tracker is not None:
+        run_tracker.mark(f"Validation started: {validation_id}")
     started = time.perf_counter()
-    exit_code = run(cmd)
+    with ProgressSession(progress_host_path, f"Validation: {validation_id}"):
+        exit_code = run(cmd)
     elapsed = time.perf_counter() - started
+    timing = parse_time_log_metrics(timing_host)
+    timing["wall_seconds"] = elapsed
     summary_path = results_dir / "summary.json"
     summary = None
     if summary_path.is_file():
@@ -5952,40 +6139,80 @@ def run_validation_mode(
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             summary = None
-    report_path = metrics_dir / "stages" / "validation" / f"{safe_metrics_name(validation_id)}.json"
+    report_path = metrics_dir / "stages" / "validation" / f"{safe_validation_id}.json"
     report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(
-        json.dumps(
-            {
-                "run_id": run_id,
-                "timestamp": timestamp,
-                "vcf_path": str(vcf_path),
-                "rdf_gzip_path": str(rdf_gzip_path),
-                "representation": representation,
-                "results_dir": str(results_dir),
-                "input_rdf_size_bytes": int(file_size_bytes(rdf_gzip_path) or 0),
-                "exit_code": int(exit_code),
-                "status": summary.get("status") if isinstance(summary, dict) else None,
-                "timing": {"wall_seconds": elapsed},
-                "temporary_rdf": {
-                    "decompressed_inside_container": True,
-                    "persisted_on_host": False,
-                    "cleanup_confirmed_by_runner": (
-                        summary.get("temporaryRdf", {}).get("cleanupConfirmed")
-                        if isinstance(summary, dict)
-                        else False
-                    ),
-                },
-            },
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    status = summary.get("status") if isinstance(summary, dict) else None
+    if not status:
+        status = "PASS" if int(exit_code) == 0 else "EXECUTION_FAILED"
+    if int(exit_code) != 0 and status == "PASS":
+        status = "EXECUTION_FAILED"
+    summary_temporary_rdf = summary.get("temporaryRdf", {}) if isinstance(summary, dict) else {}
+    payload = {
+        "run_id": run_id,
+        "timestamp": timestamp,
+        "stage": "validation",
+        "validation_id": validation_id,
+        "vcf_path": str(vcf_path),
+        "rdf_path": str(rdf_path),
+        "rdf_format": "nt.gz" if rdf_path.name.endswith(".nt.gz") else "nt",
+        "representation": representation,
+        "results_dir": str(results_dir),
+        "summary_path": str(summary_path),
+        "input_rdf_size_bytes": int(file_size_bytes(rdf_path) or 0),
+        "exit_code": int(exit_code),
+        "status": status,
+        "timing": {
+            "wall_seconds": timing.get("wall_seconds"),
+            "user_seconds": timing.get("user_seconds"),
+            "sys_seconds": timing.get("sys_seconds"),
+            "max_rss_kb": timing.get("max_rss_kb"),
+        },
+        "temporary_rdf": {
+            "decompressed_inside_container": bool(
+                summary_temporary_rdf.get(
+                    "decompressedInsideContainer", rdf_path.name.endswith(".nt.gz")
+                )
+            ),
+            "persisted_on_host": bool(summary_temporary_rdf.get("persisted", False)),
+            "cleanup_confirmed_by_runner": bool(
+                summary_temporary_rdf.get("cleanupConfirmed", False)
+            ),
+        },
+    }
+    if rdf_path.name.endswith(".nt.gz"):
+        # Compatibility alias for consumers of the original standalone report
+        # schema; ``rdf_path`` is the canonical format-neutral field.
+        payload["rdf_gzip_path"] = str(rdf_path)
+    report_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    if stage_result is not None:
+        stage_result.update(payload)
+    if write_metrics_csv:
+        # Standalone validation has no preceding conversion/compression stage,
+        # but it still exposes the same analysis-ready metrics schema used by a
+        # full run.  Full mode writes its row after compression so its selected
+        # compression columns are preserved.
+        try:
+            update_metrics_csv_with_compression(
+                metrics_csv=metrics_dir / "metrics.csv",
+                run_id=run_id,
+                timestamp=timestamp,
+                output_name=validation_id,
+                output_dir=results_dir,
+                combined_size_bytes=int(payload["input_rdf_size_bytes"]),
+                selected_methods=[],
+                method_results={},
+                validation_result=payload,
+            )
+        except OSError as exc:
+            eprint(f"Warning: failed to write validation metrics CSV: {exc}")
     if exit_code != 0:
         eprint(f"Error: validation failed. See results: {results_dir}")
         eprint(f"See log for details: {wrapper_log_path}")
+        if run_tracker is not None:
+            run_tracker.mark(f"Validation failed: {validation_id} (exit_code={exit_code})")
         return 1
+    if run_tracker is not None:
+        run_tracker.mark(f"Validation completed: {validation_id} ({status})")
     print(f"Validation results: {results_dir}")
     print(f"Validation metrics: {report_path}")
     return 0
@@ -6008,6 +6235,9 @@ def main():
             "  Full pipeline (space-optimized aggregate):\n"
             "    vcf_rdfizer.py -m full -i ./vcf_files --rdf-storage-mode space-optimized "
             "--representations hdt,cottas --rdf-compression none -o ./results\n"
+            "  Full pipeline with semantic validation:\n"
+            "    vcf_rdfizer.py -m full -i ./cohort.vcf.gz --rdf-storage-mode plain "
+            "--representations none --rdf-compression none --validate -o ./results\n"
             "  Condensed multi-sample representation:\n"
             "    vcf_rdfizer.py -m full -i ./cohort.vcf.gz --sample-representation condensed "
             "--rdf-storage-mode space-optimized --representations hdt -o ./results\n"
@@ -6096,6 +6326,16 @@ def main():
             "Genotype representation for full/validation mode: expanded emits one SampleCall and "
             "FORMAT value resource per sample; condensed emits a shared SampleSet and "
             "one sample-ordered value vector per FORMAT key (default: expanded)"
+        ),
+    )
+    parser.add_argument(
+        "--validate",
+        "--run-validation",
+        dest="run_validation",
+        action="store_true",
+        help=(
+            "Run semantic VCF/RDF validation for each input during full mode; "
+            "reports are stored under the run metrics directory"
         ),
     )
     parser.add_argument(
@@ -6212,7 +6452,15 @@ def main():
     parser.add_argument(
         "--no-progress",
         action="store_true",
-        help="Disable terminal compression/conversion progress updates",
+        help="Disable progress sidecars and terminal progress updates",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help=(
+            "Suppress terminal progress displays (including validation query updates) "
+            "while retaining progress logging and metrics"
+        ),
     )
     parser.add_argument(
         "--validation-id",
@@ -6223,7 +6471,7 @@ def main():
         "--filter-oracle",
         choices=("auto", "bcftools", "cyvcf2"),
         default="auto",
-        help="FILTER oracle for validation mode (default: auto)",
+        help="FILTER oracle for full-mode validation and standalone validation (default: auto)",
     )
     rdf_output_group = parser.add_mutually_exclusive_group()
     rdf_output_group.add_argument(
@@ -6240,8 +6488,13 @@ def main():
     )
     args = parser.parse_args()
 
-    global _PROGRESS_ALLOWED
-    _PROGRESS_ALLOWED = not args.no_progress
+    global _PROGRESS_ALLOWED, _PROGRESS_EVENTS_ALLOWED, _QUIET
+    _QUIET = bool(args.quiet)
+    # ``--no-progress`` is the opt-out for the sidecar itself. ``--quiet``
+    # only turns off terminal rendering, leaving the existing event stream
+    # available to the wrapper log/metrics machinery.
+    _PROGRESS_ALLOWED = not (args.no_progress or args.quiet)
+    _PROGRESS_EVENTS_ALLOWED = not args.no_progress
 
     if args.build and args.no_build:
         eprint("Error: --build and --no-build are mutually exclusive.")
@@ -6355,6 +6608,8 @@ def main():
                     partitioned=full_uses_partitioning,
                 )
             validate_no_output_collisions(output_plans)
+        elif args.run_validation:
+            raise ValueError("--validate/--run-validation is only valid in --mode full")
         elif mode == "tsv":
             if args.spark_partitions is not None:
                 raise ValueError("--spark-partitions is only valid in --mode full")
@@ -6384,14 +6639,6 @@ def main():
             validation_id = args.validation_id or vcf_output_prefix(validation_vcf_path)
             if not re.fullmatch(r"[A-Za-z0-9._-]+", validation_id):
                 raise ValueError("--validation-id may contain only letters, digits, dot, underscore, and hyphen")
-            validation_results_dir = out_dir / "validation" / validation_id
-            if validation_results_dir.exists() and (
-                not validation_results_dir.is_dir() or any(validation_results_dir.iterdir())
-            ):
-                raise ValueError(
-                    f"Refusing to overwrite existing validation results: {validation_results_dir}. "
-                    "Choose --validation-id or --out with a new destination."
-                )
             validate_mode_dirs([out_root, out_dir, metrics_root])
         elif mode == "compress":
             if args.spark_partitions is not None:
@@ -6530,6 +6777,20 @@ def main():
 
     source_label = metrics_run_label(metrics_source_paths, metrics_source_root)
     metrics_dir = metrics_run_directory(metrics_root, source_label, run_id)
+    if mode == "validation":
+        # Keep standalone validation reports in the same discoverable tree as
+        # full-mode stage artifacts.  The validation id remains the leaf name
+        # so existing stage/report consumers can use one layout for both modes.
+        validation_results_dir = (
+            metrics_dir / "reports" / "validation" / safe_metrics_name(validation_id)
+        )
+        if validation_results_dir.exists() and (
+            not validation_results_dir.is_dir() or any(validation_results_dir.iterdir())
+        ):
+            raise ValueError(
+                f"Refusing to overwrite existing validation results: {validation_results_dir}. "
+                "Choose --validation-id or --out with a new destination."
+            )
     manifest_options = {
         "requested_image": args.image,
         "requested_image_version": args.image_version,
@@ -6543,6 +6804,10 @@ def main():
         "chunk_min_bytes": chunk_min_bytes if mode in {"full", "compress"} else None,
         "chunk_max_bytes": chunk_max_bytes if mode in {"full", "compress"} else None,
         "spark_partitions": spark_partitions if mode == "full" else None,
+        "run_validation": bool(args.run_validation) if mode == "full" else False,
+        "filter_oracle": args.filter_oracle if mode in {"full", "validation"} else None,
+        "quiet": bool(args.quiet),
+        "no_progress": bool(args.no_progress),
         "index_format": index_format if mode == "index" else None,
         "decompression_format": fmt if mode == "decompress" else None,
         "validation_representation": args.sample_representation if mode == "validation" else None,
@@ -6723,6 +6988,8 @@ def main():
                 image_ref=image_ref,
                 out_name=args.out_name,
                 sample_workflow=sample_workflow,
+                run_validation=args.run_validation,
+                filter_oracle=args.filter_oracle,
                 rdf_storage_mode=args.rdf_storage_mode,
                 methods=full_methods,
                 hdt_strategy=args.hdt_strategy,
@@ -6771,7 +7038,7 @@ def main():
         if mode == "validation":
             return run_validation_mode(
                 vcf_path=validation_vcf_path,
-                rdf_gzip_path=validation_rdf_gzip_path,
+                rdf_path=validation_rdf_gzip_path,
                 representation=args.sample_representation,
                 validation_id=validation_id,
                 results_dir=validation_results_dir,
@@ -6781,6 +7048,7 @@ def main():
                 image_ref=image_ref,
                 filter_oracle=args.filter_oracle,
                 wrapper_log_path=wrapper_log_path,
+                write_metrics_csv=True,
             )
         if mode == "index":
             return run_index_mode(
