@@ -1,0 +1,19 @@
+PREFIX vcfr: <https://w3id.org/vcf-rdfizer/vocab#>
+
+SELECT ?record
+       (COUNT(DISTINCT ?chrom) AS ?chromCount)
+       (COUNT(DISTINCT ?pos) AS ?posCount)
+       (COUNT(DISTINCT ?ref) AS ?refCount)
+       (COUNT(DISTINCT ?alt) AS ?altCount)
+       (COUNT(DISTINCT ?call) AS ?callCount)
+WHERE {
+  ?record a vcfr:VCFRecord .
+  OPTIONAL { ?record vcfr:chrom ?chrom }
+  OPTIONAL { ?record vcfr:pos ?pos }
+  OPTIONAL { ?record vcfr:ref ?ref }
+  OPTIONAL { ?record vcfr:alt ?alt }
+  OPTIONAL { ?record vcfr:hasCall ?call }
+}
+GROUP BY ?record
+HAVING(COUNT(DISTINCT ?chrom) != 1 || COUNT(DISTINCT ?pos) != 1 || COUNT(DISTINCT ?ref) != 1 || COUNT(DISTINCT ?alt) != 1 || COUNT(DISTINCT ?call) != 1)
+LIMIT 100

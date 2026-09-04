@@ -1,5 +1,37 @@
 # Changelog
 
+## 2026-09-04 — Expanded sample representation naming
+
+- Renamed the default per-sample genotype graph strategy to `expanded`, while
+  retaining `condensed` as the alternative strategy.
+- Updated the CLI default and accepted values, internal workflow/emitter names,
+  tests, RML comments, and user documentation.
+- The emitted profile IRI is now
+  `vcfr:representationProfile vcfr:ExpandedRepresentation`.
+
+## 2026-09-04 — Input-labelled, container-complete metrics layout
+
+- Replaced timestamp-only run-metrics directories with
+  `run_metrics/<input-label>__<run-id>/`. A single VCF/RDF/representation input
+  uses its source stem (for example, `1000G_phase3_chr20`); a directory input
+  with multiple VCFs receives a deterministic batch label.
+- Added `run.json` and `summary.json` as the stable entry points for every
+  mode. The manifest records inputs, requested configuration, output root, and
+  resolved image; the summary records final status, wrapper runtime, tabular
+  rows, and an index of stage reports and logs.
+- Organized metrics by purpose: `logs/`, `timings/`, `stages/`, and `reports/`.
+  TSV, RML conversion, compression, decompression, indexing, and warnings now
+  have predictable locations instead of unrelated `raw_metrics`,
+  `*_metrics`, and timestamp-nested directories.
+- Compression-only, decompression, and standalone index modes now persist
+  container wall/CPU/system time, peak RSS, exit code, input/output sizes, and
+  structured stage reports. Full and TSV modes retain the same detail.
+- Preserved the complete partitioned-compression runner handoff under
+  `stages/partitioned/`, including every chunk build, merge, validation,
+  temporary-workspace free-space sample, timing, peak RSS, and bounded stderr
+  diagnostic. The report is retained on both successful and failed runs before
+  the temporary Docker volume is removed.
+
 ## 2026-09-03 — Streaming COTTAS merge for condensed cohorts
 
 - Replaced the final COTTAS merge/reindex implementation with a PyArrow k-way
@@ -72,8 +104,8 @@ resource requirement while retaining a queryable representation.
 ### Rerun guidance
 
 Rebuild the image and rerun the same full command. If the COTTAS stage still
-fails, inspect `raw_metrics/compression_metrics/.../__partitioned_compression__`
-and the run wrapper log for the failing `cottas-merge-r*` stage and its
+fails, inspect `stages/partitioned/<sample>.json` and the wrapper log for the
+failing `cottas-merge-r*` stage and its
 `stderr_tail`. For a resource error, lower `--chunk-target-bytes` and
 `--chunk-max-bytes`, or enlarge the Docker data-volume allocation. The raw
 `.nt.gz` retained by the failed run is a valid recovery source.

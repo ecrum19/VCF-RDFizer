@@ -1,5 +1,6 @@
 ARG RMLSTREAMER_VERSION=2.5.0
 ARG HDTC_VERSION=1.1.0
+ARG COMUNICA_VERSION=5.3.0
 
 FROM eclipse-temurin:11-jre AS build-hdt-cpp
 
@@ -65,6 +66,7 @@ ARG RMLSTREAMER_VERSION
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
     bash \
+    bcftools \
     brotli \
     ca-certificates \
     coreutils \
@@ -76,8 +78,10 @@ RUN apt-get update \
     liblzma5 \
     libserd-0-0 \
     nodejs \
+    npm \
     python3 \
     python3-venv \
+    raptor2-utils \
     time \
   && rm -rf /var/lib/apt/lists/*
 
@@ -88,7 +92,11 @@ RUN python3 -m venv /opt/pycottas-venv \
   && /opt/pycottas-venv/bin/pip install --no-cache-dir \
     pycottas==1.1.0 \
     duckdb==1.5.5 \
-    pyarrow==22.0.0
+    pyarrow==22.0.0 \
+    numpy==2.4.6 \
+    cyvcf2==0.34.0
+
+RUN npm install --global "@comunica/query-sparql-file@${COMUNICA_VERSION}"
 
 RUN mkdir -p /opt/rmlstreamer \
   && curl -fsSL \
@@ -105,6 +113,7 @@ COPY --from=build-hdtc /opt/third_party_licenses/ /usr/share/licenses/vcf-rdfize
 COPY THIRD_PARTY_NOTICES.md /usr/share/licenses/vcf-rdfizer/THIRD_PARTY_NOTICES.md
 COPY src/*.sh /opt/vcf-rdfizer/
 COPY src/*.py /opt/vcf-rdfizer/
+COPY src/validation/ /opt/vcf-rdfizer/validation/
 
 RUN chmod +x /opt/vcf-rdfizer/*.sh \
   && chmod +x /usr/local/bin/rdf2hdt \

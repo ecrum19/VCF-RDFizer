@@ -254,7 +254,11 @@ VCFR_NAMESPACE = "https://w3id.org/vcf-rdfizer/vocab#"
 RDF_TYPE_URI = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
 XSD_POSITIVE_INTEGER_URI = "http://www.w3.org/2001/XMLSchema#positiveInteger"
 SAMPLE_RDF_BUFFER_BYTES = 8 * 1024 * 1024
-SAMPLE_REPRESENTATION_CHOICES = {"dense", "condensed"}
+SAMPLE_REPRESENTATION_CHOICES = {"expanded", "condensed"}
+# This is an internal rules-compatibility value, not a third public
+# representation. It means that custom helper TSV rows must be materialized.
+SAMPLE_HELPER_STRATEGY_MATERIALIZED = "expanded"
+METRICS_LAYOUT_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -1255,6 +1259,7 @@ def read_conversion_total_triples(metrics_dir: Path, output_name: str, run_id: s
     """Read TOTAL triple count for one conversion output from conversion metrics JSON."""
     safe_name = safe_metrics_name(output_name)
     candidates = [
+        metrics_dir / "stages" / "conversion" / f"{safe_name}.json",
         metrics_dir / "conversion_metrics" / safe_name / f"{run_id}.json",
         metrics_dir / "conversion_metrics" / safe_name / run_id,
         # Backward compatibility with older artifact names:
@@ -1294,12 +1299,13 @@ def collect_full_mode_total_triples(metrics_dir: Path, run_id: str):
     total = 0
     found = False
     candidate_files = []
+    candidate_files.extend(sorted((metrics_dir / "stages" / "conversion").glob("*.json")))
     candidate_files.extend(sorted(metrics_dir.glob("conversion_metrics/*/*")))
     # Backward compatibility with older artifact names:
     candidate_files.extend(sorted(metrics_dir.glob(f"conversion-metrics-*-{run_id}.json")))
 
     for metrics_json in candidate_files:
-        if (
+        if metrics_json.parent.name != "conversion" and (
             metrics_json.name != run_id
             and metrics_json.name != f"{run_id}.json"
             and not metrics_json.name.endswith(f"-{run_id}.json")
@@ -1366,8 +1372,9 @@ def append_wrapper_timing_log(
 
 def write_failed_inputs_report(*, metrics_dir: Path, failures: list[dict]):
     """Write per-input failure summary for multi-input modes."""
-    ensure_dir(metrics_dir)
-    report_path = metrics_dir / "failed_inputs.csv"
+    report_dir = metrics_dir / "reports"
+    ensure_dir(report_dir)
+    report_path = report_dir / "failed_inputs.csv"
     header = [
         "input_index",
         "input_vcf",
@@ -1393,8 +1400,9 @@ def write_failed_inputs_report(*, metrics_dir: Path, failures: list[dict]):
 
 def write_index_warnings_report(*, metrics_dir: Path, run_id: str, warnings: list[dict]):
     """Write non-fatal full-run HDT/COTTAS index warnings as JSON."""
-    ensure_dir(metrics_dir)
-    report_path = metrics_dir / "index_warnings.json"
+    report_dir = metrics_dir / "reports"
+    ensure_dir(report_dir)
+    report_path = report_dir / "index_warnings.json"
     payload = {
         "run_id": run_id,
         "warning_count": len(warnings),
@@ -1836,11 +1844,11 @@ def write_sample_support_headers(sample_calls_tsv: Path, sample_format_tsv: Path
 
 
 def sample_support_strategy(rules_path: Path) -> str:
-    """Choose no, streamed, or expanded sample handling for one mapping file.
+    """Choose no, streamed, or materialized sample handling for one mapping file.
 
     The built-in four sample maps can be emitted directly as N-Triples without
     writing their enormous Cartesian helper TSVs. A custom mapping with extra
-    helper-table consumers retains the expanded TSV behavior.
+    helper-table consumers retains the materialized TSV behavior.
     """
     text = rules_path.read_text(encoding="utf-8")
     calls_refs = text.count('/data/tsv/sample_calls.tsv')
@@ -1854,7 +1862,7 @@ def sample_support_strategy(rules_path: Path) -> str:
         and all(fragment in text for fragment in CANONICAL_SAMPLE_RULE_FRAGMENTS)
     ):
         return "stream"
-    return "expanded"
+    return SAMPLE_HELPER_STRATEGY_MATERIALIZED
 
 
 @dataclass(frozen=True)
@@ -1869,9 +1877,9 @@ class SampleWorkflow:
 def resolve_sample_workflow(representation: str, rules_path: Path) -> SampleWorkflow:
     """Resolve rules compatibility into exactly one sample workflow.
 
-    Dense mode preserves custom helper-table mappings. Condensed mode emits its
+    Expanded mode preserves custom helper-table mappings. Condensed mode emits its
     RDF directly from records.tsv; it cannot safely coexist with custom rules
-    that consume expanded dense helper tables because that would execute both
+    that consume materialized helper tables because that would execute both
     representations and reintroduce semantic inflation.
     """
     if representation not in SAMPLE_REPRESENTATION_CHOICES:
@@ -1881,18 +1889,18 @@ def resolve_sample_workflow(representation: str, rules_path: Path) -> SampleWork
         )
 
     rules_strategy = sample_support_strategy(rules_path)
-    if representation == "dense":
+    if representation == "expanded":
         if rules_strategy == "stream":
-            return SampleWorkflow("dense", "header-only", "dense")
-        if rules_strategy == "expanded":
-            return SampleWorkflow("dense", "expanded", None)
-        return SampleWorkflow("dense", "none", None)
+            return SampleWorkflow("expanded", "header-only", "expanded")
+        if rules_strategy == SAMPLE_HELPER_STRATEGY_MATERIALIZED:
+            return SampleWorkflow("expanded", SAMPLE_HELPER_STRATEGY_MATERIALIZED, None)
+        return SampleWorkflow("expanded", "none", None)
 
-    if rules_strategy == "expanded":
+    if rules_strategy == SAMPLE_HELPER_STRATEGY_MATERIALIZED:
         raise ValueError(
             "--sample-representation condensed cannot be combined with custom rules "
-            "that consume expanded sample_calls.tsv or sample_format_values.tsv tables. "
-            "Remove those dense helper-table consumers or use dense mode."
+            "that consume materialized sample_calls.tsv or sample_format_values.tsv tables. "
+            "Remove those materialized helper-table consumers or use expanded mode."
         )
     helper_strategy = "header-only" if rules_strategy == "stream" else "none"
     return SampleWorkflow("condensed", helper_strategy, "condensed")
@@ -2118,19 +2126,19 @@ def _append_rdf_atomically(rdf_path: Path, stats: dict, producer):
         raise
 
 
-def append_dense_sample_rdf(
+def append_expanded_sample_rdf(
     records_tsv: Path,
     rdf_path: Path,
     *,
     progress_interval_records: int = 10_000,
 ) -> dict:
-    """Append the dense SampleCall/FormatFieldValue representation.
+    """Append the expanded SampleCall/FormatFieldValue representation.
 
     This produces the same canonical SampleCall and FormatFieldValue triples as
     the default RML maps without materializing V*S and V*S*F helper TSV rows.
     """
     stats = {
-        "representation": "dense",
+        "representation": "expanded",
         "records": 0,
         "sample_calls": 0,
         "format_values": 0,
@@ -2151,7 +2159,7 @@ def append_dense_sample_rdf(
             file_uri = f"file://{source_component}"
             emit(
                 f"<{file_uri}> <{VCFR_NAMESPACE}representationProfile> "
-                f"<{VCFR_NAMESPACE}DenseRepresentation> .\n"
+                f"<{VCFR_NAMESPACE}ExpandedRepresentation> .\n"
             )
             for record in record_stream:
                 row_component = _rml_uri_component(record.row_id)
@@ -2199,8 +2207,8 @@ def append_canonical_sample_rdf(
     *,
     progress_interval_records: int = 10_000,
 ) -> dict:
-    """Backward-compatible name for the dense sample RDF emitter."""
-    return append_dense_sample_rdf(
+    """Backward-compatible name for the expanded sample RDF emitter."""
+    return append_expanded_sample_rdf(
         records_tsv,
         rdf_path,
         progress_interval_records=progress_interval_records,
@@ -2432,8 +2440,8 @@ def emit_sample_representation(
     """Execute the workflow's sole direct RDF emitter, if it has one."""
     if workflow.emitter is None:
         return None
-    if workflow.emitter == "dense":
-        return append_dense_sample_rdf(records_tsv, rdf_path)
+    if workflow.emitter == "expanded":
+        return append_expanded_sample_rdf(records_tsv, rdf_path)
     if workflow.emitter == "condensed":
         return append_condensed_sample_rdf(records_tsv, header_lines_tsv, rdf_path)
     raise RuntimeError(f"unknown sample RDF emitter: {workflow.emitter}")
@@ -2450,7 +2458,7 @@ def update_conversion_metrics_after_sample_stream(
 ):
     """Bring conversion JSON/CSV metrics in sync after direct sample emission."""
     safe_name = safe_metrics_name(output_name)
-    metrics_json = metrics_dir / "conversion_metrics" / safe_name / f"{run_id}.json"
+    metrics_json = metrics_dir / "stages" / "conversion" / f"{safe_name}.json"
     output_size = int(rdf_path.stat().st_size)
     if metrics_json.is_file():
         try:
@@ -2750,6 +2758,163 @@ def safe_metrics_name(value: str) -> str:
     return safe or "rdf"
 
 
+def input_artifact_stem(path: Path) -> str:
+    """Return a stable, human-readable label for a source artifact.
+
+    Metric directories are intended for people first, so remove only the
+    recognized VCF/RDF/representation suffixes rather than repeatedly applying
+    :attr:`Path.stem` (which turns ``cohort.vcf.gz`` into ``cohort.vcf``).
+    """
+    name = path.name
+    for suffix in (
+        ".vcf.gz",
+        ".vcf",
+        ".nt.gz",
+        ".nt.br",
+        ".nt",
+        ".cottas.gz",
+        ".cottas.br",
+        ".cottas",
+        ".hdt",
+        ".gz",
+        ".br",
+    ):
+        if name.endswith(suffix):
+            return name[: -len(suffix)] or "input"
+    return path.stem or "input"
+
+
+def metrics_run_label(source_paths: list[Path], source_root: Path | None = None) -> str:
+    """Return the input-identifying label for one metrics-run directory."""
+    if len(source_paths) == 1:
+        return safe_metrics_name(input_artifact_stem(source_paths[0]))
+
+    root_label = input_artifact_stem(source_root) if source_root is not None else "inputs"
+    return safe_metrics_name(f"batch-{root_label}-{len(source_paths)}-inputs")
+
+
+def metrics_run_directory(metrics_root: Path, source_label: str, run_id: str) -> Path:
+    """Build the canonical input-labelled directory for one invocation."""
+    return metrics_root / f"{safe_metrics_name(source_label)}__{run_id}"
+
+
+def read_metrics_csv_rows(path: Path) -> list[dict]:
+    """Read a metrics CSV without allowing a damaged optional report to fail a run."""
+    if not path.is_file():
+        return []
+    try:
+        with path.open(newline="", encoding="utf-8") as handle:
+            return list(csv.DictReader(handle))
+    except OSError:
+        return []
+
+
+def write_run_manifest(
+    *,
+    metrics_dir: Path,
+    run_id: str,
+    timestamp: str,
+    mode: str,
+    source_label: str,
+    source_paths: list[Path],
+    out_root: Path,
+    options: dict,
+):
+    """Write the static, human-readable identity and configuration of a run."""
+    ensure_dir(metrics_dir)
+    payload = {
+        "metrics_layout_version": METRICS_LAYOUT_VERSION,
+        "run_id": run_id,
+        "timestamp": timestamp,
+        "mode": mode,
+        "source_label": source_label,
+        "output_root": str(out_root),
+        "metrics_directory": str(metrics_dir),
+        "inputs": [
+            {
+                "path": str(path),
+                "file_name": path.name,
+                "size_bytes": file_size_bytes(path),
+            }
+            for path in source_paths
+        ],
+        "options": options,
+    }
+    path = metrics_dir / "run.json"
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def update_run_manifest(metrics_dir: Path, **updates) -> None:
+    """Merge late-bound runtime details (such as the resolved image) into run.json."""
+    path = metrics_dir / "run.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+        payload.update(updates)
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    except (OSError, json.JSONDecodeError):
+        # Metadata must improve diagnosability, never invalidate a completed run.
+        pass
+
+
+def write_run_summary(
+    *,
+    metrics_dir: Path,
+    run_id: str,
+    timestamp: str,
+    mode: str,
+    exit_code: int,
+    elapsed_seconds: float,
+    total_triples: int | None,
+):
+    """Write one discoverable end-of-run summary for all workflow modes.
+
+    Individual stage reports retain their native detail; this file provides the
+    compact landing page that links their location and repeats the tabular rows
+    most often used for analysis.
+    """
+    stage_dir = metrics_dir / "stages"
+    stage_reports = [
+        path.relative_to(metrics_dir).as_posix()
+        for path in sorted(stage_dir.rglob("*.json"))
+    ] if stage_dir.is_dir() else []
+    report_dir = metrics_dir / "reports"
+    reports = [
+        path.relative_to(metrics_dir).as_posix()
+        for path in sorted(report_dir.iterdir())
+        if path.is_file()
+    ] if report_dir.is_dir() else []
+    payload = {
+        "metrics_layout_version": METRICS_LAYOUT_VERSION,
+        "run_id": run_id,
+        "timestamp": timestamp,
+        "completed_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        "mode": mode,
+        "status": "success" if int(exit_code) == 0 else "failure",
+        "exit_code": int(exit_code),
+        "execution": {
+            "wall_seconds": round(float(elapsed_seconds), 6),
+            "wall_human": format_duration(elapsed_seconds),
+            "total_triples": total_triples,
+        },
+        "summary_tables": {
+            "conversion_and_compression": read_metrics_csv_rows(metrics_dir / "metrics.csv"),
+            "tsv": read_metrics_csv_rows(metrics_dir / "tsv_metrics.csv"),
+            "wrapper": read_metrics_csv_rows(metrics_dir / "wrapper_execution_times.csv"),
+        },
+        "stage_reports": stage_reports,
+        "reports": reports,
+        "logs": [
+            path.relative_to(metrics_dir).as_posix()
+            for path in sorted((metrics_dir / "logs").rglob("*"))
+            if path.is_file()
+        ] if (metrics_dir / "logs").is_dir() else [],
+    }
+    path = metrics_dir / "summary.json"
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
 def progress_event_path(metrics_dir: Path | None, *components: str) -> Path | None:
     """Return a hidden, per-operation progress sidecar path."""
     if metrics_dir is None:
@@ -3043,14 +3208,14 @@ def write_compression_metrics_artifacts(
     method_results: dict[str, dict],
     index_warnings: list[dict] | None = None,
 ):
-    """Write per-output compression artifacts (time files + structured JSON)."""
+    """Write the final per-output compression summary and method timing files."""
     metrics_dir.mkdir(parents=True, exist_ok=True)
     safe_name = safe_metrics_name(output_name)
 
     for method, result in method_results.items():
-        time_log_dir = metrics_dir / "compression_time" / method / safe_name
+        time_log_dir = metrics_dir / "timings" / "compression" / safe_name
         time_log_dir.mkdir(parents=True, exist_ok=True)
-        time_log = time_log_dir / f"{run_id}.txt"
+        time_log = time_log_dir / f"{safe_metrics_name(method)}.txt"
         lines = [
             f"method={method}",
             f"exit_code={result.get('exit_code', 1)}",
@@ -3099,6 +3264,10 @@ def write_compression_metrics_artifacts(
         "combined_rdf_path": str(source_rdf_path),
         "combined_rdf_size_bytes": int(combined_size_bytes),
         "index_warnings": list(index_warnings or []),
+        # This preserves every method-specific detail returned by a container
+        # (validation, chunk plan, index information, and workspace metrics),
+        # rather than reducing it to the CSV's scalar columns.
+        "methods": method_results,
         "hdt_source": str(hdt_result.get("source") or "not_used"),
         "gzip_raw_rdf": {
             "output_gz_path": gzip_result.get("output_path", ""),
@@ -3154,9 +3323,9 @@ def write_compression_metrics_artifacts(
         },
     }
 
-    metrics_json_dir = metrics_dir / "compression_metrics" / safe_name
+    metrics_json_dir = metrics_dir / "stages" / "compression"
     metrics_json_dir.mkdir(parents=True, exist_ok=True)
-    metrics_json = metrics_json_dir / f"{run_id}.json"
+    metrics_json = metrics_json_dir / f"{safe_name}.json"
     metrics_json.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
@@ -3171,11 +3340,12 @@ def write_raw_compression_metrics_artifact(
     selected_methods: list[str],
     method_results: dict[str, dict],
     index_warnings: list[dict] | None = None,
+    auxiliary_stages: dict[str, dict] | None = None,
 ):
-    """Persist per-RDF-file compression metrics under `raw_metrics/`."""
+    """Persist the operation-level compression detail for one RDF source."""
     safe_output = safe_metrics_name(output_name)
     safe_rdf = safe_metrics_name(rdf_name)
-    raw_json_dir = metrics_dir / "raw_metrics" / "compression_metrics" / safe_output / safe_rdf
+    raw_json_dir = metrics_dir / "stages" / "compression_operations" / safe_output
     raw_json_dir.mkdir(parents=True, exist_ok=True)
 
     payload = {
@@ -3186,6 +3356,7 @@ def write_raw_compression_metrics_artifact(
         "source_rdf_path": str(source_rdf_path),
         "compression_methods": ",".join(selected_methods) if selected_methods else "none",
         "index_warnings": list(index_warnings or []),
+        "auxiliary_stages": dict(auxiliary_stages or {}),
         "methods": {},
     }
 
@@ -3204,8 +3375,35 @@ def write_raw_compression_metrics_artifact(
             "validation": result.get("validation") or details.get("validation"),
         }
 
-    raw_json = raw_json_dir / f"{run_id}.json"
+    raw_json = raw_json_dir / f"{safe_rdf}.json"
     raw_json.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def write_partitioned_container_stage_report(
+    *,
+    metrics_dir: Path,
+    output_name: str,
+    source_rdf_path: Path,
+    payload: dict,
+):
+    """Preserve the detailed stage handoff from the ephemeral Docker volume.
+
+    The partitioned runner records every chunk build, merge, validation, disk
+    watermark, and GNU-time resource measurement. Its workspace is deleted at
+    the end of the operation, so this report is the durable location for those
+    deeper container metrics on both success and failure.
+    """
+    report_dir = metrics_dir / "stages" / "partitioned"
+    ensure_dir(report_dir)
+    report = {
+        "runtime_environment": "docker-volume",
+        "source_rdf_path": str(source_rdf_path),
+        "output_name": output_name,
+        "container_result": payload,
+    }
+    report_path = report_dir / f"{safe_metrics_name(output_name)}.json"
+    report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    return report_path
 
 
 def validate_mode_dirs(paths):
@@ -3244,9 +3442,9 @@ def write_tsv_metrics_artifacts(
     output_paths: list[Path],
     output_size_bytes: int,
 ):
-    """Persist raw TSV-step metrics under `raw_metrics/`."""
+    """Persist one TSV container stage report in the canonical stage tree."""
     safe_prefix = safe_metrics_name(prefix)
-    json_dir = metrics_dir / "raw_metrics" / "tsv_metrics" / safe_prefix
+    json_dir = metrics_dir / "stages" / "tsv"
     json_dir.mkdir(parents=True, exist_ok=True)
     payload = {
         "run_id": run_id,
@@ -3265,7 +3463,7 @@ def write_tsv_metrics_artifacts(
             "output_size_bytes": int(output_size_bytes),
         },
     }
-    (json_dir / f"{run_id}.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    (json_dir / f"{safe_prefix}.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
 def run_tsv_conversion_with_metrics(
@@ -3281,10 +3479,10 @@ def run_tsv_conversion_with_metrics(
 ):
     """Run VCF->TSV conversion and collect per-input timing/resource metrics."""
     safe_prefix = safe_metrics_name(prefix)
-    raw_time_dir = metrics_dir / "raw_metrics" / "tsv_time" / safe_prefix
+    raw_time_dir = metrics_dir / "timings" / "tsv"
     raw_time_dir.mkdir(parents=True, exist_ok=True)
-    time_log_host = raw_time_dir / f"{run_id}.txt"
-    time_log_container = f"/data/metrics/raw_metrics/tsv_time/{safe_prefix}/{run_id}.txt"
+    time_log_host = raw_time_dir / f"{safe_prefix}.txt"
+    time_log_container = f"/data/metrics/timings/tsv/{safe_prefix}.txt"
 
     wrapped_command = (
         "set -euo pipefail; "
@@ -3641,6 +3839,7 @@ def run_compression_methods_for_rdf(
     metrics_output_name = output_name or target_out_dir.name
     safe_output_name = safe_metrics_name(metrics_output_name)
     safe_rdf_name = safe_metrics_name(rdf_path.name)
+    auxiliary_stage_results: dict[str, dict] = {}
 
     def run_container_command(
         *,
@@ -3692,17 +3891,20 @@ def run_compression_methods_for_rdf(
         }
         if record_method:
             method_results[method] = result
-        if record_method and metrics_dir is not None and run_id is not None and timing_host.exists():
+        else:
+            # Validation/index checks consume container resources too. Retain
+            # their measurements in the operation report rather than dropping
+            # them because they do not produce a final representation.
+            auxiliary_stage_results[method] = result
+        if metrics_dir is not None and timing_host.exists():
             raw_time_dir = (
                 metrics_dir
-                / "raw_metrics"
-                / "compression_time"
+                / "timings"
+                / "compression"
                 / safe_output_name
-                / safe_rdf_name
-                / method
             )
             raw_time_dir.mkdir(parents=True, exist_ok=True)
-            raw_time_path = raw_time_dir / f"{run_id}.txt"
+            raw_time_path = raw_time_dir / f"{safe_metrics_name(method)}.txt"
             try:
                 shutil.copyfile(timing_host, raw_time_path)
             except OSError:
@@ -3796,6 +3998,9 @@ def run_compression_methods_for_rdf(
                     ),
                 }
             report_path.unlink(missing_ok=True)
+            execution = auxiliary_stage_results.get(f"{method}-validation")
+            if execution is not None:
+                report["execution"] = execution
             return (
                 bool(report.get("valid")) and bool(report.get("count_match")),
                 report,
@@ -4163,6 +4368,7 @@ def run_compression_methods_for_rdf(
             selected_methods=methods,
             method_results=method_results,
             index_warnings=index_warnings,
+            auxiliary_stages=auxiliary_stage_results,
         )
 
     return True, method_results
@@ -4334,6 +4540,19 @@ def run_containerized_partitioned_representation_methods(
                         chunk["path"] = Path(str(chunk["path"])).name
                 details["workspace"] = "docker-volume"
                 details["workspace_cleanup"] = "removed"
+            if metrics_dir is not None:
+                try:
+                    write_partitioned_container_stage_report(
+                        metrics_dir=metrics_dir,
+                        output_name=output_name,
+                        source_rdf_path=source_rdf_path,
+                        payload=payload,
+                    )
+                except OSError as exc:
+                    eprint(
+                        "Warning: failed to preserve detailed partitioned container metrics: "
+                        f"{exc}"
+                    )
 
         missing_methods = set(methods) - set(method_results)
         if missing_methods and payload is not None and int(payload.get("exit_code", 1)) == 0:
@@ -4599,7 +4818,7 @@ def run_full_mode(
         sample_calls_tsv = tsv_dir / f"{prefix}.sample_calls.tsv"
         sample_format_tsv = tsv_dir / f"{prefix}.sample_format_values.tsv"
         try:
-            if sample_workflow.helper_strategy == "expanded":
+            if sample_workflow.helper_strategy == SAMPLE_HELPER_STRATEGY_MATERIALIZED:
                 build_sample_support_tsvs(
                     records_tsv=triplet["records"],
                     sample_calls_tsv=sample_calls_tsv,
@@ -4800,7 +5019,7 @@ def run_full_mode(
                 continue
             if triples_produced is not None:
                 triples_produced += int(sample_stats["triples"])
-            if sample_workflow.representation == "dense":
+            if sample_workflow.representation == "expanded":
                 print(
                     "    * Sample calls streamed: "
                     f"{sample_stats['sample_calls']:,}; FORMAT values: "
@@ -5322,6 +5541,31 @@ def run_compress_mode(
             return 1
 
     target_out_dir = out_dir / input_stem
+    source_size_bytes = int(file_size_bytes(rdf_path) or 0)
+    try:
+        write_compression_metrics_artifacts(
+            metrics_dir=metrics_dir,
+            run_id=run_id,
+            timestamp=timestamp,
+            output_name=input_stem,
+            source_rdf_path=rdf_path,
+            combined_size_bytes=source_size_bytes,
+            selected_methods=methods,
+            method_results=method_results,
+        )
+        update_metrics_csv_with_compression(
+            metrics_csv=metrics_dir / "metrics.csv",
+            run_id=run_id,
+            timestamp=timestamp,
+            output_name=input_stem,
+            output_dir=target_out_dir,
+            combined_size_bytes=source_size_bytes,
+            selected_methods=methods,
+            method_results=method_results,
+        )
+    except OSError as exc:
+        eprint(f"Error: unable to write compression metrics: {exc}")
+        return 1
     hdt_path = target_out_dir / f"{input_stem}.hdt"
     print_nt_hdt_summary(
         output_root=target_out_dir,
@@ -5378,6 +5622,8 @@ def run_index_mode(
     metrics_dir: Path,
     image_ref: str,
     wrapper_log_path: Path,
+    run_id: str | None = None,
+    timestamp: str | None = None,
 ):
     """Generate or regenerate the query index for one existing artifact.
 
@@ -5408,21 +5654,38 @@ def run_index_mode(
             f'"$PYTHON_BIN" {shlex.quote(COTTAS_TOOL_CONTAINER)} reindex '
             f"{shlex.quote(source_container)} spo"
         )
+    safe_input = safe_metrics_name(index_path.name)
+    timing_host = metrics_dir / "timings" / "index" / f"{safe_input}.txt"
+    timing_host.parent.mkdir(parents=True, exist_ok=True)
+    timing_container = f"/data/metrics/timings/index/{safe_input}.txt"
+    timed_command = (
+        "set -euo pipefail; "
+        f"rm -f {shlex.quote(timing_container)}; "
+        'if [[ -x /usr/bin/time ]] && /usr/bin/time --version >/dev/null 2>&1; then '
+        f"/usr/bin/time -v -o {shlex.quote(timing_container)} -- bash -lc {shlex.quote(command)}; "
+        "else "
+        f"{{ time -p bash -lc {shlex.quote(command)}; }} > {shlex.quote(timing_container)} 2>&1; "
+        "fi"
+    )
+    input_size_bytes = int(file_size_bytes(index_path) or 0)
     cmd = [
         *docker_run_base(),
         *docker_hdt_index_env_args(),
         *docker_cottas_merge_env_args(),
         "-v",
         f"{str(index_path.parent)}:/data/{mount_name}",
+        "-v",
+        f"{str(metrics_dir.resolve())}:/data/metrics",
         image_ref,
         "bash",
         "-lc",
-        command,
+        timed_command,
     ]
 
     started = time.perf_counter()
     exit_code = run(cmd)
     elapsed = time.perf_counter() - started
+    timing = parse_time_log_metrics(timing_host)
     index_path_after = (
         find_hdt_index_sidecar(index_path)
         if index_format == "hdt"
@@ -5432,12 +5695,21 @@ def run_index_mode(
     final_code = int(exit_code) if int(exit_code) != 0 else (0 if index_ready else 1)
     index_was_present = existing_index_path is not None or index_format == "cottas"
     payload = {
+        "run_id": run_id,
+        "timestamp": timestamp,
         "index_format": index_format,
         "input_path": str(index_path),
+        "input_size_bytes": input_size_bytes,
         "index_path": str(index_path_after) if index_path_after else "",
         "index_location": "sidecar" if index_format == "hdt" else "embedded",
         "exit_code": final_code,
         "wall_seconds": elapsed,
+        "timing": {
+            "wall_seconds": elapsed,
+            "user_seconds": timing.get("user_seconds"),
+            "sys_seconds": timing.get("sys_seconds"),
+            "max_rss_kb": timing.get("max_rss_kb"),
+        },
         "index_status": (
             "regenerated" if index_was_present else "generated"
         ) if index_ready else "failed",
@@ -5448,20 +5720,12 @@ def run_index_mode(
         payload["hdt_path"] = str(index_path)
     else:
         payload["cottas_path"] = str(index_path)
-    metrics_path = metrics_dir / "index_metrics.json"
+    metrics_path = metrics_dir / "stages" / "index" / f"{index_format}-{safe_input}.json"
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
     metrics_path.write_text(
         json.dumps(payload, indent=2) + "\n",
         encoding="utf-8",
     )
-    # Keep a format-specific metrics filename for discovery/compatibility,
-    # while the generic filename is used for both supported formats.
-    legacy_metrics_path = metrics_dir / f"{index_format}_index_metrics.json"
-    if legacy_metrics_path != metrics_path:
-        legacy_metrics_path.write_text(
-            json.dumps(payload, indent=2) + "\n",
-            encoding="utf-8",
-        )
-
     if final_code != 0:
         eprint(f"Error: {format_label} index regeneration failed. See log: {wrapper_log_path}")
         return 1
@@ -5492,6 +5756,9 @@ def run_decompress_mode(
     *,
     compressed_path: Path,
     decompressed_out: Path,
+    metrics_dir: Path,
+    run_id: str,
+    timestamp: str,
     image_ref: str,
     wrapper_log_path: Path,
 ):
@@ -5562,22 +5829,165 @@ def run_decompress_mode(
             f"{shlex.quote(cottas_input)} {shlex.quote(output_container)}"
         )
 
+    safe_input = safe_metrics_name(compressed_path.name)
+    timing_host = metrics_dir / "timings" / "decompression" / f"{safe_input}.txt"
+    timing_host.parent.mkdir(parents=True, exist_ok=True)
+    timing_container = f"/data/metrics/timings/decompression/{safe_input}.txt"
+    timed_command = (
+        "set -euo pipefail; "
+        f"rm -f {shlex.quote(timing_container)}; "
+        'if [[ -x /usr/bin/time ]] && /usr/bin/time --version >/dev/null 2>&1; then '
+        f"/usr/bin/time -v -o {shlex.quote(timing_container)} -- bash -lc {shlex.quote(command)}; "
+        "else "
+        f"{{ time -p bash -lc {shlex.quote(command)}; }} > {shlex.quote(timing_container)} 2>&1; "
+        "fi"
+    )
+    input_size_bytes = int(file_size_bytes(compressed_path) or 0)
     cmd = [
         *docker_run_base(),
         "-v",
         f"{str(compressed_path.parent)}:/data/in:ro",
         "-v",
         f"{str(decompressed_out.parent)}:/data/out",
+        "-v",
+        f"{str(metrics_dir.resolve())}:/data/metrics",
         image_ref,
         "bash",
         "-lc",
-        command,
+        timed_command,
     ]
-    if run(cmd) != 0:
+    started = time.perf_counter()
+    exit_code = run(cmd)
+    elapsed = time.perf_counter() - started
+    timing = parse_time_log_metrics(timing_host)
+    stage_payload = {
+        "run_id": run_id,
+        "timestamp": timestamp,
+        "format": fmt,
+        "input_path": str(compressed_path),
+        "input_size_bytes": input_size_bytes,
+        "output_path": str(decompressed_out),
+        "output_size_bytes": int(file_size_bytes(decompressed_out) or 0),
+        # Decompression is deliberately a single pass. Counting N-Triples
+        # here would reread a cohort-scale output solely for observability.
+        "output_triples": None,
+        "exit_code": int(exit_code),
+        "timing": {
+            "wall_seconds": elapsed,
+            "user_seconds": timing.get("user_seconds"),
+            "sys_seconds": timing.get("sys_seconds"),
+            "max_rss_kb": timing.get("max_rss_kb"),
+        },
+    }
+    report_path = metrics_dir / "stages" / "decompression" / f"{safe_input}.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(stage_payload, indent=2) + "\n", encoding="utf-8")
+    if exit_code != 0:
         eprint(f"Error: decompression failed. See log: {wrapper_log_path}")
         return 1
 
     print(f"Done. Decompressed file: {decompressed_out}")
+    print(f"Decompression metrics: {report_path}")
+    return 0
+
+
+def run_validation_mode(
+    *,
+    vcf_path: Path,
+    rdf_gzip_path: Path,
+    representation: str,
+    validation_id: str,
+    results_dir: Path,
+    metrics_dir: Path,
+    run_id: str,
+    timestamp: str,
+    image_ref: str,
+    filter_oracle: str,
+    wrapper_log_path: Path,
+):
+    """Run VCF/RDF semantic queries with ephemeral in-container RDF expansion.
+
+    The only mounted RDF source is the input ``.nt.gz`` file. The validation
+    runner inflates it under the container's ``/work`` temporary filesystem and
+    removes that source before the container exits; no raw N-Triples are
+    materialized in the user-selected output directory.
+    """
+    # An empty directory may be left behind if Docker itself fails before the
+    # runner starts. Reuse only that empty shell; never overwrite reports.
+    results_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        *docker_run_base(),
+        "--init",
+        "-v",
+        f"{str(vcf_path.parent)}:/data/vcf:ro",
+        "-v",
+        f"{str(rdf_gzip_path.parent)}:/data/rdf:ro",
+        "-v",
+        f"{str(results_dir)}:/data/validation",
+        image_ref,
+        "/opt/pycottas-venv/bin/python",
+        "/opt/vcf-rdfizer/validation/validation_runner.py",
+        "--vcf",
+        f"/data/vcf/{vcf_path.name}",
+        "--rdf-gz",
+        f"/data/rdf/{rdf_gzip_path.name}",
+        "--representation",
+        representation,
+        "--results-dir",
+        "/data/validation",
+        "--dataset-id",
+        validation_id,
+        "--filter-oracle",
+        filter_oracle,
+        "--scratch-dir",
+        "/work",
+    ]
+    started = time.perf_counter()
+    exit_code = run(cmd)
+    elapsed = time.perf_counter() - started
+    summary_path = results_dir / "summary.json"
+    summary = None
+    if summary_path.is_file():
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            summary = None
+    report_path = metrics_dir / "stages" / "validation" / f"{safe_metrics_name(validation_id)}.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "timestamp": timestamp,
+                "vcf_path": str(vcf_path),
+                "rdf_gzip_path": str(rdf_gzip_path),
+                "representation": representation,
+                "results_dir": str(results_dir),
+                "input_rdf_size_bytes": int(file_size_bytes(rdf_gzip_path) or 0),
+                "exit_code": int(exit_code),
+                "status": summary.get("status") if isinstance(summary, dict) else None,
+                "timing": {"wall_seconds": elapsed},
+                "temporary_rdf": {
+                    "decompressed_inside_container": True,
+                    "persisted_on_host": False,
+                    "cleanup_confirmed_by_runner": (
+                        summary.get("temporaryRdf", {}).get("cleanupConfirmed")
+                        if isinstance(summary, dict)
+                        else False
+                    ),
+                },
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    if exit_code != 0:
+        eprint(f"Error: validation failed. See results: {results_dir}")
+        eprint(f"See log for details: {wrapper_log_path}")
+        return 1
+    print(f"Validation results: {results_dir}")
+    print(f"Validation metrics: {report_path}")
     return 0
 
 
@@ -5619,6 +6029,12 @@ def main():
             "--rdf-compression gzip --representations hdt --artifact-compression gzip -o ./results\n"
             "  Decompression-only:\n"
             "    vcf_rdfizer.py -m decompress -C ./results/out/sample/sample.nt.gz -o ./results\n"
+            "  Semantic VCF/RDF validation (expanded graph):\n"
+            "    vcf_rdfizer.py -m validation -i ./sample.vcf.gz --rdf ./results/sample/sample.nt.gz "
+            "--sample-representation expanded -o ./validation-results\n"
+            "  Semantic VCF/RDF validation (condensed graph):\n"
+            "    vcf_rdfizer.py -m validation -i ./cohort.vcf.gz --rdf ./results/cohort/cohort.nt.gz "
+            "--sample-representation condensed -o ./validation-results\n"
             "  Generate or regenerate an index for an existing HDT:\n"
             "    vcf_rdfizer.py -m index -H ./results/sample/sample.hdt -o ./results\n"
             "  Generate or regenerate an index for an existing COTTAS file:\n"
@@ -5628,20 +6044,20 @@ def main():
     parser.add_argument(
         "-m",
         "--mode",
-        choices=["full", "compress", "decompress", "tsv", "index"],
+        choices=["full", "compress", "decompress", "tsv", "index", "validation"],
         default="full",
-        help="Run mode: full pipeline, TSV benchmark, compression, decompression, or index-only regeneration",
+        help="Run mode: full pipeline, TSV benchmark, compression, decompression, validation, or index-only regeneration",
     )
     parser.add_argument(
         "-i",
         "--input",
         default=None,
-        help="VCF file or directory (required for --mode full and --mode tsv)",
+        help="VCF file or directory (required for --mode full/tsv; file required for --mode validation)",
     )
     parser.add_argument(
         "--rdf",
         default=None,
-        help="Input RDF file (.nt or .nt.gz) for --mode compress",
+        help="Input RDF file (.nt or .nt.gz) for --mode compress; .nt.gz required for --mode validation",
     )
     parser.add_argument(
         "-C",
@@ -5675,11 +6091,11 @@ def main():
     parser.add_argument(
         "--sample-representation",
         choices=sorted(SAMPLE_REPRESENTATION_CHOICES),
-        default="dense",
+        default="expanded",
         help=(
-            "Genotype representation for full mode: dense emits one SampleCall and "
+            "Genotype representation for full/validation mode: expanded emits one SampleCall and "
             "FORMAT value resource per sample; condensed emits a shared SampleSet and "
-            "one sample-ordered value vector per FORMAT key (default: dense)"
+            "one sample-ordered value vector per FORMAT key (default: expanded)"
         ),
     )
     parser.add_argument(
@@ -5798,6 +6214,17 @@ def main():
         action="store_true",
         help="Disable terminal compression/conversion progress updates",
     )
+    parser.add_argument(
+        "--validation-id",
+        default=None,
+        help="Validation result identifier (default: source VCF basename)",
+    )
+    parser.add_argument(
+        "--filter-oracle",
+        choices=("auto", "bcftools", "cyvcf2"),
+        default="auto",
+        help="FILTER oracle for validation mode (default: auto)",
+    )
     rdf_output_group = parser.add_mutually_exclusive_group()
     rdf_output_group.add_argument(
         "-R",
@@ -5827,7 +6254,7 @@ def main():
     metrics_root = out_root / "run_metrics"
     run_id = datetime.now().strftime("%Y%m%dT%H%M%S")
     timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-    metrics_dir = metrics_root / run_id
+    metrics_dir = None
     mode = args.mode
     spark_partitions = None
     chunk_target_bytes = DEFAULT_CHUNK_TARGET_BYTES
@@ -5941,6 +6368,31 @@ def main():
                 expected_prefixes,
             ) = resolve_input_snapshot(input_path)
             validate_mode_dirs([out_root, out_dir, tsv_dir, metrics_root])
+        elif mode == "validation":
+            if args.spark_partitions is not None:
+                raise ValueError("--spark-partitions is only valid in --mode full")
+            if args.input is None:
+                raise ValueError("--input is required in --mode validation")
+            validation_vcf_path = Path(args.input).expanduser().resolve()
+            if not validation_vcf_path.is_file() or not is_vcf_file(validation_vcf_path):
+                raise ValueError("Validation input must be an existing .vcf or .vcf.gz file")
+            if not args.rdf:
+                raise ValueError("--rdf is required in --mode validation")
+            validation_rdf_gzip_path = Path(args.rdf).expanduser().resolve()
+            if not validation_rdf_gzip_path.is_file() or not validation_rdf_gzip_path.name.endswith(".nt.gz"):
+                raise ValueError("Validation RDF input must be an existing .nt.gz file")
+            validation_id = args.validation_id or vcf_output_prefix(validation_vcf_path)
+            if not re.fullmatch(r"[A-Za-z0-9._-]+", validation_id):
+                raise ValueError("--validation-id may contain only letters, digits, dot, underscore, and hyphen")
+            validation_results_dir = out_dir / "validation" / validation_id
+            if validation_results_dir.exists() and (
+                not validation_results_dir.is_dir() or any(validation_results_dir.iterdir())
+            ):
+                raise ValueError(
+                    f"Refusing to overwrite existing validation results: {validation_results_dir}. "
+                    "Choose --validation-id or --out with a new destination."
+                )
+            validate_mode_dirs([out_root, out_dir, metrics_root])
         elif mode == "compress":
             if args.spark_partitions is not None:
                 raise ValueError("--spark-partitions is only valid in --mode full")
@@ -6054,7 +6506,65 @@ def main():
         eprint(f"Error: {exc}")
         return 2
 
+    if mode in {"full", "tsv"}:
+        metrics_source_paths = []
+        for container_input in container_inputs:
+            try:
+                relative_input = Path(container_input).relative_to("/data/in")
+            except ValueError:
+                relative_input = Path(container_input).name
+            metrics_source_paths.append((input_mount_dir / relative_input).resolve())
+        metrics_source_root = input_path
+    elif mode == "compress":
+        metrics_source_paths = [rdf_path]
+        metrics_source_root = rdf_path
+    elif mode == "validation":
+        metrics_source_paths = [validation_vcf_path, validation_rdf_gzip_path]
+        metrics_source_root = validation_vcf_path
+    elif mode == "index":
+        metrics_source_paths = [index_path]
+        metrics_source_root = index_path
+    else:
+        metrics_source_paths = [compressed_path]
+        metrics_source_root = compressed_path
+
+    source_label = metrics_run_label(metrics_source_paths, metrics_source_root)
+    metrics_dir = metrics_run_directory(metrics_root, source_label, run_id)
+    manifest_options = {
+        "requested_image": args.image,
+        "requested_image_version": args.image_version,
+        "sample_representation": args.sample_representation if mode == "full" else None,
+        "rdf_storage_mode": args.rdf_storage_mode if mode == "full" else None,
+        "compression_methods": (
+            full_methods if mode == "full" else methods if mode == "compress" else []
+        ),
+        "hdt_strategy": args.hdt_strategy if mode in {"full", "compress"} else None,
+        "chunk_target_bytes": chunk_target_bytes if mode in {"full", "compress"} else None,
+        "chunk_min_bytes": chunk_min_bytes if mode in {"full", "compress"} else None,
+        "chunk_max_bytes": chunk_max_bytes if mode in {"full", "compress"} else None,
+        "spark_partitions": spark_partitions if mode == "full" else None,
+        "index_format": index_format if mode == "index" else None,
+        "decompression_format": fmt if mode == "decompress" else None,
+        "validation_representation": args.sample_representation if mode == "validation" else None,
+        "validation_rdf_gzip": str(validation_rdf_gzip_path) if mode == "validation" else None,
+    }
+    try:
+        manifest_path = write_run_manifest(
+            metrics_dir=metrics_dir,
+            run_id=run_id,
+            timestamp=timestamp,
+            mode=mode,
+            source_label=source_label,
+            source_paths=metrics_source_paths,
+            out_root=out_root,
+            options=manifest_options,
+        )
+    except OSError as exc:
+        eprint(f"Error: unable to create metrics directory '{metrics_dir}': {exc}")
+        return 1
+
     print(f"{step1_label}: Validating inputs {success_symbol()}")
+    print(f"  Metrics: {metrics_dir}")
 
     if mode == "full" and args.estimate_size:
         # Optional coarse sizing estimate for disk-risk visibility.
@@ -6076,8 +6586,8 @@ def main():
                 "You may run out of space."
             )
 
-    wrapper_log_path = metrics_dir / "wrapper_logs" / f"{run_id}.log"
-    progress_log_path = metrics_dir / "progress.log"
+    wrapper_log_path = metrics_dir / "logs" / "wrapper.log"
+    progress_log_path = metrics_dir / "logs" / "progress.log"
     execution_started = time.perf_counter()
     global _COMMAND_LOGGER
     _COMMAND_LOGGER = CommandLogger(wrapper_log_path)
@@ -6103,6 +6613,11 @@ def main():
         try:
             image_ref, version_requested = resolve_image_ref(args.image, args.image_version)
             resolved_image_ref = image_ref
+            update_run_manifest(
+                metrics_dir,
+                resolved_image=image_ref,
+                image_version_requested=version_requested,
+            )
         except ValueError as exc:
             run_tracker.mark(f"Image resolution failed: {exc}")
             eprint(f"Error: {exc}")
@@ -6146,6 +6661,17 @@ def main():
             metrics_write_target = metrics_dir if metrics_dir.exists() else metrics_dir.parent
             writable_targets = [
                 (out_write_target, True),
+                (metrics_write_target, True),
+            ]
+        elif mode == "validation":
+            validation_write_target = (
+                validation_results_dir.parent
+                if validation_results_dir.parent.exists()
+                else validation_results_dir.parent.parent
+            )
+            metrics_write_target = metrics_dir if metrics_dir.exists() else metrics_dir.parent
+            writable_targets = [
+                (validation_write_target, True),
                 (metrics_write_target, True),
             ]
         elif mode == "index":
@@ -6242,6 +6768,20 @@ def main():
                 chunk_max_bytes=chunk_max_bytes,
                 wrapper_log_path=wrapper_log_path,
             )
+        if mode == "validation":
+            return run_validation_mode(
+                vcf_path=validation_vcf_path,
+                rdf_gzip_path=validation_rdf_gzip_path,
+                representation=args.sample_representation,
+                validation_id=validation_id,
+                results_dir=validation_results_dir,
+                metrics_dir=metrics_dir,
+                run_id=run_id,
+                timestamp=timestamp,
+                image_ref=image_ref,
+                filter_oracle=args.filter_oracle,
+                wrapper_log_path=wrapper_log_path,
+            )
         if mode == "index":
             return run_index_mode(
                 index_path=index_path,
@@ -6249,11 +6789,16 @@ def main():
                 metrics_dir=metrics_dir,
                 image_ref=image_ref,
                 wrapper_log_path=wrapper_log_path,
+                run_id=run_id,
+                timestamp=timestamp,
             )
         # Decompression-only mode.
         return run_decompress_mode(
             compressed_path=compressed_path,
             decompressed_out=decompressed_out,
+            metrics_dir=metrics_dir,
+            run_id=run_id,
+            timestamp=timestamp,
             image_ref=image_ref,
             wrapper_log_path=wrapper_log_path,
         )
@@ -6317,6 +6862,19 @@ def main():
         if run_tracker is not None:
             run_tracker.mark(f"Run finished (exit_code={result_code})")
             run_tracker.close()
+        try:
+            summary_path = write_run_summary(
+                metrics_dir=metrics_dir,
+                run_id=run_id,
+                timestamp=timestamp,
+                mode=mode,
+                exit_code=result_code,
+                elapsed_seconds=elapsed_seconds,
+                total_triples=total_triples,
+            )
+            print(f"Metrics summary: {summary_path}")
+        except OSError as exc:
+            eprint(f"Warning: failed to write metrics summary: {exc}")
 
     return result_code
 

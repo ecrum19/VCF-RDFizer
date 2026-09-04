@@ -15,13 +15,13 @@ This directory contains RML mappings used by the conversion pipeline.
     - `/data/tsv/sample_format_values.tsv`
   - For the built-in sample maps, `sample_calls.tsv` and
     `sample_format_values.tsv` are header-only compatibility sources. In
-    `--sample-representation dense`, the Python wrapper streams their equivalent
+    `--sample-representation expanded`, the Python wrapper streams their equivalent
     `SampleCall` and `FormatFieldValue` triples directly from `records.tsv`. In
     `--sample-representation condensed`, it instead streams `SampleSet`,
     `CohortCallMatrix`, and `FormatValueVector` resources. Only one emitter runs.
   - Custom mappings with additional consumers of either helper source retain
-    expanded TSV generation in dense mode. They are rejected in condensed mode
-    to prevent simultaneous dense and condensed output.
+    materialized TSV generation in expanded mode. They are rejected in condensed mode
+    to prevent simultaneous expanded and condensed output.
   - The Python wrapper rewrites these template paths per input VCF to:
     - `/data/tsv/<sample>.file_metadata.tsv`
     - `/data/tsv/<sample>.header_lines.tsv`
@@ -58,5 +58,5 @@ The default mapping is structured to align with those classes/properties, especi
 - `vcfr:VCFHeader` + `vcfr:hasHeaderLine`
 - `vcfr:VCFRecord` core fields (`chrom`, `pos`, `ref`, `alt`)
 - `vcfr:VariantCall` with raw call attributes
-- dense `vcfr:SampleCall` / `vcfr:FormatFieldValue` resources, or condensed
+- expanded `vcfr:SampleCall` / `vcfr:FormatFieldValue` resources, or condensed
   `vcfr:CohortCallMatrix` / `vcfr:FormatValueVector` resources

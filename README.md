@@ -15,6 +15,7 @@
 VCF-RDFizer is a Docker-first CLI wrapper for:
 1. VCF -> RDF (N-Triples) with RMLStreamer
 2. Optional RDF compression/decompression
+3. Semantic validation of a compressed RDF graph against its source VCF
 
 The VCF-RDFizer vocabulary is available at [https://w3id.org/vcf-rdfizer/vocab#](https://w3id.org/vcf-rdfizer/vocab#).
 
@@ -76,28 +77,48 @@ inside this directory.
 - `tsv`: VCF -> TSV only (benchmarking)
 - `compress`: compress an existing `.nt` or `.nt.gz`
 - `decompress`: decompress `.nt.gz`, `.nt.br`, `.hdt`, `.cottas`, `.cottas.gz`, or `.cottas.br`
+- `validation`: compare a source VCF with its `.nt.gz` RDF using six semantic SPARQL queries
 - `index`: only generate or regenerate the query index for an existing `.hdt` or `.cottas`
 
 In `full` mode with multiple VCF inputs, failures are isolated per input:
 - the run continues with remaining files
-- failed inputs are summarized in `run_metrics/<RUN_ID>/failed_inputs.csv`
+- failed inputs are summarized in `run_metrics/<INPUT_LABEL>__<RUN_ID>/reports/failed_inputs.csv`
 
 ## Main Flags (Most Used)
 
-- `-m, --mode {full,compress,decompress,tsv,index}`
+- `-m, --mode {full,compress,decompress,tsv,validation,index}`
 - `-o, --out` required output root directory
 - `--rdf-compression` final raw RDF codecs: `gzip`, `brotli`, or `none`
 - `--representations` queryable RDF outputs: `hdt`, `cottas`, or `none`
 - `--artifact-compression` packaging codecs for selected representations: `gzip`, `brotli`, or `none`
 - `--hdt-strategy {auto,partitioned,single}` HDT generation policy
 - `--chunk-target-bytes`, `--chunk-min-bytes`, `--chunk-max-bytes` shared record-safe chunk sizing
-- `--sample-representation {dense,condensed}` genotype graph shape (`dense` by default)
+- `--sample-representation {expanded,condensed}` genotype graph shape (`expanded` by default)
 - `-I, --image` Docker image repo (default `ecrum19/vcf-rdfizer`)
 - `-v, --image-version` Docker tag/version
 - `-b, --build` force Docker build
 - `-B, --no-build` fail if image not found
 - `--no-progress` disable terminal progress updates
 - `-h, --help` show full usage
+
+## Validation Mode
+
+Validate one source VCF against the `.nt.gz` aggregate from the same
+conversion. The aggregate is decompressed, parsed, and queried only inside the
+Docker container; raw N-Triples are removed before the container exits.
+
+```bash
+vcf-rdfizer --mode validation \
+  --input ./cohort.vcf.gz \
+  --rdf ./results/cohort/cohort.nt.gz \
+  --sample-representation condensed \
+  --out ./validation-results
+```
+
+Use `expanded` for the default graph shape and `condensed` for the vector-based
+cohort graph. Reports are written to `<out>/validation/<dataset-id>/`. See
+[Semantic VCF/RDF validation](docs/validation.md) for query definitions,
+preflight checks, result statuses, and cleanup evidence.
 
 ## Compression Plan
 
@@ -140,8 +161,8 @@ host filesystem.
 - `-i, --input` required VCF file or directory
 - `-r, --rules` mapping rules file (`.ttl`)
   - default: `rules/default_rules.ttl`
-- `--sample-representation {dense,condensed}` sample genotype representation
-  - `dense` (default): one `SampleCall` per record/sample and one `FormatFieldValue` per FORMAT key
+- `--sample-representation {expanded,condensed}` sample genotype representation
+  - `expanded` (default): one `SampleCall` per record/sample and one `FormatFieldValue` per FORMAT key
   - `condensed`: reusable file-level samples plus one ordered value vector per record/FORMAT key
 - `--rdf-storage-mode {plain,space-optimized}` required full-mode aggregate storage policy
   - `plain`: merge RMLStreamer parts into one uncompressed `.nt`
@@ -170,23 +191,27 @@ Full mode has exactly two explicit sample workflows. There is no automatic
 sample-count threshold, so the same command always produces the same graph
 shape and downstream consumers can select the contract they support.
 
-### Dense (default)
+See [Expanded and Condensed Knowledge Representations](docs/sample-representation-guide.md)
+for a detailed, worked explanation of the graph shapes, scaling behavior, and
+selection trade-offs.
 
-Use `--sample-representation dense` for single-sample and low-sample VCFs. It
+### Expanded (default)
+
+Use `--sample-representation expanded` for single-sample and low-sample VCFs. It
 preserves the original vocabulary model:
 
 - every record/sample pair is a `vcfr:SampleCall`;
 - every represented FORMAT slot is a `vcfr:FormatFieldValue`;
-- the VCF file declares `vcfr:representationProfile vcfr:DenseRepresentation`.
+- the VCF file declares `vcfr:representationProfile vcfr:ExpandedRepresentation`.
 
 With the default rules, these triples are appended directly from `records.tsv`;
-the large expanded helper TSVs are not materialized. The final graph is still
-dense and grows approximately with `variants × samples × FORMAT fields`.
+the large materialized helper TSVs are not created. The final graph is still
+expanded and grows approximately with `variants × samples × FORMAT fields`.
 
 ```bash
 vcf-rdfizer --mode full \
   --input ./small.vcf \
-  --sample-representation dense \
+  --sample-representation expanded \
   --rdf-storage-mode plain \
   --out ./results
 ```
@@ -222,18 +247,19 @@ vcf-rdfizer --mode full \
 ```
 
 The workflow resolver runs only one sample emitter. Condensed mode rejects
-custom mappings that consume expanded `sample_calls.tsv` or
-`sample_format_values.tsv`, because running those dense maps alongside the
-condensed emitter would create both representations and restore the semantic
+custom mappings that consume materialized `sample_calls.tsv` or
+`sample_format_values.tsv`, because running those helper-table mappings alongside
+the condensed emitter would create both representations and restore the semantic
 inflation this mode is designed to avoid. Remove those helper-table consumers
-or select dense mode. Custom rules with no helper-table consumers remain
+or select expanded mode. Custom rules with no helper-table consumers remain
 compatible with condensed emission.
 
 ## TSV Mode Flags
 
 - `-i, --input` required VCF file or directory
-- Outputs per-run benchmark summary in `run_metrics/<RUN_ID>/tsv_metrics.csv`
-- Raw TSV timing + artifact JSON per input in `run_metrics/<RUN_ID>/raw_metrics/tsv_*`
+- Outputs per-run benchmark summary in `run_metrics/<INPUT_LABEL>__<RUN_ID>/tsv_metrics.csv`
+- Writes container timing and structured TSV metrics under `timings/tsv/` and
+  `stages/tsv/` in that run directory
 
 ## Compression Mode Flags
 
@@ -435,7 +461,7 @@ vcf-rdfizer \
 
 `--mode index` is deliberately an in-place maintenance operation. It mounts
 only the directory containing the selected artifact and writes metrics under
-`<out>/run_metrics/<RUN_ID>/index_metrics.json`. HDT indexing creates a
+`<out>/run_metrics/<INPUT_LABEL>__<RUN_ID>/stages/index/`. HDT indexing creates a
 versioned sidecar beside the input. COTTAS indexing rewrites the existing
 `.cottas` file through a bounded streaming Parquet rewrite, keeping the data
 in the same artifact while rebuilding its embedded index. If the operation
@@ -483,7 +509,7 @@ itself remains readable; the run continues and the HDT can be repaired later
 with the standalone command above. If COTTAS generation/indexing cannot
 produce a usable artifact, COTTAS-specific outputs are skipped while the rest
 of the full pipeline continues. These warnings are printed in the run output
-and written to `run_metrics/<RUN_ID>/index_warnings.json`. The raw RDF is
+and written to `run_metrics/<INPUT_LABEL>__<RUN_ID>/reports/index_warnings.json`. The raw RDF is
 retained when a representation-dependent output was unavailable so the
 standalone index command or a later rerun has a recoverable source.
 
@@ -494,7 +520,7 @@ Given `--out ./results`:
 - final outputs:
   - `./results/<sample>/...`
 - per-run metrics/logs:
-  - `./results/run_metrics/<RUN_ID>/...`
+  - `./results/run_metrics/<INPUT_LABEL>__<RUN_ID>/...`
 - hidden intermediates:
   - `./results/.intermediate/tsv/`
 
@@ -524,16 +550,37 @@ because that file is the gzip artifact itself.
 
 ## Metrics
 
-For each run, VCF-RDFizer writes:
+Each invocation receives a descriptive metrics directory:
 
-- `run_metrics/<RUN_ID>/metrics.csv`
-- `run_metrics/<RUN_ID>/wrapper_execution_times.csv`
-- `run_metrics/<RUN_ID>/progress.log`
-- `run_metrics/<RUN_ID>/index_warnings.json` when full-run HDT/COTTAS index
-  generation was unsuccessful but the pipeline continued
-- `run_metrics/<RUN_ID>/index_metrics.json` for standalone HDT/COTTAS index mode
-- `run_metrics/<RUN_ID>/<format>_index_metrics.json` is also written for the
-  selected format (`hdt` or `cottas`) for compatibility/discovery
+```text
+run_metrics/<INPUT_LABEL>__<RUN_ID>/
+```
+
+`<INPUT_LABEL>` is the source filename without its recognized VCF/RDF or
+representation suffix (for example, `1000G_phase3_chr20`). A multi-file input
+directory uses a batch label such as `batch-vcf_data-4-inputs`. This makes a
+metrics directory recognizable without opening a timestamp-named folder.
+
+Within each run directory, VCF-RDFizer writes:
+
+- `run.json`: source identity, resolved input paths, requested workflow
+  configuration, and image selection
+- `summary.json`: final status, wrapper wall time, summary table rows, and an
+  index of every stage report and log
+- `metrics.csv`, `tsv_metrics.csv`, and `wrapper_execution_times.csv`: compact
+  analysis-ready tables when applicable
+- `logs/wrapper.log` and `logs/progress.log`
+- `timings/<stage>/...`: raw GNU `time -v` output from inside the relevant
+  Docker container
+- `stages/tsv/`, `stages/conversion/`, `stages/compression/`,
+  `stages/compression_operations/`, `stages/decompression/`, and
+  `stages/index/`: structured stage results. `compression_operations/`
+  preserves the underlying per-RDF operation and validation reports, while
+  `compression/` provides the final output-level summary.
+- `stages/partitioned/`: the full result handoff from the temporary
+  partitioned-compression container, including every chunk build, merge,
+  validation, workspace free-space sample, exit code, CPU time, and peak RSS
+- `reports/index_warnings.json` and `reports/failed_inputs.csv` when applicable
 
 Compression metrics now include per-method:
 
@@ -561,9 +608,11 @@ usable. Explicit standalone `--mode index` runs remain strict and return a
 failure status when regeneration fails.
 
 For partitioned HDT/COTTAS runs, the final method metric reports one
-sample-level result, while raw metrics also include a sample-scoped
-`__partitioned_compression__` artifact describing chunk conversion, merge
-rounds, and the generated chunk guide.
+sample-level result while `stages/partitioned/<sample>.json` retains the full
+container-stage history. It includes chunk conversion, merge strategy and
+rounds, validation, generated chunk plan, workspace free-space samples, CPU
+time, peak RSS, exit codes, and bounded stderr diagnostics. This report is
+preserved even when the temporary Docker volume is deleted after a failure.
 
 Metrics may use internal stage names such as `hdt_gzip` and `cottas_brotli`.
 These correspond to the public combination of `--representations` and
@@ -643,9 +692,9 @@ partitioned-compression metrics JSON for diagnostics. The temporary chunk
 files and guide are not retained as host files.
 
 For the default mapping, multi-sample VCF columns remain compact in
-`records.tsv`. In dense mode, canonical `SampleCall` and `FormatFieldValue`
+`records.tsv`. In expanded mode, canonical `SampleCall` and `FormatFieldValue`
 triples are streamed directly into the final `.nt` or `.nt.gz` aggregate rather
-than first writing expanded helper rows. In condensed mode, the same input pass
+than first writing materialized helper rows. In condensed mode, the same input pass
 emits shared samples, call matrices, and FORMAT vectors, avoiding both the
 helper-table multiplier and the per-sample RDF structural multiplier.
 
@@ -698,7 +747,7 @@ Docker volume capacity.
 Safe termination:
 
 - Press `Ctrl+C` to interrupt a run.
-- The wrapper exits with code `130`, writes progress to `run_metrics/<RUN_ID>/progress.log`, and performs best-effort cleanup of tracked intermediates.
+- The wrapper exits with code `130`, writes progress to `run_metrics/<INPUT_LABEL>__<RUN_ID>/logs/progress.log`, and performs best-effort cleanup of tracked intermediates.
 - Raw RDF cleanup on interrupt follows `--keep-rmlstreamer-rdf-output`:
   - with `--keep-rmlstreamer-rdf-output`, raw RDF files are preserved
   - without it, tracked raw RDF files are removed during interrupt cleanup

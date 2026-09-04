@@ -1,0 +1,16 @@
+PREFIX vcfr: <https://w3id.org/vcf-rdfizer/vocab#>
+
+SELECT
+  (COUNT(DISTINCT ?sampleCall) AS ?sampleCallCount)
+  (COUNT(DISTINCT ?sampleId) AS ?sampleIdCount)
+  (COUNT(DISTINCT ?gtValueNode) AS ?gtValueNodeCount)
+WHERE {
+  OPTIONAL {
+    ?sampleCall a vcfr:SampleCall ; vcfr:sampleId ?sampleId .
+    OPTIONAL {
+      ?sampleCall vcfr:hasFormatValue ?gtValueNode .
+      FILTER(STRENDS(STR(?gtValueNode), "/fmt/GT"))
+      ?gtValueNode vcfr:fieldValue ?gtLiteral .
+    }
+  }
+}

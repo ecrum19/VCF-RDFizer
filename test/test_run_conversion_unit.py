@@ -70,8 +70,8 @@ printf '<s> <p> <o> .\\n' > "$out/part-000"
             merged_nt = out_dir / "rdf" / "rdf.nt"
             self.assertTrue(merged_nt.exists())
             self.assertIn("<s> <p> <o> .", merged_nt.read_text())
-            self.assertTrue((metrics_dir / "conversion_time" / "rdf" / "run123.txt").exists())
-            self.assertTrue((metrics_dir / "conversion_metrics" / "rdf" / "run123.json").exists())
+            self.assertTrue((metrics_dir / "timings" / "conversion" / "rdf.txt").exists())
+            self.assertTrue((metrics_dir / "stages" / "conversion" / "rdf.json").exists())
 
             metrics_csv = metrics_dir / "metrics.csv"
             self.assertTrue(metrics_csv.exists())
@@ -602,7 +602,7 @@ printf '<s2> <p> <o2> .\\n' > "$out/part-00001"
             self.assertIn("<s1> <p> <o1> .", aggregate_text)
             self.assertIn("<s2> <p> <o2> .", aggregate_text)
             self.assertEqual(list((out_dir / "rdf").glob("part-*.nt")), [])
-            metrics = metrics_dir / "conversion_metrics" / "rdf" / "run-space.json"
+            metrics = metrics_dir / "stages" / "conversion" / "rdf.json"
             payload = json.loads(metrics.read_text())
             self.assertEqual(payload["rdf_storage"]["mode"], "space-optimized")
             self.assertTrue(payload["rdf_storage"]["compressed"])

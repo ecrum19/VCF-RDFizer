@@ -1,0 +1,9 @@
+PREFIX vcfr: <https://w3id.org/vcf-rdfizer/vocab#>
+PREFIX xsd:  <http://www.w3.org/2001/XMLSchema#>
+
+SELECT ?record ?pos
+WHERE {
+  ?record a vcfr:VCFRecord ; vcfr:pos ?pos .
+  FILTER(DATATYPE(?pos) != xsd:integer)
+}
+LIMIT 100

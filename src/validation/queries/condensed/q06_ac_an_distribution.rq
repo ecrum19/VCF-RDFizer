@@ -1,0 +1,33 @@
+PREFIX vcfr: <https://w3id.org/vcf-rdfizer/vocab#>
+
+SELECT ?an ?ac (COUNT(DISTINCT ?record) AS ?siteCount)
+WHERE {
+  {
+    SELECT ?record (SUM(?anContribution) AS ?an) (SUM(?acContribution) AS ?ac)
+    WHERE {
+      {
+        SELECT DISTINCT ?record ?sample ?gt
+        WHERE {
+          ?file a vcfr:VCFFile ; vcfr:hasRecord ?record ; vcfr:hasSampleSet ?sampleSet .
+          ?record a vcfr:VCFRecord ; vcfr:alt ?altLiteral ; vcfr:hasCall ?call .
+          FILTER(STR(?altLiteral) != "." && !CONTAINS(STR(?altLiteral), ","))
+          ?sampleSet vcfr:hasSample ?sample .
+          ?sample vcfr:sampleIndex ?sampleIndex .
+          ?call vcfr:hasCallMatrix ?matrix .
+          ?matrix vcfr:appliesToSampleSet ?sampleSet ; vcfr:hasFormatValueVector ?gtVector .
+          ?gtVector vcfr:declaredBy ?definition ; vcfr:encodedValues ?encoded .
+          ?definition vcfr:fieldId "GT" .
+          BIND(?sampleIndex - 1 AS ?zeroIndex)
+          BIND(REPLACE(STR(?encoded), CONCAT("^(?:[^\\t]*\\t){", STR(?zeroIndex), "}([^\\t]*).*$"), "$1") AS ?gtLiteral)
+          BIND(REPLACE(STR(?gtLiteral), "[|]", "/") AS ?gt)
+        }
+      }
+      BIND(IF(REGEX(?gt, "^[01]$"), 1, IF(REGEX(?gt, "^[01]/[01]$"), 2, 0)) AS ?anContribution)
+      BIND(IF(?gt = "1", 1, IF(?gt = "0/1" || ?gt = "1/0", 1, IF(?gt = "1/1", 2, 0))) AS ?acContribution)
+    }
+    GROUP BY ?record
+  }
+  FILTER(?an > 0)
+}
+GROUP BY ?an ?ac
+ORDER BY ?an ?ac

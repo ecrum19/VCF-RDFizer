@@ -59,11 +59,13 @@ cleanup_parts_dir() {
 trap cleanup_parts_dir EXIT
 PROGRESS_FILE=${PROGRESS_FILE:-}
 PROGRESS_READY=0
-TIME_LOG_DIR="$LOGDIR/conversion_time/${SAFE_OUT_NAME}"
-METRICS_JSON_DIR="$LOGDIR/conversion_metrics/${SAFE_OUT_NAME}"
+# One invocation owns its metrics directory, so output names—not timestamps—
+# make the stage files both stable and immediately discoverable.
+TIME_LOG_DIR="$LOGDIR/timings/conversion"
+METRICS_JSON_DIR="$LOGDIR/stages/conversion"
 mkdir -p "$TIME_LOG_DIR" "$METRICS_JSON_DIR"
-TIME_LOG="$TIME_LOG_DIR/${RUN_ID}.txt"
-METRICS_JSON="$METRICS_JSON_DIR/${RUN_ID}.json"
+TIME_LOG="$TIME_LOG_DIR/${SAFE_OUT_NAME}.txt"
+METRICS_JSON="$METRICS_JSON_DIR/${SAFE_OUT_NAME}.json"
 METRICS_CSV="$LOGDIR/metrics.csv"
 TSV_EXIT_CODE=${TSV_EXIT_CODE:-0}
 TSV_WALL_SECONDS=${TSV_WALL_SECONDS:-null}
