@@ -1,0 +1,15 @@
+PREFIX vcfr: <https://w3id.org/vcf-rdfizer/vocab#>
+
+# The condensed equivalent of the expanded per-cell FORMAT digest.
+#
+# Condensed graphs store one sample-ordered vector per record and FORMAT key,
+# so the vector IRI plus its encoded values carries the same information as the
+# per-cell nodes of the expanded shape.
+SELECT ?bucket (COUNT(*) AS ?valueCount)
+WHERE {
+  ?value a vcfr:FormatValueVector ; vcfr:encodedValues ?lexLiteral .
+  BIND(STR(?lexLiteral) AS ?lex)
+  BIND(SUBSTR(SHA256(CONCAT(STR(?value), "\u001F", STR(?lex))), 1, 2) AS ?bucket)
+}
+GROUP BY ?bucket
+ORDER BY ?bucket

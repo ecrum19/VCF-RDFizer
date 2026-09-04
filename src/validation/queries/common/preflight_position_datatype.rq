@@ -1,0 +1,21 @@
+PREFIX vcfr: <https://w3id.org/vcf-rdfizer/vocab#>
+PREFIX xsd:  <http://www.w3.org/2001/XMLSchema#>
+
+# POS must carry an integer datatype, never a plain string or a fractional type.
+#
+# The accepted set is the XSD integer family rather than xsd:integer alone,
+# because a store may canonicalise an integer literal to a narrower derived
+# type at index time. QLever, for instance, reports "100"^^xsd:integer as
+# xsd:int, which would otherwise make this preflight fail every run on that
+# engine while passing on Comunica. Anything outside the family - xsd:string,
+# xsd:decimal, xsd:double, a plain literal - is still reported.
+SELECT ?record ?pos (DATATYPE(?pos) AS ?datatype)
+WHERE {
+  ?record a vcfr:VCFRecord ; vcfr:pos ?pos .
+  FILTER(DATATYPE(?pos) NOT IN (
+    xsd:integer, xsd:int, xsd:long, xsd:short, xsd:byte,
+    xsd:nonNegativeInteger, xsd:positiveInteger,
+    xsd:unsignedLong, xsd:unsignedInt, xsd:unsignedShort, xsd:unsignedByte
+  ))
+}
+LIMIT 100

@@ -1,0 +1,70 @@
+name: validation-mutation
+
+# The mutation score is the measured coverage of the semantic validation suite.
+# The host job runs on every push because it needs no Docker; the container job
+# is the authority, replaying the same catalogue under the engines that ship in
+# the image.
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  mutation-score:
+    name: mutation score (rdflib)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pip rdflib
+
+      - name: Run the mutation harness
+        env:
+          VCF_RDFIZER_MUTATION_REPORT: mutation-score.json
+        run: python -m unittest test.test_validation_mutation_unit -v
+
+      - name: Report the score
+        run: |
+          python - <<'PY'
+          import json
+          report = json.load(open("mutation-score.json"))
+          print(f"mutation score: {report['detected']}/{report['total']} "
+                f"({report['score']:.0%})")
+          for item in report["mutations"]:
+              if not item["detected"]:
+                  print(f"  undetected: {item['id']} ({item['representation']}) "
+                        f"- {item['knownUndetected']}")
+          PY
+
+      - name: Upload the score
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-score
+          path: mutation-score.json
+
+  engine-agreement:
+    name: cross-engine query agreement
+    runs-on: ubuntu-latest
+    # The image build is slow, so this gates merges rather than every push.
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build the image
+        run: docker build -t vcf-rdfizer:mutation-ci .
+
+      - name: Every validation query must agree across Comunica and QLever
+        run: |
+          docker run --rm -v "$PWD:/repo:ro" vcf-rdfizer:mutation-ci \
+            /opt/pycottas-venv/bin/python /repo/test/cross_engine_agreement.py

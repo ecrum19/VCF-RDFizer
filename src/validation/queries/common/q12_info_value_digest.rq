@@ -1,0 +1,17 @@
+PREFIX vcfr: <https://w3id.org/vcf-rdfizer/vocab#>
+
+# Structured INFO values, bound to the node that identifies record and key.
+#
+# The census counts INFO value nodes and the record digest covers the raw INFO
+# string, but neither notices a structured value that disagrees with the key it
+# was parsed from. Hashing the value together with its own IRI closes that, and
+# because the result is a histogram it needs no ordering guarantee from the
+# engine - GROUP_CONCAT would not be portable here.
+SELECT ?bucket (COUNT(*) AS ?valueCount)
+WHERE {
+  ?value a vcfr:InfoFieldValue ; vcfr:fieldValue ?lexLiteral .
+  BIND(STR(?lexLiteral) AS ?lex)
+  BIND(SUBSTR(SHA256(CONCAT(STR(?value), "\u001F", STR(?lex))), 1, 2) AS ?bucket)
+}
+GROUP BY ?bucket
+ORDER BY ?bucket

@@ -24,7 +24,9 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
   "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
-dependencies = []
+dependencies = [
+  "rich>=13.7.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/ecrum19/VCF-RDFizer"
@@ -32,15 +34,19 @@ Issues = "https://github.com/ecrum19/VCF-RDFizer/issues"
 
 [project.scripts]
 vcf-rdfizer = "vcf_rdfizer:main"
+vcf-rdfizer-rules = "vcf_rdfizer_rules:main"
 
 [project.optional-dependencies]
 dev = [
   "build>=1.2.2",
   "twine>=5.1.1",
+  # Test-only: an in-process SPARQL engine for the validation mutation harness,
+  # so it needs no Docker. The suite skips those tests when it is absent.
+  "rdflib>=7.0.0",
 ]
 
 [tool.setuptools]
-py-modules = ["vcf_rdfizer"]
+py-modules = ["vcf_rdfizer", "vcf_rdfizer_gzip", "vcf_rdfizer_rules"]
 packages = ["vcf_rdfizer_data", "vcf_rdfizer_data.rules"]
 include-package-data = true
 

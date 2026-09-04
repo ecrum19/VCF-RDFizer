@@ -1,0 +1,16 @@
+PREFIX vcfr: <https://w3id.org/vcf-rdfizer/vocab#>
+
+SELECT
+  (COUNT(DISTINCT ?sample) AS ?sampleCount)
+  (COUNT(DISTINCT ?sampleId) AS ?sampleIdCount)
+  (COUNT(DISTINCT ?gtVector) AS ?gtVectorCount)
+WHERE {
+  OPTIONAL {
+    ?sampleSet a vcfr:SampleSet ; vcfr:hasSample ?sample .
+    ?sample vcfr:sampleName ?sampleId .
+  }
+  OPTIONAL {
+    ?gtVector a vcfr:FormatValueVector ; vcfr:declaredBy ?definition ; vcfr:encodedValues ?encoded .
+    ?definition vcfr:fieldId "GT" .
+  }
+}

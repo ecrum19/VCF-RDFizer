@@ -1,0 +1,9 @@
+PREFIX vcfr: <https://w3id.org/vcf-rdfizer/vocab#>
+
+SELECT ?s ?p ?o (DATATYPE(?o) AS ?datatype)
+WHERE {
+  ?s ?p ?o .
+  FILTER(ISLITERAL(?o) && STR(?o) = ".")
+  FILTER(DATATYPE(?o) != vcfr:Null)
+}
+LIMIT 100

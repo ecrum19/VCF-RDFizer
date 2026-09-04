@@ -1,0 +1,10 @@
+PREFIX vcfr: <https://w3id.org/vcf-rdfizer/vocab#>
+PREFIX xsd:  <http://www.w3.org/2001/XMLSchema#>
+
+SELECT ?chrom ?windowIndex (COUNT(DISTINCT ?record) AS ?recordCount)
+WHERE {
+  ?record a vcfr:VCFRecord ; vcfr:chrom ?chrom ; vcfr:pos ?pos .
+  BIND(FLOOR((xsd:integer(?pos) - 1) / 1000000) AS ?windowIndex)
+}
+GROUP BY ?chrom ?windowIndex
+ORDER BY ?chrom ?windowIndex

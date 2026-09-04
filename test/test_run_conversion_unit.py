@@ -60,6 +60,7 @@ printf '<s> <p> <o> .\\n' > "$out/part-000"
                     "LOGDIR": str(metrics_dir),
                     "RUN_ID": "run123",
                     "TIMESTAMP": "2026-01-01T00:00:00",
+                    "PROGRESS_FILE": str(metrics_dir / ".progress" / "rml.jsonl"),
                 }
             )
 
@@ -69,8 +70,8 @@ printf '<s> <p> <o> .\\n' > "$out/part-000"
             merged_nt = out_dir / "rdf" / "rdf.nt"
             self.assertTrue(merged_nt.exists())
             self.assertIn("<s> <p> <o> .", merged_nt.read_text())
-            self.assertTrue((metrics_dir / "conversion_time" / "rdf" / "run123.txt").exists())
-            self.assertTrue((metrics_dir / "conversion_metrics" / "rdf" / "run123.json").exists())
+            self.assertTrue((metrics_dir / "timings" / "conversion" / "rdf.txt").exists())
+            self.assertTrue((metrics_dir / "stages" / "conversion" / "rdf.json").exists())
 
             metrics_csv = metrics_dir / "metrics.csv"
             self.assertTrue(metrics_csv.exists())
@@ -82,6 +83,15 @@ printf '<s> <p> <o> .\\n' > "$out/part-000"
             self.assertEqual(row["run_id"], "run123")
             self.assertEqual(row["output_name"], "rdf")
             self.assertEqual(row["exit_code_java"], "0")
+
+            progress_path = metrics_dir / ".progress" / "rml.jsonl"
+            progress_events = [
+                json.loads(line) for line in progress_path.read_text().splitlines()
+            ]
+            self.assertEqual(progress_events[0]["stage"], "rmlstreamer")
+            self.assertEqual(progress_events[0]["phase"], "started")
+            self.assertEqual(progress_events[-1]["stage"], "rdf-aggregate")
+            self.assertEqual(progress_events[-1]["phase"], "complete")
 
     def test_run_conversion_preserves_unrelated_files_in_existing_output_directory(self):
         """RMLStreamer parts do not require deleting the sample output directory."""
@@ -592,7 +602,7 @@ printf '<s2> <p> <o2> .\\n' > "$out/part-00001"
             self.assertIn("<s1> <p> <o1> .", aggregate_text)
             self.assertIn("<s2> <p> <o2> .", aggregate_text)
             self.assertEqual(list((out_dir / "rdf").glob("part-*.nt")), [])
-            metrics = metrics_dir / "conversion_metrics" / "rdf" / "run-space.json"
+            metrics = metrics_dir / "stages" / "conversion" / "rdf.json"
             payload = json.loads(metrics.read_text())
             self.assertEqual(payload["rdf_storage"]["mode"], "space-optimized")
             self.assertTrue(payload["rdf_storage"]["compressed"])

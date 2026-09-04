@@ -6,16 +6,56 @@ This module orchestrates the end-to-end Dockerized pipeline:
 2) convert VCF -> TSV
 3) run RMLStreamer conversion
 4) run selected compression/decompression operations
-5) persist run and compression metrics
+5) optionally regenerate the query index for an existing HDT or COTTAS file
+6) persist run and compression metrics
 
 The implementation is intentionally split into small helpers so failures can be
 diagnosed at a specific stage and future workflow changes stay localized.
+
+Division of labour
+------------------
+This file is the *host* side and stays free of heavy data processing: it plans
+work, launches containers, and reads their reports back. Everything that walks
+the RDF itself lives in the image (``src/``):
+
+- ``src/vcf_as_tsv.sh``             VCF -> per-input records/header/metadata TSV
+- ``src/run_conversion.sh``         RMLStreamer run + part merge into one aggregate
+- ``src/partitioned_compression.py``  record-safe chunking, HDT/COTTAS merge
+- ``src/cottas_tool.py``            COTTAS convert/merge/reindex/decompress
+- ``src/validate_compression.py``   round-trip triple-count check per artifact
+- ``src/validation/``               semantic VCF-vs-RDF SPARQL validation
+
+The one deliberate exception is genotype RDF emission (see the "Multi-sample
+(genotype) representations" section): doing it through RML would require
+materializing variants x samples helper tables first.
+
+Section map (search for the banner comments)
+--------------------------------------------
+Command execution and Docker environment helpers .. `run`, `CommandLogger`,
+    `ProgressSession`, `check_docker`
+Input discovery and naming helpers ................ `resolve_input_snapshot`
+General formatting and file-system utility helpers  `format_bytes`, `ensure_dir`
+Triple counting and run-level metrics reporting ... `count_triples_in_nt_files`
+Console summaries, artifact naming, ... ........... `planned_output_paths`
+Destructive filesystem operations ................. `remove_*_with_docker_fallback`
+Preflight input collection and disk estimation .... `estimate_pipeline_sizes`
+Per-input TSV discovery ........................... `discover_tsv_triplets`
+Multi-sample (genotype) representations ........... `append_expanded_sample_rdf`,
+    `append_condensed_sample_rdf`, `SampleRecordStream`
+RML mapping rendering and Docker image resolution . `render_rules_for_triplet`
+Compression plan parsing and strategy selection ... `build_compression_methods`
+Run metrics layout: naming, manifest, and summary . `write_run_manifest`
+Metrics serialization helpers ..................... `update_metrics_csv_*`
+Mode runners ...................................... `run_full_mode`,
+    `run_tsv_mode`, `run_compress_mode`, `run_decompress_mode`,
+    `run_index_mode`, `run_validation_mode`, `main`
 """
 
 import argparse
 import csv
 import gzip
 import importlib.resources as importlib_resources
+import io
 import json
 import os
 import re
@@ -25,13 +65,46 @@ import signal
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote_plus
+
+try:
+    import vcf_rdfizer_gzip
+except ImportError:  # pragma: no cover - shipped alongside this module
+    vcf_rdfizer_gzip = None
+
+try:
+    from rich.console import Console
+    from rich.progress import (
+        BarColumn,
+        Progress,
+        SpinnerColumn,
+        TaskProgressColumn,
+        TextColumn,
+        TimeElapsedColumn,
+        TimeRemainingColumn,
+    )
+except ImportError:  # pragma: no cover - package metadata installs Rich
+    Console = None
+    Progress = None
+    BarColumn = None
+    SpinnerColumn = None
+    TaskProgressColumn = None
+    TextColumn = None
+    TimeElapsedColumn = None
+    TimeRemainingColumn = None
 
 
 RMLSTREAMER_JAR_CONTAINER = "/opt/rmlstreamer/RMLStreamer-v2.5.0-standalone.jar"
 _COMMAND_LOGGER = None
 _DOCKER_USE_SUDO = False
+_ACTIVE_PROGRESS = None
+_PROGRESS_ALLOWED = True
+_PROGRESS_EVENTS_ALLOWED = True
+_QUIET = False
+PROGRESS_POLL_INTERVAL_SECONDS = 0.25
 
 COMPRESSED_VCF_EXPANSION_FACTOR = 5.0
 TSV_OVERHEAD_FACTOR = 1.10
@@ -83,6 +156,24 @@ TSV_BENCHMARK_HEADER = [
 ]
 
 COMPRESSION_COMMON_COLUMNS = ["combined_rdf_size_bytes", "compression_methods"]
+
+VALIDATION_METRICS_COLUMNS = [
+    "validation_status",
+    "validation_exit_code",
+    "validation_wall_seconds",
+    "validation_user_seconds",
+    "validation_sys_seconds",
+    "validation_max_rss_kb",
+    "validation_results_path",
+    "validation_rdf_path",
+    # Benchmark columns. The oracle and the engine compute the same answers
+    # from the same data, so these two are directly comparable; the engine
+    # column is a "|"-joined list when several engines ran.
+    "validation_engines",
+    "validation_oracle_seconds",
+    "validation_engine_query_seconds",
+    "validation_engine_setup_seconds",
+]
 
 COMPRESSION_METHOD_COLUMNS = {
     "gzip": [
@@ -184,7 +275,109 @@ DEFAULT_CHUNK_TARGET_BYTES = 512 * 1024 * 1024
 DEFAULT_CHUNK_MIN_BYTES = 128 * 1024 * 1024
 DEFAULT_CHUNK_MAX_BYTES = 1024 * 1024 * 1024
 HDT_INDEX_HELPER_CONTAINER = "/opt/vcf-rdfizer/ensure_hdt_index.sh"
+COTTAS_TOOL_CONTAINER = "/opt/vcf-rdfizer/cottas_tool.py"
 PARTITIONED_COMPRESSION_RUNNER_CONTAINER = "/opt/vcf-rdfizer/partitioned_compression.py"
+SAMPLE_CALLS_HEADER = [
+    "SOURCE_FILE",
+    "ROW_ID",
+    "SAMPLE_INDEX",
+    "SAMPLE_ID",
+    "SAMPLE_URI_ID",
+    "SAMPLE_PAYLOAD",
+]
+SAMPLE_FORMAT_HEADER = [
+    "SOURCE_FILE",
+    "ROW_ID",
+    "SAMPLE_INDEX",
+    "SAMPLE_ID",
+    "SAMPLE_URI_ID",
+    "FORMAT_INDEX",
+    "FORMAT_KEY",
+    "FORMAT_VALUE",
+]
+CANONICAL_SAMPLE_RULE_MARKERS = (
+    "<#VariantCallToSampleLinkMap>",
+    "<#SampleCallMap>",
+    "<#SampleCallToFormatValueLinkMap>",
+    "<#FormatFieldValueMap>",
+)
+CANONICAL_SAMPLE_RULE_FRAGMENTS = (
+    'rr:template "file://{SOURCE_FILE}#call/{ROW_ID}"',
+    "rr:predicate vcfr:hasSampleCall",
+    'rr:template "file://{SOURCE_FILE}#sample/{ROW_ID}/{SAMPLE_URI_ID}"',
+    "rr:class vcfr:SampleCall",
+    "rr:predicate vcfr:sampleId",
+    'rml:reference "SAMPLE_ID"',
+    "rr:predicate vcfr:hasFormatValue",
+    'rr:template "file://{SOURCE_FILE}#sample/{ROW_ID}/{SAMPLE_URI_ID}/fmt/{FORMAT_KEY}"',
+    "rr:class vcfr:FormatFieldValue",
+    "rr:predicate vcfr:fieldValue",
+    'rml:reference "FORMAT_VALUE"',
+)
+VCFR_NAMESPACE = "https://w3id.org/vcf-rdfizer/vocab#"
+RDF_TYPE_URI = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+XSD_POSITIVE_INTEGER_URI = "http://www.w3.org/2001/XMLSchema#positiveInteger"
+SAMPLE_RDF_BUFFER_BYTES = 8 * 1024 * 1024
+# An N-Triples subject is always an IRI reference or a blank node label, so a
+# line starting with one of these bytes and ending in " ." is a statement.
+_NTRIPLES_SUBJECT_STARTS = (b"<", b"_")
+SAMPLE_REPRESENTATION_CHOICES = {"expanded", "condensed"}
+# How the INFO column is represented. "raw" is the historical behaviour (an
+# opaque vcfr:infoRaw string). "structured" additionally emits one
+# vcfr:InfoFieldValue per record and key, which is what makes INFO queryable.
+INFO_REPRESENTATION_CHOICES = ("raw", "structured")
+DEFAULT_INFO_REPRESENTATION = "structured"
+# Semantic validation accepts any artifact the pipeline can produce. Anything
+# that is not already plain N-Triples is decoded inside the container first.
+VALIDATION_RDF_SUFFIXES = (
+    (".nt.gz", "nt.gz"),
+    (".nt.br", "nt.br"),
+    (".nt", "nt"),
+    (".cottas.gz", "cottas.gz"),
+    (".cottas.br", "cottas.br"),
+    (".cottas", "cottas"),
+    (".hdt", "hdt"),
+)
+VALIDATION_ENGINE_CHOICES = ("comunica", "qlever", "hdt", "cottas")
+DEFAULT_VALIDATION_ENGINE = "comunica"
+
+
+def parse_validation_engines(raw: str) -> list[str]:
+    """Parse --validation-engine into an ordered, de-duplicated engine list.
+
+    Several engines may be requested in one run. Each answers the whole query
+    set, so their results are cross-checked and their timings are directly
+    comparable. The first is the primary, whose reports keep the single-engine
+    layout that existing consumers read.
+    """
+    value = (raw or "").strip()
+    if value == "all":
+        return list(VALIDATION_ENGINE_CHOICES)
+    engines: list[str] = []
+    for token in value.split(","):
+        engine = token.strip()
+        if not engine:
+            continue
+        if engine not in VALIDATION_ENGINE_CHOICES:
+            allowed = ",".join(VALIDATION_ENGINE_CHOICES)
+            raise ValueError(
+                f"Unsupported value '{engine}' for --validation-engine. "
+                f"Use {allowed}, or all."
+            )
+        if engine not in engines:
+            engines.append(engine)
+    if not engines:
+        raise ValueError("--validation-engine requires at least one engine")
+    return engines
+# Which produced artifacts a full run should semantically validate. "aggregate"
+# is the .nt/.nt.gz RMLStreamer output; the others are the selected
+# representations, each decoded back to N-Triples before it is checked.
+VALIDATION_TARGET_CHOICES = ("aggregate", "hdt", "cottas")
+DEFAULT_VALIDATION_TARGETS = "aggregate"
+# This is an internal rules-compatibility value, not a third public
+# representation. It means that custom helper TSV rows must be materialized.
+SAMPLE_HELPER_STRATEGY_MATERIALIZED = "expanded"
+METRICS_LAYOUT_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -206,17 +399,29 @@ class CommandLogger:
             self._handle.write(f"cwd={cwd}\n")
         self._handle.flush()
 
-        result = subprocess.run(
-            cmd,
-            cwd=cwd,
-            env=env,
-            stdout=self._handle,
-            stderr=self._handle,
-            text=True,
-        )
-        self._handle.write(f"[exit {result.returncode}]\n")
+        if _ACTIVE_PROGRESS is not None and _ACTIVE_PROGRESS.enabled:
+            process = subprocess.Popen(
+                cmd,
+                cwd=cwd,
+                env=env,
+                stdout=self._handle,
+                stderr=self._handle,
+                text=True,
+            )
+            exit_code = _ACTIVE_PROGRESS.wait_for_process(process)
+        else:
+            result = subprocess.run(
+                cmd,
+                cwd=cwd,
+                env=env,
+                stdout=self._handle,
+                stderr=self._handle,
+                text=True,
+            )
+            exit_code = result.returncode
+        self._handle.write(f"[exit {exit_code}]\n")
         self._handle.flush()
-        return result.returncode
+        return exit_code
 
     def close(self):
         if not self._handle.closed:
@@ -242,6 +447,230 @@ def ui_symbol(symbol: str, fallback: str) -> str:
 def success_symbol() -> str:
     """Unicode checkmark with ASCII fallback for Windows cp1252 consoles."""
     return ui_symbol("✅", "[ok]")
+
+
+def progress_ui_enabled() -> bool:
+    """Return whether transient Rich progress output should be displayed."""
+    if not _PROGRESS_ALLOWED or Progress is None or Console is None:
+        return False
+    if os.environ.get("VCF_RDFIZER_NO_PROGRESS"):
+        return False
+    if os.environ.get("CI"):
+        return False
+    stream = getattr(sys, "stderr", None)
+    isatty = getattr(stream, "isatty", None)
+    return bool(callable(isatty) and isatty())
+
+
+def progress_events_enabled() -> bool:
+    """Return whether progress sidecars should be consumed at all.
+
+    Rich needs a TTY to redraw a spinner, but compression is often launched
+    through ``tee``, a scheduler, or a remote shell with redirected stderr.
+    Keep collecting the same low-volume events in those cases so
+    ``ProgressSession`` can render readable line-based status instead.
+    """
+    if not _PROGRESS_EVENTS_ALLOWED or (not _PROGRESS_ALLOWED and not _QUIET):
+        return False
+    if os.environ.get("VCF_RDFIZER_NO_PROGRESS"):
+        return False
+    return not os.environ.get("CI")
+
+
+class ProgressSession:
+    """Render low-volume progress events from one Docker operation with Rich.
+
+    The container writes newline-delimited JSON to ``path``. The host polls the
+    small sidecar while the Docker process runs, keeping command logs and
+    binary subprocess stdout separate from terminal UI output.
+    """
+
+    def __init__(self, path: Path | None, label: str):
+        self.path = path
+        self.label = label
+        self.enabled = progress_events_enabled()
+        # ``--quiet`` keeps producing/consuming sidecar events so the normal
+        # progress bookkeeping remains available to logs and orchestration,
+        # but disables every terminal rendering path.
+        self.render_enabled = self.enabled and _PROGRESS_ALLOWED
+        self.rich_enabled = self.render_enabled and progress_ui_enabled()
+        self._offset = 0
+        self._progress = None
+        self._starter_task = None
+        self._tasks: dict[str, int] = {}
+        self._previous = None
+        self._plain_event_states: dict[str, tuple[str, object, object]] = {}
+
+    def __enter__(self):
+        global _ACTIVE_PROGRESS
+        self._previous = _ACTIVE_PROGRESS
+        _ACTIVE_PROGRESS = self
+        if self.path is not None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.unlink(missing_ok=True)
+
+        if not self.render_enabled:
+            return self
+        if not self.rich_enabled:
+            eprint(f"{self.label}: started")
+            return self
+
+        console = Console(stderr=True, highlight=False)
+        self._progress = Progress(
+            SpinnerColumn(),
+            TextColumn("{task.description}", style="progress.description", markup=False),
+            BarColumn(),
+            TaskProgressColumn(),
+            TextColumn("{task.fields[detail]}", markup=False),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+            refresh_per_second=8,
+            transient=True,
+            auto_refresh=False,
+        )
+        self._starter_task = self._progress.add_task(
+            self.label,
+            total=None,
+            detail="starting",
+        )
+        self._progress.start()
+        return self
+
+    @staticmethod
+    def _number(value):
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float)):
+            return value
+        if isinstance(value, str):
+            try:
+                return int(value)
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _detail(event: dict) -> str:
+        completed = ProgressSession._number(event.get("completed"))
+        unit = event.get("unit")
+        if completed is None:
+            detail = ""
+        elif unit == "bytes":
+            detail = f"{format_bytes(int(completed))}"
+        elif unit == "triples":
+            detail = f"{int(completed):,} triples"
+        elif unit == "chunks":
+            detail = f"{int(completed):,} chunks"
+        elif unit == "parts":
+            detail = f"{int(completed):,} parts"
+        elif unit == "queries":
+            detail = f"{int(completed):,} queries"
+        else:
+            detail = f"{int(completed):,}"
+
+        parts = ProgressSession._number(event.get("parts"))
+        if parts is not None and unit != "parts":
+            detail = f"{detail} · {int(parts):,} parts" if detail else f"{int(parts):,} parts"
+        extra = event.get("detail")
+        if extra:
+            detail = f"{detail} · {extra}" if detail else str(extra)
+        return detail
+
+    def _update_event(self, event: dict):
+        if not self.render_enabled:
+            return
+        stage = str(event.get("stage") or "work")
+        phase = str(event.get("phase") or "working")
+        if self._progress is None:
+            # A redirected terminal cannot host a redrawable Rich spinner.
+            # Emit compact, state-changing lines instead so lengthy
+            # compression still visibly advances in a terminal or log.
+            completed = event.get("completed")
+            total = event.get("total")
+            state = (phase, completed, total)
+            if self._plain_event_states.get(stage) != state:
+                self._plain_event_states[stage] = state
+                detail = self._detail(event)
+                suffix = f" — {detail}" if detail else ""
+                eprint(f"  {self.label}: {stage} {phase}{suffix}")
+            return
+        task_id = self._tasks.get(stage)
+        if task_id is None:
+            if self._starter_task is not None:
+                self._progress.remove_task(self._starter_task)
+                self._starter_task = None
+            total = self._number(event.get("total"))
+            task_id = self._progress.add_task(
+                f"{stage}: {phase}",
+                total=total if total is not None else None,
+                detail=self._detail(event),
+            )
+            self._tasks[stage] = task_id
+            return
+
+        update = {
+            "description": f"{stage}: {phase}",
+            "detail": self._detail(event),
+        }
+        if "total" in event:
+            total = self._number(event.get("total"))
+            update["total"] = total if total is not None else None
+        completed = self._number(event.get("completed"))
+        if completed is not None:
+            update["completed"] = completed
+        self._progress.update(task_id, **update)
+
+    def poll_events(self):
+        """Consume complete JSONL events without retaining the event stream."""
+        if not self.enabled or self.path is None or not self.path.exists():
+            return
+        try:
+            with self.path.open("rb") as handle:
+                handle.seek(self._offset)
+                data = handle.read()
+        except OSError:
+            return
+
+        consumed = 0
+        for raw_line in data.splitlines(keepends=True):
+            if not raw_line.endswith(b"\n"):
+                break
+            consumed += len(raw_line)
+            try:
+                event = json.loads(raw_line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if isinstance(event, dict):
+                self._update_event(event)
+        self._offset += consumed
+
+    def wait_for_process(self, process):
+        """Wait while polling progress, without a second monitor thread."""
+        while process.poll() is None:
+            self.poll_events()
+            if self._progress is not None:
+                self._progress.refresh()
+            time.sleep(PROGRESS_POLL_INTERVAL_SECONDS)
+        self.poll_events()
+        if self._progress is not None:
+            self._progress.refresh()
+        return process.returncode
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        global _ACTIVE_PROGRESS
+        self.poll_events()
+        if self._progress is not None:
+            self._progress.stop()
+        elif self.render_enabled:
+            eprint(f"{self.label}: finished")
+        if self.path is not None:
+            try:
+                self.path.unlink()
+            except OSError:
+                pass
+        _ACTIVE_PROGRESS = self._previous
+        return False
 
 
 class RunTracker:
@@ -354,7 +783,25 @@ def run(cmd, cwd=None, env=None):
     """
     if _COMMAND_LOGGER is not None:
         return _COMMAND_LOGGER.run(cmd, cwd=cwd, env=env)
-    return subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True).returncode
+    if _ACTIVE_PROGRESS is not None and _ACTIVE_PROGRESS.enabled:
+        process = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return _ACTIVE_PROGRESS.wait_for_process(process)
+    # Only the exit code is returned, so discard the streams at the fd level.
+    # `capture_output=True` would buffer an entire container's output in memory
+    # before throwing it away.
+    return subprocess.run(
+        cmd,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ).returncode
 
 
 def docker_cmd_prefix(*, use_sudo: bool | None = None):
@@ -377,6 +824,28 @@ def docker_run_base(*, as_user: bool = True):
     if callable(getuid) and callable(getgid):
         base.extend(["--user", f"{getuid()}:{getgid()}"])
     return base
+
+
+def docker_hdt_index_env_args() -> list[str]:
+    """Forward an optional host-side hdtc memory budget into Docker."""
+    memory_limit = os.environ.get("HDT_INDEX_MEMORY_LIMIT", "").strip()
+    if not memory_limit:
+        return []
+    return ["-e", f"HDT_INDEX_MEMORY_LIMIT={memory_limit}"]
+
+
+def docker_hdt_merge_env_args() -> list[str]:
+    """Forward an optional host-side hdtc merge memory budget into Docker."""
+    memory_limit = os.environ.get("HDT_MERGE_MEMORY_LIMIT", "").strip()
+    if not memory_limit:
+        return []
+    return ["-e", f"HDT_MERGE_MEMORY_LIMIT={memory_limit}"]
+
+
+def docker_cottas_merge_env_args() -> list[str]:
+    """Forward an optional bounded COTTAS streaming-merge batch size."""
+    batch_rows = os.environ.get("COTTAS_MERGE_BATCH_ROWS", "").strip()
+    return ["-e", f"COTTAS_MERGE_BATCH_ROWS={batch_rows}"] if batch_rows else []
 
 
 def _can_write_dir(path: Path) -> bool:
@@ -519,28 +988,6 @@ def list_vcfs_in_dir(path: Path):
     return files
 
 
-def resolve_input(input_path: Path):
-    """Legacy input resolver (single mount + container input path)."""
-    if not input_path.exists():
-        raise ValueError(f"Input path not found: {input_path}")
-
-    if input_path.is_file():
-        if not is_vcf_file(input_path):
-            raise ValueError("Input file must end with .vcf or .vcf.gz")
-        input_dir = input_path.parent
-        container_input = f"/data/in/{input_path.name}"
-        return input_dir, container_input
-
-    if input_path.is_dir():
-        vcfs = list_vcfs_in_dir(input_path)
-        if not vcfs:
-            raise ValueError("No .vcf or .vcf.gz files found in the input directory")
-        container_input = "/data/in"
-        return input_path, container_input
-
-    raise ValueError("Input path must be a file or a directory")
-
-
 def vcf_output_prefix(path: Path) -> str:
     """Derive stable sample prefix from VCF filename."""
     name = path.name
@@ -635,7 +1082,7 @@ def file_size_bytes(path: Path):
 
 
 def find_hdt_index_sidecar(hdt_path: Path) -> Path | None:
-    """Return HDT Java's non-empty versioned index sidecar."""
+    """Return the non-empty canonical HDT versioned index sidecar."""
     for candidate in sorted(hdt_path.parent.glob(f"{hdt_path.name}.index.*")):
         size = file_size_bytes(candidate)
         if size is not None and size > 0:
@@ -643,261 +1090,54 @@ def find_hdt_index_sidecar(hdt_path: Path) -> Path | None:
     return None
 
 
-def write_nt_chunk(chunk_path: Path, source_paths: list[Path]) -> int:
-    """Concatenate one or more RDF files into a chunk-local `.nt` input."""
-    ensure_dir(chunk_path.parent)
-    total_bytes = 0
-    with chunk_path.open("w", encoding="utf-8") as out_handle:
-        for source_path in source_paths:
-            with source_path.open("r", encoding="utf-8", errors="replace") as in_handle:
-                for line in in_handle:
-                    out_handle.write(line)
-                    total_bytes += len(line.encode("utf-8"))
-    return total_bytes
+def open_rdf_binary(path: Path):
+    """Open plain or gzip line-oriented RDF for buffered binary line iteration.
 
-
-def split_nt_file_for_hdt(
-    source_path: Path,
-    chunk_dir: Path,
-    *,
-    target_bytes: int,
-    max_bytes: int,
-) -> list[Path]:
-    """Split an oversized RDF file into line-preserving chunk files for HDT conversion."""
-    ensure_dir(chunk_dir)
-    chunk_paths: list[Path] = []
-    chunk_handle = None
-    chunk_path = None
-    chunk_size = 0
-
-    def open_chunk(index: int):
-        path = chunk_dir / f"{source_path.stem}.split-{index:05d}.nt"
-        return path, path.open("w", encoding="utf-8")
-
-    try:
-        with source_path.open("r", encoding="utf-8", errors="replace") as in_handle:
-            chunk_index = 0
-            for line in in_handle:
-                line_size = len(line.encode("utf-8"))
-                if chunk_handle is None:
-                    chunk_path, chunk_handle = open_chunk(chunk_index)
-                    chunk_paths.append(chunk_path)
-                    chunk_size = 0
-                    chunk_index += 1
-                elif chunk_size > 0 and (
-                    chunk_size >= target_bytes or chunk_size + line_size > max_bytes
-                ):
-                    chunk_handle.close()
-                    chunk_path, chunk_handle = open_chunk(chunk_index)
-                    chunk_paths.append(chunk_path)
-                    chunk_size = 0
-                    chunk_index += 1
-
-                chunk_handle.write(line)
-                chunk_size += line_size
-    finally:
-        if chunk_handle is not None and not chunk_handle.closed:
-            chunk_handle.close()
-
-    return chunk_paths or [source_path]
-
-
-def iter_rdf_binary_lines(path: Path):
-    """Yield RDF records from plain or gzip-compressed line-oriented RDF."""
-    opener = gzip.open if path.name.endswith(".gz") else Path.open
-    with opener(path, "rb") as handle:
-        for line in handle:
-            yield line
-
-
-def plan_record_safe_rdf_chunks(
-    source_paths: list[Path],
-    chunk_dir: Path,
-    *,
-    target_bytes: int,
-    min_bytes: int,
-    max_bytes: int,
-    guide_path: Path | None = None,
-) -> tuple[list[Path], dict]:
-    """Create bounded RDF chunks without splitting a line-level statement.
-
-    The guide is written as boundaries are discovered during this single
-    sequential pass. A separate pre-scan would read/decompress the complete
-    aggregate twice, so the guide and chunk files are produced together.
-    Logical offsets are uncompressed offsets and therefore work for both plain
-    and gzip-backed aggregate sources.
+    ``GzipFile.readline`` is markedly slower than a ``BufferedReader`` wrapped
+    around the same stream, which matters when the caller walks every record of
+    a cohort-scale aggregate.
     """
-    if not source_paths:
-        return [], {"source_file_count": 0, "chunk_count": 0, "chunk_input_bytes": 0}
-    if target_bytes <= 0 or min_bytes <= 0 or max_bytes <= 0:
-        raise ValueError("RDF chunk sizes must be positive.")
-    if min_bytes > target_bytes or target_bytes > max_bytes:
-        raise ValueError("RDF chunk sizes must satisfy min <= target <= max.")
-
-    ensure_dir(chunk_dir)
-    chunk_paths: list[Path] = []
-    guide_chunks: list[dict] = []
-    chunk_handle = None
-    chunk_path = None
-    chunk_size = 0
-    chunk_start_offset = 0
-    chunk_start_record = 0
-    logical_offset = 0
-    record_count = 0
-    total_bytes = 0
-    chunk_index = 0
-
-    def close_chunk():
-        nonlocal chunk_handle, chunk_path, chunk_size
-        if chunk_handle is None or chunk_path is None:
-            return
-        chunk_handle.close()
-        chunk_paths.append(chunk_path)
-        guide_chunks.append(
-            {
-                "chunk_id": len(guide_chunks),
-                "path": str(chunk_path),
-                "start_record": chunk_start_record,
-                "end_record": record_count,
-                "start_uncompressed_byte": chunk_start_offset,
-                "end_uncompressed_byte": logical_offset,
-                "record_count": record_count - chunk_start_record,
-                "payload_bytes": chunk_size,
-            }
-        )
-        chunk_handle = None
-        chunk_path = None
-        chunk_size = 0
-
-    try:
-        for source_path in source_paths:
-            for line in iter_rdf_binary_lines(source_path):
-                if not line.endswith(b"\n"):
-                    raise ValueError(
-                        f"RDF source contains a non-line-terminated record: {source_path}"
-                    )
-                line_size = len(line)
-                if chunk_handle is None:
-                    chunk_path = chunk_dir / f"chunk-{chunk_index:05d}.nt"
-                    chunk_index += 1
-                    chunk_handle = chunk_path.open("wb")
-                    chunk_start_offset = logical_offset
-                    chunk_start_record = record_count
-                elif chunk_size > 0 and (
-                    (chunk_size >= target_bytes and chunk_size >= min_bytes)
-                    or chunk_size + line_size > max_bytes
-                ):
-                    close_chunk()
-                    chunk_path = chunk_dir / f"chunk-{chunk_index:05d}.nt"
-                    chunk_index += 1
-                    chunk_handle = chunk_path.open("wb")
-                    chunk_start_offset = logical_offset
-                    chunk_start_record = record_count
-
-                chunk_handle.write(line)
-                chunk_size += line_size
-                logical_offset += line_size
-                total_bytes += line_size
-                record_count += 1
-    finally:
-        close_chunk()
-
-    plan = {
-        "source_file_count": len(source_paths),
-        "source_paths": [str(path) for path in source_paths],
-        "chunk_count": len(chunk_paths),
-        "chunk_input_bytes": total_bytes,
-        "record_count": record_count,
-        "target_chunk_bytes": target_bytes,
-        "min_chunk_bytes": min_bytes,
-        "max_chunk_bytes": max_bytes,
-        "chunks": guide_chunks,
-    }
-    if guide_path is not None:
-        ensure_dir(guide_path.parent)
-        plan["guide_path"] = str(guide_path)
-        guide_path.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
-    return chunk_paths, plan
+    if path.name.endswith(".gz"):
+        return io.BufferedReader(gzip.open(path, "rb"))
+    return path.open("rb")
 
 
-def plan_partitioned_hdt_chunks(
-    rdf_paths: list[Path],
-    chunk_dir: Path,
-    *,
-    target_bytes: int,
-    min_bytes: int,
-    max_bytes: int,
-) -> tuple[list[Path], dict]:
-    """Plan chunk-local `.nt` inputs for partitioned HDT generation.
+def is_triple_line(line: bytes) -> bool:
+    """Return whether a serialized line represents an N-Triples statement.
 
-    The goal is to keep HDT conversion work units small enough to be fast,
-    while also avoiding the pathological "many tiny HDTs" case. Existing RDF
-    part files are treated as the first split boundary, and only oversized
-    parts are re-split on line boundaries.
+    This mirrors the container-side predicate in ``validate_compression.py`` and
+    ``partitioned_compression.py`` so a host-side fallback count can never
+    disagree with the authoritative count produced inside Docker. The leading
+    check short-circuits the ordinary ``<subject> ... .`` line without
+    allocating a stripped copy of it.
     """
-    ensure_dir(chunk_dir)
-
-    prepared_inputs: list[tuple[Path, int]] = []
-    for rdf_path in rdf_paths:
-        size = int(file_size_bytes(rdf_path) or 0)
-        if size <= max_bytes:
-            prepared_inputs.append((rdf_path, size))
-            continue
-        for split_path in split_nt_file_for_hdt(
-            rdf_path,
-            chunk_dir / "_split_inputs",
-            target_bytes=target_bytes,
-            max_bytes=max_bytes,
-        ):
-            prepared_inputs.append((split_path, int(file_size_bytes(split_path) or 0)))
-
-    chunk_groups: list[list[tuple[Path, int]]] = []
-    current_group: list[tuple[Path, int]] = []
-    current_size = 0
-    for path, size in prepared_inputs:
-        if not current_group:
-            current_group = [(path, size)]
-            current_size = size
-            continue
-        if current_size < min_bytes or current_size + size <= target_bytes:
-            current_group.append((path, size))
-            current_size += size
-            continue
-        chunk_groups.append(current_group)
-        current_group = [(path, size)]
-        current_size = size
-    if current_group:
-        chunk_groups.append(current_group)
-
-    chunk_inputs: list[Path] = []
-    chunk_input_bytes = 0
-    for chunk_index, group in enumerate(chunk_groups):
-        chunk_path = chunk_dir / f"chunk-{chunk_index:05d}.nt"
-        chunk_input_bytes += write_nt_chunk(chunk_path, [path for path, _size in group])
-        chunk_inputs.append(chunk_path)
-
-    plan = {
-        "source_file_count": len(rdf_paths),
-        "prepared_input_count": len(prepared_inputs),
-        "chunk_count": len(chunk_inputs),
-        "chunk_input_bytes": chunk_input_bytes,
-    }
-    return chunk_inputs, plan
+    if line.endswith(b".\n") and line[:1] in _NTRIPLES_SUBJECT_STARTS:
+        return True
+    stripped = line.strip()
+    return bool(stripped) and not stripped.startswith(b"#") and stripped.endswith(b".")
 
 
+# ---------------------------------------------------------------------------
+# Triple counting and run-level metrics reporting
+# The container stages own the authoritative counts; the helpers here read
+# them back and provide host-side fallbacks.
+# ---------------------------------------------------------------------------
 def count_triples_in_nt_files(paths: list[Path]) -> int | None:
-    """Count triples in RDF line-oriented files as a fallback when metrics are missing."""
+    """Count triples in RDF line-oriented files as a fallback when metrics are missing.
+
+    The scan stays at the byte level: decoding a cohort-scale aggregate to
+    ``str`` only to run a regex per line costs several times more than the
+    read itself.
+    """
     total = 0
     matched_any = False
-    pattern = re.compile(r"^\s*[^#].*\.\s*$")
     for path in paths:
         if not path.exists() or not path.is_file():
             continue
         try:
-            opener = gzip.open if path.name.endswith(".gz") else Path.open
-            with opener(path, "rt", encoding="utf-8", errors="replace") as handle:
+            with open_rdf_binary(path) as handle:
                 for line in handle:
-                    if pattern.match(line):
+                    if is_triple_line(line):
                         total += 1
                         matched_any = True
         except OSError:
@@ -926,6 +1166,7 @@ def read_conversion_total_triples(metrics_dir: Path, output_name: str, run_id: s
     """Read TOTAL triple count for one conversion output from conversion metrics JSON."""
     safe_name = safe_metrics_name(output_name)
     candidates = [
+        metrics_dir / "stages" / "conversion" / f"{safe_name}.json",
         metrics_dir / "conversion_metrics" / safe_name / f"{run_id}.json",
         metrics_dir / "conversion_metrics" / safe_name / run_id,
         # Backward compatibility with older artifact names:
@@ -965,12 +1206,13 @@ def collect_full_mode_total_triples(metrics_dir: Path, run_id: str):
     total = 0
     found = False
     candidate_files = []
+    candidate_files.extend(sorted((metrics_dir / "stages" / "conversion").glob("*.json")))
     candidate_files.extend(sorted(metrics_dir.glob("conversion_metrics/*/*")))
     # Backward compatibility with older artifact names:
     candidate_files.extend(sorted(metrics_dir.glob(f"conversion-metrics-*-{run_id}.json")))
 
     for metrics_json in candidate_files:
-        if (
+        if metrics_json.parent.name != "conversion" and (
             metrics_json.name != run_id
             and metrics_json.name != f"{run_id}.json"
             and not metrics_json.name.endswith(f"-{run_id}.json")
@@ -1037,8 +1279,9 @@ def append_wrapper_timing_log(
 
 def write_failed_inputs_report(*, metrics_dir: Path, failures: list[dict]):
     """Write per-input failure summary for multi-input modes."""
-    ensure_dir(metrics_dir)
-    report_path = metrics_dir / "failed_inputs.csv"
+    report_dir = metrics_dir / "reports"
+    ensure_dir(report_dir)
+    report_path = report_dir / "failed_inputs.csv"
     header = [
         "input_index",
         "input_vcf",
@@ -1062,6 +1305,23 @@ def write_failed_inputs_report(*, metrics_dir: Path, failures: list[dict]):
     return report_path
 
 
+def write_index_warnings_report(*, metrics_dir: Path, run_id: str, warnings: list[dict]):
+    """Write non-fatal full-run HDT/COTTAS index warnings as JSON."""
+    report_dir = metrics_dir / "reports"
+    ensure_dir(report_dir)
+    report_path = report_dir / "index_warnings.json"
+    payload = {
+        "run_id": run_id,
+        "warning_count": len(warnings),
+        "warnings": warnings,
+    }
+    report_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return report_path
+
+
+# ---------------------------------------------------------------------------
+# Console summaries, artifact naming, and output-collision planning
+# ---------------------------------------------------------------------------
 def print_nt_hdt_summary(
     *,
     output_root: Path,
@@ -1189,7 +1449,7 @@ def planned_output_paths(
     )
     if any(method in HDT_COMPRESSION_METHODS for method in methods):
         planned.add(target_dir / f"{output_name}.hdt")
-        # The pinned HDT Java package generates this versioned sidecar.
+        # The pinned Java-free indexer generates this canonical sidecar.
         planned.add(target_dir / f"{output_name}.hdt.index.v1-1")
     if any(method in COTTAS_COMPRESSION_METHODS for method in methods):
         planned.add(target_dir / f"{output_name}.cottas")
@@ -1244,6 +1504,11 @@ def compression_method_label_for_path(path: Path, method: str) -> str:
     return labels.get(method, method)
 
 
+# ---------------------------------------------------------------------------
+# Destructive filesystem operations
+# Container stages can leave artifacts owned by another uid, so every
+# deletion retries inside the image before it is reported as a failure.
+# ---------------------------------------------------------------------------
 def remove_file_with_docker_fallback(
     *,
     path: Path,
@@ -1384,6 +1649,9 @@ def cleanup_interrupted_full_run(
     return removed, failed
 
 
+# ---------------------------------------------------------------------------
+# Preflight input collection and disk-footprint estimation
+# ---------------------------------------------------------------------------
 def existing_parent(path: Path) -> Path:
     """Return the closest existing parent path (used for disk free-space anchor)."""
     cur = path
@@ -1412,20 +1680,42 @@ def collect_input_vcfs(input_path: Path):
     return []
 
 
+def uncompressed_vcf_bytes(vcf: Path) -> tuple[float, str]:
+    """Return ``(uncompressed_bytes, method)`` for one VCF input.
+
+    A gzip input's real uncompressed size is read from its structure when that
+    is possible without inflating it (see :mod:`vcf_rdfizer_gzip`); otherwise
+    this falls back to the coarse expansion factor rather than spending a full
+    decompression pass on a preflight estimate.
+    """
+    size = vcf.stat().st_size
+    if not vcf.name.endswith(".vcf.gz"):
+        return float(size), "stat"
+    if vcf_rdfizer_gzip is not None:
+        try:
+            measured, method = vcf_rdfizer_gzip.uncompressed_size_without_inflating(vcf)
+        except OSError:
+            measured, method = None, "unknown"
+        # A `.vcf.gz` whose content is not really gzip reports method "stat";
+        # that is not a measurement of anything, so keep the conservative
+        # expansion factor rather than under-stating a disk-space warning.
+        if measured is not None and method != "stat":
+            return float(measured), method
+    return size * COMPRESSED_VCF_EXPANSION_FACTOR, "estimated"
+
+
 def estimate_pipeline_sizes(vcf_files, out_dir: Path):
     """Estimate rough TSV/RDF footprint for preflight disk-space warnings."""
     input_bytes = 0
     est_tsv_bytes = 0
     est_rdf_low_bytes = 0
     est_rdf_high_bytes = 0
+    methods: set[str] = set()
 
     for vcf in vcf_files:
-        size = vcf.stat().st_size
-        input_bytes += size
-        if vcf.name.endswith(".vcf.gz"):
-            expanded_vcf = size * COMPRESSED_VCF_EXPANSION_FACTOR
-        else:
-            expanded_vcf = float(size)
+        input_bytes += vcf.stat().st_size
+        expanded_vcf, method = uncompressed_vcf_bytes(vcf)
+        methods.add(method)
 
         est_tsv_bytes += expanded_vcf * TSV_OVERHEAD_FACTOR
         est_rdf_low_bytes += expanded_vcf * RDF_EXPANSION_LOW_FACTOR
@@ -1441,11 +1731,15 @@ def estimate_pipeline_sizes(vcf_files, out_dir: Path):
         "rdf_high_bytes": int(est_rdf_high_bytes),
         "free_disk_bytes": int(free_disk_bytes),
         "disk_anchor": out_anchor,
+        # "estimated" means at least one gzip input fell back to the coarse
+        # expansion factor; anything else means every input size was measured.
+        "input_size_methods": sorted(methods),
+        "uncompressed_input_estimated": "estimated" in methods,
     }
 
 
 # ---------------------------------------------------------------------------
-# Mapping/rules and Docker image management helpers
+# Per-input TSV discovery
 # ---------------------------------------------------------------------------
 def slugify(value: str) -> str:
     """Normalize a value for safe filesystem naming."""
@@ -1483,6 +1777,1178 @@ def discover_tsv_triplets(tsv_dir: Path):
     )
 
 
+# ---------------------------------------------------------------------------
+# Multi-sample (genotype) representations
+# Expanded and condensed genotype RDF is emitted here rather than by
+# RMLStreamer: the equivalent RML maps would first have to materialize
+# variants x samples (x FORMAT keys) helper TSV rows.
+# See docs/sample-representation-guide.md for the emitted shapes.
+# ---------------------------------------------------------------------------
+def write_sample_support_headers(sample_calls_tsv: Path, sample_format_tsv: Path):
+    """Create empty sample helper tables with their canonical TSV headers."""
+    sample_calls_tsv.parent.mkdir(parents=True, exist_ok=True)
+    sample_format_tsv.parent.mkdir(parents=True, exist_ok=True)
+    with sample_calls_tsv.open("w", newline="", encoding="utf-8") as sample_calls_handle, \
+        sample_format_tsv.open("w", newline="", encoding="utf-8") as sample_format_handle:
+        csv.writer(sample_calls_handle, delimiter="\t").writerow(SAMPLE_CALLS_HEADER)
+        csv.writer(sample_format_handle, delimiter="\t").writerow(SAMPLE_FORMAT_HEADER)
+
+
+def sample_support_strategy(rules_path: Path) -> str:
+    """Choose no, streamed, or materialized sample handling for one mapping file.
+
+    The built-in four sample maps can be emitted directly as N-Triples without
+    writing their enormous Cartesian helper TSVs. A custom mapping with extra
+    helper-table consumers retains the materialized TSV behavior.
+    """
+    text = rules_path.read_text(encoding="utf-8")
+    calls_refs = text.count('/data/tsv/sample_calls.tsv')
+    format_refs = text.count('/data/tsv/sample_format_values.tsv')
+    if calls_refs == 0 and format_refs == 0:
+        return "none"
+    if (
+        calls_refs == 2
+        and format_refs == 2
+        and all(marker in text for marker in CANONICAL_SAMPLE_RULE_MARKERS)
+        and all(fragment in text for fragment in CANONICAL_SAMPLE_RULE_FRAGMENTS)
+    ):
+        return "stream"
+    return SAMPLE_HELPER_STRATEGY_MATERIALIZED
+
+
+@dataclass(frozen=True)
+class SampleWorkflow:
+    """One mutually exclusive sample-representation execution plan."""
+
+    representation: str
+    helper_strategy: str
+    emitter: str | None
+
+
+def resolve_sample_workflow(representation: str, rules_path: Path) -> SampleWorkflow:
+    """Resolve rules compatibility into exactly one sample workflow.
+
+    Expanded mode preserves custom helper-table mappings. Condensed mode emits its
+    RDF directly from records.tsv; it cannot safely coexist with custom rules
+    that consume materialized helper tables because that would execute both
+    representations and reintroduce semantic inflation.
+    """
+    if representation not in SAMPLE_REPRESENTATION_CHOICES:
+        choices = ", ".join(sorted(SAMPLE_REPRESENTATION_CHOICES))
+        raise ValueError(
+            f"unsupported sample representation '{representation}'; choose {choices}"
+        )
+
+    rules_strategy = sample_support_strategy(rules_path)
+    if representation == "expanded":
+        if rules_strategy == "stream":
+            return SampleWorkflow("expanded", "header-only", "expanded")
+        if rules_strategy == SAMPLE_HELPER_STRATEGY_MATERIALIZED:
+            return SampleWorkflow("expanded", SAMPLE_HELPER_STRATEGY_MATERIALIZED, None)
+        return SampleWorkflow("expanded", "none", None)
+
+    if rules_strategy == SAMPLE_HELPER_STRATEGY_MATERIALIZED:
+        raise ValueError(
+            "--sample-representation condensed cannot be combined with custom rules "
+            "that consume materialized sample_calls.tsv or sample_format_values.tsv tables. "
+            "Remove those materialized helper-table consumers or use expanded mode."
+        )
+    helper_strategy = "header-only" if rules_strategy == "stream" else "none"
+    return SampleWorkflow("condensed", helper_strategy, "condensed")
+
+
+def _set_max_csv_field_size():
+    """Allow chromosome-scale multi-sample payload columns in Python's CSV reader."""
+    limit = sys.maxsize
+    while True:
+        try:
+            csv.field_size_limit(limit)
+            return
+        except OverflowError:
+            limit //= 10
+
+
+def _sample_id_to_uri_id(sample_id: str, fallback_index: int) -> str:
+    candidate = re.sub(r"[^A-Za-z0-9._~-]+", "_", sample_id).strip("_")
+    return candidate or f"sample_{fallback_index}"
+
+
+# Characters that ``quote_plus(..., safe="*-._")`` leaves untouched. Sample
+# ids, FORMAT keys, and numeric row ids are almost always drawn from this set,
+# so the fast path below skips percent-encoding entirely for them.
+_URI_COMPONENT_PASSTHROUGH_RE = re.compile(r"[A-Za-z0-9*\-._]*\Z")
+# Characters that require N-Triples escaping. VCF genotype/FORMAT payloads
+# essentially never contain them, so the common case avoids five str.replace
+# scans of the value.
+_NTRIPLES_ESCAPE_RE = re.compile(r'[\\"\n\r\t]')
+
+
+def _rml_uri_component(value: str) -> str:
+    """Match RMLStreamer's Java URLEncoder-based template substitution."""
+    if _URI_COMPONENT_PASSTHROUGH_RE.match(value) is not None:
+        return value
+    encoded = quote_plus(value, safe="*-._", encoding="utf-8", errors="strict")
+    # urllib follows current RFC rules and always leaves '~' unescaped, whereas
+    # java.net.URLEncoder (used by RMLStreamer 2.5.0) encodes it.
+    return encoded.replace("+", "%20").replace("~", "%7E")
+
+
+def _ntriples_string_literal(value: str) -> str:
+    """Serialize an RDF 1.1 plain/xsd:string literal for N-Triples."""
+    if _NTRIPLES_ESCAPE_RE.search(value) is None:
+        return f'"{value}"'
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
+    return f'"{escaped}"'
+
+
+def _ntriples_literal(value: str) -> str:
+    literal = _ntriples_string_literal(value)
+    if value == ".":
+        literal += f"^^<{VCFR_NAMESPACE}Null>"
+    return literal
+
+
+@dataclass(frozen=True)
+class SampleColumn:
+    """One reusable VCF sample column."""
+
+    index: int
+    sample_id: str
+    uri_id: str
+
+
+@dataclass(frozen=True)
+class ParsedSampleRecord:
+    """One VCF record with FORMAT keys aligned to all sample columns."""
+
+    source_file: str
+    row_id: str
+    #: Raw QUAL and INFO columns, needed by the record-detail emitter.
+    qual: str
+    info: str
+    format_keys: tuple[str, ...]
+    sample_payloads: tuple[str, ...]
+    sample_values: tuple[tuple[str, ...], ...]
+
+
+class SampleRecordStream:
+    """Read a records.tsv sample block once and expose a stable sample schema."""
+
+    def __init__(self, records_tsv: Path):
+        self.records_tsv = records_tsv
+        self.columns: tuple[SampleColumn, ...] = ()
+        self.source_file = ""
+        self._handle = None
+        self._reader = None
+        self._header: list[str] = []
+        self._pending_row: list[str] | None = None
+        # A cohort VCF repeats the same FORMAT string on nearly every record.
+        # Cache the derived key tuple (and its duplicate check) per distinct
+        # FORMAT/width combination instead of rebuilding it per record.
+        self._format_key_cache: dict[tuple[str, int], tuple[str, ...]] = {}
+
+    def __enter__(self):
+        _set_max_csv_field_size()
+        self._handle = self.records_tsv.open(newline="", encoding="utf-8")
+        self._reader = csv.reader(self._handle, delimiter="\t")
+        self._header = next(self._reader, None) or []
+        self._pending_row = self._next_nonempty_row()
+        if self._pending_row:
+            self.source_file = self._pending_row[0] if self._pending_row else ""
+
+        sample_header = self._header[-1].strip() if len(self._header) >= 12 else ""
+        declared_ids = (
+            []
+            if sample_header == "SAMPLES"
+            else [token for token in sample_header.split() if token]
+        )
+        if not declared_ids and self._pending_row is not None and len(self._header) >= 12:
+            samples_raw = self._pending_row[-1] if self._pending_row else ""
+            payload_count = len(samples_raw.split()) if samples_raw else 0
+            declared_ids = [f"SAMPLE_{index}" for index in range(1, payload_count + 1)]
+
+        uri_id_counts: dict[str, int] = {}
+        columns: list[SampleColumn] = []
+        for index, sample_id in enumerate(declared_ids, start=1):
+            uri_id_base = _sample_id_to_uri_id(sample_id, index)
+            uri_id_counts[uri_id_base] = uri_id_counts.get(uri_id_base, 0) + 1
+            occurrence = uri_id_counts[uri_id_base]
+            uri_id = f"{uri_id_base}_{occurrence}" if occurrence > 1 else uri_id_base
+            columns.append(SampleColumn(index, sample_id, uri_id))
+        self.columns = tuple(columns)
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self._handle is not None:
+            self._handle.close()
+        self._handle = None
+        self._reader = None
+
+    def _next_nonempty_row(self) -> list[str] | None:
+        if self._reader is None:
+            return None
+        for row in self._reader:
+            if row:
+                return row
+        return None
+
+    def __iter__(self):
+        if self._reader is None:
+            raise RuntimeError("SampleRecordStream must be used as a context manager")
+        pending = self._pending_row
+        self._pending_row = None
+        if pending is not None:
+            yield self._parse_row(pending)
+        for row in self._reader:
+            if row:
+                yield self._parse_row(row)
+
+    def _parse_row(self, row: list[str]) -> ParsedSampleRecord:
+        if len(row) < len(self._header):
+            row = row + [""] * (len(self._header) - len(row))
+
+        source_file = row[0] if len(row) > 0 else ""
+        if self.source_file and source_file != self.source_file:
+            raise ValueError(
+                f"records TSV mixes SOURCE_FILE values '{self.source_file}' and "
+                f"'{source_file}'"
+            )
+        row_id = row[1] if len(row) > 1 else ""
+        qual_raw = row[7] if len(row) > 7 else ""
+        info_raw = row[9] if len(row) > 9 else ""
+        format_raw = row[10] if len(row) > 10 else ""
+        samples_raw = row[-1] if len(row) >= 12 else ""
+        declared_format_keys = format_raw.split(":") if format_raw else []
+        sample_payloads = samples_raw.split() if samples_raw else []
+        if len(sample_payloads) > len(self.columns):
+            raise ValueError(
+                f"record {row_id or '(unknown)'} contains {len(sample_payloads)} sample "
+                f"payloads but the TSV header declares {len(self.columns)} sample columns"
+            )
+        sample_payloads.extend([""] * (len(self.columns) - len(sample_payloads)))
+
+        raw_sample_values = [
+            payload.split(":") if payload else [] for payload in sample_payloads
+        ]
+        total_fields = max(
+            [len(declared_format_keys), *(len(values) for values in raw_sample_values)],
+            default=0,
+        )
+        cache_key = (format_raw, total_fields)
+        format_keys = self._format_key_cache.get(cache_key)
+        if format_keys is None:
+            format_keys = tuple(
+                declared_format_keys[index]
+                if index < len(declared_format_keys) and declared_format_keys[index]
+                else f"FIELD_{index + 1}"
+                for index in range(total_fields)
+            )
+            if len(set(format_keys)) != len(format_keys):
+                raise ValueError(
+                    f"record {row_id or '(unknown)'} contains duplicate FORMAT keys: "
+                    + ":".join(format_keys)
+                )
+            self._format_key_cache[cache_key] = format_keys
+
+        sample_values = tuple(
+            tuple(values[index] if index < len(values) else "" for index in range(total_fields))
+            for values in raw_sample_values
+        )
+        return ParsedSampleRecord(
+            source_file=source_file,
+            row_id=row_id,
+            qual=qual_raw,
+            info=info_raw,
+            format_keys=format_keys,
+            sample_payloads=tuple(sample_payloads),
+            sample_values=sample_values,
+        )
+
+
+def _append_rdf_atomically(rdf_path: Path, stats: dict, producer):
+    """Append generated N-Triples and restore the original artifact on failure."""
+    original_size = rdf_path.stat().st_size
+    opener = gzip.open if rdf_path.name.endswith(".gz") else Path.open
+    output_handle = None
+    buffer = bytearray()
+    # ``emit`` runs once per emitted triple (billions of times for a cohort
+    # aggregate), so the counter is a local int and only reaches ``stats``
+    # once the producer has finished.
+    emitted = 0
+
+    def emit(line: str):
+        nonlocal buffer, emitted
+        buffer.extend(line.encode("utf-8"))
+        emitted += 1
+        if len(buffer) >= SAMPLE_RDF_BUFFER_BYTES:
+            output_handle.write(buffer)
+            buffer = bytearray()
+
+    try:
+        output_handle = opener(rdf_path, "ab")
+        producer(emit)
+        stats["triples"] += emitted
+        if buffer:
+            output_handle.write(buffer)
+        output_handle.close()
+        output_handle = None
+        stats["appended_bytes"] = rdf_path.stat().st_size - original_size
+        return stats
+    except BaseException:
+        if output_handle is not None:
+            try:
+                output_handle.close()
+            except OSError:
+                pass
+        with rdf_path.open("r+b") as rollback_handle:
+            rollback_handle.truncate(original_size)
+        raise
+
+
+def append_expanded_sample_rdf(
+    records_tsv: Path,
+    rdf_path: Path,
+    *,
+    progress_interval_records: int = 10_000,
+) -> dict:
+    """Append the expanded SampleCall/FormatFieldValue representation.
+
+    This produces the same canonical SampleCall and FormatFieldValue triples as
+    the default RML maps without materializing V*S and V*S*F helper TSV rows.
+    """
+    stats = {
+        "representation": "expanded",
+        "records": 0,
+        "sample_calls": 0,
+        "format_values": 0,
+        "triples": 0,
+        "appended_bytes": 0,
+    }
+    if not records_tsv.is_file():
+        return stats
+    if not rdf_path.is_file():
+        raise FileNotFoundError(f"RDF aggregate not found for sample streaming: {rdf_path}")
+
+    with SampleRecordStream(records_tsv) as record_stream:
+        if not record_stream.columns or not record_stream.source_file:
+            return stats
+
+        def produce(emit):
+            source_component = _rml_uri_component(record_stream.source_file)
+            file_uri = f"file://{source_component}"
+            emit(
+                f"<{file_uri}> <{VCFR_NAMESPACE}representationProfile> "
+                f"<{VCFR_NAMESPACE}ExpandedRepresentation> .\n"
+            )
+            # Sample columns and their serialized sampleId literal are fixed for
+            # the whole file; FORMAT keys are drawn from a handful of distinct
+            # values. Encoding them once per file instead of once per
+            # record/sample removes the dominant cost of this loop.
+            sample_prefixes = [
+                (
+                    _rml_uri_component(column.uri_id),
+                    _ntriples_literal(column.sample_id),
+                )
+                for column in record_stream.columns
+            ]
+            format_components: dict[str, str] = {}
+            sample_call_count = 0
+            format_value_count = 0
+
+            for record in record_stream:
+                row_component = _rml_uri_component(record.row_id)
+                call_uri = f"{file_uri}#call/{row_component}"
+                format_keys = record.format_keys
+                record_sample_values = record.sample_values
+
+                for sample_index, (sample_component, sample_id_literal) in enumerate(
+                    sample_prefixes
+                ):
+                    sample_uri = f"{file_uri}#sample/{row_component}/{sample_component}"
+                    sample_values = record_sample_values[sample_index]
+
+                    emit(f"<{call_uri}> <{VCFR_NAMESPACE}hasSampleCall> <{sample_uri}> .\n")
+                    emit(f"<{sample_uri}> <{RDF_TYPE_URI}> <{VCFR_NAMESPACE}SampleCall> .\n")
+                    emit(
+                        f"<{sample_uri}> <{VCFR_NAMESPACE}sampleId> "
+                        f"{sample_id_literal} .\n"
+                    )
+                    sample_call_count += 1
+
+                    for format_index, format_key in enumerate(format_keys):
+                        format_value = sample_values[format_index]
+                        format_component = format_components.get(format_key)
+                        if format_component is None:
+                            format_component = _rml_uri_component(format_key)
+                            format_components[format_key] = format_component
+                        format_uri = f"{sample_uri}/fmt/{format_component}"
+                        emit(f"<{sample_uri}> <{VCFR_NAMESPACE}hasFormatValue> <{format_uri}> .\n")
+                        emit(f"<{format_uri}> <{RDF_TYPE_URI}> <{VCFR_NAMESPACE}FormatFieldValue> .\n")
+                        if format_value:
+                            emit(
+                                f"<{format_uri}> <{VCFR_NAMESPACE}fieldValue> "
+                                f"{_ntriples_literal(format_value)} .\n"
+                            )
+                        format_value_count += 1
+
+                stats["records"] += 1
+                stats["sample_calls"] = sample_call_count
+                stats["format_values"] = format_value_count
+                if progress_interval_records > 0 and stats["records"] % progress_interval_records == 0:
+                    print(
+                        "    * Sample RDF streaming: "
+                        f"{stats['records']:,} variants, {sample_call_count:,} calls",
+                        flush=True,
+                    )
+
+        return _append_rdf_atomically(rdf_path, stats, produce)
+
+
+def append_canonical_sample_rdf(
+    records_tsv: Path,
+    rdf_path: Path,
+    *,
+    progress_interval_records: int = 10_000,
+) -> dict:
+    """Backward-compatible name for the expanded sample RDF emitter."""
+    return append_expanded_sample_rdf(
+        records_tsv,
+        rdf_path,
+        progress_interval_records=progress_interval_records,
+    )
+
+
+@dataclass(frozen=True)
+class FormatDefinition:
+    """Structured attributes and RDF identity for one FORMAT declaration."""
+
+    uri: str
+    field_number: str
+    description: str
+    #: The declared VCF Type (Integer/Float/Flag/Character/String). Defaults to
+    #: String so an undeclared field still has a usable value type.
+    value_type: str = "String"
+
+
+def _parse_structured_header_fields(value: str) -> dict[str, str]:
+    """Parse comma-delimited VCF header attributes while respecting quotes."""
+    inner = value.strip()
+    if inner.startswith("<") and inner.endswith(">"):
+        inner = inner[1:-1]
+
+    tokens: list[str] = []
+    token: list[str] = []
+    in_quotes = False
+    escaped = False
+    for character in inner:
+        if escaped:
+            token.append(character)
+            escaped = False
+        elif character == "\\" and in_quotes:
+            token.append(character)
+            escaped = True
+        elif character == '"':
+            token.append(character)
+            in_quotes = not in_quotes
+        elif character == "," and not in_quotes:
+            tokens.append("".join(token))
+            token = []
+        else:
+            token.append(character)
+    tokens.append("".join(token))
+
+    fields: dict[str, str] = {}
+    for item in tokens:
+        if "=" not in item:
+            continue
+        key, raw_value = item.split("=", 1)
+        parsed_value = raw_value.strip()
+        if len(parsed_value) >= 2 and parsed_value[0] == parsed_value[-1] == '"':
+            parsed_value = parsed_value[1:-1]
+            parsed_value = parsed_value.replace('\\"', '"').replace("\\\\", "\\")
+        fields[key.strip()] = parsed_value
+    return fields
+
+
+def _load_field_definitions(
+    header_lines_tsv: Path, header_key: str
+) -> dict[str, FormatDefinition]:
+    """Map declared field IDs to structured definitions backed by HeaderLine IRIs.
+
+    Serves both ``##FORMAT`` and ``##INFO`` declarations, which share the
+    ``<ID=,Number=,Type=,Description=>`` syntax and the same vocabulary shape
+    (``vcfr:FieldDefinition`` with ``fieldId``/``fieldNumber``/``fieldType``).
+    """
+    definitions: dict[str, FormatDefinition] = {}
+    if not header_lines_tsv.is_file():
+        return definitions
+    wanted = header_key.upper()
+    _set_max_csv_field_size()
+    with header_lines_tsv.open(newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle, delimiter="\t"):
+            if (row.get("HEADER_KEY") or "").upper() != wanted:
+                continue
+            fields = _parse_structured_header_fields(row.get("HEADER_VALUE") or "")
+            field_id = fields.get("ID", "").strip()
+            if not field_id:
+                continue
+            source_component = _rml_uri_component(row.get("SOURCE_FILE") or "")
+            index_component = _rml_uri_component(row.get("HEADER_INDEX") or "")
+            definitions.setdefault(
+                field_id,
+                FormatDefinition(
+                    uri=f"file://{source_component}#header/line/{index_component}",
+                    field_number=fields.get("Number") or ".",
+                    description=(
+                        fields.get("Description")
+                        or f"{wanted} field {field_id} (source declaration has no Description)"
+                    ),
+                    value_type=fields.get("Type") or "String",
+                ),
+            )
+    return definitions
+
+
+def _load_format_definitions(header_lines_tsv: Path) -> dict[str, FormatDefinition]:
+    """Backward-compatible accessor for the FORMAT declarations."""
+    return _load_field_definitions(header_lines_tsv, "FORMAT")
+
+
+#: Maps a declared VCF INFO/FORMAT Type to its vocabulary value-type class.
+VCF_VALUE_TYPE_CLASSES = {
+    "Integer": "IntegerType",
+    "Float": "FloatType",
+    "Flag": "FlagType",
+    "Character": "CharacterType",
+    "String": "StringType",
+}
+#: Typed value predicates used when a single-valued field declares a numeric or
+#: flag type. Multi-valued fields (Number=A/R/G/.) keep only the lexical value,
+#: because the vocabulary gives one InfoFieldValue node per key.
+XSD_INTEGER_URI = "http://www.w3.org/2001/XMLSchema#integer"
+XSD_DECIMAL_URI = "http://www.w3.org/2001/XMLSchema#decimal"
+XSD_BOOLEAN_URI = "http://www.w3.org/2001/XMLSchema#boolean"
+
+
+def parse_info_entries(info: str) -> list[tuple[str, str | None]]:
+    """Split an INFO column into ``(key, value)`` pairs.
+
+    An entry without ``=`` is a Flag: a presence assertion with no value, which
+    the vocabulary models as ``vcfr:fieldValueBoolean true``.
+    """
+    if info in ("", "."):
+        return []
+    entries: list[tuple[str, str | None]] = []
+    for item in info.split(";"):
+        if not item:
+            continue
+        key, separator, value = item.partition("=")
+        entries.append((key, value if separator else None))
+    return entries
+
+
+def _typed_info_object(value: str, declared_type: str) -> tuple[str, str] | None:
+    """Return ``(predicate_local_name, literal)`` for a typed single value."""
+    if "," in value or value == ".":
+        return None
+    try:
+        if declared_type == "Integer":
+            return "fieldValueInteger", f'"{int(value)}"^^<{XSD_INTEGER_URI}>'
+        if declared_type == "Float":
+            # Serialize the source lexical form rather than a reparsed float, so
+            # the graph never gains or loses precision relative to the VCF.
+            float(value)
+            return "fieldValueDecimal", f'"{value}"^^<{XSD_DECIMAL_URI}>'
+    except ValueError:
+        # A value that contradicts its declared type is kept as a plain literal
+        # rather than dropped; the conversion must not silently lose data.
+        return None
+    return None
+
+
+# How the VCF meta-information block is represented. "basic" is the historical
+# behaviour: every '##' line becomes an untyped vcfr:HeaderLine carrying its raw
+# key and value. "structured" additionally types each line with the vocabulary's
+# subclass and lifts the attributes of FILTER, ALT and contig declarations into
+# their own properties, so the header becomes queryable rather than just present.
+HEADER_REPRESENTATION_CHOICES = ("basic", "structured")
+DEFAULT_HEADER_REPRESENTATION = "structured"
+
+#: '##' key (lower-cased) -> the vocabulary subclass for that line.
+HEADER_LINE_CLASSES = {
+    "fileformat": "FileFormatHeaderLine",
+    "filedate": "FileDateHeaderLine",
+    "source": "SourceHeaderLine",
+    "reference": "ReferenceHeaderLine",
+    "info": "INFOHeaderLine",
+    "format": "FORMATHeaderLine",
+    "filter": "FILTERHeaderLine",
+    "alt": "ALTHeaderLine",
+    "contig": "ContigHeaderLine",
+}
+#: contig attribute -> vocabulary predicate.
+CONTIG_ATTRIBUTES = {
+    "length": "contigLength",
+    "md5": "contigMd5",
+    "assembly": "contigAssembly",
+}
+
+
+XSD_DATE_URI = "http://www.w3.org/2001/XMLSchema#date"
+#: ##fileDate has no mandated format. These are the two forms seen in practice
+#: that map unambiguously onto xsd:date, which the SHACL shape requires.
+FILE_DATE_PATTERNS = (
+    (re.compile(r"^(\d{4})(\d{2})(\d{2})$"), "{0}-{1}-{2}"),
+    (re.compile(r"^(\d{4})-(\d{2})-(\d{2})$"), "{0}-{1}-{2}"),
+)
+
+
+def file_date_object(value: str) -> str | None:
+    """Serialize ##fileDate as xsd:date when its form allows, else lexically.
+
+    Returns None for an absent value so no triple is emitted, matching RML's
+    behaviour for an empty reference.
+    """
+    value = (value or "").strip()
+    if not value or value == ".":
+        return None
+    for pattern, template in FILE_DATE_PATTERNS:
+        match = pattern.match(value)
+        if match:
+            return f'"{template.format(*match.groups())}"^^<{XSD_DATE_URI}>'
+    # An unrecognized form is preserved verbatim rather than dropped; the SHACL
+    # layer reports it as non-conformant.
+    return _ntriples_string_literal(value)
+
+
+def append_header_representation_rdf(
+    header_lines_tsv: Path,
+    rdf_path: Path,
+) -> dict:
+    """Append typed header lines and structured FILTER/ALT/contig declarations.
+
+    The default mapping emits every '##' line as an untyped ``vcfr:HeaderLine``
+    with a raw key and value. The vocabulary already defines a subclass per line
+    type and dedicated properties for the FILTER, ALT and contig attributes;
+    this emits them, which is what makes the meta-information block queryable.
+
+    Emitted directly rather than through RML because the attributes live inside
+    a single ``<ID=...,length=...>`` value that RML cannot decompose.
+    """
+    stats = {
+        "representation": "header",
+        "header_lines": 0,
+        "typed_lines": 0,
+        "filter_definitions": 0,
+        "alt_definitions": 0,
+        "contigs": 0,
+        "file_dates": 0,
+        "triples": 0,
+        "appended_bytes": 0,
+    }
+    if not header_lines_tsv.is_file():
+        return stats
+    if not rdf_path.is_file():
+        raise FileNotFoundError(f"RDF aggregate not found for header streaming: {rdf_path}")
+
+    _set_max_csv_field_size()
+    with header_lines_tsv.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle, delimiter="\t"))
+
+    def produce(emit):
+        source_file = rows[0].get("SOURCE_FILE", "") if rows else ""
+        file_uri = f"file://{_rml_uri_component(source_file)}"
+        contig_count = 0
+        for row in rows:
+            key = (row.get("HEADER_KEY") or "").strip()
+            value = row.get("HEADER_VALUE") or ""
+            index_component = _rml_uri_component(row.get("HEADER_INDEX") or "")
+            line_uri = f"file://{_rml_uri_component(row.get('SOURCE_FILE') or '')}" \
+                       f"#header/line/{index_component}"
+            stats["header_lines"] += 1
+
+            line_class = HEADER_LINE_CLASSES.get(key.lower())
+            if line_class is None:
+                # An unrecognized '##' key keeps only the base HeaderLine type
+                # the mapping already emitted; inventing a subclass for it would
+                # put a term in the graph that the vocabulary does not define.
+                continue
+            emit(f"<{line_uri}> <{RDF_TYPE_URI}> <{VCFR_NAMESPACE}{line_class}> .\n")
+            stats["typed_lines"] += 1
+
+            if key.lower() not in {"filter", "alt", "contig"}:
+                continue
+            fields = _parse_structured_header_fields(value)
+            identifier = (fields.get("ID") or "").strip()
+            if not identifier:
+                continue
+            description = fields.get("Description")
+
+            if key.lower() == "filter":
+                emit(f"<{line_uri}> <{RDF_TYPE_URI}> <{VCFR_NAMESPACE}FilterDefinition> .\n")
+                emit(
+                    f"<{line_uri}> <{VCFR_NAMESPACE}filterId> "
+                    f"{_ntriples_string_literal(identifier)} .\n"
+                )
+                stats["filter_definitions"] += 1
+            elif key.lower() == "alt":
+                emit(f"<{line_uri}> <{RDF_TYPE_URI}> <{VCFR_NAMESPACE}AltDefinition> .\n")
+                emit(
+                    f"<{line_uri}> <{VCFR_NAMESPACE}altId> "
+                    f"{_ntriples_string_literal(identifier)} .\n"
+                )
+                stats["alt_definitions"] += 1
+            else:
+                contig_count += 1
+                stats["contigs"] += 1
+                emit(
+                    f"<{line_uri}> <{VCFR_NAMESPACE}contigId> "
+                    f"{_ntriples_string_literal(identifier)} .\n"
+                )
+                for attribute, predicate in CONTIG_ATTRIBUTES.items():
+                    attribute_value = fields.get(attribute)
+                    if attribute_value:
+                        emit(
+                            f"<{line_uri}> <{VCFR_NAMESPACE}{predicate}> "
+                            f"{_ntriples_string_literal(attribute_value)} .\n"
+                        )
+                continue
+
+            if description:
+                emit(
+                    f"<{line_uri}> <{VCFR_NAMESPACE}fieldDescription> "
+                    f"{_ntriples_string_literal(description)} .\n"
+                )
+
+        for row in rows:
+            if (row.get("HEADER_KEY") or "").strip().lower() != "filedate":
+                continue
+            date_object = file_date_object(row.get("HEADER_VALUE") or "")
+            if date_object is not None:
+                emit(f"<{file_uri}> <{VCFR_NAMESPACE}fileDate> {date_object} .\n")
+                stats["file_dates"] += 1
+            break
+
+        if contig_count:
+            emit(
+                f"<{file_uri}> <{VCFR_NAMESPACE}contigCount> "
+                f'"{contig_count}"^^<{XSD_INTEGER_URI}> .\n'
+            )
+
+    return _append_rdf_atomically(rdf_path, stats, produce)
+
+
+def _qual_object(value: str) -> str:
+    """Serialize QUAL as the SHACL shape requires: xsd:decimal, or vcfr:Null.
+
+    The shape is ``sh:or([sh:datatype xsd:decimal] [sh:datatype vcfr:Null])``,
+    which RML cannot satisfy because the datatype depends on the row. A value
+    that is neither numeric nor the missing token is kept as a plain literal
+    rather than dropped: a non-conformant graph is more useful than a lossy one,
+    and the SHACL layer reports it.
+    """
+    if value in ("", "."):
+        return f'"."^^<{VCFR_NAMESPACE}Null>'
+    try:
+        float(value)
+    except ValueError:
+        return _ntriples_string_literal(value)
+    # Serialize the source lexical form so no precision is gained or lost.
+    return f'"{value}"^^<{XSD_DECIMAL_URI}>'
+
+
+def append_record_detail_rdf(
+    records_tsv: Path,
+    header_lines_tsv: Path,
+    rdf_path: Path,
+    *,
+    emit_qual: bool = True,
+    emit_info: bool = True,
+    progress_interval_records: int = 10_000,
+) -> dict:
+    """Append per-record detail the RML mapping cannot express.
+
+    Covers QUAL (whose datatype depends on the value) and the structured INFO
+    representation (which would otherwise need a materialized helper table of
+    variants x INFO keys). Both are per-record, so they share one pass over
+    ``records.tsv``.
+
+    The default mapping emits INFO only as an opaque ``vcfr:infoRaw`` string.
+    This adds the structured form the vocabulary already defines - one
+    ``vcfr:InfoFieldValue`` per record and key, at the IRI template the
+    vocabulary declares - so INFO becomes queryable rather than just present.
+
+    Emitted directly rather than through RML for the same reason the genotype
+    representations are: RML would need a materialized helper table of
+    variants x INFO keys, and it cannot switch value datatype on a declared
+    ``Type``.
+    """
+    stats = {
+        "representation": "record-detail",
+        "records": 0,
+        "qual_values": 0,
+        "info_values": 0,
+        "info_definitions": 0,
+        "triples": 0,
+        "appended_bytes": 0,
+    }
+    if not records_tsv.is_file():
+        return stats
+    if not rdf_path.is_file():
+        raise FileNotFoundError(f"RDF aggregate not found for INFO streaming: {rdf_path}")
+
+    definitions = _load_field_definitions(header_lines_tsv, "INFO")
+
+    with SampleRecordStream(records_tsv) as record_stream:
+        if not record_stream.source_file:
+            return stats
+
+        def produce(emit):
+            source_component = _rml_uri_component(record_stream.source_file)
+            file_uri = f"file://{source_component}"
+            emitted_definitions: set[str] = set()
+            key_components: dict[str, str] = {}
+            value_count = 0
+            definition_count = 0
+
+            qual_count = 0
+            for record in record_stream:
+                row_component = _rml_uri_component(record.row_id)
+                call_uri = f"{file_uri}#call/{row_component}"
+                if emit_qual:
+                    emit(
+                        f"<{call_uri}> <{VCFR_NAMESPACE}qual> "
+                        f"{_qual_object(record.qual)} .\n"
+                    )
+                    qual_count += 1
+                for key, value in (parse_info_entries(record.info) if emit_info else ()):
+                    key_component = key_components.get(key)
+                    if key_component is None:
+                        key_component = _rml_uri_component(key)
+                        key_components[key] = key_component
+                    info_uri = f"{call_uri}/info/{key_component}"
+
+                    definition = definitions.get(key)
+                    if definition is None:
+                        definition = FormatDefinition(
+                            uri=f"{file_uri}#header/info/{key_component}",
+                            field_number=".",
+                            description=(
+                                f"Synthesized definition for undeclared INFO key {key}"
+                            ),
+                            value_type="Flag" if value is None else "String",
+                        )
+                    if definition.uri not in emitted_definitions:
+                        emitted_definitions.add(definition.uri)
+                        definition_count += 1
+                        type_class = VCF_VALUE_TYPE_CLASSES.get(
+                            definition.value_type, "StringType"
+                        )
+                        emit(
+                            f"<{definition.uri}> <{RDF_TYPE_URI}> "
+                            f"<{VCFR_NAMESPACE}InfoFieldDefinition> .\n"
+                        )
+                        emit(
+                            f"<{definition.uri}> <{VCFR_NAMESPACE}fieldId> "
+                            f"{_ntriples_string_literal(key)} .\n"
+                        )
+                        emit(
+                            f"<{definition.uri}> <{VCFR_NAMESPACE}fieldNumber> "
+                            f"{_ntriples_string_literal(definition.field_number)} .\n"
+                        )
+                        emit(
+                            f"<{definition.uri}> <{VCFR_NAMESPACE}fieldDescription> "
+                            f"{_ntriples_string_literal(definition.description)} .\n"
+                        )
+                        emit(
+                            f"<{definition.uri}> <{VCFR_NAMESPACE}fieldType> "
+                            f"<{VCFR_NAMESPACE}{type_class}> .\n"
+                        )
+
+                    emit(f"<{call_uri}> <{VCFR_NAMESPACE}hasInfoValue> <{info_uri}> .\n")
+                    emit(
+                        f"<{info_uri}> <{RDF_TYPE_URI}> "
+                        f"<{VCFR_NAMESPACE}InfoFieldValue> .\n"
+                    )
+                    emit(
+                        f"<{info_uri}> <{VCFR_NAMESPACE}declaredBy> "
+                        f"<{definition.uri}> .\n"
+                    )
+                    if value is None:
+                        emit(
+                            f"<{info_uri}> <{VCFR_NAMESPACE}fieldValueBoolean> "
+                            f'"true"^^<{XSD_BOOLEAN_URI}> .\n'
+                        )
+                    else:
+                        emit(
+                            f"<{info_uri}> <{VCFR_NAMESPACE}fieldValue> "
+                            f"{_ntriples_literal(value)} .\n"
+                        )
+                        typed = _typed_info_object(value, definition.value_type)
+                        if typed is not None:
+                            predicate, literal = typed
+                            emit(
+                                f"<{info_uri}> <{VCFR_NAMESPACE}{predicate}> "
+                                f"{literal} .\n"
+                            )
+                    value_count += 1
+
+                stats["records"] += 1
+                stats["qual_values"] = qual_count
+                stats["info_values"] = value_count
+                stats["info_definitions"] = definition_count
+                if (
+                    progress_interval_records > 0
+                    and stats["records"] % progress_interval_records == 0
+                ):
+                    print(
+                        f"    * INFO RDF streaming: {stats['records']:,} variants, "
+                        f"{value_count:,} values",
+                        flush=True,
+                    )
+
+        return _append_rdf_atomically(rdf_path, stats, produce)
+
+
+def append_condensed_sample_rdf(
+    records_tsv: Path,
+    header_lines_tsv: Path,
+    rdf_path: Path,
+    *,
+    progress_interval_records: int = 10_000,
+) -> dict:
+    """Append sample-ordered cohort matrices and FORMAT value vectors."""
+    stats = {
+        "representation": "condensed",
+        "records": 0,
+        "samples": 0,
+        "matrices": 0,
+        "format_vectors": 0,
+        "format_definitions": 0,
+        "triples": 0,
+        "appended_bytes": 0,
+    }
+    if not records_tsv.is_file():
+        return stats
+    if not rdf_path.is_file():
+        raise FileNotFoundError(f"RDF aggregate not found for sample streaming: {rdf_path}")
+
+    definitions = _load_format_definitions(header_lines_tsv)
+    with SampleRecordStream(records_tsv) as record_stream:
+        if not record_stream.columns or not record_stream.source_file:
+            return stats
+
+        def produce(emit):
+            source_component = _rml_uri_component(record_stream.source_file)
+            file_uri = f"file://{source_component}"
+            sample_set_uri = f"{file_uri}#samples"
+            emitted_definitions: set[str] = set()
+            # FORMAT keys repeat on every record; encode each distinct key once.
+            format_components: dict[str, str] = {}
+
+            emit(
+                f"<{file_uri}> <{VCFR_NAMESPACE}representationProfile> "
+                f"<{VCFR_NAMESPACE}CondensedRepresentation> .\n"
+            )
+            emit(f"<{file_uri}> <{VCFR_NAMESPACE}hasSampleSet> <{sample_set_uri}> .\n")
+            emit(f"<{sample_set_uri}> <{RDF_TYPE_URI}> <{VCFR_NAMESPACE}SampleSet> .\n")
+
+            for sample_column in record_stream.columns:
+                sample_component = _rml_uri_component(sample_column.uri_id)
+                sample_uri = f"{sample_set_uri}/{sample_component}"
+                emit(f"<{sample_set_uri}> <{VCFR_NAMESPACE}hasSample> <{sample_uri}> .\n")
+                emit(f"<{sample_uri}> <{RDF_TYPE_URI}> <{VCFR_NAMESPACE}VCFSample> .\n")
+                emit(
+                    f"<{sample_uri}> <{VCFR_NAMESPACE}sampleName> "
+                    f"{_ntriples_string_literal(sample_column.sample_id)} .\n"
+                )
+                emit(
+                    f"<{sample_uri}> <{VCFR_NAMESPACE}sampleIndex> "
+                    f'"{sample_column.index}"^^<{XSD_POSITIVE_INTEGER_URI}> .\n'
+                )
+                stats["samples"] += 1
+
+            for record in record_stream:
+                if not record.format_keys:
+                    continue
+                row_component = _rml_uri_component(record.row_id)
+                call_uri = f"{file_uri}#call/{row_component}"
+                matrix_uri = f"{call_uri}/matrix"
+                emit(f"<{call_uri}> <{VCFR_NAMESPACE}hasCallMatrix> <{matrix_uri}> .\n")
+                emit(f"<{matrix_uri}> <{RDF_TYPE_URI}> <{VCFR_NAMESPACE}CohortCallMatrix> .\n")
+                emit(
+                    f"<{matrix_uri}> <{VCFR_NAMESPACE}appliesToSampleSet> "
+                    f"<{sample_set_uri}> .\n"
+                )
+                stats["matrices"] += 1
+
+                for format_index, format_key in enumerate(record.format_keys):
+                    format_component = format_components.get(format_key)
+                    if format_component is None:
+                        format_component = _rml_uri_component(format_key)
+                        format_components[format_key] = format_component
+                    vector_uri = f"{matrix_uri}/fmt/{format_component}"
+                    definition = definitions.get(format_key)
+                    if definition is None:
+                        definition = FormatDefinition(
+                            uri=f"{file_uri}#header/format/{format_component}",
+                            field_number=".",
+                            description=(
+                                f"Synthesized definition for undeclared FORMAT key {format_key}"
+                            ),
+                        )
+                    definition_uri = definition.uri
+                    if definition_uri not in emitted_definitions:
+                        emit(
+                            f"<{definition_uri}> <{RDF_TYPE_URI}> "
+                            f"<{VCFR_NAMESPACE}FormatFieldDefinition> .\n"
+                        )
+                        emit(
+                            f"<{definition_uri}> <{VCFR_NAMESPACE}fieldId> "
+                            f"{_ntriples_string_literal(format_key)} .\n"
+                        )
+                        emit(
+                            f"<{definition_uri}> <{VCFR_NAMESPACE}fieldNumber> "
+                            f"{_ntriples_string_literal(definition.field_number)} .\n"
+                        )
+                        emit(
+                            f"<{definition_uri}> <{VCFR_NAMESPACE}fieldDescription> "
+                            f"{_ntriples_string_literal(definition.description)} .\n"
+                        )
+                        emitted_definitions.add(definition_uri)
+                        stats["format_definitions"] += 1
+
+                    encoded_values = "\t".join(
+                        values[format_index] or "." for values in record.sample_values
+                    )
+                    emit(
+                        f"<{matrix_uri}> <{VCFR_NAMESPACE}hasFormatValueVector> "
+                        f"<{vector_uri}> .\n"
+                    )
+                    emit(f"<{vector_uri}> <{RDF_TYPE_URI}> <{VCFR_NAMESPACE}FormatValueVector> .\n")
+                    emit(
+                        f"<{vector_uri}> <{VCFR_NAMESPACE}declaredBy> "
+                        f"<{definition_uri}> .\n"
+                    )
+                    emit(
+                        f"<{vector_uri}> <{VCFR_NAMESPACE}valueEncoding> "
+                        f"<{VCFR_NAMESPACE}VCFTextVector> .\n"
+                    )
+                    emit(
+                        f"<{vector_uri}> <{VCFR_NAMESPACE}encodedValues> "
+                        f"{_ntriples_string_literal(encoded_values)} .\n"
+                    )
+                    stats["format_vectors"] += 1
+
+                stats["records"] += 1
+                if progress_interval_records > 0 and stats["records"] % progress_interval_records == 0:
+                    print(
+                        "    * Condensed sample RDF streaming: "
+                        f"{stats['records']:,} variants, {stats['format_vectors']:,} vectors",
+                        flush=True,
+                    )
+
+        return _append_rdf_atomically(rdf_path, stats, produce)
+
+
+def emit_record_detail(
+    info_representation: str,
+    *,
+    records_tsv: Path,
+    header_lines_tsv: Path,
+    rdf_path: Path,
+) -> dict | None:
+    """Append QUAL and, when selected, the structured INFO representation.
+
+    QUAL is always emitted: the RML mapping cannot type it per row, so this is
+    the only place it can come from.
+    """
+    if info_representation not in INFO_REPRESENTATION_CHOICES:
+        raise ValueError(f"unknown INFO representation: {info_representation}")
+    return append_record_detail_rdf(
+        records_tsv, header_lines_tsv, rdf_path,
+        emit_qual=True, emit_info=info_representation == "structured",
+    )
+
+
+def emit_sample_representation(
+    workflow: SampleWorkflow,
+    *,
+    records_tsv: Path,
+    header_lines_tsv: Path,
+    rdf_path: Path,
+) -> dict | None:
+    """Execute the workflow's sole direct RDF emitter, if it has one."""
+    if workflow.emitter is None:
+        return None
+    if workflow.emitter == "expanded":
+        return append_expanded_sample_rdf(records_tsv, rdf_path)
+    if workflow.emitter == "condensed":
+        return append_condensed_sample_rdf(records_tsv, header_lines_tsv, rdf_path)
+    raise RuntimeError(f"unknown sample RDF emitter: {workflow.emitter}")
+
+
+def update_conversion_metrics_after_sample_stream(
+    *,
+    metrics_dir: Path,
+    output_name: str,
+    run_id: str,
+    rdf_path: Path,
+    total_triples: int,
+    sample_stats: dict,
+):
+    """Bring conversion JSON/CSV metrics in sync after direct sample emission."""
+    safe_name = safe_metrics_name(output_name)
+    metrics_json = metrics_dir / "stages" / "conversion" / f"{safe_name}.json"
+    output_size = int(rdf_path.stat().st_size)
+    if metrics_json.is_file():
+        try:
+            payload = json.loads(metrics_json.read_text(encoding="utf-8"))
+            artifacts = payload.setdefault("artifacts", {})
+            prior_triples = artifacts.get("output_triples")
+            if isinstance(prior_triples, dict):
+                for key in list(prior_triples):
+                    prior_triples[key] = int(total_triples)
+                prior_triples["TOTAL"] = int(total_triples)
+            else:
+                artifacts["output_triples"] = int(total_triples)
+            artifacts["output_size_bytes"] = output_size
+            payload["sample_representation"] = sample_stats
+            # Retained for consumers of pre-condensed conversion metrics.
+            payload["sample_streaming"] = sample_stats
+            metrics_json.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    metrics_csv = metrics_dir / "metrics.csv"
+    if not metrics_csv.is_file():
+        return
+    try:
+        with metrics_csv.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            fieldnames = list(reader.fieldnames or [])
+            rows = list(reader)
+        changed = False
+        for row in rows:
+            if row.get("run_id") == run_id and row.get("output_name") == output_name:
+                row["output_triples"] = str(int(total_triples))
+                row["output_dir_size_bytes"] = str(output_size)
+                changed = True
+        if changed:
+            with metrics_csv.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+    except OSError:
+        pass
+
+
 def build_sample_support_tsvs(records_tsv: Path, sample_calls_tsv: Path, sample_format_tsv: Path):
     """Materialize per-sample helper TSVs from records.tsv.
 
@@ -1491,131 +2957,47 @@ def build_sample_support_tsvs(records_tsv: Path, sample_calls_tsv: Path, sample_
     - one `SampleCall` per sample/record
     - one `FormatFieldValue` per sample/record/FORMAT key
     """
-    sample_calls_tsv.parent.mkdir(parents=True, exist_ok=True)
-    sample_format_tsv.parent.mkdir(parents=True, exist_ok=True)
-
-    def sample_id_to_uri_id(sample_id: str, fallback_index: int) -> str:
-        candidate = re.sub(r"[^A-Za-z0-9._~-]+", "_", sample_id).strip("_")
-        if not candidate:
-            candidate = f"sample_{fallback_index}"
-        return candidate
-
-    with sample_calls_tsv.open("w", newline="", encoding="utf-8") as sample_calls_handle, \
-        sample_format_tsv.open("w", newline="", encoding="utf-8") as sample_format_handle:
+    write_sample_support_headers(sample_calls_tsv, sample_format_tsv)
+    with sample_calls_tsv.open("a", newline="", encoding="utf-8") as sample_calls_handle, \
+        sample_format_tsv.open("a", newline="", encoding="utf-8") as sample_format_handle:
         sample_calls_writer = csv.writer(sample_calls_handle, delimiter="\t")
         sample_format_writer = csv.writer(sample_format_handle, delimiter="\t")
-
-        sample_calls_writer.writerow(
-            [
-                "SOURCE_FILE",
-                "ROW_ID",
-                "SAMPLE_INDEX",
-                "SAMPLE_ID",
-                "SAMPLE_URI_ID",
-                "SAMPLE_PAYLOAD",
-            ]
-        )
-        sample_format_writer.writerow(
-            [
-                "SOURCE_FILE",
-                "ROW_ID",
-                "SAMPLE_INDEX",
-                "SAMPLE_ID",
-                "SAMPLE_URI_ID",
-                "FORMAT_INDEX",
-                "FORMAT_KEY",
-                "FORMAT_VALUE",
-            ]
-        )
 
         if not records_tsv.exists():
             return
 
-        with records_tsv.open(newline="", encoding="utf-8") as records_handle:
-            reader = csv.reader(records_handle, delimiter="\t")
-            header = next(reader, None)
-            if not header:
-                return
-
-            sample_header = header[-1].strip() if len(header) >= 12 else ""
-            declared_sample_ids = [token for token in sample_header.split() if token]
-
-            for row in reader:
-                if not row:
-                    continue
-                if len(row) < len(header):
-                    row = row + [""] * (len(header) - len(row))
-
-                source_file = row[0] if len(row) > 0 else ""
-                row_id = row[1] if len(row) > 1 else ""
-                format_raw = row[10] if len(row) > 10 else ""
-                samples_raw = row[-1] if len(row) >= 12 else ""
-
-                format_keys = [token for token in format_raw.split(":")] if format_raw else []
-                sample_payloads = [token for token in samples_raw.split()] if samples_raw else []
-
-                total_samples = max(len(declared_sample_ids), len(sample_payloads))
-                if total_samples == 0:
-                    continue
-
-                sample_uri_seen: dict[str, int] = {}
-                for sample_idx in range(total_samples):
-                    sample_id = (
-                        declared_sample_ids[sample_idx]
-                        if sample_idx < len(declared_sample_ids)
-                        else f"SAMPLE_{sample_idx + 1}"
-                    )
-                    sample_payload = (
-                        sample_payloads[sample_idx]
-                        if sample_idx < len(sample_payloads)
-                        else ""
-                    )
-                    sample_index_value = str(sample_idx + 1)
-                    sample_uri_id_base = sample_id_to_uri_id(sample_id, sample_idx + 1)
-                    sample_uri_seen[sample_uri_id_base] = sample_uri_seen.get(sample_uri_id_base, 0) + 1
-                    if sample_uri_seen[sample_uri_id_base] > 1:
-                        sample_uri_id = f"{sample_uri_id_base}_{sample_uri_seen[sample_uri_id_base]}"
-                    else:
-                        sample_uri_id = sample_uri_id_base
-
+        with SampleRecordStream(records_tsv) as record_stream:
+            for record in record_stream:
+                for sample_offset, sample_column in enumerate(record_stream.columns):
                     sample_calls_writer.writerow(
                         [
-                            source_file,
-                            row_id,
-                            sample_index_value,
-                            sample_id,
-                            sample_uri_id,
-                            sample_payload,
+                            record.source_file,
+                            record.row_id,
+                            str(sample_column.index),
+                            sample_column.sample_id,
+                            sample_column.uri_id,
+                            record.sample_payloads[sample_offset],
                         ]
                     )
 
-                    value_tokens = sample_payload.split(":") if sample_payload else []
-                    total_fields = max(len(format_keys), len(value_tokens))
-                    for format_idx in range(total_fields):
-                        format_key = (
-                            format_keys[format_idx]
-                            if format_idx < len(format_keys) and format_keys[format_idx]
-                            else f"FIELD_{format_idx + 1}"
-                        )
-                        format_value = (
-                            value_tokens[format_idx]
-                            if format_idx < len(value_tokens)
-                            else ""
-                        )
+                    for format_offset, format_key in enumerate(record.format_keys):
                         sample_format_writer.writerow(
                             [
-                                source_file,
-                                row_id,
-                                sample_index_value,
-                                sample_id,
-                                sample_uri_id,
-                                str(format_idx + 1),
+                                record.source_file,
+                                record.row_id,
+                                str(sample_column.index),
+                                sample_column.sample_id,
+                                sample_column.uri_id,
+                                str(format_offset + 1),
                                 format_key,
-                                format_value,
+                                record.sample_values[sample_offset][format_offset],
                             ]
                         )
 
 
+# ---------------------------------------------------------------------------
+# RML mapping rendering and Docker image resolution
+# ---------------------------------------------------------------------------
 def render_rules_for_triplet(
     template_rules: Path,
     output_rules: Path,
@@ -1694,6 +3076,12 @@ def resolve_image_ref(image: str, image_version: str | None):
     return f"{image}:{image_version}", True
 
 
+# ---------------------------------------------------------------------------
+# Compression plan parsing and strategy selection
+# The public CLI takes three orthogonal options (--rdf-compression,
+# --representations, --artifact-compression); they are translated here into
+# the flat internal stage names used by the execution helpers.
+# ---------------------------------------------------------------------------
 def parse_compression_methods(raw: str):
     """Parse internal compression stage names used by the execution helpers."""
     value = (raw or "").strip()
@@ -1808,7 +3196,7 @@ def should_use_partitioned_hdt(
     hdt_strategy: str,
     rdf_storage_mode: str | None = None,
 ) -> bool:
-    """Resolve whether the HDT pipeline should use chunked generation + HDTCat."""
+    """Resolve whether the HDT pipeline should use chunked generation + hdtc merge."""
     if not compression_uses_hdt(methods):
         return False
     if hdt_strategy == "single":
@@ -1820,42 +3208,226 @@ def should_use_partitioned_hdt(
     return mode == "full" and rdf_storage_mode in RDF_STORAGE_MODES
 
 
+# ---------------------------------------------------------------------------
+# Run metrics layout: naming, manifest, and summary
+# ---------------------------------------------------------------------------
 def safe_metrics_name(value: str) -> str:
     """Sanitize names used in metrics artifact filenames."""
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("_")
     return safe or "rdf"
 
 
-def metrics_header_for_methods(selected_methods: list[str]) -> list[str]:
+def input_artifact_stem(path: Path) -> str:
+    """Return a stable, human-readable label for a source artifact.
+
+    Metric directories are intended for people first, so remove only the
+    recognized VCF/RDF/representation suffixes rather than repeatedly applying
+    :attr:`Path.stem` (which turns ``cohort.vcf.gz`` into ``cohort.vcf``).
+    """
+    name = path.name
+    for suffix in (
+        ".vcf.gz",
+        ".vcf",
+        ".nt.gz",
+        ".nt.br",
+        ".nt",
+        ".cottas.gz",
+        ".cottas.br",
+        ".cottas",
+        ".hdt",
+        ".gz",
+        ".br",
+    ):
+        if name.endswith(suffix):
+            return name[: -len(suffix)] or "input"
+    return path.stem or "input"
+
+
+def metrics_run_label(source_paths: list[Path], source_root: Path | None = None) -> str:
+    """Return the input-identifying label for one metrics-run directory."""
+    if len(source_paths) == 1:
+        return safe_metrics_name(input_artifact_stem(source_paths[0]))
+
+    root_label = input_artifact_stem(source_root) if source_root is not None else "inputs"
+    return safe_metrics_name(f"batch-{root_label}-{len(source_paths)}-inputs")
+
+
+def metrics_run_directory(metrics_root: Path, source_label: str, run_id: str) -> Path:
+    """Build the canonical input-labelled directory for one invocation."""
+    return metrics_root / f"{safe_metrics_name(source_label)}__{run_id}"
+
+
+def read_metrics_csv_rows(path: Path) -> list[dict]:
+    """Read a metrics CSV without allowing a damaged optional report to fail a run."""
+    if not path.is_file():
+        return []
+    try:
+        with path.open(newline="", encoding="utf-8") as handle:
+            return list(csv.DictReader(handle))
+    except OSError:
+        return []
+
+
+def write_run_manifest(
+    *,
+    metrics_dir: Path,
+    run_id: str,
+    timestamp: str,
+    mode: str,
+    source_label: str,
+    source_paths: list[Path],
+    out_root: Path,
+    options: dict,
+):
+    """Write the static, human-readable identity and configuration of a run."""
+    ensure_dir(metrics_dir)
+    payload = {
+        "metrics_layout_version": METRICS_LAYOUT_VERSION,
+        "run_id": run_id,
+        "timestamp": timestamp,
+        "mode": mode,
+        "source_label": source_label,
+        "output_root": str(out_root),
+        "metrics_directory": str(metrics_dir),
+        "inputs": [
+            {
+                "path": str(path),
+                "file_name": path.name,
+                "size_bytes": file_size_bytes(path),
+            }
+            for path in source_paths
+        ],
+        "options": options,
+    }
+    path = metrics_dir / "run.json"
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def update_run_manifest(metrics_dir: Path, **updates) -> None:
+    """Merge late-bound runtime details (such as the resolved image) into run.json."""
+    path = metrics_dir / "run.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+        payload.update(updates)
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    except (OSError, json.JSONDecodeError):
+        # Metadata must improve diagnosability, never invalidate a completed run.
+        pass
+
+
+def write_run_summary(
+    *,
+    metrics_dir: Path,
+    run_id: str,
+    timestamp: str,
+    mode: str,
+    exit_code: int,
+    elapsed_seconds: float,
+    total_triples: int | None,
+):
+    """Write one discoverable end-of-run summary for all workflow modes.
+
+    Individual stage reports retain their native detail; this file provides the
+    compact landing page that links their location and repeats the tabular rows
+    most often used for analysis.
+    """
+    stage_dir = metrics_dir / "stages"
+    stage_reports = [
+        path.relative_to(metrics_dir).as_posix()
+        for path in sorted(stage_dir.rglob("*.json"))
+    ] if stage_dir.is_dir() else []
+    report_dir = metrics_dir / "reports"
+    reports = [
+        path.relative_to(metrics_dir).as_posix()
+        for path in sorted(report_dir.rglob("*"))
+        if path.is_file()
+    ] if report_dir.is_dir() else []
+    payload = {
+        "metrics_layout_version": METRICS_LAYOUT_VERSION,
+        "run_id": run_id,
+        "timestamp": timestamp,
+        "completed_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        "mode": mode,
+        "status": "success" if int(exit_code) == 0 else "failure",
+        "exit_code": int(exit_code),
+        "execution": {
+            "wall_seconds": round(float(elapsed_seconds), 6),
+            "wall_human": format_duration(elapsed_seconds),
+            "total_triples": total_triples,
+        },
+        "summary_tables": {
+            "conversion_and_compression": read_metrics_csv_rows(metrics_dir / "metrics.csv"),
+            "tsv": read_metrics_csv_rows(metrics_dir / "tsv_metrics.csv"),
+            "wrapper": read_metrics_csv_rows(metrics_dir / "wrapper_execution_times.csv"),
+        },
+        "stage_reports": stage_reports,
+        "reports": reports,
+        "logs": [
+            path.relative_to(metrics_dir).as_posix()
+            for path in sorted((metrics_dir / "logs").rglob("*"))
+            if path.is_file()
+        ] if (metrics_dir / "logs").is_dir() else [],
+    }
+    path = metrics_dir / "summary.json"
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def progress_event_path(metrics_dir: Path | None, *components: str) -> Path | None:
+    """Return a hidden, per-operation progress sidecar path."""
+    if metrics_dir is None:
+        return None
+    safe_components = [safe_metrics_name(component) for component in components]
+    filename = "-".join(safe_components or ["run"]) + ".jsonl"
+    return metrics_dir / ".progress" / filename
+
+
+def container_progress_path(path: Path | None, metrics_dir: Path | None) -> str | None:
+    """Translate a host progress sidecar into its mounted container path."""
+    if path is None or metrics_dir is None:
+        return None
+    try:
+        relative = path.resolve().relative_to(metrics_dir.resolve())
+    except ValueError:
+        return None
+    return f"/data/metrics/{relative.as_posix()}"
+
+
+def metrics_header_for_methods(
+    selected_methods: list[str], *, include_validation: bool = False
+) -> list[str]:
     """Build a run-specific metrics.csv header with only relevant columns."""
     methods = list(selected_methods or [])
     header = list(CONVERSION_METRICS_HEADER)
-    if not methods:
+    if methods:
+        header.extend(COMPRESSION_COMMON_COLUMNS)
+        if "gzip" in methods:
+            header.extend(COMPRESSION_METHOD_COLUMNS["gzip"])
+        if "brotli" in methods:
+            header.extend(COMPRESSION_METHOD_COLUMNS["brotli"])
+
+        uses_cottas = any(method in COTTAS_COMPRESSION_METHODS for method in methods)
+        if uses_cottas:
+            header.extend(COMPRESSION_METHOD_COLUMNS["cottas"])
+
+        uses_hdt = any(method in HDT_COMPRESSION_METHODS for method in methods)
+        if uses_hdt:
+            header.extend(COMPRESSION_METHOD_COLUMNS["hdt"])
+            header.append(HDT_SOURCE_COLUMN)
+        if "hdt_gzip" in methods:
+            header.extend(COMPRESSION_METHOD_COLUMNS["hdt_gzip"])
+        if "hdt_brotli" in methods:
+            header.extend(COMPRESSION_METHOD_COLUMNS["hdt_brotli"])
+        if "cottas_gzip" in methods:
+            header.extend(COMPRESSION_METHOD_COLUMNS["cottas_gzip"])
+        if "cottas_brotli" in methods:
+            header.extend(COMPRESSION_METHOD_COLUMNS["cottas_brotli"])
+
+    if include_validation:
+        header.extend(VALIDATION_METRICS_COLUMNS)
+    if not methods and not include_validation:
         return header
-
-    header.extend(COMPRESSION_COMMON_COLUMNS)
-    if "gzip" in methods:
-        header.extend(COMPRESSION_METHOD_COLUMNS["gzip"])
-    if "brotli" in methods:
-        header.extend(COMPRESSION_METHOD_COLUMNS["brotli"])
-
-    uses_cottas = any(method in COTTAS_COMPRESSION_METHODS for method in methods)
-    if uses_cottas:
-        header.extend(COMPRESSION_METHOD_COLUMNS["cottas"])
-
-    uses_hdt = any(method in HDT_COMPRESSION_METHODS for method in methods)
-    if uses_hdt:
-        header.extend(COMPRESSION_METHOD_COLUMNS["hdt"])
-        header.append(HDT_SOURCE_COLUMN)
-    if "hdt_gzip" in methods:
-        header.extend(COMPRESSION_METHOD_COLUMNS["hdt_gzip"])
-    if "hdt_brotli" in methods:
-        header.extend(COMPRESSION_METHOD_COLUMNS["hdt_brotli"])
-    if "cottas_gzip" in methods:
-        header.extend(COMPRESSION_METHOD_COLUMNS["cottas_gzip"])
-    if "cottas_brotli" in methods:
-        header.extend(COMPRESSION_METHOD_COLUMNS["cottas_brotli"])
-
     return unique_in_order(header)
 
 
@@ -1873,6 +3445,7 @@ def update_metrics_csv_with_compression(
     selected_methods: list[str],
     method_results: dict[str, dict],
     tsv_metrics: dict | None = None,
+    validation_result: dict | None = None,
 ):
     """Upsert compression-related columns in `metrics.csv` for one output artifact.
 
@@ -1880,7 +3453,9 @@ def update_metrics_csv_with_compression(
     HDT-first metrics (gzip_on_hdt / brotli_on_hdt) to avoid ambiguity.
     """
     metrics_csv.parent.mkdir(parents=True, exist_ok=True)
-    target_header = metrics_header_for_methods(selected_methods)
+    target_header = metrics_header_for_methods(
+        selected_methods, include_validation=validation_result is not None
+    )
     rows = []
     existing_header = []
 
@@ -1918,7 +3493,6 @@ def update_metrics_csv_with_compression(
         row["combined_rdf_size_bytes"] = str(int(combined_size_bytes))
     if "compression_methods" in row:
         row["compression_methods"] = "|".join(selected_methods) if selected_methods else "none"
-
     defaults = {
         "exit_code_tsv": "0",
         "wall_seconds_tsv": "null",
@@ -1971,6 +3545,23 @@ def update_metrics_csv_with_compression(
         "sys_seconds_brotli_on_hdt": "null",
         "max_rss_kb_brotli_on_hdt": "null",
     }
+    if validation_result is not None:
+        defaults.update(
+            {
+                "validation_engines": "",
+                "validation_oracle_seconds": "null",
+                "validation_engine_query_seconds": "",
+                "validation_engine_setup_seconds": "",
+                "validation_status": "NOT_RUN",
+                "validation_exit_code": "null",
+                "validation_wall_seconds": "null",
+                "validation_user_seconds": "null",
+                "validation_sys_seconds": "null",
+                "validation_max_rss_kb": "null",
+                "validation_results_path": "",
+                "validation_rdf_path": "",
+            }
+        )
     for key, value in defaults.items():
         if key in row:
             row[key] = value
@@ -2081,6 +3672,55 @@ def update_metrics_csv_with_compression(
             row["exit_code_brotli_on_cottas"] = str(int(cottas_brotli_result.get("exit_code") or 0))
         assign_timing("brotli_on_cottas", cottas_brotli_result)
 
+    if validation_result is not None:
+        validation_timing = validation_result.get("timing") or {}
+        if "validation_status" in row:
+            row["validation_status"] = str(
+                validation_result.get("status") or "EXECUTION_FAILED"
+            )
+        if "validation_exit_code" in row:
+            exit_code = validation_result.get("exit_code")
+            row["validation_exit_code"] = "null" if exit_code is None else str(int(exit_code))
+        for key, metric_key in (
+            ("validation_wall_seconds", "wall_seconds"),
+            ("validation_user_seconds", "user_seconds"),
+            ("validation_sys_seconds", "sys_seconds"),
+        ):
+            if key in row:
+                value = validation_timing.get(metric_key)
+                row[key] = "null" if value is None else f"{float(value):.6f}"
+        if "validation_max_rss_kb" in row:
+            rss = validation_timing.get("max_rss_kb")
+            row["validation_max_rss_kb"] = "null" if rss is None else str(int(rss))
+        if "validation_results_path" in row:
+            row["validation_results_path"] = str(validation_result.get("results_dir") or "")
+        if "validation_rdf_path" in row:
+            row["validation_rdf_path"] = str(
+                validation_result.get("rdf_path")
+                or validation_result.get("rdf_gzip_path")
+                or ""
+            )
+        benchmark = validation_result.get("benchmark") or {}
+        if "validation_engines" in row:
+            row["validation_engines"] = "|".join(validation_result.get("engines") or [])
+        if "validation_oracle_seconds" in row:
+            oracle = benchmark.get("oracleSeconds")
+            row["validation_oracle_seconds"] = (
+                "null" if oracle is None else f"{float(oracle):.6f}"
+            )
+        for column, key in (
+            ("validation_engine_query_seconds", "engineQuerySeconds"),
+            ("validation_engine_setup_seconds", "engineSetupSeconds"),
+        ):
+            if column in row:
+                # "engine=seconds" pairs, so one column holds every engine's
+                # figure without the header depending on which engines ran.
+                values = benchmark.get(key) or {}
+                row[column] = "|".join(
+                    f"{name}={float(value):.6f}"
+                    for name, value in values.items() if value is not None
+                )
+
     with metrics_csv.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=target_header)
         writer.writeheader()
@@ -2097,15 +3737,17 @@ def write_compression_metrics_artifacts(
     combined_size_bytes: int,
     selected_methods: list[str],
     method_results: dict[str, dict],
+    index_warnings: list[dict] | None = None,
+    validation_result: dict | None = None,
 ):
-    """Write per-output compression artifacts (time files + structured JSON)."""
+    """Write the final per-output compression summary and method timing files."""
     metrics_dir.mkdir(parents=True, exist_ok=True)
     safe_name = safe_metrics_name(output_name)
 
     for method, result in method_results.items():
-        time_log_dir = metrics_dir / "compression_time" / method / safe_name
+        time_log_dir = metrics_dir / "timings" / "compression" / safe_name
         time_log_dir.mkdir(parents=True, exist_ok=True)
-        time_log = time_log_dir / f"{run_id}.txt"
+        time_log = time_log_dir / f"{safe_metrics_name(method)}.txt"
         lines = [
             f"method={method}",
             f"exit_code={result.get('exit_code', 1)}",
@@ -2153,6 +3795,11 @@ def write_compression_metrics_artifacts(
         "compression_methods": ",".join(selected_methods) if selected_methods else "none",
         "combined_rdf_path": str(source_rdf_path),
         "combined_rdf_size_bytes": int(combined_size_bytes),
+        "index_warnings": list(index_warnings or []),
+        # This preserves every method-specific detail returned by a container
+        # (validation, chunk plan, index information, and workspace metrics),
+        # rather than reducing it to the CSV's scalar columns.
+        "methods": method_results,
         "hdt_source": str(hdt_result.get("source") or "not_used"),
         "gzip_raw_rdf": {
             "output_gz_path": gzip_result.get("output_path", ""),
@@ -2207,10 +3854,12 @@ def write_compression_metrics_artifacts(
             "timing": timing_payload(cottas_brotli_result),
         },
     }
+    if validation_result is not None:
+        payload["semantic_validation"] = validation_result
 
-    metrics_json_dir = metrics_dir / "compression_metrics" / safe_name
+    metrics_json_dir = metrics_dir / "stages" / "compression"
     metrics_json_dir.mkdir(parents=True, exist_ok=True)
-    metrics_json = metrics_json_dir / f"{run_id}.json"
+    metrics_json = metrics_json_dir / f"{safe_name}.json"
     metrics_json.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
@@ -2224,11 +3873,13 @@ def write_raw_compression_metrics_artifact(
     source_rdf_path: Path,
     selected_methods: list[str],
     method_results: dict[str, dict],
+    index_warnings: list[dict] | None = None,
+    auxiliary_stages: dict[str, dict] | None = None,
 ):
-    """Persist per-RDF-file compression metrics under `raw_metrics/`."""
+    """Persist the operation-level compression detail for one RDF source."""
     safe_output = safe_metrics_name(output_name)
     safe_rdf = safe_metrics_name(rdf_name)
-    raw_json_dir = metrics_dir / "raw_metrics" / "compression_metrics" / safe_output / safe_rdf
+    raw_json_dir = metrics_dir / "stages" / "compression_operations" / safe_output
     raw_json_dir.mkdir(parents=True, exist_ok=True)
 
     payload = {
@@ -2238,6 +3889,8 @@ def write_raw_compression_metrics_artifact(
         "rdf_name": rdf_name,
         "source_rdf_path": str(source_rdf_path),
         "compression_methods": ",".join(selected_methods) if selected_methods else "none",
+        "index_warnings": list(index_warnings or []),
+        "auxiliary_stages": dict(auxiliary_stages or {}),
         "methods": {},
     }
 
@@ -2256,8 +3909,35 @@ def write_raw_compression_metrics_artifact(
             "validation": result.get("validation") or details.get("validation"),
         }
 
-    raw_json = raw_json_dir / f"{run_id}.json"
+    raw_json = raw_json_dir / f"{safe_rdf}.json"
     raw_json.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def write_partitioned_container_stage_report(
+    *,
+    metrics_dir: Path,
+    output_name: str,
+    source_rdf_path: Path,
+    payload: dict,
+):
+    """Preserve the detailed stage handoff from the ephemeral Docker volume.
+
+    The partitioned runner records every chunk build, merge, validation, disk
+    watermark, and GNU-time resource measurement. Its workspace is deleted at
+    the end of the operation, so this report is the durable location for those
+    deeper container metrics on both success and failure.
+    """
+    report_dir = metrics_dir / "stages" / "partitioned"
+    ensure_dir(report_dir)
+    report = {
+        "runtime_environment": "docker-volume",
+        "source_rdf_path": str(source_rdf_path),
+        "output_name": output_name,
+        "container_result": payload,
+    }
+    report_path = report_dir / f"{safe_metrics_name(output_name)}.json"
+    report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    return report_path
 
 
 def validate_mode_dirs(paths):
@@ -2296,9 +3976,9 @@ def write_tsv_metrics_artifacts(
     output_paths: list[Path],
     output_size_bytes: int,
 ):
-    """Persist raw TSV-step metrics under `raw_metrics/`."""
+    """Persist one TSV container stage report in the canonical stage tree."""
     safe_prefix = safe_metrics_name(prefix)
-    json_dir = metrics_dir / "raw_metrics" / "tsv_metrics" / safe_prefix
+    json_dir = metrics_dir / "stages" / "tsv"
     json_dir.mkdir(parents=True, exist_ok=True)
     payload = {
         "run_id": run_id,
@@ -2317,7 +3997,7 @@ def write_tsv_metrics_artifacts(
             "output_size_bytes": int(output_size_bytes),
         },
     }
-    (json_dir / f"{run_id}.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    (json_dir / f"{safe_prefix}.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
 def run_tsv_conversion_with_metrics(
@@ -2333,10 +4013,10 @@ def run_tsv_conversion_with_metrics(
 ):
     """Run VCF->TSV conversion and collect per-input timing/resource metrics."""
     safe_prefix = safe_metrics_name(prefix)
-    raw_time_dir = metrics_dir / "raw_metrics" / "tsv_time" / safe_prefix
+    raw_time_dir = metrics_dir / "timings" / "tsv"
     raw_time_dir.mkdir(parents=True, exist_ok=True)
-    time_log_host = raw_time_dir / f"{run_id}.txt"
-    time_log_container = f"/data/metrics/raw_metrics/tsv_time/{safe_prefix}/{run_id}.txt"
+    time_log_host = raw_time_dir / f"{safe_prefix}.txt"
+    time_log_container = f"/data/metrics/timings/tsv/{safe_prefix}.txt"
 
     wrapped_command = (
         "set -euo pipefail; "
@@ -2364,7 +4044,8 @@ def run_tsv_conversion_with_metrics(
     ]
 
     started = time.perf_counter()
-    exit_code = run(cmd)
+    with ProgressSession(None, f"TSV conversion: {prefix}"):
+        exit_code = run(cmd)
     elapsed = time.perf_counter() - started
 
     timing = parse_time_log_metrics(time_log_host)
@@ -2583,7 +4264,9 @@ def ensure_image_available(
             return 2
         print(f"{step_label}: Ensuring Docker image is available")
         print("  - Building Docker image")
-        if docker_build_image(image_ref, repo_root) != 0:
+        with ProgressSession(None, "Building Docker image"):
+            image_exit_code = docker_build_image(image_ref, repo_root)
+        if image_exit_code != 0:
             eprint(f"Error: docker build failed. See log: {wrapper_log_path}")
             return 1
         print(f"{step_label}: Ensuring Docker image is available {success_symbol()}")
@@ -2596,7 +4279,9 @@ def ensure_image_available(
     if version_requested:
         print(f"{step_label}: Ensuring Docker image is available")
         print(f"  - Pulling image: {image_ref}")
-        if docker_pull_image(image_ref) != 0:
+        with ProgressSession(None, "Pulling Docker image"):
+            image_exit_code = docker_pull_image(image_ref)
+        if image_exit_code != 0:
             eprint(f"Error: image version '{image_ref}' not found. See log: {wrapper_log_path}")
             return 2
         print(f"{step_label}: Ensuring Docker image is available {success_symbol()}")
@@ -2609,12 +4294,16 @@ def ensure_image_available(
     print(f"{step_label}: Ensuring Docker image is available")
     if has_local_dockerfile:
         print("  - Image missing locally, building")
-        if docker_build_image(image_ref, repo_root) != 0:
+        with ProgressSession(None, "Building Docker image"):
+            image_exit_code = docker_build_image(image_ref, repo_root)
+        if image_exit_code != 0:
             eprint(f"Error: docker build failed. See log: {wrapper_log_path}")
             return 1
     else:
         print(f"  - Image missing locally, pulling: {image_ref}")
-        if docker_pull_image(image_ref) != 0:
+        with ProgressSession(None, "Pulling Docker image"):
+            image_exit_code = docker_pull_image(image_ref)
+        if image_exit_code != 0:
             eprint(f"Error: image '{image_ref}' could not be pulled. See log: {wrapper_log_path}")
             return 2
     print(f"{step_label}: Ensuring Docker image is available {success_symbol()}")
@@ -2635,6 +4324,7 @@ def run_compression_methods_for_rdf(
     timestamp: str | None = None,
     output_name: str | None = None,
     expected_triples: int | None = None,
+    index_warnings: list[dict] | None = None,
 ):
     """Run selected compression stages for a single RDF file.
 
@@ -2669,6 +4359,7 @@ def run_compression_methods_for_rdf(
         target_out_container = f"/data/out/{relative_out.as_posix()}"
 
     method_results: dict[str, dict] = {}
+    allow_index_failure = index_warnings is not None
     hdt_name = f"{input_stem}.hdt"
     hdt_path = target_out_dir / hdt_name
     hdt_container = f"{target_out_container}/{hdt_name}"
@@ -2678,9 +4369,10 @@ def run_compression_methods_for_rdf(
     cottas_path = target_out_dir / cottas_name
     cottas_container = f"{target_out_container}/{cottas_name}"
     cottas_is_ready = False
+    cottas_failure_warning: dict | None = None
     metrics_output_name = output_name or target_out_dir.name
     safe_output_name = safe_metrics_name(metrics_output_name)
-    safe_rdf_name = safe_metrics_name(rdf_path.name)
+    auxiliary_stage_results: dict[str, dict] = {}
 
     def run_container_command(
         *,
@@ -2688,6 +4380,7 @@ def run_compression_methods_for_rdf(
         artifact_name: str,
         command: str,
         record_method: bool = True,
+        quiet_failure: bool = False,
     ):
         """Execute one compression command in Docker and capture timing/size."""
         timing_name = f".{input_stem}.{method}.time"
@@ -2704,17 +4397,17 @@ def run_compression_methods_for_rdf(
         )
         cmd = [
             *docker_run_base(),
+            *docker_hdt_index_env_args(),
             "-v",
             f"{str(in_dir)}:/data/in:ro",
             "-v",
             f"{str(out_dir)}:/data/out",
-            image_ref,
-            "bash",
-            "-lc",
-            wrapped_command,
         ]
+        cmd.extend([image_ref, "bash", "-lc", wrapped_command])
         started = time.perf_counter()
-        exit_code = run(cmd)
+        progress_label = f"{method.replace('_', ' ').title()}: {input_stem}"
+        with ProgressSession(None, progress_label):
+            exit_code = run(cmd)
         elapsed = time.perf_counter() - started
         timing = parse_time_log_metrics(timing_host)
         output_path = target_out_dir / artifact_name
@@ -2731,17 +4424,20 @@ def run_compression_methods_for_rdf(
         }
         if record_method:
             method_results[method] = result
-        if record_method and metrics_dir is not None and run_id is not None and timing_host.exists():
+        else:
+            # Validation/index checks consume container resources too. Retain
+            # their measurements in the operation report rather than dropping
+            # them because they do not produce a final representation.
+            auxiliary_stage_results[method] = result
+        if metrics_dir is not None and timing_host.exists():
             raw_time_dir = (
                 metrics_dir
-                / "raw_metrics"
-                / "compression_time"
+                / "timings"
+                / "compression"
                 / safe_output_name
-                / safe_rdf_name
-                / method
             )
             raw_time_dir.mkdir(parents=True, exist_ok=True)
-            raw_time_path = raw_time_dir / f"{run_id}.txt"
+            raw_time_path = raw_time_dir / f"{safe_metrics_name(method)}.txt"
             try:
                 shutil.copyfile(timing_host, raw_time_path)
             except OSError:
@@ -2753,10 +4449,35 @@ def run_compression_methods_for_rdf(
                 pass
         if record_method and method == "hdt":
             method_results[method]["source"] = "generated"
-        if exit_code != 0 and record_method:
-            eprint(f"Error: {method} compression failed. See log: {wrapper_log_path}")
+        if exit_code != 0:
+            if record_method and not quiet_failure:
+                eprint(f"Error: {method} compression failed. See log: {wrapper_log_path}")
             return False
         return True
+
+    def record_index_warning(
+        *,
+        index_format: str,
+        artifact_path: Path,
+        message: str,
+        stage: str,
+    ) -> dict:
+        """Record one recoverable representation/index problem for a full run."""
+        compact = " ".join(str(message).split())
+        warning = {
+            "format": index_format,
+            "stage": stage,
+            "status": "index_unavailable",
+            "artifact_path": str(artifact_path),
+            "message": compact,
+        }
+        if warning not in index_warnings:
+            index_warnings.append(warning)
+            eprint(
+                f"Warning: {index_format.upper()} index generation failed for "
+                f"'{artifact_path}'; continuing with the remaining pipeline. {compact}"
+            )
+        return warning
 
     def validate_container_artifact(
         *,
@@ -2766,56 +4487,84 @@ def run_compression_methods_for_rdf(
         artifact_container: str,
     ) -> tuple[bool, dict]:
         """Validate a base representation before any packaging or cleanup."""
-        report_name = f".{input_stem}.{artifact_format}.validation.json"
-        report_path = target_out_dir / report_name
-        report_container = f"{target_out_container}/{report_name}"
-        command_parts = [
-            "set -euo pipefail;",
-            f"rm -f {shlex.quote(report_container)};",
-            'PYTHON_BIN="${COTTAS_PYTHON_BIN:-$(command -v python3 || true)}";',
-            'if [[ -z "$PYTHON_BIN" || ! -x "$PYTHON_BIN" ]]; then ',
-            'echo "Missing Python executable in container" >&2; exit 127; fi;',
-            'VALIDATOR="/opt/vcf-rdfizer/validate_compression.py";',
-            'if [[ ! -f "$VALIDATOR" ]]; then ',
-            'echo "Missing compression validator in container" >&2; exit 127; fi;',
-            '"$PYTHON_BIN" "$VALIDATOR"',
-            f"--source {shlex.quote(input_container)}",
-            f"--artifact {shlex.quote(artifact_container)}",
-            f"--format {shlex.quote(artifact_format)}",
-            f"--result-path {shlex.quote(report_container)}",
-        ]
-        if expected_triples is not None:
-            command_parts.append(f"--expected-triples {int(expected_triples)}")
-        command = " ".join(command_parts)
-        if not run_container_command(
-            method=f"{method}-validation",
-            artifact_name=report_name,
-            command=command,
-            record_method=False,
-        ):
-            report = {
-                "valid": False,
-                "count_match": False,
-                "error": f"{artifact_format.upper()} validation command failed",
-            }
-        else:
+        def perform_validation(*, skip_index_check: bool) -> tuple[bool, dict]:
+            report_name = f".{input_stem}.{artifact_format}.validation.json"
+            report_path = target_out_dir / report_name
+            report_container = f"{target_out_container}/{report_name}"
+            command_parts = [
+                "set -euo pipefail;",
+                f"rm -f {shlex.quote(report_container)};",
+                'PYTHON_BIN="${COTTAS_PYTHON_BIN:-$(command -v python3 || true)}";',
+                'if [[ -z "$PYTHON_BIN" || ! -x "$PYTHON_BIN" ]]; then ',
+                'echo "Missing Python executable in container" >&2; exit 127; fi;',
+                'VALIDATOR="/opt/vcf-rdfizer/validate_compression.py";',
+                'if [[ ! -f "$VALIDATOR" ]]; then ',
+                'echo "Missing compression validator in container" >&2; exit 127; fi;',
+                '"$PYTHON_BIN" "$VALIDATOR"',
+                f"--source {shlex.quote(input_container)}",
+                f"--artifact {shlex.quote(artifact_container)}",
+                f"--format {shlex.quote(artifact_format)}",
+                f"--result-path {shlex.quote(report_container)}",
+            ]
+            if expected_triples is not None:
+                command_parts.append(f"--expected-triples {int(expected_triples)}")
+            if skip_index_check:
+                command_parts.append("--skip-index-check")
+            command = " ".join(command_parts)
+            command_ok = run_container_command(
+                method=f"{method}-validation",
+                artifact_name=report_name,
+                command=command,
+                record_method=False,
+                quiet_failure=skip_index_check,
+            )
             try:
                 report = json.loads(report_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
                 report = {
                     "valid": False,
                     "count_match": False,
-                    "error": f"validator did not produce a valid report: {exc}",
+                    "error": (
+                        f"{artifact_format.upper()} validation command failed"
+                        if not command_ok
+                        else f"validator did not produce a valid report: {exc}"
+                    ),
                 }
-        report_path.unlink(missing_ok=True)
-        valid = bool(report.get("valid")) and bool(report.get("count_match"))
-        if not valid:
-            eprint(
-                f"Error: {artifact_format.upper()} validation failed for {artifact_name}: "
-                f"{report.get('error', 'decoded triple count mismatch')}. "
-                f"See log: {wrapper_log_path}"
+            report_path.unlink(missing_ok=True)
+            execution = auxiliary_stage_results.get(f"{method}-validation")
+            if execution is not None:
+                report["execution"] = execution
+            return (
+                bool(report.get("valid")) and bool(report.get("count_match")),
+                report,
             )
-        return valid, report
+
+        valid, report = perform_validation(skip_index_check=False)
+        if valid:
+            return True, report
+
+        if allow_index_failure and artifact_format == "hdt":
+            readable, readable_report = perform_validation(skip_index_check=True)
+            if readable:
+                warning = record_index_warning(
+                    index_format="hdt",
+                    artifact_path=target_out_dir / artifact_name,
+                    stage="hdt-index",
+                    message=report.get(
+                        "error",
+                        "HDT validation succeeded when the index check was skipped",
+                    ),
+                )
+                readable_report["index_status"] = "failed"
+                readable_report["index_warning"] = warning
+                return True, readable_report
+
+        eprint(
+            f"Error: {artifact_format.upper()} validation failed for {artifact_name}: "
+            f"{report.get('error', 'decoded triple count mismatch')}. "
+            f"See log: {wrapper_log_path}"
+        )
+        return False, report
 
     def ensure_hdt_available():
         """Ensure `.hdt` exists for HDT-based compound methods."""
@@ -2843,8 +4592,14 @@ def run_compression_methods_for_rdf(
                 artifact_container=hdt_container,
             )
             if not valid:
+                # ``validate_container_artifact`` already downgrades a
+                # recoverable HDT index problem to a warning and returns True,
+                # so reaching this point means the artifact itself is unusable.
                 return False
             method_results["hdt"]["validation"] = report
+            if report.get("index_status"):
+                method_results["hdt"]["index_status"] = report["index_status"]
+                method_results["hdt"]["index_warning"] = report.get("index_warning")
             hdt_is_ready = True
             return True
         hdt_command = (
@@ -2873,15 +4628,20 @@ def run_compression_methods_for_rdf(
         if not valid:
             return False
         method_results["hdt"]["validation"] = report
+        if report.get("index_status"):
+            method_results["hdt"]["index_status"] = report["index_status"]
+            method_results["hdt"]["index_warning"] = report.get("index_warning")
         hdt_is_ready = True
         hdt_source = "generated"
         return True
 
     def ensure_cottas_available():
         """Ensure `.cottas` exists for COTTAS packaging stages."""
-        nonlocal cottas_is_ready
+        nonlocal cottas_is_ready, cottas_failure_warning
         if cottas_is_ready:
             return True
+        if cottas_failure_warning is not None:
+            return False
         if cottas_path.exists():
             method_results.setdefault(
                 "cottas",
@@ -2920,7 +4680,15 @@ def run_compression_methods_for_rdf(
             method="cottas",
             artifact_name=cottas_name,
             command=cottas_command,
+            quiet_failure=allow_index_failure,
         ):
+            if allow_index_failure:
+                cottas_failure_warning = record_index_warning(
+                    index_format="cottas",
+                    artifact_path=cottas_path,
+                    stage="cottas-index",
+                    message="COTTAS conversion/index creation did not produce a usable artifact",
+                )
             return False
         valid, report = validate_container_artifact(
             method="cottas",
@@ -2929,10 +4697,47 @@ def run_compression_methods_for_rdf(
             artifact_container=cottas_container,
         )
         if not valid:
+            if allow_index_failure:
+                cottas_failure_warning = record_index_warning(
+                    index_format="cottas",
+                    artifact_path=cottas_path,
+                    stage="cottas-index",
+                    message=report.get(
+                        "error",
+                        "COTTAS validation failed after conversion/index creation",
+                    ),
+                )
             return False
         method_results["cottas"]["validation"] = report
         cottas_is_ready = True
         return True
+
+    def mark_cottas_method_unavailable(method: str):
+        """Mark COTTAS and dependent packaging methods as skipped after a failure."""
+        warning = cottas_failure_warning
+        if warning is None:
+            return
+        result = method_results.setdefault(
+            method,
+            {
+                "exit_code": 1,
+                "wall_seconds": 0.0,
+                "user_seconds": 0.0,
+                "sys_seconds": 0.0,
+                "max_rss_kb": 0,
+                "output_path": str(
+                    {
+                        "cottas": cottas_path,
+                        "cottas_gzip": target_out_dir / f"{input_stem}.cottas.gz",
+                        "cottas_brotli": target_out_dir / f"{input_stem}.cottas.br",
+                    }.get(method, cottas_path)
+                ),
+                "output_size_bytes": 0,
+            },
+        )
+        result["exit_code"] = 1
+        result["index_status"] = "failed"
+        result["index_warning"] = warning
 
     for method in methods:
         if method == "gzip":
@@ -2989,7 +4794,10 @@ def run_compression_methods_for_rdf(
 
         if method == "cottas":
             if not ensure_cottas_available():
-                return False, method_results
+                if not allow_index_failure:
+                    return False, method_results
+                mark_cottas_method_unavailable(method)
+                continue
             if status_indent is not None:
                 suffix = " (reused existing COTTAS)" if method_results[method].get("source") == "existing" else ""
                 print(f"{status_indent}- {method}: {cottas_name} {success_symbol()}{suffix}")
@@ -3039,7 +4847,10 @@ def run_compression_methods_for_rdf(
 
         if method == "cottas_gzip":
             if not ensure_cottas_available():
-                return False, method_results
+                if not allow_index_failure:
+                    return False, method_results
+                mark_cottas_method_unavailable(method)
+                continue
             artifact_name = f"{input_stem}.cottas.gz"
             out_container = f"{target_out_container}/{artifact_name}"
             command = (
@@ -3055,7 +4866,10 @@ def run_compression_methods_for_rdf(
 
         if method == "cottas_brotli":
             if not ensure_cottas_available():
-                return False, method_results
+                if not allow_index_failure:
+                    return False, method_results
+                mark_cottas_method_unavailable(method)
+                continue
             artifact_name = f"{input_stem}.cottas.br"
             out_container = f"{target_out_container}/{artifact_name}"
             command = (
@@ -3079,6 +4893,8 @@ def run_compression_methods_for_rdf(
             source_rdf_path=rdf_path,
             selected_methods=methods,
             method_results=method_results,
+            index_warnings=index_warnings,
+            auxiliary_stages=auxiliary_stage_results,
         )
 
     return True, method_results
@@ -3099,12 +4915,14 @@ def run_containerized_partitioned_representation_methods(
     min_chunk_bytes: int,
     max_chunk_bytes: int,
     expected_triples: int | None = None,
+    index_warnings: list[dict] | None = None,
 ):
     """Run partitioned compression in an ephemeral Docker-managed volume.
 
-    The source and final outputs are the only bind mounts. Chunks, DuckDB
-    scratch data, HDT/COTTAS merge intermediates, and stage timing files stay
-    in a named volume that is removed in ``finally`` on both success and
+    The source and final outputs are the primary bind mounts. When interactive
+    progress is enabled, a small metrics sidecar is mounted as well. Chunks,
+    DuckDB scratch data, HDT/COTTAS merge intermediates, and stage timing files
+    stay in a named volume that is removed in ``finally`` on both success and
     failure. A short JSON handoff carries the container-side metrics back to
     the host without exposing the temporary workspace.
     """
@@ -3118,6 +4936,12 @@ def run_containerized_partitioned_representation_methods(
         f"vcf-rdfizer-{safe_output_name[:40]}-{os.getpid()}-{time.time_ns()}"
     )
     result_path = out_dir / f".{safe_output_name}.partitioned-results.json"
+    progress_host_path = (
+        progress_event_path(metrics_dir, "partitioned", safe_output_name)
+        if progress_events_enabled()
+        else None
+    )
+    progress_container_ref = container_progress_path(progress_host_path, metrics_dir)
     method_results: dict[str, dict] = {}
     volume_created = False
 
@@ -3151,15 +4975,22 @@ def run_containerized_partitioned_representation_methods(
 
         command = [
             *docker_run_base(),
+            *docker_hdt_index_env_args(),
+            *docker_hdt_merge_env_args(),
+            *docker_cottas_merge_env_args(),
             "--mount",
             f"type=volume,source={volume_name},target=/work",
         ]
-        if source_mount is not None:
-            command.extend(["-v", source_mount])
+        command.extend(["-v", source_mount])
         command.extend(
             [
                 "-v",
                 f"{out_resolved}:/data/out",
+                *(
+                    ["-v", f"{metrics_dir.resolve()}:/data/metrics"]
+                    if metrics_dir is not None and progress_container_ref is not None
+                    else []
+                ),
                 image_ref,
                 "python3",
                 PARTITIONED_COMPRESSION_RUNNER_CONTAINER,
@@ -3180,9 +5011,17 @@ def run_containerized_partitioned_representation_methods(
                 *(["--expected-triples", str(expected_triples)] if expected_triples is not None else []),
                 "--result-path",
                 f"/data/out/{result_path.name}",
+                *(
+                    ["--progress-path", progress_container_ref]
+                    if progress_container_ref is not None
+                    else []
+                ),
             ]
         )
-        run_exit_code = run(command)
+        if index_warnings is not None:
+            command.append("--allow-index-failures")
+        with ProgressSession(progress_host_path, f"Partitioned compression: {output_name}"):
+            run_exit_code = run(command)
         payload = None
         if result_path.is_file():
             try:
@@ -3191,6 +5030,22 @@ def run_containerized_partitioned_representation_methods(
                 eprint(f"Error: invalid partitioned compression result: {exc}. See log: {wrapper_log_path}")
 
         if payload is not None:
+            for warning in payload.get("index_warnings", []):
+                artifact_path = str(warning.get("artifact_path", ""))
+                if artifact_path.startswith("/data/out/"):
+                    warning["artifact_path"] = str(
+                        out_dir / artifact_path.removeprefix("/data/out/")
+                    )
+                if warning not in (index_warnings or []):
+                    if index_warnings is not None:
+                        index_warnings.append(warning)
+                    eprint(
+                        "Warning: "
+                        f"{str(warning.get('format', 'representation')).upper()} index generation "
+                        f"failed for '{warning.get('artifact_path', output_name)}'; "
+                        "continuing with the remaining pipeline. "
+                        f"{warning.get('message', '')}"
+                    )
             method_results = payload.get("methods", {})
             for method, result in method_results.items():
                 artifact_path = out_dir / compression_artifact_name_for_method(
@@ -3210,6 +5065,19 @@ def run_containerized_partitioned_representation_methods(
                         chunk["path"] = Path(str(chunk["path"])).name
                 details["workspace"] = "docker-volume"
                 details["workspace_cleanup"] = "removed"
+            if metrics_dir is not None:
+                try:
+                    write_partitioned_container_stage_report(
+                        metrics_dir=metrics_dir,
+                        output_name=output_name,
+                        source_rdf_path=source_rdf_path,
+                        payload=payload,
+                    )
+                except OSError as exc:
+                    eprint(
+                        "Warning: failed to preserve detailed partitioned container metrics: "
+                        f"{exc}"
+                    )
 
         missing_methods = set(methods) - set(method_results)
         if missing_methods and payload is not None and int(payload.get("exit_code", 1)) == 0:
@@ -3235,6 +5103,7 @@ def run_containerized_partitioned_representation_methods(
                 source_rdf_path=out_dir,
                 selected_methods=methods,
                 method_results=method_results,
+                index_warnings=index_warnings,
             )
         return True, method_results
     finally:
@@ -3269,6 +5138,7 @@ def run_partitioned_representation_methods_for_rdf_files(
     min_chunk_bytes: int,
     max_chunk_bytes: int,
     expected_triples: int | None = None,
+    index_warnings: list[dict] | None = None,
 ):
     """Dispatch aggregate RDF to the ephemeral container pipeline.
 
@@ -3300,6 +5170,7 @@ def run_partitioned_representation_methods_for_rdf_files(
         min_chunk_bytes=min_chunk_bytes,
         max_chunk_bytes=max_chunk_bytes,
         expected_triples=expected_triples,
+        index_warnings=index_warnings,
     )
 
 
@@ -3307,7 +5178,6 @@ def run_full_mode(
     *,
     input_mount_dir: Path,
     container_inputs: list[str],
-    input_metrics_target: str,
     expected_prefixes: list[str],
     rules_path: Path,
     out_dir: Path,
@@ -3315,6 +5185,16 @@ def run_full_mode(
     metrics_dir: Path,
     image_ref: str,
     out_name: str,
+    sample_workflow: SampleWorkflow,
+    info_representation: str = DEFAULT_INFO_REPRESENTATION,
+    header_representation: str = DEFAULT_HEADER_REPRESENTATION,
+    run_validation: bool = False,
+    validation_artifacts: list[str] | None = None,
+    validation_engine: str | list[str] = DEFAULT_VALIDATION_ENGINE,
+    validation_engine_options: dict | None = None,
+    validation_strict_conformance: bool = False,
+    validation_shacl_shapes: Path | None = None,
+    filter_oracle: str = "auto",
     rdf_storage_mode: str,
     methods: list[str],
     hdt_strategy: str,
@@ -3330,10 +5210,25 @@ def run_full_mode(
     wrapper_log_path: Path,
     run_tracker: RunTracker | None = None,
 ):
-    """Execute full pipeline: per-input TSV -> RDF -> compression -> metrics."""
-    print("Step 3/5: Processing per-input pipeline (TSV -> RDF -> compression)")
+    """Execute full pipeline: per-input TSV -> RDF -> compression -> validation."""
+    pipeline_label = "TSV -> RDF -> compression"
+    if run_validation:
+        pipeline_label += " -> validation"
+    print(f"Step 3/5: Processing per-input pipeline ({pipeline_label})")
     if spark_partitions is not None:
         print(f"  Spark partition hint: {spark_partitions}")
+    print(f"  Sample representation: {sample_workflow.representation}")
+    print(f"  INFO representation: {info_representation}")
+    print(f"  Header representation: {header_representation}")
+    validation_artifacts = list(validation_artifacts or ["aggregate"])
+    if run_validation:
+        engine_label = (
+            validation_engine if isinstance(validation_engine, str)
+            else ", ".join(validation_engine)
+        )
+        print(
+            f"  Validation: {', '.join(validation_artifacts)} via {engine_label}"
+        )
     intermediate_dir = tsv_dir.parent
     ensure_dir(tsv_dir)
     ensure_dir(out_dir)
@@ -3370,6 +5265,7 @@ def run_full_mode(
     total_triples_produced = 0
     saw_triple_counts = False
     input_failures: list[dict] = []
+    index_warnings: list[dict] = []
 
     total_inputs = len(container_inputs)
     for idx, (container_input, expected_prefix) in enumerate(
@@ -3383,6 +5279,9 @@ def run_full_mode(
         except ValueError:
             input_vcf = container_input
         input_failed = False
+        input_index_warnings: list[dict] = []
+        validation_failed = False
+        validation_result: dict | None = None
 
         def fail_current(stage: str, message: str):
             nonlocal input_failed
@@ -3409,13 +5308,10 @@ def run_full_mode(
 
         # Pre-flight write checks for expected TSV outputs to fail fast on
         # permission/mount problems before starting container work.
-        for suffix in (
-            "records.tsv",
-            "header_lines.tsv",
-            "file_metadata.tsv",
-            "sample_calls.tsv",
-            "sample_format_values.tsv",
-        ):
+        expected_tsv_suffixes = ["records.tsv", "header_lines.tsv", "file_metadata.tsv"]
+        if sample_workflow.helper_strategy != "none":
+            expected_tsv_suffixes.extend(["sample_calls.tsv", "sample_format_values.tsv"])
+        for suffix in expected_tsv_suffixes:
             expected_tsv_output = tsv_dir / f"{expected_prefix}.{suffix}"
             if not ensure_writable_path_or_fix(
                 target_path=expected_tsv_output,
@@ -3471,11 +5367,20 @@ def run_full_mode(
         sample_calls_tsv = tsv_dir / f"{prefix}.sample_calls.tsv"
         sample_format_tsv = tsv_dir / f"{prefix}.sample_format_values.tsv"
         try:
-            build_sample_support_tsvs(
-                records_tsv=triplet["records"],
-                sample_calls_tsv=sample_calls_tsv,
-                sample_format_tsv=sample_format_tsv,
-            )
+            if sample_workflow.helper_strategy == SAMPLE_HELPER_STRATEGY_MATERIALIZED:
+                build_sample_support_tsvs(
+                    records_tsv=triplet["records"],
+                    sample_calls_tsv=sample_calls_tsv,
+                    sample_format_tsv=sample_format_tsv,
+                )
+            elif sample_workflow.helper_strategy == "header-only":
+                # RMLStreamer sees valid, empty canonical sources. Their
+                # equivalent triples are appended directly after base mapping.
+                write_sample_support_headers(sample_calls_tsv, sample_format_tsv)
+            elif sample_workflow.helper_strategy != "none":
+                raise RuntimeError(
+                    f"unknown sample helper strategy: {sample_workflow.helper_strategy}"
+                )
         except Exception as exc:
             fail_current(
                 "tsv-derivation",
@@ -3512,6 +5417,12 @@ def run_full_mode(
             )
             continue
         container_generated_rules = f"/data/rules/{generated_rules.name}"
+        progress_host_path = (
+            progress_event_path(metrics_dir, "rmlstreamer", safe_prefix)
+            if progress_events_enabled()
+            else None
+        )
+        progress_container_ref = container_progress_path(progress_host_path, metrics_dir)
 
         run_cmd = [
             *docker_run_base(),
@@ -3598,11 +5509,13 @@ def run_full_mode(
             f"IN_VCF={container_input}",
             "-e",
             "LOGDIR=/data/metrics",
-            image_ref,
-            "bash",
-            "/opt/vcf-rdfizer/run_conversion.sh",
         ]
-        if run(run_cmd) != 0:
+        if progress_container_ref is not None:
+            run_cmd.extend(["-e", f"PROGRESS_FILE={progress_container_ref}"])
+        run_cmd.extend([image_ref, "bash", "/opt/vcf-rdfizer/run_conversion.sh"])
+        with ProgressSession(progress_host_path, f"RMLStreamer: {prefix}"):
+            rdf_exit_code = run(run_cmd)
+        if rdf_exit_code != 0:
             fail_current(
                 "rdf-conversion",
                 f"RMLStreamer step failed for '{prefix}'. See log: {wrapper_log_path}",
@@ -3632,8 +5545,105 @@ def run_full_mode(
             )
             continue
 
+        sample_stats = None
+        if sample_workflow.emitter is not None:
+            print(
+                f"    * Streaming {sample_workflow.representation} multi-sample RDF "
+                "(no expanded helper TSVs)"
+            )
+            try:
+                sample_stats = emit_sample_representation(
+                    sample_workflow,
+                    records_tsv=triplet["records"],
+                    header_lines_tsv=triplet["headers"],
+                    rdf_path=raw_rdf_files[0],
+                )
+            except Exception as exc:
+                fail_current(
+                    f"{sample_workflow.representation}-sample-rdf-streaming",
+                    f"failed streaming {sample_workflow.representation} sample RDF "
+                    f"for '{prefix}': {exc}. "
+                    f"See log: {wrapper_log_path}",
+                )
+                continue
+            if triples_produced is not None:
+                triples_produced += int(sample_stats["triples"])
+            if sample_workflow.representation == "expanded":
+                print(
+                    "    * Sample calls streamed: "
+                    f"{sample_stats['sample_calls']:,}; FORMAT values: "
+                    f"{sample_stats['format_values']:,}"
+                )
+            else:
+                print(
+                    "    * Condensed matrices streamed: "
+                    f"{sample_stats['matrices']:,}; FORMAT vectors: "
+                    f"{sample_stats['format_vectors']:,}; reusable samples: "
+                    f"{sample_stats['samples']:,}"
+                )
+
+        header_stats = None
+        if header_representation != "basic":
+            print(f"    * Streaming {header_representation} header RDF")
+            try:
+                header_stats = append_header_representation_rdf(
+                    triplet["headers"], raw_rdf_files[0]
+                )
+            except Exception as exc:
+                fail_current(
+                    "header-rdf-streaming",
+                    f"failed streaming {header_representation} header RDF for "
+                    f"'{prefix}': {exc}. See log: {wrapper_log_path}",
+                )
+                continue
+            if triples_produced is not None:
+                triples_produced += int(header_stats["triples"])
+            print(
+                f"    * Header lines typed: {header_stats['typed_lines']:,}; "
+                f"contigs: {header_stats['contigs']:,}"
+            )
+
+        info_stats = None
+        if True:
+            print(f"    * Streaming QUAL and {info_representation} INFO RDF")
+            try:
+                info_stats = emit_record_detail(
+                    info_representation,
+                    records_tsv=triplet["records"],
+                    header_lines_tsv=triplet["headers"],
+                    rdf_path=raw_rdf_files[0],
+                )
+            except Exception as exc:
+                fail_current(
+                    "record-detail-rdf-streaming",
+                    f"failed streaming QUAL/{info_representation} INFO RDF for "
+                    f"'{prefix}': {exc}. See log: {wrapper_log_path}",
+                )
+                continue
+            if info_stats is not None:
+                if triples_produced is not None:
+                    triples_produced += int(info_stats["triples"])
+                print(
+                    f"    * QUAL values streamed: {info_stats['qual_values']:,}; "
+                    f"INFO values: {info_stats['info_values']:,}; "
+                    f"declarations: {info_stats['info_definitions']:,}"
+                )
+
         if triples_produced is None:
             triples_produced = count_triples_in_nt_files(raw_rdf_files)
+        if header_stats is not None:
+            sample_stats = {**(sample_stats or {}), "header": header_stats}
+        if info_stats is not None:
+            sample_stats = {**(sample_stats or {}), "info": info_stats}
+        if sample_stats is not None and triples_produced is not None:
+            update_conversion_metrics_after_sample_stream(
+                metrics_dir=metrics_dir,
+                output_name=output_name,
+                run_id=run_id,
+                rdf_path=raw_rdf_files[0],
+                total_triples=triples_produced,
+                sample_stats=sample_stats,
+            )
         if triples_produced is not None:
             saw_triple_counts = True
             total_triples_produced += triples_produced
@@ -3669,6 +5679,7 @@ def run_full_mode(
                     timestamp=timestamp,
                     output_name=output_name,
                     expected_triples=triples_produced,
+                    index_warnings=input_index_warnings,
                 )
                 if not ok:
                     fail_current(
@@ -3694,17 +5705,128 @@ def run_full_mode(
                     min_chunk_bytes=chunk_min_bytes,
                     max_chunk_bytes=chunk_max_bytes,
                     expected_triples=triples_produced,
+                    index_warnings=input_index_warnings,
                 )
                 if not ok:
                     fail_current(
                         "compression",
                         f"partitioned compression failed for '{output_name}'. See log: {wrapper_log_path}",
                     )
+        for warning in input_index_warnings:
+            warning.setdefault("input_index", idx)
+            warning.setdefault("input_vcf", input_vcf)
+            warning.setdefault("expected_prefix", expected_prefix)
+            if warning not in index_warnings:
+                index_warnings.append(warning)
         if input_failed:
             continue
         print(f"    * Compression {success_symbol()}")
         if run_tracker is not None:
             run_tracker.mark(f"Input {idx}: compression completed for {output_name}")
+
+        if run_validation:
+            # Each requested target is validated independently, so a run can
+            # prove that the aggregate, the HDT, and the COTTAS artifact all
+            # reproduce the same VCF summaries. `validation_result` keeps the
+            # aggregate's report in the metrics row for backward compatibility;
+            # every target also gets its own stage report and results tree.
+            validation_targets = resolve_validation_targets(
+                requested=validation_artifacts,
+                output_dir=out_dir / output_name,
+                output_name=output_name,
+                aggregate_path=raw_rdf_files[0],
+                selected_methods=selected_methods,
+            )
+            validation_failures: list[str] = []
+            for target in validation_targets:
+                target_id = (
+                    output_name
+                    if target["name"] == "aggregate"
+                    else f"{output_name}__{target['name']}"
+                )
+                safe_target_id = safe_metrics_name(target_id)
+                target_results_dir = (
+                    metrics_dir / "reports" / "validation" / safe_target_id
+                )
+                print(
+                    f"    * Semantic validation ({target['name']}, {engine_label}): "
+                    f"{target['path'].name}"
+                )
+                target_result = {
+                    "run_id": run_id,
+                    "timestamp": timestamp,
+                    "stage": "validation",
+                    "validation_id": target_id,
+                    "validation_target": target["name"],
+                    "vcf_path": str(input_vcf),
+                    "rdf_path": str(target["path"]),
+                    "rdf_format": target["format"],
+                    "engine": engine_label,
+                    "representation": sample_workflow.representation,
+                    "results_dir": str(target_results_dir),
+                    "summary_path": str(target_results_dir / "summary.json"),
+                    "input_rdf_size_bytes": int(file_size_bytes(target["path"]) or 0),
+                    "exit_code": 1,
+                    "status": "EXECUTION_FAILED",
+                    "timing": {
+                        "wall_seconds": None,
+                        "user_seconds": None,
+                        "sys_seconds": None,
+                        "max_rss_kb": None,
+                    },
+                    "temporary_rdf": {
+                        "decompressed_inside_container": target["format"] != "nt",
+                        "persisted_on_host": False,
+                        "cleanup_confirmed_by_runner": False,
+                    },
+                }
+                try:
+                    target_exit_code = run_validation_mode(
+                        vcf_path=Path(input_vcf),
+                        rdf_path=target["path"],
+                        rdf_format=target["format"],
+                        representation=sample_workflow.representation,
+                        validation_id=target_id,
+                        results_dir=target_results_dir,
+                        metrics_dir=metrics_dir,
+                        run_id=run_id,
+                        timestamp=timestamp,
+                        image_ref=image_ref,
+                        filter_oracle=filter_oracle,
+                        engine=validation_engine,
+                        engine_options=validation_engine_options,
+                        strict_conformance=validation_strict_conformance,
+                        shacl_shapes=validation_shacl_shapes,
+                        wrapper_log_path=wrapper_log_path,
+                        run_tracker=run_tracker,
+                        stage_result=target_result,
+                    )
+                except Exception as exc:
+                    target_result["error"] = str(exc)
+                    try:
+                        stage_path = (
+                            metrics_dir / "stages" / "validation" / f"{safe_target_id}.json"
+                        )
+                        stage_path.parent.mkdir(parents=True, exist_ok=True)
+                        stage_path.write_text(
+                            json.dumps(target_result, indent=2) + "\n", encoding="utf-8"
+                        )
+                    except OSError:
+                        pass
+                    eprint(
+                        f"Error: semantic validation could not be completed for "
+                        f"'{target_id}': {exc}. See log: {wrapper_log_path}"
+                    )
+                    target_exit_code = 1
+                if target["name"] == "aggregate":
+                    validation_result = target_result
+                if int(target_exit_code) != 0:
+                    validation_failures.append(target["name"])
+            if validation_result is None and validation_targets:
+                # Only non-aggregate targets ran; keep the first for the row.
+                validation_result = target_result
+            validation_failed = bool(validation_failures)
+            validation_exit_code = 1 if validation_failed else 0
 
         raw_size_before_cleanup_by_file = {
             raw_rdf_path.name: int(file_size_bytes(raw_rdf_path) or 0) for raw_rdf_path in raw_rdf_files
@@ -3725,6 +5847,8 @@ def run_full_mode(
                 combined_size_bytes=combined_size_before_cleanup,
                 selected_methods=selected_methods,
                 method_results=aggregated_results,
+                index_warnings=input_index_warnings,
+                validation_result=validation_result,
             )
             update_metrics_csv_with_compression(
                 metrics_csv=metrics_dir / "metrics.csv",
@@ -3736,6 +5860,7 @@ def run_full_mode(
                 selected_methods=selected_methods,
                 method_results=aggregated_results,
                 tsv_metrics=tsv_metrics,
+                validation_result=validation_result,
             )
         except PermissionError as exc:
             blocked_path = exc.filename or str(metrics_dir)
@@ -3747,18 +5872,42 @@ def run_full_mode(
             )
             return 1
 
+        if validation_failed:
+            fail_current(
+                "validation",
+                "semantic VCF/RDF validation failed for "
+                f"'{output_name}' ({', '.join(validation_failures)}). "
+                f"See results: {metrics_dir / 'reports' / 'validation'}",
+            )
+
         rdf_storage_removed = False
-        if selected_methods and (
+        if not validation_failed and selected_methods and (
             remove_rdf_storage_output or not keep_rmlstreamer_rdf_output
         ):
             # Cleanup raw RDF only after every selected compression method has
             # completed successfully for that specific RDF artifact.
             cleanup_failed = False
+            warning_formats = {
+                warning.get("format")
+                for warning in input_index_warnings
+                if warning.get("format") in {"hdt", "cottas"}
+            }
+            optional_failed_methods = {
+                method
+                for method in selected_methods
+                if (
+                    (method in HDT_COMPRESSION_METHODS and "hdt" in warning_formats)
+                    or (method in COTTAS_COMPRESSION_METHODS and "cottas" in warning_formats)
+                )
+            }
             if use_partitioned_compression:
                 missing_or_failed_hdt = []
                 for method in partitioned_methods:
                     result = partitioned_representation_results.get(method)
-                    if result is None or int(result.get("exit_code", 1)) != 0:
+                    if (
+                        method not in optional_failed_methods
+                        and (result is None or int(result.get("exit_code", 1)) != 0)
+                    ):
                         missing_or_failed_hdt.append(method)
                 if missing_or_failed_hdt:
                     fail_current(
@@ -3778,7 +5927,10 @@ def run_full_mode(
                 missing_or_failed = []
                 for method in methods_to_validate:
                     result = method_results.get(method)
-                    if result is None or int(result.get("exit_code", 1)) != 0:
+                    if (
+                        method not in optional_failed_methods
+                        and (result is None or int(result.get("exit_code", 1)) != 0)
+                    ):
                         missing_or_failed.append(method)
                 if missing_or_failed:
                     fail_current(
@@ -3789,6 +5941,13 @@ def run_full_mode(
                         f"See log: {wrapper_log_path}",
                     )
                     cleanup_failed = True
+                    break
+
+                if optional_failed_methods:
+                    eprint(
+                        f"Warning: retaining raw RDF '{raw_rdf_path.name}' because "
+                        "one or more COTTAS/HDT index-dependent outputs were unavailable."
+                    )
                     break
 
                 # In space-optimized mode the aggregate `.nt.gz` is itself
@@ -3816,93 +5975,64 @@ def run_full_mode(
                 continue
             rdf_storage_removed = not any(path.exists() for path in raw_rdf_files)
 
-        if raw_rdf_files:
-            output_root = out_dir / output_name
-            raw_total_size = sum(raw_size_before_cleanup_by_file.values())
+        # Full mode always produces exactly one aggregate per input.
+        output_root = out_dir / output_name
+        raw_total_size = sum(raw_size_before_cleanup_by_file.values())
 
-            if keep_rmlstreamer_rdf_output:
-                raw_note = "retained via --keep-rmlstreamer-rdf-output"
-            elif rdf_storage_removed and remove_rdf_storage_output:
-                raw_note = "removed via --remove-rdf-storage-output"
-            elif rdf_storage_removed and selected_methods:
-                raw_note = "removed after successful compression"
-            elif selected_methods and rdf_storage_mode == "space-optimized" and "gzip" in selected_methods:
-                raw_note = "retained because it is also the selected gzip artifact"
-            elif selected_methods:
-                raw_note = "retained"
-            else:
-                raw_note = "kept (compression methods set to none)"
+        if validation_failed:
+            raw_note = "retained after validation failure"
+        elif keep_rmlstreamer_rdf_output:
+            raw_note = "retained via --keep-rmlstreamer-rdf-output"
+        elif rdf_storage_removed and remove_rdf_storage_output:
+            raw_note = "removed via --remove-rdf-storage-output"
+        elif rdf_storage_removed and selected_methods:
+            raw_note = "removed after successful compression"
+        elif selected_methods and rdf_storage_mode == "space-optimized" and "gzip" in selected_methods:
+            raw_note = "retained because it is also the selected gzip artifact"
+        elif selected_methods:
+            raw_note = "retained"
+        else:
+            raw_note = "kept (compression methods set to none)"
 
-            first_path = raw_rdf_files[0]
-            print(f"    * Output directory: {output_root}")
-            print(f"      - RDF aggregate: {first_path.name}")
-            raw_text = format_bytes(raw_total_size)
-            print(
-                f"      - {rdf_label_for_path(first_path)}: {raw_text} "
-                f"({raw_note})"
-            )
+        first_path = raw_rdf_files[0]
+        print(f"    * Output directory: {output_root}")
+        print(f"      - RDF aggregate: {first_path.name}")
+        raw_text = format_bytes(raw_total_size)
+        print(
+            f"      - {rdf_label_for_path(first_path)}: {raw_text} "
+            f"({raw_note})"
+        )
 
-            if selected_methods:
-                for method in selected_methods:
-                    if use_partitioned_compression and method in PARTITIONED_COMPRESSION_METHODS:
-                        result = partitioned_representation_results.get(method)
-                        label = compression_method_label_for_path(first_path, method)
-                        if not result or int(result.get("exit_code", 1)) != 0:
-                            print(f"      - {label}: not generated")
-                        else:
-                            print(
-                                f"      - {label}: {format_bytes(int(result.get('output_size_bytes') or 0))} "
-                                f"({result.get('output_path', '')})"
-                            )
-                        continue
-                    method_total = 0
-                    method_count = 0
-                    for raw_rdf_path in raw_rdf_files:
-                        result = method_results_by_file.get(raw_rdf_path.name, {}).get(method)
-                        if not result or int(result.get("exit_code", 1)) != 0:
-                            continue
-                        method_total += int(result.get("output_size_bytes") or 0)
-                        method_count += 1
-
+        if selected_methods:
+            for method in selected_methods:
+                if use_partitioned_compression and method in PARTITIONED_COMPRESSION_METHODS:
+                    result = partitioned_representation_results.get(method)
                     label = compression_method_label_for_path(first_path, method)
-                    if method_count == 0:
+                    if not result or int(result.get("exit_code", 1)) != 0:
                         print(f"      - {label}: not generated")
                     else:
-                        print(f"      - {label}: {format_bytes(method_total)}")
-            else:
-                print("      - Compression: none selected")
-                print(f"      - Final RDF size (no compression): {format_bytes(raw_total_size)}")
-        else:
-            for raw_rdf_path in raw_rdf_files:
-                hdt_path = (out_dir / output_name) / f"{raw_rdf_path.stem}.hdt"
-                rdf_size = file_size_bytes(raw_rdf_path)
-                nt_note = None
-                method_results = method_results_by_file.get(raw_rdf_path.name, {})
-                if raw_rdf_path.exists() and keep_rmlstreamer_rdf_output:
-                    nt_note = "retained via --keep-rmlstreamer-rdf-output"
-                elif raw_rdf_path.exists() and selected_methods and rdf_storage_mode == "space-optimized" and "gzip" in selected_methods:
-                    nt_note = "retained because it is also the selected gzip artifact"
-                elif not raw_rdf_path.exists() and remove_rdf_storage_output:
-                    nt_note = "removed via --remove-rdf-storage-output"
-                elif not raw_rdf_path.exists() and selected_methods:
-                    nt_note = "removed after successful compression"
-                elif not raw_rdf_path.exists() and not selected_methods:
-                    nt_note = "kept (compression methods set to none)"
+                        print(
+                            f"      - {label}: {format_bytes(int(result.get('output_size_bytes') or 0))} "
+                            f"({result.get('output_path', '')})"
+                        )
+                    continue
+                method_total = 0
+                method_count = 0
+                for raw_rdf_path in raw_rdf_files:
+                    result = method_results_by_file.get(raw_rdf_path.name, {}).get(method)
+                    if not result or int(result.get("exit_code", 1)) != 0:
+                        continue
+                    method_total += int(result.get("output_size_bytes") or 0)
+                    method_count += 1
+
+                label = compression_method_label_for_path(first_path, method)
+                if method_count == 0:
+                    print(f"      - {label}: not generated")
                 else:
-                    nt_note = "retained"
-                print_nt_hdt_summary(
-                    output_root=out_dir / output_name,
-                    nt_path=raw_rdf_path,
-                    hdt_path=hdt_path,
-                    indent="    ",
-                    nt_note=nt_note,
-                    nt_size_override=rdf_size,
-                    selected_methods=selected_methods,
-                    method_results=method_results,
-                )
-            if not selected_methods:
-                total_raw_size = sum(raw_size_before_cleanup_by_file.values())
-                print(f"    * Final RDF size (no compression): {format_bytes(total_raw_size)}")
+                    print(f"      - {label}: {format_bytes(method_total)}")
+        else:
+            print("      - Compression: none selected")
+            print(f"      - Final RDF size (no compression): {format_bytes(raw_total_size)}")
 
         if not keep_tsv:
             # Cleanup only the triplet generated for this input iteration.
@@ -3934,7 +6064,10 @@ def run_full_mode(
                 continue
 
         if run_tracker is not None:
-            run_tracker.mark(f"Input {idx}/{total_inputs} completed: {output_name}")
+            if input_failed:
+                run_tracker.mark(f"Input {idx}/{total_inputs} finished with failures: {output_name}")
+            else:
+                run_tracker.mark(f"Input {idx}/{total_inputs} completed: {output_name}")
 
     if not keep_tsv and intermediate_dir.exists():
         if not remove_path_with_docker_fallback(
@@ -3956,6 +6089,19 @@ def run_full_mode(
     elif not selected_methods:
         print("Total triples produced (full run): unavailable")
 
+    index_warning_report = None
+    if index_warnings:
+        index_warning_report = write_index_warnings_report(
+            metrics_dir=metrics_dir,
+            run_id=run_id,
+            warnings=index_warnings,
+        )
+        eprint(
+            f"Index generation warnings were recorded for {len(index_warnings)} item(s): "
+            f"{index_warning_report}"
+        )
+        print(f"Index warnings: {index_warning_report}")
+
     if input_failures:
         report_path = write_failed_inputs_report(metrics_dir=metrics_dir, failures=input_failures)
         eprint(
@@ -3970,9 +6116,15 @@ def run_full_mode(
             )
         return 1
 
-    print("Conversion process finished.")
+    if index_warning_report is not None:
+        print("Conversion process finished with index warnings.")
+    else:
+        print("Conversion process finished.")
     if run_tracker is not None:
-        run_tracker.mark("Full pipeline finished successfully")
+        run_tracker.mark(
+            "Full pipeline finished successfully"
+            + (f" with index warnings; report: {index_warning_report}" if index_warning_report else "")
+        )
     return 0
 
 
@@ -4077,6 +6229,31 @@ def run_compress_mode(
             return 1
 
     target_out_dir = out_dir / input_stem
+    source_size_bytes = int(file_size_bytes(rdf_path) or 0)
+    try:
+        write_compression_metrics_artifacts(
+            metrics_dir=metrics_dir,
+            run_id=run_id,
+            timestamp=timestamp,
+            output_name=input_stem,
+            source_rdf_path=rdf_path,
+            combined_size_bytes=source_size_bytes,
+            selected_methods=methods,
+            method_results=method_results,
+        )
+        update_metrics_csv_with_compression(
+            metrics_csv=metrics_dir / "metrics.csv",
+            run_id=run_id,
+            timestamp=timestamp,
+            output_name=input_stem,
+            output_dir=target_out_dir,
+            combined_size_bytes=source_size_bytes,
+            selected_methods=methods,
+            method_results=method_results,
+        )
+    except OSError as exc:
+        eprint(f"Error: unable to write compression metrics: {exc}")
+        return 1
     hdt_path = target_out_dir / f"{input_stem}.hdt"
     print_nt_hdt_summary(
         output_root=target_out_dir,
@@ -4088,6 +6265,69 @@ def run_compress_mode(
     )
     print("Conversion process finished.")
     return 0
+
+
+def detect_validation_rdf_format(path: Path) -> str | None:
+    """Infer the validator's artifact format from a filename, or None."""
+    for suffix, fmt in VALIDATION_RDF_SUFFIXES:
+        if path.name.endswith(suffix):
+            return fmt
+    return None
+
+
+def resolve_validation_targets(
+    *,
+    requested: list[str],
+    output_dir: Path,
+    output_name: str,
+    aggregate_path: Path,
+    selected_methods: list[str],
+) -> list[dict]:
+    """Map requested validation targets onto artifacts that actually exist.
+
+    A representation that was not selected, or whose artifact is missing after
+    a recoverable index warning, is skipped rather than reported as a failure:
+    the run already recorded why it is absent.
+    """
+    targets: list[dict] = []
+    for name in requested:
+        if name == "aggregate":
+            fmt = detect_validation_rdf_format(aggregate_path)
+            if aggregate_path.is_file() and fmt is not None:
+                targets.append({"name": name, "path": aggregate_path, "format": fmt})
+            continue
+        method_group = (
+            HDT_COMPRESSION_METHODS if name == "hdt" else COTTAS_COMPRESSION_METHODS
+        )
+        if not any(method in method_group for method in selected_methods):
+            continue
+        candidate = output_dir / f"{output_name}.{name}"
+        if candidate.is_file():
+            targets.append({"name": name, "path": candidate, "format": name})
+    return targets
+
+
+def parse_validation_targets(raw: str) -> list[str]:
+    """Parse --validate-artifacts into an ordered, de-duplicated target list."""
+    value = (raw or "").strip()
+    if value == "" or value == "none":
+        return []
+    if value == "all":
+        return list(VALIDATION_TARGET_CHOICES)
+    targets: list[str] = []
+    for token in value.split(","):
+        target = token.strip()
+        if not target:
+            continue
+        if target not in VALIDATION_TARGET_CHOICES:
+            allowed = ",".join(VALIDATION_TARGET_CHOICES)
+            raise ValueError(
+                f"Unsupported value '{target}' for --validate-artifacts. "
+                f"Use {allowed}, all, or none."
+            )
+        if target not in targets:
+            targets.append(target)
+    return targets
 
 
 def detect_compressed_format(path: Path):
@@ -4126,6 +6366,126 @@ def default_decompressed_name(path: Path, fmt: str):
     return f"{path.stem}.nt"
 
 
+def run_index_mode(
+    *,
+    index_path: Path,
+    index_format: str,
+    metrics_dir: Path,
+    image_ref: str,
+    wrapper_log_path: Path,
+    run_id: str | None = None,
+    timestamp: str | None = None,
+):
+    """Generate or regenerate the query index for one existing artifact.
+
+    HDT writes its index as a versioned sibling sidecar. COTTAS stores its
+    query index in the Parquet artifact itself, so the Docker-side adapter
+    rewrites that file atomically with the requested index order.
+    """
+    format_label = index_format.upper()
+    print(f"Step 3/3: Regenerating {format_label} index")
+    ensure_dir(metrics_dir)
+
+    existing_index_path = (
+        find_hdt_index_sidecar(index_path) if index_format == "hdt" else None
+    )
+    mount_name = "hdt" if index_format == "hdt" else "cottas"
+    source_container = f"/data/{mount_name}/{index_path.name}"
+    if index_format == "hdt":
+        command = (
+            "set -euo pipefail; "
+            f"{shlex.quote(HDT_INDEX_HELPER_CONTAINER)} {shlex.quote(source_container)}"
+        )
+    else:
+        command = (
+            "set -euo pipefail; "
+            'PYTHON_BIN="${COTTAS_PYTHON_BIN:-$(command -v python3 || true)}"; '
+            'if [[ -z "$PYTHON_BIN" || ! -x "$PYTHON_BIN" ]]; then '
+            'echo "Missing pycottas Python executable in container" >&2; exit 127; fi; '
+            f'"$PYTHON_BIN" {shlex.quote(COTTAS_TOOL_CONTAINER)} reindex '
+            f"{shlex.quote(source_container)} spo"
+        )
+    safe_input = safe_metrics_name(index_path.name)
+    timing_host = metrics_dir / "timings" / "index" / f"{safe_input}.txt"
+    timing_host.parent.mkdir(parents=True, exist_ok=True)
+    timing_container = f"/data/metrics/timings/index/{safe_input}.txt"
+    timed_command = (
+        "set -euo pipefail; "
+        f"rm -f {shlex.quote(timing_container)}; "
+        'if [[ -x /usr/bin/time ]] && /usr/bin/time --version >/dev/null 2>&1; then '
+        f"/usr/bin/time -v -o {shlex.quote(timing_container)} -- bash -lc {shlex.quote(command)}; "
+        "else "
+        f"{{ time -p bash -lc {shlex.quote(command)}; }} > {shlex.quote(timing_container)} 2>&1; "
+        "fi"
+    )
+    input_size_bytes = int(file_size_bytes(index_path) or 0)
+    cmd = [
+        *docker_run_base(),
+        *docker_hdt_index_env_args(),
+        *docker_cottas_merge_env_args(),
+        "-v",
+        f"{str(index_path.parent)}:/data/{mount_name}",
+        "-v",
+        f"{str(metrics_dir.resolve())}:/data/metrics",
+        image_ref,
+        "bash",
+        "-lc",
+        timed_command,
+    ]
+
+    started = time.perf_counter()
+    exit_code = run(cmd)
+    elapsed = time.perf_counter() - started
+    timing = parse_time_log_metrics(timing_host)
+    index_path_after = (
+        find_hdt_index_sidecar(index_path)
+        if index_format == "hdt"
+        else (index_path if file_size_bytes(index_path) else None)
+    )
+    index_ready = index_path_after is not None
+    final_code = int(exit_code) if int(exit_code) != 0 else (0 if index_ready else 1)
+    index_was_present = existing_index_path is not None or index_format == "cottas"
+    payload = {
+        "run_id": run_id,
+        "timestamp": timestamp,
+        "index_format": index_format,
+        "input_path": str(index_path),
+        "input_size_bytes": input_size_bytes,
+        "index_path": str(index_path_after) if index_path_after else "",
+        "index_location": "sidecar" if index_format == "hdt" else "embedded",
+        "exit_code": final_code,
+        "wall_seconds": elapsed,
+        "timing": {
+            "wall_seconds": elapsed,
+            "user_seconds": timing.get("user_seconds"),
+            "sys_seconds": timing.get("sys_seconds"),
+            "max_rss_kb": timing.get("max_rss_kb"),
+        },
+        "index_status": (
+            "regenerated" if index_was_present else "generated"
+        ) if index_ready else "failed",
+        "index_size_bytes": file_size_bytes(index_path_after) if index_path_after else 0,
+    }
+    if index_format == "hdt":
+        # Preserve the field used by the original HDT-only metrics payload.
+        payload["hdt_path"] = str(index_path)
+    else:
+        payload["cottas_path"] = str(index_path)
+    metrics_path = metrics_dir / "stages" / "index" / f"{index_format}-{safe_input}.json"
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    metrics_path.write_text(
+        json.dumps(payload, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    if final_code != 0:
+        eprint(f"Error: {format_label} index regeneration failed. See log: {wrapper_log_path}")
+        return 1
+
+    print(f"{format_label} index ready: {index_path_after}")
+    print(f"Index metrics: {metrics_path}")
+    return 0
+
+
 def run_hdt_index_mode(
     *,
     hdt_path: Path,
@@ -4133,60 +6493,23 @@ def run_hdt_index_mode(
     image_ref: str,
     wrapper_log_path: Path,
 ):
-    """Eagerly create the HDT Java index beside an existing HDT file."""
-    print("Step 3/3: Initializing HDT index")
-    ensure_dir(metrics_dir)
-    existing_index_path = find_hdt_index_sidecar(hdt_path)
-    index_existed = existing_index_path is not None
-    source_container = f"/data/hdt/{hdt_path.name}"
-    command = (
-        "set -euo pipefail; "
-        f"{shlex.quote(HDT_INDEX_HELPER_CONTAINER)} {shlex.quote(source_container)}"
+    """Backward-compatible wrapper for the HDT-only index helper."""
+    return run_index_mode(
+        index_path=hdt_path,
+        index_format="hdt",
+        metrics_dir=metrics_dir,
+        image_ref=image_ref,
+        wrapper_log_path=wrapper_log_path,
     )
-    cmd = [
-        *docker_run_base(),
-        "-v",
-        f"{str(hdt_path.parent)}:/data/hdt",
-        image_ref,
-        "bash",
-        "-lc",
-        command,
-    ]
-
-    started = time.perf_counter()
-    exit_code = run(cmd)
-    elapsed = time.perf_counter() - started
-    index_path = find_hdt_index_sidecar(hdt_path)
-    index_ready = index_path is not None
-    final_code = int(exit_code) if int(exit_code) != 0 else (0 if index_ready else 1)
-    payload = {
-        "hdt_path": str(hdt_path),
-        "index_path": str(index_path) if index_path else "",
-        "exit_code": final_code,
-        "wall_seconds": elapsed,
-        "index_status": (
-            "existing" if index_existed else "generated"
-        ) if index_ready else "failed",
-        "index_size_bytes": file_size_bytes(index_path) if index_path else 0,
-    }
-    (metrics_dir / "hdt_index_metrics.json").write_text(
-        json.dumps(payload, indent=2) + "\n",
-        encoding="utf-8",
-    )
-
-    if final_code != 0:
-        eprint(f"Error: HDT index initialization failed. See log: {wrapper_log_path}")
-        return 1
-
-    print(f"HDT index ready: {index_path}")
-    print(f"HDT index metrics: {metrics_dir / 'hdt_index_metrics.json'}")
-    return 0
 
 
 def run_decompress_mode(
     *,
     compressed_path: Path,
     decompressed_out: Path,
+    metrics_dir: Path,
+    run_id: str,
+    timestamp: str,
     image_ref: str,
     wrapper_log_path: Path,
 ):
@@ -4257,22 +6580,292 @@ def run_decompress_mode(
             f"{shlex.quote(cottas_input)} {shlex.quote(output_container)}"
         )
 
+    safe_input = safe_metrics_name(compressed_path.name)
+    timing_host = metrics_dir / "timings" / "decompression" / f"{safe_input}.txt"
+    timing_host.parent.mkdir(parents=True, exist_ok=True)
+    timing_container = f"/data/metrics/timings/decompression/{safe_input}.txt"
+    timed_command = (
+        "set -euo pipefail; "
+        f"rm -f {shlex.quote(timing_container)}; "
+        'if [[ -x /usr/bin/time ]] && /usr/bin/time --version >/dev/null 2>&1; then '
+        f"/usr/bin/time -v -o {shlex.quote(timing_container)} -- bash -lc {shlex.quote(command)}; "
+        "else "
+        f"{{ time -p bash -lc {shlex.quote(command)}; }} > {shlex.quote(timing_container)} 2>&1; "
+        "fi"
+    )
+    input_size_bytes = int(file_size_bytes(compressed_path) or 0)
     cmd = [
         *docker_run_base(),
         "-v",
         f"{str(compressed_path.parent)}:/data/in:ro",
         "-v",
         f"{str(decompressed_out.parent)}:/data/out",
+        "-v",
+        f"{str(metrics_dir.resolve())}:/data/metrics",
         image_ref,
         "bash",
         "-lc",
-        command,
+        timed_command,
     ]
-    if run(cmd) != 0:
+    started = time.perf_counter()
+    exit_code = run(cmd)
+    elapsed = time.perf_counter() - started
+    timing = parse_time_log_metrics(timing_host)
+    stage_payload = {
+        "run_id": run_id,
+        "timestamp": timestamp,
+        "format": fmt,
+        "input_path": str(compressed_path),
+        "input_size_bytes": input_size_bytes,
+        "output_path": str(decompressed_out),
+        "output_size_bytes": int(file_size_bytes(decompressed_out) or 0),
+        # Decompression is deliberately a single pass. Counting N-Triples
+        # here would reread a cohort-scale output solely for observability.
+        "output_triples": None,
+        "exit_code": int(exit_code),
+        "timing": {
+            "wall_seconds": elapsed,
+            "user_seconds": timing.get("user_seconds"),
+            "sys_seconds": timing.get("sys_seconds"),
+            "max_rss_kb": timing.get("max_rss_kb"),
+        },
+    }
+    report_path = metrics_dir / "stages" / "decompression" / f"{safe_input}.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(stage_payload, indent=2) + "\n", encoding="utf-8")
+    if exit_code != 0:
         eprint(f"Error: decompression failed. See log: {wrapper_log_path}")
         return 1
 
     print(f"Done. Decompressed file: {decompressed_out}")
+    print(f"Decompression metrics: {report_path}")
+    return 0
+
+
+def run_validation_mode(
+    *,
+    vcf_path: Path,
+    rdf_path: Path,
+    representation: str,
+    validation_id: str,
+    results_dir: Path,
+    metrics_dir: Path,
+    run_id: str,
+    timestamp: str,
+    image_ref: str,
+    filter_oracle: str,
+    wrapper_log_path: Path,
+    engine: str | list[str] = DEFAULT_VALIDATION_ENGINE,
+    engine_options: dict | None = None,
+    rdf_format: str | None = None,
+    strict_conformance: bool = False,
+    shacl_shapes: Path | None = None,
+    run_tracker: RunTracker | None = None,
+    stage_result: dict | None = None,
+    write_metrics_csv: bool = False,
+):
+    """Run VCF/RDF semantic queries with container-local temporary state.
+
+    Accepts any artifact the pipeline produces (``.nt``, ``.nt.gz``, ``.nt.br``,
+    ``.hdt``, ``.cottas``, ``.cottas[.gz|.br]``). Anything other than plain
+    N-Triples is decoded under the container's ``/work`` filesystem, so
+    validating an ``.hdt`` proves it decodes to a graph that still satisfies
+    every semantic check. No validation scratch RDF is persisted on the host.
+
+    ``engine`` selects the SPARQL backend (``comunica`` or ``qlever``); both
+    answer the same queries, so it is a scale decision, not a semantic one.
+    """
+    # An empty directory may be left behind if Docker itself fails before the
+    # runner starts. Reuse only that empty shell; never overwrite reports.
+    results_dir.mkdir(parents=True, exist_ok=True)
+    safe_validation_id = safe_metrics_name(validation_id)
+    timing_host = metrics_dir / "timings" / "validation" / f"{safe_validation_id}.txt"
+    timing_host.parent.mkdir(parents=True, exist_ok=True)
+    timing_container = f"/data/metrics/timings/validation/{safe_validation_id}.txt"
+    progress_host_path = (
+        progress_event_path(metrics_dir, "validation", safe_validation_id)
+        if progress_events_enabled()
+        else None
+    )
+    progress_container_ref = container_progress_path(progress_host_path, metrics_dir)
+    resolved_format = rdf_format or detect_validation_rdf_format(rdf_path)
+    if resolved_format is None:
+        raise ValueError(
+            f"Unsupported RDF artifact for validation: {rdf_path.name}. "
+            "Expected one of .nt, .nt.gz, .nt.br, .hdt, .cottas, .cottas.gz, .cottas.br"
+        )
+    options = dict(engine_options or {})
+    engine_list = [engine] if isinstance(engine, str) else list(engine)
+    engine_args: list[str] = ["--engine", ",".join(engine_list)]
+    for flag, key in (
+        ("--query-timeout", "query_timeout"),
+        ("--qlever-memory-gb", "qlever_memory_gb"),
+        ("--qlever-port", "qlever_port"),
+        ("--qlever-startup-timeout", "qlever_startup_timeout"),
+    ):
+        value = options.get(key)
+        if value is not None:
+            engine_args.extend([flag, str(value)])
+    for flag, key in (
+        ("--qlever-index-arg", "qlever_index_args"),
+        ("--qlever-server-arg", "qlever_server_args"),
+    ):
+        for value in options.get(key) or []:
+            engine_args.extend([flag, str(value)])
+    if strict_conformance:
+        engine_args.append("--strict-conformance")
+    shacl_mount: list[str] = []
+    if shacl_shapes is not None:
+        # Mounted read-only in its own directory so the shapes file can live
+        # anywhere on the host without exposing its parent tree for writing.
+        shacl_mount = ["-v", f"{shacl_shapes.parent.resolve()}:/data/shacl:ro"]
+        engine_args.extend(["--shacl-shapes", f"/data/shacl/{shacl_shapes.name}"])
+
+    cmd = [
+        *docker_run_base(),
+        "--init",
+        "-v",
+        f"{str(vcf_path.parent)}:/data/vcf:ro",
+        "-v",
+        f"{str(rdf_path.parent)}:/data/rdf:ro",
+        "-v",
+        f"{str(results_dir)}:/data/validation",
+        "-v",
+        f"{str(metrics_dir.resolve())}:/data/metrics",
+        *shacl_mount,
+        image_ref,
+        "/usr/bin/time",
+        "-v",
+        "-o",
+        timing_container,
+        "--",
+        "/opt/pycottas-venv/bin/python",
+        "/opt/vcf-rdfizer/validation/validation_runner.py",
+        "--vcf",
+        f"/data/vcf/{vcf_path.name}",
+        "--rdf",
+        f"/data/rdf/{rdf_path.name}",
+        "--rdf-format",
+        resolved_format,
+        *engine_args,
+        "--representation",
+        representation,
+        "--results-dir",
+        "/data/validation",
+        "--dataset-id",
+        validation_id,
+        "--filter-oracle",
+        filter_oracle,
+        "--scratch-dir",
+        "/work",
+        *(
+            ["--progress-path", progress_container_ref]
+            if progress_container_ref is not None
+            else []
+        ),
+        *(["--quiet"] if _QUIET else []),
+    ]
+    if run_tracker is not None:
+        run_tracker.mark(f"Validation started: {validation_id}")
+    started = time.perf_counter()
+    with ProgressSession(progress_host_path, f"Validation: {validation_id}"):
+        exit_code = run(cmd)
+    elapsed = time.perf_counter() - started
+    timing = parse_time_log_metrics(timing_host)
+    timing["wall_seconds"] = elapsed
+    summary_path = results_dir / "summary.json"
+    summary = None
+    if summary_path.is_file():
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            summary = None
+    report_path = metrics_dir / "stages" / "validation" / f"{safe_validation_id}.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    status = summary.get("status") if isinstance(summary, dict) else None
+    if not status:
+        status = "PASS" if int(exit_code) == 0 else "EXECUTION_FAILED"
+    if int(exit_code) != 0 and status == "PASS":
+        status = "EXECUTION_FAILED"
+    summary_temporary_rdf = summary.get("temporaryRdf", {}) if isinstance(summary, dict) else {}
+    payload = {
+        "run_id": run_id,
+        "timestamp": timestamp,
+        "stage": "validation",
+        "validation_id": validation_id,
+        "vcf_path": str(vcf_path),
+        "rdf_path": str(rdf_path),
+        "rdf_format": resolved_format,
+        "engine": engine_list[0],
+        "engines": engine_list,
+        "strict_conformance": bool(strict_conformance),
+        "representation": representation,
+        "results_dir": str(results_dir),
+        "summary_path": str(summary_path),
+        # Lift the oracle-versus-SPARQL timings into the stage report so a
+        # benchmark can be read from the run metrics without opening the
+        # detailed validation results.
+        "engine_statuses": summary.get("engineStatuses") if isinstance(summary, dict) else None,
+        "engine_agreement": summary.get("engineAgreement") if isinstance(summary, dict) else None,
+        "benchmark": summary.get("benchmark") if isinstance(summary, dict) else None,
+        "benchmark_csv_path": str(results_dir / "benchmark.csv"),
+        "input_rdf_size_bytes": int(file_size_bytes(rdf_path) or 0),
+        "exit_code": int(exit_code),
+        "status": status,
+        "timing": {
+            "wall_seconds": timing.get("wall_seconds"),
+            "user_seconds": timing.get("user_seconds"),
+            "sys_seconds": timing.get("sys_seconds"),
+            "max_rss_kb": timing.get("max_rss_kb"),
+        },
+        "temporary_rdf": {
+            "decompressed_inside_container": bool(
+                summary_temporary_rdf.get(
+                    "decompressedInsideContainer", resolved_format != "nt"
+                )
+            ),
+            "persisted_on_host": bool(summary_temporary_rdf.get("persisted", False)),
+            "cleanup_confirmed_by_runner": bool(
+                summary_temporary_rdf.get("cleanupConfirmed", False)
+            ),
+        },
+    }
+    if resolved_format == "nt.gz":
+        # Compatibility alias for consumers of the original standalone report
+        # schema; ``rdf_path`` is the canonical format-neutral field.
+        payload["rdf_gzip_path"] = str(rdf_path)
+    report_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    if stage_result is not None:
+        stage_result.update(payload)
+    if write_metrics_csv:
+        # Standalone validation has no preceding conversion/compression stage,
+        # but it still exposes the same analysis-ready metrics schema used by a
+        # full run.  Full mode writes its row after compression so its selected
+        # compression columns are preserved.
+        try:
+            update_metrics_csv_with_compression(
+                metrics_csv=metrics_dir / "metrics.csv",
+                run_id=run_id,
+                timestamp=timestamp,
+                output_name=validation_id,
+                output_dir=results_dir,
+                combined_size_bytes=int(payload["input_rdf_size_bytes"]),
+                selected_methods=[],
+                method_results={},
+                validation_result=payload,
+            )
+        except OSError as exc:
+            eprint(f"Warning: failed to write validation metrics CSV: {exc}")
+    if exit_code != 0:
+        eprint(f"Error: validation failed. See results: {results_dir}")
+        eprint(f"See log for details: {wrapper_log_path}")
+        if run_tracker is not None:
+            run_tracker.mark(f"Validation failed: {validation_id} (exit_code={exit_code})")
+        return 1
+    if run_tracker is not None:
+        run_tracker.mark(f"Validation completed: {validation_id} ({status})")
+    print(f"Validation results: {results_dir}")
+    print(f"Validation metrics: {report_path}")
     return 0
 
 
@@ -4293,6 +6886,12 @@ def main():
             "  Full pipeline (space-optimized aggregate):\n"
             "    vcf_rdfizer.py -m full -i ./vcf_files --rdf-storage-mode space-optimized "
             "--representations hdt,cottas --rdf-compression none -o ./results\n"
+            "  Full pipeline with semantic validation:\n"
+            "    vcf_rdfizer.py -m full -i ./cohort.vcf.gz --rdf-storage-mode plain "
+            "--representations none --rdf-compression none --validate -o ./results\n"
+            "  Condensed multi-sample representation:\n"
+            "    vcf_rdfizer.py -m full -i ./cohort.vcf.gz --sample-representation condensed "
+            "--rdf-storage-mode space-optimized --representations hdt -o ./results\n"
             "  Space-optimized full pipeline with shared HDT/COTTAS chunks:\n"
             "    vcf_rdfizer.py -m full -i ./vcf_files --rdf-storage-mode space-optimized "
             "--representations hdt,cottas --rdf-compression none "
@@ -4311,27 +6910,35 @@ def main():
             "--rdf-compression gzip --representations hdt --artifact-compression gzip -o ./results\n"
             "  Decompression-only:\n"
             "    vcf_rdfizer.py -m decompress -C ./results/out/sample/sample.nt.gz -o ./results\n"
-            "  Initialize an existing HDT index:\n"
+            "  Semantic VCF/RDF validation (expanded graph):\n"
+            "    vcf_rdfizer.py -m validation -i ./sample.vcf.gz --rdf ./results/sample/sample.nt.gz "
+            "--sample-representation expanded -o ./validation-results\n"
+            "  Semantic VCF/RDF validation (condensed graph):\n"
+            "    vcf_rdfizer.py -m validation -i ./cohort.vcf.gz --rdf ./results/cohort/cohort.nt.gz "
+            "--sample-representation condensed -o ./validation-results\n"
+            "  Generate or regenerate an index for an existing HDT:\n"
             "    vcf_rdfizer.py -m index -H ./results/sample/sample.hdt -o ./results\n"
+            "  Generate or regenerate an index for an existing COTTAS file:\n"
+            "    vcf_rdfizer.py -m index --cottas ./results/sample/sample.cottas -o ./results\n"
         ),
     )
     parser.add_argument(
         "-m",
         "--mode",
-        choices=["full", "compress", "decompress", "tsv", "index"],
+        choices=["full", "compress", "decompress", "tsv", "index", "validation"],
         default="full",
-        help="Run mode: full pipeline, TSV benchmark, compression, decompression, or HDT index initialization",
+        help="Run mode: full pipeline, TSV benchmark, compression, decompression, validation, or index-only regeneration",
     )
     parser.add_argument(
         "-i",
         "--input",
         default=None,
-        help="VCF file or directory (required for --mode full and --mode tsv)",
+        help="VCF file or directory (required for --mode full/tsv; file required for --mode validation)",
     )
     parser.add_argument(
         "--rdf",
         default=None,
-        help="Input RDF file (.nt or .nt.gz) for --mode compress",
+        help="Input RDF file (.nt or .nt.gz) for --mode compress; .nt.gz required for --mode validation",
     )
     parser.add_argument(
         "-C",
@@ -4343,7 +6950,12 @@ def main():
         "-H",
         "--hdt",
         default=None,
-        help="Existing HDT file for --mode index; HDT Java creates a versioned .hdt.index.* sidecar beside it",
+        help="Existing .hdt file for --mode index; creates or regenerates its versioned .hdt.index.* sidecar",
+    )
+    parser.add_argument(
+        "--cottas",
+        default=None,
+        help="Existing .cottas file for --mode index; rebuilds its embedded query index in place",
     )
     parser.add_argument(
         "-d",
@@ -4356,6 +6968,48 @@ def main():
         "--rules",
         default=None,
         help="RML mapping rules .ttl (default: <repo>/rules/default_rules.ttl)",
+    )
+    parser.add_argument(
+        "--sample-representation",
+        choices=sorted(SAMPLE_REPRESENTATION_CHOICES),
+        default="expanded",
+        help=(
+            "Genotype representation for full/validation mode: expanded emits one SampleCall and "
+            "FORMAT value resource per sample; condensed emits a shared SampleSet and "
+            "one sample-ordered value vector per FORMAT key (default: expanded)"
+        ),
+    )
+    parser.add_argument(
+        "--header-representation",
+        choices=HEADER_REPRESENTATION_CHOICES,
+        default=DEFAULT_HEADER_REPRESENTATION,
+        help=(
+            "VCF meta-information representation: structured types each '##' line "
+            "with its vocabulary subclass and lifts FILTER/ALT/contig attributes "
+            "into their own properties; basic keeps only untyped header lines "
+            f"(default: {DEFAULT_HEADER_REPRESENTATION})"
+        ),
+    )
+    parser.add_argument(
+        "--info-representation",
+        choices=INFO_REPRESENTATION_CHOICES,
+        default=DEFAULT_INFO_REPRESENTATION,
+        help=(
+            "INFO column representation: structured also emits one "
+            "vcfr:InfoFieldValue per record and key alongside the raw string, "
+            "making INFO queryable; raw keeps only vcfr:infoRaw "
+            f"(default: {DEFAULT_INFO_REPRESENTATION})"
+        ),
+    )
+    parser.add_argument(
+        "--validate",
+        "--run-validation",
+        dest="run_validation",
+        action="store_true",
+        help=(
+            "Run semantic VCF/RDF validation for each input during full mode; "
+            "reports are stored under the run metrics directory"
+        ),
     )
     parser.add_argument(
         "--rdf-storage-mode",
@@ -4442,7 +7096,7 @@ def main():
         choices=sorted(HDT_STRATEGY_CHOICES),
         default=DEFAULT_HDT_STRATEGY,
         help=(
-            "HDT generation strategy: auto uses partitioned HDT+HDTCat for full-mode aggregate storage, "
+            "HDT generation strategy: auto uses partitioned HDT+hdtc merge for full-mode aggregate storage, "
             "single uses one rdf2hdt run, partitioned forces chunked HDT generation"
         ),
     )
@@ -4468,6 +7122,106 @@ def main():
         action="store_true",
         help="Print a rough storage estimate before running conversion",
     )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable progress sidecars and terminal progress updates",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help=(
+            "Suppress terminal progress displays (including validation query updates) "
+            "while retaining progress logging and metrics"
+        ),
+    )
+    parser.add_argument(
+        "--validation-id",
+        default=None,
+        help="Validation result identifier (default: source VCF basename)",
+    )
+    parser.add_argument(
+        "--filter-oracle",
+        choices=("auto", "bcftools", "cyvcf2"),
+        default="auto",
+        help="FILTER oracle for full-mode validation and standalone validation (default: auto)",
+    )
+    parser.add_argument(
+        "--shacl-shapes",
+        default=None,
+        help=(
+            "Validate each graph against a SHACL shapes file as an independent "
+            "structural layer (for example the vocabulary's published shapes). "
+            "Off by default: it loads the whole graph into memory, so it does "
+            "not scale to a cohort-sized aggregate"
+        ),
+    )
+    parser.add_argument(
+        "--strict-conformance",
+        action="store_true",
+        help=(
+            "Fail validation when a missing token is serialized as a plain '.' "
+            "literal instead of '.'^^vcfr:Null (reported but non-fatal by default)"
+        ),
+    )
+    parser.add_argument(
+        "--validation-engine",
+        default=DEFAULT_VALIDATION_ENGINE,
+        help=(
+            "SPARQL engine(s) for validation, comma-separated, or 'all'. "
+            "comunica queries the graph in memory; qlever builds an on-disk "
+            "index and serves it; hdt and cottas query those compressed "
+            "artifacts natively without decoding them. Requesting several runs "
+            "the whole query set on each, cross-checks their answers, and "
+            "records comparable timings for benchmarking "
+            f"(choices: {', '.join(VALIDATION_ENGINE_CHOICES)}; "
+            f"default: {DEFAULT_VALIDATION_ENGINE})"
+        ),
+    )
+    parser.add_argument(
+        "--validate-artifacts",
+        default=DEFAULT_VALIDATION_TARGETS,
+        help=(
+            "Which produced artifacts full-mode --validate should check "
+            "(comma-separated): aggregate,hdt,cottas, or all "
+            f"(default: {DEFAULT_VALIDATION_TARGETS}). A representation that was "
+            "not produced is skipped."
+        ),
+    )
+    parser.add_argument(
+        "--validation-query-timeout",
+        default=None,
+        help="Per-query timeout in seconds for validation (default: engine default)",
+    )
+    parser.add_argument(
+        "--qlever-memory-gb",
+        default=None,
+        help="QLever index/server memory budget in GiB (default: 4)",
+    )
+    parser.add_argument(
+        "--qlever-port",
+        default=None,
+        help="Container-local port for the QLever server (default: 7019)",
+    )
+    parser.add_argument(
+        "--qlever-startup-timeout",
+        default=None,
+        help="Seconds to wait for the QLever server to answer after indexing (default: 900)",
+    )
+    parser.add_argument(
+        "--qlever-index-arg",
+        action="append",
+        default=[],
+        metavar="ARG",
+        help="Extra argument for QLever's index builder (repeatable)",
+    )
+    parser.add_argument(
+        "--qlever-server-arg",
+        action="append",
+        default=[],
+        metavar="ARG",
+        help="Extra argument for QLever's server (repeatable)",
+    )
     rdf_output_group = parser.add_mutually_exclusive_group()
     rdf_output_group.add_argument(
         "-R",
@@ -4483,6 +7237,14 @@ def main():
     )
     args = parser.parse_args()
 
+    global _PROGRESS_ALLOWED, _PROGRESS_EVENTS_ALLOWED, _QUIET
+    _QUIET = bool(args.quiet)
+    # ``--no-progress`` is the opt-out for the sidecar itself. ``--quiet``
+    # only turns off terminal rendering, leaving the existing event stream
+    # available to the wrapper log/metrics machinery.
+    _PROGRESS_ALLOWED = not (args.no_progress or args.quiet)
+    _PROGRESS_EVENTS_ALLOWED = not args.no_progress
+
     if args.build and args.no_build:
         eprint("Error: --build and --no-build are mutually exclusive.")
         return 2
@@ -4494,7 +7256,7 @@ def main():
     metrics_root = out_root / "run_metrics"
     run_id = datetime.now().strftime("%Y%m%dT%H%M%S")
     timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-    metrics_dir = metrics_root / run_id
+    metrics_dir = None
     mode = args.mode
     spark_partitions = None
     chunk_target_bytes = DEFAULT_CHUNK_TARGET_BYTES
@@ -4503,7 +7265,35 @@ def main():
 
     step1_label = "Step 1/5" if mode == "full" else "Step 1/3"
 
+    validation_artifacts: list[str] = []
+    validation_engines: list[str] = [DEFAULT_VALIDATION_ENGINE]
+    validation_engine_options: dict = {}
+    shacl_shapes_path: Path | None = None
     try:
+        for option_name, key in (
+            ("--validation-query-timeout", "query_timeout"),
+            ("--qlever-memory-gb", "qlever_memory_gb"),
+            ("--qlever-port", "qlever_port"),
+            ("--qlever-startup-timeout", "qlever_startup_timeout"),
+        ):
+            raw_value = getattr(args, option_name.lstrip("-").replace("-", "_"))
+            if raw_value is not None:
+                validation_engine_options[key] = parse_positive_int(
+                    raw_value, name=option_name
+                )
+        if args.qlever_index_arg:
+            validation_engine_options["qlever_index_args"] = list(args.qlever_index_arg)
+        if args.qlever_server_arg:
+            validation_engine_options["qlever_server_args"] = list(args.qlever_server_arg)
+        if validation_engine_options.get("qlever_port", 1) > 65535:
+            raise ValueError("--qlever-port must be between 1 and 65535")
+        validation_engines = parse_validation_engines(args.validation_engine)
+        validation_artifacts = parse_validation_targets(args.validate_artifacts)
+        if args.shacl_shapes is not None:
+            shacl_shapes_path = Path(args.shacl_shapes).expanduser().resolve()
+            if not shacl_shapes_path.is_file():
+                raise ValueError(f"SHACL shapes file not found: {shacl_shapes_path}")
+
         chunk_target_bytes = parse_positive_int(
             args.chunk_target_bytes, name="--chunk-target-bytes"
         )
@@ -4528,7 +7318,7 @@ def main():
             (
                 input_mount_dir,
                 container_inputs,
-                input_metrics_target,
+                _input_metrics_target,
                 expected_prefixes,
             ) = resolve_input_snapshot(input_path)
             if args.rules is None:
@@ -4537,6 +7327,17 @@ def main():
                 rules_path = Path(args.rules).expanduser().resolve()
             if not rules_path.exists() or not rules_path.is_file():
                 raise ValueError(f"rules file not found: {rules_path}")
+            sample_workflow = resolve_sample_workflow(
+                args.sample_representation,
+                rules_path,
+            )
+            if args.validate_artifacts != DEFAULT_VALIDATION_TARGETS and not args.run_validation:
+                raise ValueError("--validate-artifacts requires --validate")
+            if not validation_artifacts and args.run_validation:
+                raise ValueError(
+                    "--validate-artifacts resolved to no targets; choose at least one of "
+                    + ", ".join(VALIDATION_TARGET_CHOICES)
+                )
             validate_mode_dirs([out_root, out_dir, tsv_dir, metrics_root])
             if args.legacy_compression is not None:
                 if (
@@ -4591,6 +7392,8 @@ def main():
                     partitioned=full_uses_partitioning,
                 )
             validate_no_output_collisions(output_plans)
+        elif args.run_validation:
+            raise ValueError("--validate/--run-validation is only valid in --mode full")
         elif mode == "tsv":
             if args.spark_partitions is not None:
                 raise ValueError("--spark-partitions is only valid in --mode full")
@@ -4604,6 +7407,34 @@ def main():
                 expected_prefixes,
             ) = resolve_input_snapshot(input_path)
             validate_mode_dirs([out_root, out_dir, tsv_dir, metrics_root])
+        elif mode == "validation":
+            if args.spark_partitions is not None:
+                raise ValueError("--spark-partitions is only valid in --mode full")
+            if args.input is None:
+                raise ValueError("--input is required in --mode validation")
+            validation_vcf_path = Path(args.input).expanduser().resolve()
+            if not validation_vcf_path.is_file() or not is_vcf_file(validation_vcf_path):
+                raise ValueError("Validation input must be an existing .vcf or .vcf.gz file")
+            if not args.rdf:
+                raise ValueError("--rdf is required in --mode validation")
+            validation_rdf_gzip_path = Path(args.rdf).expanduser().resolve()
+            if not validation_rdf_gzip_path.is_file():
+                raise ValueError(f"Validation RDF input not found: {validation_rdf_gzip_path}")
+            validation_rdf_format = detect_validation_rdf_format(validation_rdf_gzip_path)
+            if validation_rdf_format is None:
+                supported = ", ".join(fmt for _suffix, fmt in VALIDATION_RDF_SUFFIXES)
+                raise ValueError(
+                    "Validation RDF input must be one of: " + supported
+                )
+            if args.validate_artifacts != DEFAULT_VALIDATION_TARGETS:
+                raise ValueError(
+                    "--validate-artifacts is only valid in --mode full; in validation "
+                    "mode pass the artifact directly with --rdf"
+                )
+            validation_id = args.validation_id or vcf_output_prefix(validation_vcf_path)
+            if not re.fullmatch(r"[A-Za-z0-9._-]+", validation_id):
+                raise ValueError("--validation-id may contain only letters, digits, dot, underscore, and hyphen")
+            validate_mode_dirs([out_root, out_dir, metrics_root])
         elif mode == "compress":
             if args.spark_partitions is not None:
                 raise ValueError("--spark-partitions is only valid in --mode full")
@@ -4664,22 +7495,25 @@ def main():
         elif mode == "index":
             if args.spark_partitions is not None:
                 raise ValueError("--spark-partitions is only valid in --mode full")
-            if not args.hdt:
-                raise ValueError("--hdt is required in --mode index")
-            hdt_path = Path(args.hdt).expanduser().resolve()
-            if not hdt_path.exists() or not hdt_path.is_file():
-                raise ValueError(f"HDT input file not found: {hdt_path}")
-            if hdt_path.suffix != ".hdt":
-                raise ValueError("HDT index input must end with .hdt")
-            validate_mode_dirs([out_root, out_dir, metrics_root])
-            existing_indexes = sorted(hdt_path.parent.glob(f"{hdt_path.name}.index.*"))
-            if existing_indexes:
+            if bool(args.hdt) == bool(args.cottas):
                 raise ValueError(
-                    "Refusing to overwrite existing output file(s): "
-                    + ", ".join(str(path) for path in existing_indexes)
-                    + ". VCF-RDFizer does not overwrite outputs; rename/remove the "
-                    "existing index and try again."
+                    "provide exactly one of --hdt or --cottas in --mode index"
                 )
+            if args.hdt:
+                index_format = "hdt"
+                index_path = Path(args.hdt).expanduser().resolve()
+                if index_path.suffix != ".hdt":
+                    raise ValueError("HDT index input must end with .hdt")
+            else:
+                index_format = "cottas"
+                index_path = Path(args.cottas).expanduser().resolve()
+                if index_path.suffix != ".cottas":
+                    raise ValueError("COTTAS index input must end with .cottas")
+            if not index_path.exists() or not index_path.is_file():
+                raise ValueError(
+                    f"{index_format.upper()} input file not found: {index_path}"
+                )
+            validate_mode_dirs([out_root, out_dir, metrics_root])
         else:
             if args.spark_partitions is not None:
                 raise ValueError("--spark-partitions is only valid in --mode full")
@@ -4714,7 +7548,95 @@ def main():
         eprint(f"Error: {exc}")
         return 2
 
+    if mode in {"full", "tsv"}:
+        metrics_source_paths = []
+        for container_input in container_inputs:
+            try:
+                relative_input = Path(container_input).relative_to("/data/in")
+            except ValueError:
+                relative_input = Path(container_input).name
+            metrics_source_paths.append((input_mount_dir / relative_input).resolve())
+        metrics_source_root = input_path
+    elif mode == "compress":
+        metrics_source_paths = [rdf_path]
+        metrics_source_root = rdf_path
+    elif mode == "validation":
+        metrics_source_paths = [validation_vcf_path, validation_rdf_gzip_path]
+        metrics_source_root = validation_vcf_path
+    elif mode == "index":
+        metrics_source_paths = [index_path]
+        metrics_source_root = index_path
+    else:
+        metrics_source_paths = [compressed_path]
+        metrics_source_root = compressed_path
+
+    source_label = metrics_run_label(metrics_source_paths, metrics_source_root)
+    metrics_dir = metrics_run_directory(metrics_root, source_label, run_id)
+    if mode == "validation":
+        # Keep standalone validation reports in the same discoverable tree as
+        # full-mode stage artifacts.  The validation id remains the leaf name
+        # so existing stage/report consumers can use one layout for both modes.
+        validation_results_dir = (
+            metrics_dir / "reports" / "validation" / safe_metrics_name(validation_id)
+        )
+        if validation_results_dir.exists() and (
+            not validation_results_dir.is_dir() or any(validation_results_dir.iterdir())
+        ):
+            # This runs after the argument-validation try/except above, so it
+            # must report the same way that block does instead of surfacing an
+            # uncaught traceback.
+            eprint(
+                f"Error: Refusing to overwrite existing validation results: "
+                f"{validation_results_dir}. "
+                "Choose --validation-id or --out with a new destination."
+            )
+            return 2
+    manifest_options = {
+        "requested_image": args.image,
+        "requested_image_version": args.image_version,
+        "sample_representation": args.sample_representation if mode == "full" else None,
+        "info_representation": args.info_representation if mode == "full" else None,
+        "header_representation": args.header_representation if mode == "full" else None,
+        "rdf_storage_mode": args.rdf_storage_mode if mode == "full" else None,
+        "compression_methods": (
+            full_methods if mode == "full" else methods if mode == "compress" else []
+        ),
+        "hdt_strategy": args.hdt_strategy if mode in {"full", "compress"} else None,
+        "chunk_target_bytes": chunk_target_bytes if mode in {"full", "compress"} else None,
+        "chunk_min_bytes": chunk_min_bytes if mode in {"full", "compress"} else None,
+        "chunk_max_bytes": chunk_max_bytes if mode in {"full", "compress"} else None,
+        "spark_partitions": spark_partitions if mode == "full" else None,
+        "run_validation": bool(args.run_validation) if mode == "full" else False,
+        "validation_artifacts": validation_artifacts if mode == "full" and args.run_validation else None,
+        "validation_engine": validation_engines if mode in {"full", "validation"} else None,
+        "validation_strict_conformance": bool(args.strict_conformance) if mode in {"full", "validation"} else None,
+        "validation_shacl_shapes": str(shacl_shapes_path) if shacl_shapes_path else None,
+        "validation_engine_options": validation_engine_options or None,
+        "filter_oracle": args.filter_oracle if mode in {"full", "validation"} else None,
+        "quiet": bool(args.quiet),
+        "no_progress": bool(args.no_progress),
+        "index_format": index_format if mode == "index" else None,
+        "decompression_format": fmt if mode == "decompress" else None,
+        "validation_representation": args.sample_representation if mode == "validation" else None,
+        "validation_rdf_gzip": str(validation_rdf_gzip_path) if mode == "validation" else None,
+    }
+    try:
+        write_run_manifest(
+            metrics_dir=metrics_dir,
+            run_id=run_id,
+            timestamp=timestamp,
+            mode=mode,
+            source_label=source_label,
+            source_paths=metrics_source_paths,
+            out_root=out_root,
+            options=manifest_options,
+        )
+    except OSError as exc:
+        eprint(f"Error: unable to create metrics directory '{metrics_dir}': {exc}")
+        return 1
+
     print(f"{step1_label}: Validating inputs {success_symbol()}")
+    print(f"  Metrics: {metrics_dir}")
 
     if mode == "full" and args.estimate_size:
         # Optional coarse sizing estimate for disk-risk visibility.
@@ -4727,6 +7649,11 @@ def main():
             "    - Estimated RDF N-Triples size: "
             f"{format_bytes(estimate['rdf_low_bytes'])} to {format_bytes(estimate['rdf_high_bytes'])}"
         )
+        if estimate["uncompressed_input_estimated"]:
+            print(
+                "      (a gzip input's uncompressed size could not be read from its "
+                "structure, so its expansion was assumed)"
+            )
         print(
             f"    - Free disk space at {estimate['disk_anchor']}: {format_bytes(estimate['free_disk_bytes'])}"
         )
@@ -4736,8 +7663,8 @@ def main():
                 "You may run out of space."
             )
 
-    wrapper_log_path = metrics_dir / "wrapper_logs" / f"{run_id}.log"
-    progress_log_path = metrics_dir / "progress.log"
+    wrapper_log_path = metrics_dir / "logs" / "wrapper.log"
+    progress_log_path = metrics_dir / "logs" / "progress.log"
     execution_started = time.perf_counter()
     global _COMMAND_LOGGER
     _COMMAND_LOGGER = CommandLogger(wrapper_log_path)
@@ -4763,6 +7690,11 @@ def main():
         try:
             image_ref, version_requested = resolve_image_ref(args.image, args.image_version)
             resolved_image_ref = image_ref
+            update_run_manifest(
+                metrics_dir,
+                resolved_image=image_ref,
+                image_version_requested=version_requested,
+            )
         except ValueError as exc:
             run_tracker.mark(f"Image resolution failed: {exc}")
             eprint(f"Error: {exc}")
@@ -4808,10 +7740,21 @@ def main():
                 (out_write_target, True),
                 (metrics_write_target, True),
             ]
+        elif mode == "validation":
+            validation_write_target = (
+                validation_results_dir.parent
+                if validation_results_dir.parent.exists()
+                else validation_results_dir.parent.parent
+            )
+            metrics_write_target = metrics_dir if metrics_dir.exists() else metrics_dir.parent
+            writable_targets = [
+                (validation_write_target, True),
+                (metrics_write_target, True),
+            ]
         elif mode == "index":
             metrics_write_target = metrics_dir if metrics_dir.exists() else metrics_dir.parent
             writable_targets = [
-                (hdt_path.parent, True),
+                (index_path.parent, True),
                 (metrics_write_target, True),
             ]
         else:
@@ -4848,7 +7791,6 @@ def main():
             return run_full_mode(
                 input_mount_dir=input_mount_dir,
                 container_inputs=container_inputs,
-                input_metrics_target=input_metrics_target,
                 expected_prefixes=expected_prefixes,
                 rules_path=rules_path,
                 out_dir=out_dir,
@@ -4856,6 +7798,16 @@ def main():
                 metrics_dir=metrics_dir,
                 image_ref=image_ref,
                 out_name=args.out_name,
+                sample_workflow=sample_workflow,
+                info_representation=args.info_representation,
+                header_representation=args.header_representation,
+                run_validation=args.run_validation,
+                validation_artifacts=validation_artifacts,
+                validation_engine=validation_engines,
+                validation_engine_options=validation_engine_options,
+                validation_strict_conformance=args.strict_conformance,
+                validation_shacl_shapes=shacl_shapes_path,
+                filter_oracle=args.filter_oracle,
                 rdf_storage_mode=args.rdf_storage_mode,
                 methods=full_methods,
                 hdt_strategy=args.hdt_strategy,
@@ -4901,17 +7853,43 @@ def main():
                 chunk_max_bytes=chunk_max_bytes,
                 wrapper_log_path=wrapper_log_path,
             )
+        if mode == "validation":
+            return run_validation_mode(
+                vcf_path=validation_vcf_path,
+                rdf_path=validation_rdf_gzip_path,
+                rdf_format=validation_rdf_format,
+                representation=args.sample_representation,
+                validation_id=validation_id,
+                results_dir=validation_results_dir,
+                metrics_dir=metrics_dir,
+                run_id=run_id,
+                timestamp=timestamp,
+                image_ref=image_ref,
+                filter_oracle=args.filter_oracle,
+                engine=validation_engines,
+                engine_options=validation_engine_options,
+                strict_conformance=args.strict_conformance,
+                shacl_shapes=shacl_shapes_path,
+                wrapper_log_path=wrapper_log_path,
+                write_metrics_csv=True,
+            )
         if mode == "index":
-            return run_hdt_index_mode(
-                hdt_path=hdt_path,
+            return run_index_mode(
+                index_path=index_path,
+                index_format=index_format,
                 metrics_dir=metrics_dir,
                 image_ref=image_ref,
                 wrapper_log_path=wrapper_log_path,
+                run_id=run_id,
+                timestamp=timestamp,
             )
         # Decompression-only mode.
         return run_decompress_mode(
             compressed_path=compressed_path,
             decompressed_out=decompressed_out,
+            metrics_dir=metrics_dir,
+            run_id=run_id,
+            timestamp=timestamp,
             image_ref=image_ref,
             wrapper_log_path=wrapper_log_path,
         )
@@ -4975,6 +7953,19 @@ def main():
         if run_tracker is not None:
             run_tracker.mark(f"Run finished (exit_code={result_code})")
             run_tracker.close()
+        try:
+            summary_path = write_run_summary(
+                metrics_dir=metrics_dir,
+                run_id=run_id,
+                timestamp=timestamp,
+                mode=mode,
+                exit_code=result_code,
+                elapsed_seconds=elapsed_seconds,
+                total_triples=total_triples,
+            )
+            print(f"Metrics summary: {summary_path}")
+        except OSError as exc:
+            eprint(f"Warning: failed to write metrics summary: {exc}")
 
     return result_code
 

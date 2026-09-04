@@ -1,3 +1,4 @@
+import csv
 import gzip
 import subprocess
 import tempfile
@@ -112,6 +113,37 @@ class VcfAsTsvUnitTests(VerboseTestCase):
                 records_text[1],
                 "multi.vcf\t1\t1\t10\trs1\tA\tG\t50\tPASS\t.\tGT:DP\t0/1:42 0/0:18",
             )
+
+    def test_vcf_as_tsv_preserves_thousands_of_sample_columns(self):
+        """A 1000 Genomes-sized sample header and payload remain aligned."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_file = tmp_path / "many-samples.vcf"
+            output_dir = tmp_path / "tsv"
+            sample_ids = [f"S{i:04d}" for i in range(2504)]
+            payloads = [f"{i % 2}/{(i + 1) % 2}:{10 + (i % 90)}" for i in range(2504)]
+            input_file.write_text(
+                "##fileformat=VCFv4.2\n"
+                + "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t"
+                + "\t".join(sample_ids)
+                + "\n20\t10\trs1\tA\tG\t50\tPASS\t.\tGT:DP\t"
+                + "\t".join(payloads)
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                ["bash", str(SCRIPT), str(input_file), str(output_dir)],
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            with (output_dir / "many-samples.records.tsv").open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.reader(handle, delimiter="\t"))
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[0][-1].split(), sample_ids)
+            self.assertEqual(rows[1][-1].split(), payloads)
 
     def test_vcf_as_tsv_single_gz_file_mode(self):
         """Single .vcf.gz input: decompresses and writes per-VCF split TSV outputs."""

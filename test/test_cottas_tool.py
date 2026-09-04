@@ -64,22 +64,17 @@ class CottasToolTests(unittest.TestCase):
             self.assertTrue(all(path.parent == scratch_root for path in observed_workspaces))
             self.assertFalse(any(scratch_root.iterdir()))
 
-    def test_merge_uses_the_same_isolated_scratch_policy(self):
-        """Pairwise merges do not inherit a DuckDB database from chunk conversion."""
+    def test_merge_uses_the_bounded_streaming_adapter(self):
+        """Two input merges delegate to the non-sorting streaming implementation."""
         module = load_cottas_tool()
-        observed_workspaces = []
+        calls = []
 
-        def fake_cat(paths, cottas_path, *, index, remove_input_files):
-            self.assertTrue(all(Path(path).is_absolute() for path in paths))
-            self.assertTrue(Path(cottas_path).is_absolute())
-            self.assertEqual(index, "spo")
-            self.assertTrue(remove_input_files)
-            database_path = Path.cwd() / "pycottas.duckdb"
-            if database_path.exists():
-                raise RuntimeError("Table with name quads already exists")
-            database_path.write_text("temporary DuckDB state\n")
-            Path(cottas_path).write_text("merged COTTAS output\n")
-            observed_workspaces.append(Path.cwd())
+        def fake_streaming_merge(paths, output_path, *, index, remove_input_files, progress_path=None):
+            calls.append((paths, output_path, index, remove_input_files, progress_path))
+            Path(output_path).write_text("merged COTTAS output\n")
+            if remove_input_files:
+                for path in paths:
+                    Path(path).unlink()
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -90,8 +85,13 @@ class CottasToolTests(unittest.TestCase):
             left.write_text("left\n")
             right.write_text("right\n")
 
-            with mock.patch.dict(sys.modules, {"pycottas": types.SimpleNamespace(cat=fake_cat)}), mock.patch.dict(
+            with mock.patch.dict(
+                sys.modules,
+                {"pycottas": types.SimpleNamespace()},
+            ), mock.patch.dict(
                 os.environ, {"COTTAS_SCRATCH_DIR": str(scratch_root)}, clear=False
+            ), mock.patch.object(
+                module, "streaming_cottas_merge", side_effect=fake_streaming_merge
             ), mock.patch.object(
                 sys,
                 "argv",
@@ -100,7 +100,63 @@ class CottasToolTests(unittest.TestCase):
                 self.assertEqual(module.main(), 0)
 
             self.assertTrue(output.is_file())
-            self.assertEqual(len(observed_workspaces), 1)
+            self.assertEqual(
+                calls,
+                [([str(left.resolve()), str(right.resolve())], str(output.resolve()), "spo", True, None)],
+            )
+            self.assertFalse(left.exists())
+            self.assertFalse(right.exists())
+            self.assertFalse(any(scratch_root.iterdir()))
+
+    def test_merge_many_passes_all_inputs_to_streaming_merge(self):
+        """The production merge passes every sorted chunk through one bounded pass."""
+        module = load_cottas_tool()
+        calls = []
+
+        def fake_streaming_merge(paths, output_path, *, index, remove_input_files, progress_path=None):
+            calls.append((paths, output_path, index, remove_input_files, progress_path))
+            Path(output_path).write_text("merged COTTAS output\n")
+            if remove_input_files:
+                for path in paths:
+                    Path(path).unlink()
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            scratch_root = (root / "scratch").resolve()
+            inputs = []
+            for number in range(3):
+                path = root / f"chunk-{number}.cottas"
+                path.write_text(f"chunk {number}\n")
+                inputs.append(path)
+            output = root / "merged.cottas"
+
+            with mock.patch.dict(
+                sys.modules,
+                {"pycottas": types.SimpleNamespace()},
+            ), mock.patch.dict(
+                os.environ, {"COTTAS_SCRATCH_DIR": str(scratch_root)}, clear=False
+            ), mock.patch.object(
+                module, "streaming_cottas_merge", side_effect=fake_streaming_merge
+            ), mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "cottas_tool.py",
+                    "merge-many",
+                    "--input-cottas-files",
+                    *(str(path) for path in inputs),
+                    "--output-cottas-file",
+                    str(output),
+                ],
+            ):
+                self.assertEqual(module.main(), 0)
+
+            self.assertTrue(output.is_file())
+            self.assertEqual(
+                calls,
+                [([str(path.resolve()) for path in inputs], str(output.resolve()), "spo", True, None)],
+            )
+            self.assertTrue(all(not path.exists() for path in inputs))
             self.assertFalse(any(scratch_root.iterdir()))
 
     def test_decompress_uses_pycottas_and_isolated_scratch(self):
@@ -139,3 +195,72 @@ class CottasToolTests(unittest.TestCase):
             self.assertEqual(output.read_text(), "<s> <p> <o> .\n")
             self.assertEqual(len(observed_workspaces), 1)
             self.assertFalse(any(scratch_root.iterdir()))
+
+    def test_reindex_rewrites_atomically_without_removing_input(self):
+        """Reindex uses a streaming rewrite and replaces only on success."""
+        module = load_cottas_tool()
+        calls = []
+
+        def fake_streaming_merge(paths, cottas_path, *, index, remove_input_files, progress_path=None):
+            calls.append((paths, cottas_path, index, remove_input_files))
+            self.assertNotEqual(Path(cottas_path), source)
+            self.assertTrue(Path(cottas_path).name.startswith(f".{source.name}.reindex-"))
+            Path(cottas_path).write_text("reindexed COTTAS\n")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            scratch_root = root / "scratch"
+            source = root / "input.cottas"
+            source.write_text("original COTTAS\n")
+
+            with mock.patch.dict(
+                sys.modules,
+                {"pycottas": types.SimpleNamespace()},
+            ), mock.patch.dict(
+                os.environ, {"COTTAS_SCRATCH_DIR": str(scratch_root)}, clear=False
+            ), mock.patch.object(
+                module, "streaming_cottas_merge", side_effect=fake_streaming_merge
+            ), mock.patch.object(
+                sys,
+                "argv",
+                ["cottas_tool.py", "reindex", str(source)],
+            ):
+                self.assertEqual(module.main(), 0)
+
+            self.assertEqual(source.read_text(), "reindexed COTTAS\n")
+            self.assertEqual(
+                calls,
+                [([str(source.resolve())], mock.ANY, "spo", False)],
+            )
+            self.assertEqual(list(root.glob(".input.cottas.reindex-*.cottas")), [])
+
+    def test_reindex_keeps_original_when_streaming_merge_fails(self):
+        """A failed COTTAS rebuild does not replace the existing artifact."""
+        module = load_cottas_tool()
+
+        def failing_streaming_merge(*args, **kwargs):
+            raise RuntimeError("simulated reindex failure")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            scratch_root = root / "scratch"
+            source = root / "input.cottas"
+            source.write_text("original COTTAS\n")
+
+            with mock.patch.dict(
+                sys.modules,
+                {"pycottas": types.SimpleNamespace()},
+            ), mock.patch.dict(
+                os.environ, {"COTTAS_SCRATCH_DIR": str(scratch_root)}, clear=False
+            ), mock.patch.object(
+                module, "streaming_cottas_merge", side_effect=failing_streaming_merge
+            ), mock.patch.object(
+                sys,
+                "argv",
+                ["cottas_tool.py", "reindex", str(source)],
+            ):
+                with self.assertRaisesRegex(RuntimeError, "simulated reindex failure"):
+                    module.main()
+
+            self.assertEqual(source.read_text(), "original COTTAS\n")
+            self.assertEqual(list(root.glob(".input.cottas.reindex-*.cottas")), [])

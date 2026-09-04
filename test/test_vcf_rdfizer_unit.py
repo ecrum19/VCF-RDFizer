@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
@@ -218,6 +219,20 @@ def prepare_inputs(base: Path):
     return input_dir, rules_path
 
 
+def load_validation_runner_module():
+    """Load the container validator without requiring cyvcf2 on the host."""
+    validator_path = Path(__file__).parents[1] / "src" / "validation" / "validation_runner.py"
+    fake_cyvcf2 = types.ModuleType("cyvcf2")
+    fake_cyvcf2.VCF = object
+    fake_cyvcf2.__version__ = "test"
+    spec = importlib.util.spec_from_file_location("validation_runner_test", validator_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    with mock.patch.dict(sys.modules, {"cyvcf2": fake_cyvcf2}):
+        spec.loader.exec_module(module)
+    return module
+
+
 def mocked_triplets():
     return [
         {
@@ -243,20 +258,262 @@ def output_name_from_command(cmd):
 
 def latest_metrics_run_dir(metrics_root: Path) -> Path:
     """Return the single/latest per-run metrics directory."""
-    run_dirs = sorted(
-        (
-            path
-            for path in metrics_root.iterdir()
-            if path.is_dir() and re.match(r"^\d{8}T\d{6}$", path.name)
-        ),
-        key=lambda path: path.name,
-    )
+    run_dirs = []
+    for path in metrics_root.iterdir():
+        if not path.is_dir():
+            continue
+        match = re.match(r"^.+__(\d{8}T\d{6})$", path.name)
+        if match:
+            run_dirs.append((match.group(1), path))
+    run_dirs.sort(key=lambda item: item[0])
     if not run_dirs:
         raise AssertionError(f"No per-run metrics directories found under {metrics_root}")
-    return run_dirs[-1]
+    return run_dirs[-1][1]
 
 
 class WrapperUnitTests(VerboseTestCase):
+    def test_metrics_directory_uses_recognizable_input_label(self):
+        """Metrics runs keep the full input stem alongside their timestamp."""
+        metrics_root = Path("/tmp/metrics")
+        label = vcf_rdfizer.metrics_run_label(
+            [Path("/data/1000G_phase3_chr20.vcf.gz")]
+        )
+        self.assertEqual(label, "1000G_phase3_chr20")
+        self.assertEqual(
+            vcf_rdfizer.metrics_run_directory(
+                metrics_root, label, "20260904T123456"
+            ),
+            metrics_root / "1000G_phase3_chr20__20260904T123456",
+        )
+
+    def test_hdt_index_memory_limit_is_forwarded_to_docker(self):
+        """A host hdtc memory override is passed to indexing containers."""
+        with mock.patch.dict(os.environ, {"HDT_INDEX_MEMORY_LIMIT": "2G"}):
+            self.assertEqual(
+                vcf_rdfizer.docker_hdt_index_env_args(),
+                ["-e", "HDT_INDEX_MEMORY_LIMIT=2G"],
+            )
+
+    def test_hdt_merge_memory_limit_is_forwarded_to_docker(self):
+        """A host hdtc merge-memory override is passed to partitioned containers."""
+        with mock.patch.dict(os.environ, {"HDT_MERGE_MEMORY_LIMIT": "768M"}):
+            self.assertEqual(
+                vcf_rdfizer.docker_hdt_merge_env_args(),
+                ["-e", "HDT_MERGE_MEMORY_LIMIT=768M"],
+            )
+
+    def test_cottas_merge_batch_rows_are_forwarded_to_docker(self):
+        """The bounded COTTAS streaming-merge batch size reaches Docker."""
+        with mock.patch.dict(
+            os.environ,
+            {
+                "COTTAS_MERGE_BATCH_ROWS": "1024",
+            },
+        ):
+            self.assertEqual(
+                vcf_rdfizer.docker_cottas_merge_env_args(),
+                [
+                    "-e",
+                    "COTTAS_MERGE_BATCH_ROWS=1024",
+                ],
+            )
+
+    def test_plain_progress_is_shown_when_rich_or_a_tty_is_unavailable(self):
+        """Long compression work remains visible through redirected terminals."""
+        previous_progress_setting = vcf_rdfizer._PROGRESS_ALLOWED
+        try:
+            vcf_rdfizer._PROGRESS_ALLOWED = True
+            with tempfile.TemporaryDirectory() as td, mock.patch.dict(
+                os.environ,
+                {"VCF_RDFIZER_NO_PROGRESS": "", "CI": ""},
+                clear=False,
+            ), mock.patch.object(vcf_rdfizer, "Progress", None), mock.patch.object(
+                vcf_rdfizer, "Console", None
+            ):
+                progress_path = Path(td) / "partitioned.jsonl"
+                terminal = StringIO()
+                with redirect_stderr(terminal), vcf_rdfizer.ProgressSession(
+                    progress_path, "Partitioned compression: cohort"
+                ) as session:
+                    progress_path.write_text(
+                        json.dumps(
+                            {
+                                "stage": "cottas-merge",
+                                "phase": "started",
+                                "unit": "stage",
+                                "detail": "cottas-merge-disk",
+                            }
+                        )
+                        + "\n"
+                    )
+                    session.poll_events()
+
+                displayed = terminal.getvalue()
+                self.assertIn("Partitioned compression: cohort: started", displayed)
+                self.assertIn("cottas-merge started", displayed)
+                self.assertIn("cottas-merge-disk", displayed)
+        finally:
+            vcf_rdfizer._PROGRESS_ALLOWED = previous_progress_setting
+
+    def test_quiet_progress_consumes_sidecar_without_terminal_output(self):
+        """Quiet mode keeps event handling active but renders no progress lines."""
+        previous_allowed = vcf_rdfizer._PROGRESS_ALLOWED
+        previous_events = vcf_rdfizer._PROGRESS_EVENTS_ALLOWED
+        previous_quiet = vcf_rdfizer._QUIET
+        try:
+            vcf_rdfizer._PROGRESS_ALLOWED = False
+            vcf_rdfizer._PROGRESS_EVENTS_ALLOWED = True
+            vcf_rdfizer._QUIET = True
+            with tempfile.TemporaryDirectory() as td, mock.patch.dict(
+                os.environ,
+                {"VCF_RDFIZER_NO_PROGRESS": "", "CI": ""},
+                clear=False,
+            ), mock.patch.object(vcf_rdfizer, "Progress", None), mock.patch.object(
+                vcf_rdfizer, "Console", None
+            ):
+                progress_path = Path(td) / "validation.jsonl"
+                terminal = StringIO()
+                with redirect_stderr(terminal), vcf_rdfizer.ProgressSession(
+                    progress_path, "Validation: cohort"
+                ) as session:
+                    progress_path.write_text(
+                        json.dumps(
+                            {
+                                "stage": "validation",
+                                "phase": "started",
+                                "completed": 0,
+                                "total": 2,
+                            }
+                        )
+                        + "\n"
+                    )
+                    session.poll_events()
+
+                self.assertEqual(terminal.getvalue(), "")
+        finally:
+            vcf_rdfizer._PROGRESS_ALLOWED = previous_allowed
+            vcf_rdfizer._PROGRESS_EVENTS_ALLOWED = previous_events
+            vcf_rdfizer._QUIET = previous_quiet
+
+    def test_validation_forwards_progress_sidecar_and_quiet_flag(self):
+        """Validation uses the shared sidecar protocol and propagates --quiet."""
+        previous_allowed = vcf_rdfizer._PROGRESS_ALLOWED
+        previous_events = vcf_rdfizer._PROGRESS_EVENTS_ALLOWED
+        previous_quiet = vcf_rdfizer._QUIET
+        try:
+            vcf_rdfizer._PROGRESS_ALLOWED = False
+            vcf_rdfizer._PROGRESS_EVENTS_ALLOWED = True
+            vcf_rdfizer._QUIET = True
+            with tempfile.TemporaryDirectory() as td:
+                tmp_path = Path(td)
+                vcf_path = tmp_path / "sample.vcf"
+                vcf_path.write_text("##fileformat=VCFv4.2\n#CHROM\tPOS\n")
+                rdf_path = tmp_path / "sample.nt"
+                rdf_path.write_text("<s> <p> <o> .\n")
+                metrics_dir = tmp_path / "metrics"
+                results_dir = metrics_dir / "reports" / "validation" / "sample"
+                commands = []
+
+                def fake_run(cmd, cwd=None, env=None):
+                    commands.append(cmd)
+                    return 0
+
+                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), redirect_stdout(
+                    StringIO()
+                ):
+                    rc = vcf_rdfizer.run_validation_mode(
+                        vcf_path=vcf_path,
+                        rdf_path=rdf_path,
+                        representation="expanded",
+                        validation_id="sample",
+                        results_dir=results_dir,
+                        metrics_dir=metrics_dir,
+                        run_id="20260904T123456",
+                        timestamp="2026-09-04T12:34:56",
+                        image_ref="example/vcf-rdfizer:latest",
+                        filter_oracle="auto",
+                        wrapper_log_path=tmp_path / "wrapper.log",
+                    )
+
+                self.assertEqual(rc, 0)
+                self.assertEqual(len(commands), 1)
+                command = commands[0]
+                self.assertIn("--progress-path", command)
+                self.assertIn(
+                    "/data/metrics/.progress/validation-sample.jsonl", command
+                )
+                self.assertIn("--quiet", command)
+        finally:
+            vcf_rdfizer._PROGRESS_ALLOWED = previous_allowed
+            vcf_rdfizer._PROGRESS_EVENTS_ALLOWED = previous_events
+            vcf_rdfizer._QUIET = previous_quiet
+
+    def test_validation_runner_emits_query_progress_in_quiet_mode(self):
+        """The container validator still writes lifecycle events when stdout is quiet."""
+        validator = load_validation_runner_module()
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            vcf_path = tmp_path / "sample.vcf"
+            vcf_path.write_text("##fileformat=VCFv4.2\n#CHROM\tPOS\n")
+            rdf_path = tmp_path / "sample.nt"
+            rdf_path.write_text("<s> <p> <o> .\n")
+            scratch_dir = tmp_path / "scratch"
+            scratch_dir.mkdir()
+            results_dir = tmp_path / "results"
+            progress_path = tmp_path / ".progress" / "validation.jsonl"
+            args = argparse.Namespace(
+                results_dir=results_dir,
+                representation="expanded",
+                progress_path=progress_path,
+                quiet=True,
+                scratch_dir=scratch_dir,
+                rdf=rdf_path,
+                rdf_format="nt",
+                engine="comunica",
+                engines=["comunica"],
+                mapping_policy="strict",
+                strict_conformance=False,
+                shacl_shapes=None,
+                query_timeout=60,
+                qlever_memory_gb=4,
+                qlever_port=7019,
+                qlever_startup_timeout=60,
+                qlever_index_arg=[],
+                qlever_server_arg=[],
+                vcf=vcf_path,
+                filter_oracle="cyvcf2",
+                dataset_id="sample",
+            )
+            query_file = tmp_path / "query.rq"
+            query_file.write_text("SELECT * WHERE { ?s ?p ?o }\n")
+            parser = {
+                "totalRecords": 1,
+                "sampleCount": 0,
+                "gtRecordCount": 0,
+            }
+            failing_engine = mock.MagicMock()
+            failing_engine.describe.return_value = {"engine": "comunica"}
+            failing_engine.execute.return_value = {"status": "FAILED"}
+            with mock.patch.object(validator, "query_path", return_value=query_file), mock.patch.object(
+                validator, "parse_vcf", return_value=parser
+            ), mock.patch.object(
+                validator, "validate_ntriples", return_value={"status": "PASS"}
+            ), mock.patch.object(validator, "build_manifest", return_value={}), mock.patch.object(
+                validator, "build_engine", return_value=failing_engine
+            ), redirect_stdout(StringIO()) as output:
+                rc = validator.run_validation(args)
+
+            self.assertEqual(rc, 1)
+            self.assertEqual(output.getvalue(), "")
+            events = [
+                json.loads(line) for line in progress_path.read_text().splitlines()
+            ]
+            self.assertEqual(events[0]["phase"], "started")
+            self.assertEqual(events[0]["unit"], "queries")
+            self.assertEqual(events[1]["phase"], "progress")
+            self.assertEqual(events[1]["completed"], 0)
+            self.assertEqual(events[-1]["phase"], "failed")
+
     def test_validator_counts_plain_and_gzip_ntriples(self):
         """The Docker validator's fallback source count handles .nt and .nt.gz."""
         validator_path = Path(__file__).parents[1] / "src" / "validate_compression.py"
@@ -540,7 +797,7 @@ class WrapperUnitTests(VerboseTestCase):
                 if emulate_validation_command(cmd):
                     return 0
                 script = str(cmd[-1]) if cmd else ""
-                time_match = re.search(r"-o\s+(/data/metrics/raw_metrics/tsv_time/[^\s;]+)", script)
+                time_match = re.search(r"-o\s+(/data/metrics/timings/tsv/[^\s;]+)", script)
                 if metrics_mount and time_match:
                     time_log = Path(metrics_mount) / time_match.group(1).replace("/data/metrics/", "", 1)
                     time_log.parent.mkdir(parents=True, exist_ok=True)
@@ -576,12 +833,12 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertEqual(metrics["sys_seconds"], 1.5)
             self.assertEqual(metrics["max_rss_kb"], 2048)
 
-            raw_json = metrics_dir / "raw_metrics" / "tsv_metrics" / "sample" / "run-tsv-elapsed.json"
+            raw_json = metrics_dir / "stages" / "tsv" / "sample.json"
             payload = json.loads(raw_json.read_text())
             self.assertEqual(payload["timing"]["wall_seconds"], 360.0)
 
-    def test_run_compression_methods_persists_raw_metrics_and_time_logs(self):
-        """Per-file compression timing/metrics are retained under raw_metrics."""
+    def test_run_compression_methods_persists_stage_metrics_and_time_logs(self):
+        """Per-file compression timing/metrics use the canonical stages/timings tree."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             out_dir = tmp_path / "out" / "sample"
@@ -634,29 +891,24 @@ class WrapperUnitTests(VerboseTestCase):
             safe_rdf = vcf_rdfizer.safe_metrics_name("sample.nt")
             hdt_time = (
                 metrics_dir
-                / "raw_metrics"
-                / "compression_time"
+                / "timings"
+                / "compression"
                 / safe_output
-                / safe_rdf
-                / "hdt"
-                / "run-1.txt"
+                / "hdt.txt"
             )
             gzip_time = (
                 metrics_dir
-                / "raw_metrics"
-                / "compression_time"
+                / "timings"
+                / "compression"
                 / safe_output
-                / safe_rdf
-                / "gzip"
-                / "run-1.txt"
+                / "gzip.txt"
             )
             raw_json = (
                 metrics_dir
-                / "raw_metrics"
-                / "compression_metrics"
+                / "stages"
+                / "compression_operations"
                 / safe_output
-                / safe_rdf
-                / "run-1.json"
+                / f"{safe_rdf}.json"
             )
 
             self.assertTrue(hdt_time.exists())
@@ -713,8 +965,8 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertEqual(method_results["hdt"]["sys_seconds"], 4.5)
             self.assertEqual(method_results["hdt"]["max_rss_kb"], 8192)
 
-    def test_run_compression_methods_records_implicit_hdt_in_raw_metrics(self):
-        """Compound HDT methods include the implicit HDT stage in raw metrics JSON."""
+    def test_run_compression_methods_records_implicit_hdt_in_stage_metrics(self):
+        """Compound HDT methods include the implicit HDT stage in the operation report."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             out_dir = tmp_path / "out" / "sample"
@@ -767,11 +1019,10 @@ class WrapperUnitTests(VerboseTestCase):
             safe_rdf = vcf_rdfizer.safe_metrics_name("sample.nt")
             raw_json = (
                 metrics_dir
-                / "raw_metrics"
-                / "compression_metrics"
+                / "stages"
+                / "compression_operations"
                 / safe_output
-                / safe_rdf
-                / "run-2.json"
+                / f"{safe_rdf}.json"
             )
             self.assertTrue(raw_json.exists())
 
@@ -840,16 +1091,126 @@ class WrapperUnitTests(VerboseTestCase):
 
             raw_json = (
                 metrics_dir
-                / "raw_metrics"
-                / "compression_metrics"
+                / "stages"
+                / "compression_operations"
                 / "sample"
-                / "sample.nt"
-                / "run-cottas-package.json"
+                / "sample.nt.json"
             )
             self.assertTrue(raw_json.exists())
             payload = json.loads(raw_json.read_text())
             self.assertIn("cottas_gzip", payload["methods"])
             self.assertIn("cottas_brotli", payload["methods"])
+
+    def test_full_compression_recovers_from_hdt_index_failure(self):
+        """A readable HDT remains packageable when only index creation fails."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir = tmp_path / "input"
+            out_dir = tmp_path / "out"
+            target_dir = out_dir / "sample"
+            input_dir.mkdir()
+            target_dir.mkdir(parents=True)
+            rdf_path = input_dir / "sample.nt"
+            rdf_path.write_text("<s> <p> <o> .\n")
+            hdt_path = target_dir / "sample.hdt"
+            hdt_path.write_text("readable-hdt\n")
+            warnings = []
+            validation_calls = []
+
+            def fake_run(cmd, cwd=None, env=None):
+                rendered = str(cmd[-1]) if cmd else ""
+                if "validate_compression.py" not in rendered:
+                    if "gzip -c /data/out/sample/sample.hdt" in rendered:
+                        (target_dir / "sample.hdt.gz").write_text("packaged-hdt\n")
+                    return 0
+                validation_calls.append(rendered)
+                result_match = re.search(
+                    r"--result-path\s+['\"]?(/data/out/[^\s'\";]+)",
+                    rendered,
+                )
+                result_path = out_dir / result_match.group(1).replace("/data/out/", "", 1)
+                result_path.parent.mkdir(parents=True, exist_ok=True)
+                if "--skip-index-check" in rendered:
+                    result_path.write_text(
+                        json.dumps(
+                            {
+                                "valid": True,
+                                "source_triples": 1,
+                                "decoded_triples": 1,
+                                "count_match": True,
+                            }
+                        )
+                    )
+                    return 0
+                result_path.write_text(
+                    json.dumps(
+                        {
+                            "valid": False,
+                            "source_triples": 1,
+                            "decoded_triples": 1,
+                            "count_match": False,
+                            "error": "HDT index/readability check failed",
+                        }
+                    )
+                )
+                return 1
+
+            with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run):
+                ok, method_results = vcf_rdfizer.run_compression_methods_for_rdf(
+                    rdf_path=rdf_path,
+                    out_dir=out_dir,
+                    target_out_dir=target_dir,
+                    image_ref="example/vcf-rdfizer:latest",
+                    methods=["hdt", "hdt_gzip"],
+                    wrapper_log_path=tmp_path / "wrapper.log",
+                    status_indent=None,
+                    index_warnings=warnings,
+                )
+
+            self.assertTrue(ok)
+            self.assertEqual(len(validation_calls), 2)
+            self.assertEqual(method_results["hdt"]["index_status"], "failed")
+            self.assertEqual(method_results["hdt_gzip"]["exit_code"], 0)
+            self.assertEqual(warnings[0]["format"], "hdt")
+
+    def test_full_compression_continues_after_cottas_index_failure(self):
+        """COTTAS failure is recorded while independent raw RDF compression continues."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir = tmp_path / "input"
+            out_dir = tmp_path / "out"
+            target_dir = out_dir / "sample"
+            input_dir.mkdir()
+            target_dir.mkdir(parents=True)
+            rdf_path = input_dir / "sample.nt"
+            rdf_path.write_text("<s> <p> <o> .\n")
+            warnings = []
+
+            def fake_run(cmd, cwd=None, env=None):
+                rendered = str(cmd[-1]) if cmd else ""
+                if "cottas_tool.py convert" in rendered:
+                    return 1
+                if "gzip -c /data/in/sample.nt" in rendered:
+                    (target_dir / "sample.nt.gz").write_text("gzip\n")
+                return 0
+
+            with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run):
+                ok, method_results = vcf_rdfizer.run_compression_methods_for_rdf(
+                    rdf_path=rdf_path,
+                    out_dir=out_dir,
+                    target_out_dir=target_dir,
+                    image_ref="example/vcf-rdfizer:latest",
+                    methods=["cottas", "gzip"],
+                    wrapper_log_path=tmp_path / "wrapper.log",
+                    status_indent=None,
+                    index_warnings=warnings,
+                )
+
+            self.assertTrue(ok)
+            self.assertEqual(method_results["cottas"]["exit_code"], 1)
+            self.assertEqual(method_results["gzip"]["exit_code"], 0)
+            self.assertEqual(warnings[0]["format"], "cottas")
+            self.assertTrue((target_dir / "sample.nt.gz").exists())
 
     def test_compression_validation_mismatch_fails_before_success(self):
         """A decoded triple-count mismatch fails compression and preserves RDF input."""
@@ -902,70 +1263,6 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertFalse(ok)
             self.assertEqual(method_results["hdt"]["exit_code"], 0)
             self.assertTrue(rdf_path.exists())
-
-    def test_plan_partitioned_hdt_chunks_groups_small_inputs_and_splits_large_ones(self):
-        """Partition planning coalesces small RDF parts and line-splits oversized ones."""
-        with tempfile.TemporaryDirectory() as td:
-            tmp_path = Path(td)
-            rdf_dir = tmp_path / "rdf"
-            chunk_dir = tmp_path / "chunks"
-            rdf_dir.mkdir()
-
-            small_a = rdf_dir / "part-a.nt"
-            small_b = rdf_dir / "part-b.nt"
-            large = rdf_dir / "part-c.nt"
-            small_a.write_text("<a> <p> <o> .\n")
-            small_b.write_text("<b> <p> <o> .\n")
-            large.write_text((" <c> <p> <o> .\n".lstrip()) * 8)
-
-            chunk_inputs, plan = vcf_rdfizer.plan_partitioned_hdt_chunks(
-                [small_a, small_b, large],
-                chunk_dir,
-                target_bytes=40,
-                min_bytes=10,
-                max_bytes=60,
-            )
-
-            self.assertGreaterEqual(len(chunk_inputs), 2)
-            self.assertEqual(plan["source_file_count"], 3)
-            self.assertEqual(plan["chunk_count"], len(chunk_inputs))
-            self.assertTrue(all(path.exists() for path in chunk_inputs))
-            first_chunk_text = chunk_inputs[0].read_text()
-            self.assertIn("<a> <p> <o> .", first_chunk_text)
-            self.assertIn("<b> <p> <o> .", first_chunk_text)
-
-    def test_record_safe_chunk_planner_reads_gzip_and_writes_boundary_guide(self):
-        """Gzip-backed chunking preserves complete records and records exact ranges."""
-        with tempfile.TemporaryDirectory() as td:
-            tmp_path = Path(td)
-            source = tmp_path / "aggregate.nt.gz"
-            source_payload = (
-                b"<s1> <p> <o1> .\n"
-                b"<s2> <p> <o2> .\n"
-                b"<s3> <p> <o3> .\n"
-            )
-            import gzip
-
-            with gzip.open(source, "wb") as handle:
-                handle.write(source_payload)
-
-            chunk_dir = tmp_path / "chunks"
-            guide = tmp_path / "chunks.json"
-            chunk_paths, plan = vcf_rdfizer.plan_record_safe_rdf_chunks(
-                [source],
-                chunk_dir,
-                target_bytes=20,
-                min_bytes=10,
-                max_bytes=30,
-                guide_path=guide,
-            )
-
-            self.assertTrue(guide.exists())
-            self.assertEqual(plan["record_count"], 3)
-            self.assertEqual(plan["chunk_count"], len(chunk_paths))
-            self.assertEqual(b"".join(path.read_bytes() for path in chunk_paths), source_payload)
-            self.assertTrue(all(path.read_bytes().endswith(b"\n") for path in chunk_paths))
-            self.assertEqual(json.loads(guide.read_text())["chunks"], plan["chunks"])
 
     def test_run_partitioned_hdt_methods_merges_chunks_and_generates_index(self):
         """Partitioned HDT/COTTAS pipelines share chunks in one container."""
@@ -1030,6 +1327,7 @@ class WrapperUnitTests(VerboseTestCase):
             source = tmp_path / "input.nt"
             source.write_text("<s> <p> <o> .\n")
             out_dir = tmp_path / "out" / "sample"
+            metrics_dir = tmp_path / "metrics"
             commands = []
 
             def fake_run(cmd, cwd=None, env=None):
@@ -1046,6 +1344,9 @@ class WrapperUnitTests(VerboseTestCase):
                     image_ref="example/vcf-rdfizer:latest",
                     methods=["hdt", "cottas"],
                     wrapper_log_path=tmp_path / "wrapper.log",
+                    metrics_dir=metrics_dir,
+                    run_id="20260904T123456",
+                    timestamp="2026-09-04T12:34:56",
                     output_name="sample",
                     target_chunk_bytes=40,
                     min_chunk_bytes=10,
@@ -1064,6 +1365,15 @@ class WrapperUnitTests(VerboseTestCase):
                 cmd for cmd in commands if vcf_rdfizer.PARTITIONED_COMPRESSION_RUNNER_CONTAINER in cmd
             )
             self.assertIn(f"{source.parent.resolve()}:/data/in:ro", runner_command)
+            report = json.loads(
+                (metrics_dir / "stages" / "partitioned" / "sample.json").read_text()
+            )
+            self.assertEqual(report["runtime_environment"], "docker-volume")
+            self.assertEqual(report["container_result"]["exit_code"], 0)
+            self.assertEqual(
+                report["container_result"]["methods"]["hdt"]["details"]["workspace"],
+                "docker-volume",
+            )
 
     def test_containerized_partitioned_pipeline_removes_volume_after_failure(self):
         """A failed container run still removes its named workspace volume."""
@@ -1072,6 +1382,7 @@ class WrapperUnitTests(VerboseTestCase):
             source = tmp_path / "input.nt"
             source.write_text("<s> <p> <o> .\n")
             out_dir = tmp_path / "out"
+            metrics_dir = tmp_path / "metrics"
             commands = []
 
             def fake_run(cmd, cwd=None, env=None):
@@ -1097,6 +1408,9 @@ class WrapperUnitTests(VerboseTestCase):
                     image_ref="example/vcf-rdfizer:latest",
                     methods=["cottas"],
                     wrapper_log_path=tmp_path / "wrapper.log",
+                    metrics_dir=metrics_dir,
+                    run_id="20260904T123456",
+                    timestamp="2026-09-04T12:34:56",
                     output_name="sample",
                     target_chunk_bytes=40,
                     min_chunk_bytes=10,
@@ -1107,6 +1421,10 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertEqual(method_results, {})
             self.assertTrue(any("volume" in cmd and "rm" in cmd for cmd in commands))
             self.assertFalse(any(path.name.startswith(".") for path in out_dir.glob("*")))
+            report = json.loads(
+                (metrics_dir / "stages" / "partitioned" / "sample.json").read_text()
+            )
+            self.assertEqual(report["container_result"]["exit_code"], 1)
 
     def test_main_full_mode_records_tsv_metrics_and_raw_artifacts(self):
         """Full mode stores TSV timing/metrics artifacts and writes TSV fields into metrics.csv."""
@@ -1131,7 +1449,7 @@ class WrapperUnitTests(VerboseTestCase):
                     )
                     script = str(cmd[-1]) if cmd else ""
                     time_match = re.search(
-                        r"-o\s+(/data/metrics/raw_metrics/tsv_time/[^\s;]+)",
+                        r"-o\s+(/data/metrics/timings/tsv/[^\s;]+)",
                         script,
                     )
                     if metrics_mount and time_match:
@@ -1184,10 +1502,8 @@ class WrapperUnitTests(VerboseTestCase):
 
             self.assertEqual(rc, 0)
             run_metrics_dir = latest_metrics_run_dir(out_dir / "run_metrics")
-            run_id = run_metrics_dir.name
-
-            tsv_time = run_metrics_dir / "raw_metrics" / "tsv_time" / "sample" / f"{run_id}.txt"
-            tsv_json = run_metrics_dir / "raw_metrics" / "tsv_metrics" / "sample" / f"{run_id}.json"
+            tsv_time = run_metrics_dir / "timings" / "tsv" / "sample.txt"
+            tsv_json = run_metrics_dir / "stages" / "tsv" / "sample.json"
             self.assertTrue(tsv_time.exists())
             self.assertTrue(tsv_json.exists())
 
@@ -1199,6 +1515,103 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertEqual(row.get("exit_code_tsv"), "0")
             self.assertIn("wall_seconds_tsv", row)
             self.assertNotEqual(row.get("tsv_output_size_bytes", ""), "")
+
+    def test_main_full_mode_runs_validation_and_harmonizes_reports_and_metrics(self):
+        """--validate adds one canonical validation stage and CSV row to a full run."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+            out_dir = tmp_path / "out"
+            validation_calls = []
+
+            def fake_run(cmd, cwd=None, env=None):
+                if "/opt/vcf-rdfizer/vcf_as_tsv.sh" in cmd:
+                    tsv_dir = out_dir / ".intermediate" / "tsv"
+                    tsv_dir.mkdir(parents=True, exist_ok=True)
+                    (tsv_dir / "sample.records.tsv").write_text("SOURCE_FILE\tROW_ID\nsample.vcf\t1\n")
+                    (tsv_dir / "sample.header_lines.tsv").write_text("SOURCE_FILE\tLINE\nsample.vcf\t##x\n")
+                    (tsv_dir / "sample.file_metadata.tsv").write_text("SOURCE_FILE\tKEY\tVALUE\nsample.vcf\tk\tv\n")
+                elif "/opt/vcf-rdfizer/run_conversion.sh" in cmd:
+                    sample_dir = out_dir / "sample"
+                    sample_dir.mkdir(parents=True, exist_ok=True)
+                    (sample_dir / "sample.nt").write_text("<s> <p> <o> .\n")
+                return 0
+
+            def fake_validation(**kwargs):
+                validation_calls.append(kwargs)
+                results_dir = kwargs["results_dir"]
+                results_dir.mkdir(parents=True, exist_ok=True)
+                summary_path = results_dir / "summary.json"
+                summary_path.write_text(json.dumps({"status": "PASS", "temporaryRdf": {"persisted": False}}))
+                payload = {
+                    "run_id": kwargs["run_id"],
+                    "timestamp": kwargs["timestamp"],
+                    "stage": "validation",
+                    "vcf_path": str(kwargs["vcf_path"]),
+                    "rdf_path": str(kwargs["rdf_path"]),
+                    "rdf_format": "nt",
+                    "representation": kwargs["representation"],
+                    "results_dir": str(results_dir),
+                    "summary_path": str(summary_path),
+                    "exit_code": 0,
+                    "status": "PASS",
+                    "timing": {"wall_seconds": 0.25, "user_seconds": 0.1, "sys_seconds": 0.02, "max_rss_kb": 512},
+                    "temporary_rdf": {"decompressed_inside_container": False, "persisted_on_host": False, "cleanup_confirmed_by_runner": True},
+                }
+                kwargs["stage_result"].update(payload)
+                stage_path = kwargs["metrics_dir"] / "stages" / "validation" / "sample.json"
+                stage_path.parent.mkdir(parents=True, exist_ok=True)
+                stage_path.write_text(json.dumps(payload))
+                return 0
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch.object(
+                    vcf_rdfizer, "check_docker", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "docker_image_exists", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "discover_tsv_triplets", return_value=mocked_triplets()
+                ), mock.patch.object(
+                    vcf_rdfizer, "run_validation_mode", side_effect=fake_validation
+                ):
+                    rc = invoke_main(
+                        [
+                            "--input",
+                            str(input_dir),
+                            "--rules",
+                            str(rules_path),
+                            "--rdf-storage-mode",
+                            "plain",
+                            "--compression",
+                            "none",
+                            "--validate",
+                            "--out",
+                            str(out_dir),
+                            "--keep-tsv",
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(validation_calls), 1)
+            self.assertEqual(validation_calls[0]["rdf_path"].name, "sample.nt")
+            run_metrics_dir = latest_metrics_run_dir(out_dir / "run_metrics")
+            report_dir = run_metrics_dir / "reports" / "validation" / "sample"
+            self.assertTrue((report_dir / "summary.json").exists())
+            self.assertTrue((run_metrics_dir / "stages" / "validation" / "sample.json").exists())
+            with (run_metrics_dir / "metrics.csv").open(newline="", encoding="utf-8") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(row["validation_status"], "PASS")
+            self.assertEqual(row["validation_exit_code"], "0")
+            self.assertEqual(
+                Path(row["validation_rdf_path"]).resolve(),
+                (out_dir / "sample" / "sample.nt").resolve(),
+            )
+            summary = json.loads((run_metrics_dir / "summary.json").read_text())
+            self.assertIn("reports/validation/sample/summary.json", summary["reports"])
 
     def test_build_sample_support_tsvs_expands_per_sample_and_per_format_rows(self):
         """records.tsv is expanded into helper tables for sample calls and format key/value pairs."""
@@ -1260,6 +1673,276 @@ class WrapperUnitTests(VerboseTestCase):
             sample_calls_rows = sample_calls_tsv.read_text().splitlines()
             self.assertIn("sample.vcf\t2\t1\tSAMPLE-A\tSAMPLE-A\t0/1:42", sample_calls_rows)
             self.assertIn("sample.vcf\t2\t2\tSAMPLE/B\tSAMPLE_B\t0/0:18", sample_calls_rows)
+
+    def test_default_sample_maps_stream_without_expanded_helper_tables(self):
+        """Canonical sample maps emit RDF directly while compatibility TSVs stay empty."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            records_tsv = tmp_path / "sample.records.tsv"
+            records_tsv.write_text(
+                "SOURCE_FILE\tROW_ID\tCHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE-A SAMPLE/B\n"
+                "sample.vcf\t2\t1\t100\t.\tA\tG\t50\tPASS\t.\tGT:DP\t0/1:42 ./.:.\n",
+                encoding="utf-8",
+            )
+            rdf_path = tmp_path / "sample.nt"
+            rdf_path.write_text("<base> <predicate> <object> .\n", encoding="utf-8")
+            sample_calls_tsv = tmp_path / "sample.sample_calls.tsv"
+            sample_format_tsv = tmp_path / "sample.sample_format_values.tsv"
+
+            vcf_rdfizer.write_sample_support_headers(sample_calls_tsv, sample_format_tsv)
+            stats = vcf_rdfizer.append_canonical_sample_rdf(
+                records_tsv,
+                rdf_path,
+                progress_interval_records=0,
+            )
+
+            self.assertEqual(sample_calls_tsv.read_text().splitlines(), ["\t".join(vcf_rdfizer.SAMPLE_CALLS_HEADER)])
+            self.assertEqual(sample_format_tsv.read_text().splitlines(), ["\t".join(vcf_rdfizer.SAMPLE_FORMAT_HEADER)])
+            self.assertEqual(stats["records"], 1)
+            self.assertEqual(stats["sample_calls"], 2)
+            self.assertEqual(stats["format_values"], 4)
+            self.assertEqual(stats["triples"], 19)
+            rdf_lines = rdf_path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(rdf_lines), 20)
+            self.assertIn(
+                "<file://sample.vcf> <https://w3id.org/vcf-rdfizer/vocab#representationProfile> "
+                "<https://w3id.org/vcf-rdfizer/vocab#ExpandedRepresentation> .",
+                rdf_lines,
+            )
+            self.assertIn(
+                "<file://sample.vcf#call/2> <https://w3id.org/vcf-rdfizer/vocab#hasSampleCall> "
+                "<file://sample.vcf#sample/2/SAMPLE-A> .",
+                rdf_lines,
+            )
+            self.assertIn(
+                '"."^^<https://w3id.org/vcf-rdfizer/vocab#Null> .',
+                rdf_lines[-1],
+            )
+
+    def test_sample_streaming_accepts_a_csv_field_larger_than_python_default(self):
+        """Thousands of long sample payloads do not hit csv.field_size_limit."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            sample_ids = [f"S{i:04d}" for i in range(2504)]
+            payload = "A" * 60
+            records_tsv = tmp_path / "large.records.tsv"
+            records_tsv.write_text(
+                "SOURCE_FILE\tROW_ID\tCHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t"
+                + " ".join(sample_ids)
+                + "\nlarge.vcf\t1\t20\t1\t.\tA\tG\t.\tPASS\t.\tGT\t"
+                + " ".join([payload] * len(sample_ids))
+                + "\n",
+                encoding="utf-8",
+            )
+            rdf_path = tmp_path / "large.nt.gz"
+            with gzip.open(rdf_path, "wt", encoding="utf-8") as handle:
+                handle.write("<base> <predicate> <object> .\n")
+
+            stats = vcf_rdfizer.append_canonical_sample_rdf(
+                records_tsv,
+                rdf_path,
+                progress_interval_records=0,
+            )
+
+            self.assertEqual(stats["sample_calls"], 2504)
+            self.assertEqual(stats["format_values"], 2504)
+            self.assertEqual(stats["triples"], 1 + (2504 * 6))
+            with gzip.open(rdf_path, "rt", encoding="utf-8") as handle:
+                self.assertEqual(sum(1 for _line in handle), 2 + (2504 * 6))
+
+    def test_sample_support_strategy_preserves_custom_helper_consumers(self):
+        """Only the exact canonical helper maps use direct RDF streaming."""
+        default_rules = Path(__file__).parents[1] / "rules" / "default_rules.ttl"
+        self.assertEqual(vcf_rdfizer.sample_support_strategy(default_rules), "stream")
+        with tempfile.TemporaryDirectory() as td:
+            custom_rules = Path(td) / "custom.ttl"
+            custom_rules.write_text(
+                default_rules.read_text(encoding="utf-8")
+                + '\n<#Extra> csvw:url "/data/tsv/sample_calls.tsv" .\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(vcf_rdfizer.sample_support_strategy(custom_rules), "expanded")
+
+    def test_sample_workflow_resolver_selects_one_compatible_branch(self):
+        """Expanded and condensed plans are mutually exclusive and rules-aware."""
+        default_rules = Path(__file__).parents[1] / "rules" / "default_rules.ttl"
+
+        expanded = vcf_rdfizer.resolve_sample_workflow("expanded", default_rules)
+        condensed = vcf_rdfizer.resolve_sample_workflow("condensed", default_rules)
+
+        self.assertEqual(expanded.helper_strategy, "header-only")
+        self.assertEqual(expanded.emitter, "expanded")
+        self.assertEqual(condensed.helper_strategy, "header-only")
+        self.assertEqual(condensed.emitter, "condensed")
+
+        with tempfile.TemporaryDirectory() as td:
+            custom_rules = Path(td) / "custom.ttl"
+            custom_rules.write_text(
+                default_rules.read_text(encoding="utf-8")
+                + '\n<#Extra> csvw:url "/data/tsv/sample_calls.tsv" .\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                vcf_rdfizer.resolve_sample_workflow("expanded", custom_rules).helper_strategy,
+                "expanded",
+            )
+            with self.assertRaisesRegex(ValueError, "cannot be combined"):
+                vcf_rdfizer.resolve_sample_workflow("condensed", custom_rules)
+
+    def test_condensed_sample_emitter_uses_shared_samples_and_ordered_vectors(self):
+        """Condensed mode emits one SampleSet and FORMAT vector per key, not expanded calls."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            records_tsv = tmp_path / "cohort.records.tsv"
+            records_tsv.write_text(
+                "SOURCE_FILE\tROW_ID\tCHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1 S2 S3\n"
+                "cohort.vcf\t7\t1\t100\t.\tA\tG\t50\tPASS\t.\tGT:DP:AD\t"
+                "0/1:42:30,12 ./.:.:. 1/1:9\n",
+                encoding="utf-8",
+            )
+            headers_tsv = tmp_path / "cohort.header_lines.tsv"
+            headers_tsv.write_text(
+                "SOURCE_FILE\tHEADER_INDEX\tHEADER_KEY\tHEADER_VALUE\tRAW_LINE\n"
+                "cohort.vcf\t1\tFORMAT\t<ID=GT,Number=1,Type=String,Description=Genotype>\tx\n"
+                "cohort.vcf\t2\tFORMAT\t<ID=DP,Number=1,Type=Integer,Description=Depth>\tx\n"
+                "cohort.vcf\t3\tFORMAT\t<ID=AD,Number=R,Type=Integer,Description=Depths>\tx\n",
+                encoding="utf-8",
+            )
+            rdf_path = tmp_path / "cohort.nt"
+            rdf_path.write_text("<base> <predicate> <object> .\n", encoding="utf-8")
+
+            stats = vcf_rdfizer.append_condensed_sample_rdf(
+                records_tsv,
+                headers_tsv,
+                rdf_path,
+                progress_interval_records=0,
+            )
+
+            self.assertEqual(stats["representation"], "condensed")
+            self.assertEqual(stats["samples"], 3)
+            self.assertEqual(stats["matrices"], 1)
+            self.assertEqual(stats["format_vectors"], 3)
+            self.assertEqual(stats["format_definitions"], 3)
+            self.assertEqual(stats["triples"], 45)
+            rdf_text = rdf_path.read_text(encoding="utf-8")
+            self.assertIn("vocab#CondensedRepresentation", rdf_text)
+            self.assertIn("vocab#SampleSet", rdf_text)
+            self.assertIn("#samples/S3> <https://w3id.org/vcf-rdfizer/vocab#sampleIndex>", rdf_text)
+            self.assertIn("#call/7/matrix/fmt/GT", rdf_text)
+            self.assertIn('"0/1\\t./.\\t1/1"', rdf_text)
+            self.assertIn('"30,12\\t.\\t."', rdf_text)
+            self.assertIn("#header/line/1> .", rdf_text)
+            self.assertIn("vocab#fieldNumber> \"1\"", rdf_text)
+            self.assertIn("vocab#fieldDescription> \"Genotype\"", rdf_text)
+            self.assertNotIn("vocab#hasSampleCall", rdf_text)
+            self.assertNotIn("vocab#FormatFieldValue", rdf_text)
+
+    def test_structured_format_header_parser_preserves_quoted_commas(self):
+        """FORMAT descriptions with commas and escaped quotes remain one attribute."""
+        fields = vcf_rdfizer._parse_structured_header_fields(
+            '<ID=GT,Number=1,Type=String,Description="Genotype, with \\"quoted\\" text">'
+        )
+
+        self.assertEqual(fields["ID"], "GT")
+        self.assertEqual(fields["Number"], "1")
+        self.assertEqual(fields["Description"], 'Genotype, with "quoted" text')
+
+    def test_condensed_sample_emitter_rolls_back_on_sample_count_mismatch(self):
+        """Malformed sample alignment fails atomically without a partial condensed graph."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            records_tsv = tmp_path / "bad.records.tsv"
+            records_tsv.write_text(
+                "SOURCE_FILE\tROW_ID\tCHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n"
+                "bad.vcf\t1\t1\t100\t.\tA\tG\t50\tPASS\t.\tGT\t0/1 0/0\n",
+                encoding="utf-8",
+            )
+            headers_tsv = tmp_path / "bad.header_lines.tsv"
+            headers_tsv.write_text(
+                "SOURCE_FILE\tHEADER_INDEX\tHEADER_KEY\tHEADER_VALUE\tRAW_LINE\n",
+                encoding="utf-8",
+            )
+            rdf_path = tmp_path / "bad.nt"
+            original = "<base> <predicate> <object> .\n"
+            rdf_path.write_text(original, encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "2 sample payloads"):
+                vcf_rdfizer.append_condensed_sample_rdf(
+                    records_tsv,
+                    headers_tsv,
+                    rdf_path,
+                    progress_interval_records=0,
+                )
+
+            self.assertEqual(rdf_path.read_text(encoding="utf-8"), original)
+
+    def test_main_condensed_mode_runs_only_the_condensed_emitter(self):
+        """The full CLI routes default rules to condensed output without expanded sample triples."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_file = tmp_path / "cohort.vcf"
+            input_file.write_text(
+                "##fileformat=VCFv4.2\n"
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\n"
+                "1\t100\t.\tA\tG\t50\tPASS\t.\tGT\t0/1\t0/0\n",
+                encoding="utf-8",
+            )
+            out_dir = tmp_path / "out"
+
+            def fake_tsv_conversion(**kwargs):
+                tsv_dir = kwargs["tsv_dir"]
+                prefix = kwargs["prefix"]
+                tsv_dir.mkdir(parents=True, exist_ok=True)
+                (tsv_dir / f"{prefix}.records.tsv").write_text(
+                    "SOURCE_FILE\tROW_ID\tCHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1 S2\n"
+                    "cohort.vcf\t1\t1\t100\t.\tA\tG\t50\tPASS\t.\tGT\t0/1 0/0\n",
+                    encoding="utf-8",
+                )
+                (tsv_dir / f"{prefix}.header_lines.tsv").write_text(
+                    "SOURCE_FILE\tHEADER_INDEX\tHEADER_KEY\tHEADER_VALUE\tRAW_LINE\n"
+                    "cohort.vcf\t1\tFORMAT\t<ID=GT,Number=1,Type=String,Description=Genotype>\tx\n",
+                    encoding="utf-8",
+                )
+                (tsv_dir / f"{prefix}.file_metadata.tsv").write_text(
+                    "SOURCE_FILE\tFILE_FORMAT\tFILE_DATE\tSOURCE_SOFTWARE\tREFERENCE_GENOME\tHEADER_COUNT\tRECORD_COUNT\n"
+                    "cohort.vcf\tVCFv4.2\t\t\t\t1\t1\n",
+                    encoding="utf-8",
+                )
+                return {"exit_code": 0, "output_size_bytes": 1}
+
+            with mock.patch.object(vcf_rdfizer, "run", return_value=0), mock.patch.object(
+                vcf_rdfizer, "check_docker", return_value=True
+            ), mock.patch.object(
+                vcf_rdfizer, "docker_image_exists", return_value=True
+            ), mock.patch.object(
+                vcf_rdfizer,
+                "run_tsv_conversion_with_metrics",
+                side_effect=fake_tsv_conversion,
+            ):
+                rc = invoke_main(
+                    [
+                        "--input",
+                        str(input_file),
+                        "--out",
+                        str(out_dir),
+                        "--sample-representation",
+                        "condensed",
+                        "--compression",
+                        "none",
+                        "--keep-tsv",
+                    ]
+                )
+
+            self.assertEqual(rc, 0)
+            rdf_text = (out_dir / "cohort" / "cohort.nt").read_text(encoding="utf-8")
+            self.assertIn("vocab#CondensedRepresentation", rdf_text)
+            self.assertIn("vocab#CohortCallMatrix", rdf_text)
+            self.assertNotIn("vocab#SampleCall", rdf_text)
+            self.assertNotIn("vocab#FormatFieldValue", rdf_text)
+            helper_rows = (
+                out_dir / ".intermediate" / "tsv" / "cohort.sample_calls.tsv"
+            ).read_text(encoding="utf-8").splitlines()
+            self.assertEqual(helper_rows, ["\t".join(vcf_rdfizer.SAMPLE_CALLS_HEADER)])
 
     def test_render_rules_for_triplet_rewrites_helper_tsv_placeholders(self):
         """Rule rendering rewrites records/header/metadata and helper TSV placeholders."""
@@ -1332,13 +2015,15 @@ class WrapperUnitTests(VerboseTestCase):
         self.assertEqual(exc.exception.code, 0)
         text = out_buf.getvalue()
         self.assertIn("Examples:", text)
-        self.assertIn("-m {full,compress,decompress,tsv,index}", text)
+        self.assertIn("-m {full,compress,decompress,tsv,index,validation}", text)
         self.assertIn("-i INPUT", text)
         self.assertIn("--keep-rmlstreamer-rdf-output", text)
         self.assertIn("--remove-rdf-storage-output", text)
         self.assertIn("--rdf-compression", text)
         self.assertIn("--representations", text)
         self.assertIn("--artifact-compression", text)
+        self.assertIn("--cottas", text)
+        self.assertIn("--quiet", text)
         self.assertNotIn("--keep-rdf", text)
         self.assertNotIn("--compression", text)
 
@@ -1474,7 +2159,7 @@ class WrapperUnitTests(VerboseTestCase):
                     )
                     script = str(cmd[-1]) if cmd else ""
                     time_match = re.search(
-                        r"-o\s+(/data/metrics/raw_metrics/tsv_time/[^\s;]+)",
+                        r"-o\s+(/data/metrics/timings/tsv/[^\s;]+)",
                         script,
                     )
                     if metrics_mount and time_match:
@@ -1517,9 +2202,8 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertNotIn("/opt/vcf-rdfizer/run_conversion.sh", " ".join(map(str, commands[0])))
 
             run_metrics_dir = latest_metrics_run_dir(out_dir / "run_metrics")
-            run_id = run_metrics_dir.name
-            tsv_time = run_metrics_dir / "raw_metrics" / "tsv_time" / "sample" / f"{run_id}.txt"
-            tsv_json = run_metrics_dir / "raw_metrics" / "tsv_metrics" / "sample" / f"{run_id}.json"
+            tsv_time = run_metrics_dir / "timings" / "tsv" / "sample.txt"
+            tsv_json = run_metrics_dir / "stages" / "tsv" / "sample.json"
             self.assertTrue(tsv_time.exists())
             self.assertTrue(tsv_json.exists())
 
@@ -1708,6 +2392,13 @@ class WrapperUnitTests(VerboseTestCase):
                 rows = list(csv.DictReader(handle))
             self.assertEqual(rows[-1]["mode"], "compress")
             self.assertEqual(rows[-1]["status"], "success")
+            self.assertRegex(run_metrics_dir.name, r"^sample__\d{8}T\d{6}$")
+            manifest = json.loads((run_metrics_dir / "run.json").read_text())
+            summary = json.loads((run_metrics_dir / "summary.json").read_text())
+            self.assertEqual(manifest["source_label"], "sample")
+            self.assertEqual(manifest["inputs"][0]["path"], str(rdf_path.resolve()))
+            self.assertEqual(summary["status"], "success")
+            self.assertIn("logs/wrapper.log", summary["logs"])
 
     def test_main_full_mode_prints_triplets_and_logs_total(self):
         """Full mode prints produced triples and records them in runtime timing log."""
@@ -1731,11 +2422,14 @@ class WrapperUnitTests(VerboseTestCase):
                     sample_dir.mkdir(parents=True, exist_ok=True)
                     (sample_dir / f"{out_name}.nt").write_text("<s> <p> <o> .\n")
                     payload = {"artifacts": {"output_triples": {"TOTAL": 17}}}
-                    run_metrics_dir = metrics_dir / run_id
-                    run_metrics_dir.mkdir(parents=True, exist_ok=True)
-                    conversion_metrics_dir = run_metrics_dir / "conversion_metrics" / out_name
+                    metrics_mount = next(
+                        part.split(":", 1)[0]
+                        for part in cmd
+                        if isinstance(part, str) and part.endswith(":/data/metrics")
+                    )
+                    conversion_metrics_dir = Path(metrics_mount) / "stages" / "conversion"
                     conversion_metrics_dir.mkdir(parents=True, exist_ok=True)
-                    (conversion_metrics_dir / f"{run_id}.json").write_text(
+                    (conversion_metrics_dir / f"{out_name}.json").write_text(
                         json.dumps(payload),
                         encoding="utf-8",
                     )
@@ -1895,6 +2589,135 @@ class WrapperUnitTests(VerboseTestCase):
         rc = invoke_main(["--mode", "compress"])
         self.assertEqual(rc, 2)
 
+    def test_main_validation_mode_runs_container_local_nt_gzip_validation(self):
+        """Validation mounts only .nt.gz input and invokes the internal runner."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            vcf_path = tmp_path / "sample.vcf"
+            vcf_path.write_text("##fileformat=VCFv4.2\n#CHROM\tPOS\n")
+            rdf_path = tmp_path / "sample.nt.gz"
+            with gzip.open(rdf_path, "wt", encoding="utf-8") as handle:
+                handle.write("<s> <p> <o> .\n")
+            out_dir = tmp_path / "out"
+            commands = []
+
+            def fake_run(cmd, cwd=None, env=None):
+                commands.append(cmd)
+                return 0
+
+            with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch.object(
+                vcf_rdfizer, "check_docker", return_value=True
+            ), mock.patch.object(vcf_rdfizer, "docker_image_exists", return_value=True):
+                rc = invoke_main(
+                    [
+                        "--mode",
+                        "validation",
+                        "--input",
+                        str(vcf_path),
+                        "--rdf",
+                        str(rdf_path),
+                        "--sample-representation",
+                        "condensed",
+                        "--out",
+                        str(out_dir),
+                    ]
+                )
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(commands), 1)
+            command = commands[0]
+            self.assertIn("/opt/vcf-rdfizer/validation/validation_runner.py", command)
+            self.assertIn("/data/rdf/sample.nt.gz", command)
+            self.assertIn("condensed", command)
+            results_dir = next((out_dir / "run_metrics").glob("*/reports/validation/sample"))
+            self.assertTrue(results_dir.is_dir())
+            stage = next((out_dir / "run_metrics").glob("*/stages/validation/sample.json"))
+            payload = json.loads(stage.read_text())
+            self.assertTrue(payload["temporary_rdf"]["decompressed_inside_container"])
+            self.assertFalse(payload["temporary_rdf"]["persisted_on_host"])
+            with stage.parent.parent.parent.joinpath("metrics.csv").open(
+                newline="", encoding="utf-8"
+            ) as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(row["validation_status"], "PASS")
+            self.assertEqual(row["validation_exit_code"], "0")
+
+    def test_main_validation_mode_reports_existing_results_without_traceback(self):
+        """A populated results directory exits 2 with a message, not an exception."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            vcf_path = tmp_path / "sample.vcf"
+            vcf_path.write_text("##fileformat=VCFv4.2\n#CHROM\tPOS\n")
+            rdf_path = tmp_path / "sample.nt.gz"
+            with gzip.open(rdf_path, "wt", encoding="utf-8") as handle:
+                handle.write("<s> <p> <o> .\n")
+            metrics_dir = tmp_path / "metrics"
+            existing = metrics_dir / "reports" / "validation" / "sample"
+            existing.mkdir(parents=True)
+            (existing / "summary.json").write_text("{}", encoding="utf-8")
+
+            stderr = StringIO()
+            with mock.patch.object(
+                vcf_rdfizer, "metrics_run_directory", return_value=metrics_dir
+            ), redirect_stderr(stderr):
+                rc = invoke_main(
+                    [
+                        "--mode",
+                        "validation",
+                        "--input",
+                        str(vcf_path),
+                        "--rdf",
+                        str(rdf_path),
+                        "--out",
+                        str(tmp_path / "out"),
+                    ]
+                )
+
+            self.assertEqual(rc, 2)
+            self.assertIn("Refusing to overwrite existing validation results", stderr.getvalue())
+
+    def test_run_validation_mode_accepts_plain_nt_for_full_runs(self):
+        """The shared validation runner selects --rdf-nt for a plain aggregate."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            vcf_path = tmp_path / "sample.vcf"
+            vcf_path.write_text("##fileformat=VCFv4.2\n#CHROM\tPOS\n")
+            rdf_path = tmp_path / "sample.nt"
+            rdf_path.write_text("<s> <p> <o> .\n")
+            metrics_dir = tmp_path / "metrics"
+            results_dir = metrics_dir / "reports" / "validation" / "sample"
+            commands = []
+
+            def fake_run(cmd, cwd=None, env=None):
+                commands.append(cmd)
+                return 0
+
+            stage_result = {}
+            with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run):
+                rc = vcf_rdfizer.run_validation_mode(
+                    vcf_path=vcf_path,
+                    rdf_path=rdf_path,
+                    representation="expanded",
+                    validation_id="sample",
+                    results_dir=results_dir,
+                    metrics_dir=metrics_dir,
+                    run_id="20260904T123456",
+                    timestamp="2026-09-04T12:34:56",
+                    image_ref="example/vcf-rdfizer:latest",
+                    filter_oracle="auto",
+                    wrapper_log_path=tmp_path / "wrapper.log",
+                    stage_result=stage_result,
+                )
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(commands), 1)
+            self.assertIn("--rdf", commands[0])
+            self.assertIn("--rdf-format", commands[0])
+            self.assertIn("nt", commands[0])
+            self.assertIn("/data/rdf/sample.nt", commands[0])
+            self.assertEqual(stage_result["rdf_format"], "nt")
+            self.assertFalse(stage_result["temporary_rdf"]["decompressed_inside_container"])
+
     def test_main_rejects_spark_partitions_outside_full_mode(self):
         """--spark-partitions is rejected for non-full modes."""
         rc = invoke_main(
@@ -2002,7 +2825,7 @@ class WrapperUnitTests(VerboseTestCase):
 
             self.assertEqual(rc, 130)
             run_metrics_dir = latest_metrics_run_dir(out_dir / "run_metrics")
-            progress_log = run_metrics_dir / "progress.log"
+            progress_log = run_metrics_dir / "logs" / "progress.log"
             self.assertTrue(progress_log.exists())
             self.assertIn("Run interrupted by user signal", progress_log.read_text())
 
@@ -2216,7 +3039,12 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertEqual(len(commands), 1)
             self.assertIn("ensure_hdt_index.sh", commands[0][-1])
             self.assertTrue(any(arg.endswith(":/data/hdt") for arg in commands[0]))
-            metrics = latest_metrics_run_dir(out_dir / "run_metrics") / "hdt_index_metrics.json"
+            metrics = (
+                latest_metrics_run_dir(out_dir / "run_metrics")
+                / "stages"
+                / "index"
+                / "hdt-sample.hdt.json"
+            )
             payload = json.loads(metrics.read_text())
             self.assertEqual(payload["index_status"], "generated")
             self.assertEqual(
@@ -2224,36 +3052,214 @@ class WrapperUnitTests(VerboseTestCase):
                 (tmp_path / "sample.hdt.index.v1-1").resolve(),
             )
 
-    def test_hdt_index_helper_uses_exit_only_and_verifies_sidecar(self):
-        """The Docker-side helper initializes the index without issuing a query."""
+    def test_main_index_mode_regenerates_existing_hdt_sidecar(self):
+        """Index mode permits an existing HDT sidecar and invokes regeneration."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
-            java_home = tmp_path / "java-home"
-            bin_dir = java_home / "bin"
-            bin_dir.mkdir(parents=True)
-            search = bin_dir / "hdtSearch.sh"
-            search.write_text(
-                "#!/usr/bin/env bash\n"
-                "read -r command\n"
-                "[[ \"$command\" == \"exit\" ]] || exit 3\n"
-                "printf 'index\\n' > \"${1}.index.v1-1\"\n",
-                encoding="utf-8",
-            )
-            search.chmod(0o755)
             hdt_path = tmp_path / "sample.hdt"
             hdt_path.write_bytes(b"fake-hdt")
+            existing_index = tmp_path / "sample.hdt.index.v1-1"
+            existing_index.write_text("old-index\n")
+            out_dir = tmp_path / "out"
+            commands = []
+
+            def fake_run(cmd, cwd=None, env=None):
+                commands.append(cmd)
+                rendered = str(cmd[-1])
+                if "ensure_hdt_index.sh" in rendered:
+                    existing_index.write_text("new-index\n")
+                return 0
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch.object(
+                    vcf_rdfizer, "check_docker", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "docker_image_exists", return_value=True
+                ):
+                    rc = invoke_main(
+                        [
+                            "--mode",
+                            "index",
+                            "--hdt",
+                            str(hdt_path),
+                            "--out",
+                            str(out_dir),
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(existing_index.read_text(), "new-index\n")
+            payload = json.loads(
+                (
+                    latest_metrics_run_dir(out_dir / "run_metrics")
+                    / "stages"
+                    / "index"
+                    / "hdt-sample.hdt.json"
+                ).read_text()
+            )
+            self.assertEqual(payload["index_status"], "regenerated")
+
+    def test_main_index_mode_reindexes_existing_cottas(self):
+        """Index mode invokes the COTTAS adapter and records embedded-index metadata."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            cottas_path = tmp_path / "sample.cottas"
+            cottas_path.write_text("old-cottas\n")
+            out_dir = tmp_path / "out"
+            commands = []
+
+            def fake_run(cmd, cwd=None, env=None):
+                commands.append(cmd)
+                rendered = str(cmd[-1])
+                if "cottas_tool.py" in rendered and " reindex " in rendered:
+                    cottas_path.write_text("reindexed-cottas\n")
+                return 0
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), mock.patch.object(
+                    vcf_rdfizer, "check_docker", return_value=True
+                ), mock.patch.object(
+                    vcf_rdfizer, "docker_image_exists", return_value=True
+                ):
+                    rc = invoke_main(
+                        [
+                            "--mode",
+                            "index",
+                            "--cottas",
+                            str(cottas_path),
+                            "--out",
+                            str(out_dir),
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(cottas_path.read_text(), "reindexed-cottas\n")
+            self.assertEqual(len(commands), 1)
+            self.assertIn("cottas_tool.py reindex", commands[0][-1])
+            self.assertTrue(any(arg.endswith(":/data/cottas") for arg in commands[0]))
+            payload = json.loads(
+                (
+                    latest_metrics_run_dir(out_dir / "run_metrics")
+                    / "stages"
+                    / "index"
+                    / "cottas-sample.cottas.json"
+                ).read_text()
+            )
+            self.assertEqual(payload["index_format"], "cottas")
+            self.assertEqual(payload["index_location"], "embedded")
+            self.assertEqual(payload["index_status"], "regenerated")
+            self.assertTrue(
+                (latest_metrics_run_dir(out_dir / "run_metrics") / "summary.json").exists()
+            )
+
+    def test_main_index_mode_requires_exactly_one_index_input(self):
+        """Index mode rejects missing or ambiguous HDT/COTTAS inputs."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            hdt_path = tmp_path / "sample.hdt"
+            cottas_path = tmp_path / "sample.cottas"
+            hdt_path.write_bytes(b"hdt")
+            cottas_path.write_bytes(b"cottas")
+
+            for options in (
+                [],
+                ["--hdt", str(hdt_path), "--cottas", str(cottas_path)],
+            ):
+                rc = invoke_main(["--mode", "index", *options, "--out", str(tmp_path / "out")])
+                self.assertEqual(rc, 2)
+
+    def test_hdt_index_helper_uses_hdtc_and_verifies_sidecar(self):
+        """The helper uses hdtc's Java-free bounded-memory index command."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            work_root = tmp_path / "index-work"
+            work_root.mkdir()
+            invocation_path = tmp_path / "invocation.txt"
+            hdtc = tmp_path / "hdtc"
+            hdtc.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' \"$@\" > \"$HDT_TEST_INVOCATION\"\n"
+                "[[ \"$1\" == \"--quiet\" && \"$2\" == \"index\" ]] || exit 3\n"
+                "hdt_path=$3\n"
+                "printf 'index\\n' > \"${hdt_path}.index.v1-1\"\n",
+                encoding="utf-8",
+            )
+            hdtc.chmod(0o755)
+            hdt_path = tmp_path / "sample.hdt"
+            hdt_path.write_bytes(b"fake-hdt")
+            existing_index = Path(str(hdt_path) + ".index.v1-1")
+            existing_index.write_text("old-index\n", encoding="utf-8")
             helper = Path(__file__).parents[1] / "src" / "ensure_hdt_index.sh"
 
             result = subprocess.run(
                 ["bash", str(helper), str(hdt_path)],
-                env={**os.environ, "HDT_JAVA_HOME": str(java_home)},
+                env={
+                    **os.environ,
+                    "HDTC_BIN": str(hdtc),
+                    "HDT_INDEX_WORK_ROOT": str(work_root),
+                    "HDT_INDEX_MEMORY_LIMIT": "768M",
+                    "HDT_TEST_INVOCATION": str(invocation_path),
+                },
                 capture_output=True,
                 text=True,
             )
 
             self.assertEqual(result.returncode, 0, msg=result.stderr)
             self.assertTrue(Path(str(hdt_path) + ".index.v1-1").exists())
+            self.assertEqual(existing_index.read_text(encoding="utf-8"), "index\n")
             self.assertIn(f"HDT index ready: {hdt_path}.index.v1-1", result.stdout)
+            invocation = invocation_path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(
+                invocation[0:5],
+                ["--quiet", "index", str(hdt_path), "--memory-limit", "768M"],
+            )
+            self.assertEqual(invocation[5], "--temp-dir")
+            self.assertTrue(Path(invocation[6]).parent.samefile(work_root))
+            self.assertEqual(list(work_root.iterdir()), [])
+
+    def test_hdt_index_helper_restores_existing_sidecar_on_failure(self):
+        """Failed HDT regeneration restores the sidecar that was moved aside."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            work_root = tmp_path / "index-work"
+            work_root.mkdir()
+            hdtc = tmp_path / "hdtc"
+            hdtc.write_text(
+                "#!/usr/bin/env bash\n"
+                "hdt_path=$3\n"
+                "printf 'partial-index\\n' > \"${hdt_path}.index.v1-1\"\n"
+                "exit 7\n",
+                encoding="utf-8",
+            )
+            hdtc.chmod(0o755)
+            hdt_path = tmp_path / "sample.hdt"
+            hdt_path.write_bytes(b"fake-hdt")
+            existing_index = Path(str(hdt_path) + ".index.v1-1")
+            existing_index.write_text("old-index\n", encoding="utf-8")
+            helper = Path(__file__).parents[1] / "src" / "ensure_hdt_index.sh"
+
+            result = subprocess.run(
+                ["bash", str(helper), str(hdt_path)],
+                env={
+                    **os.environ,
+                    "HDTC_BIN": str(hdtc),
+                    "HDT_INDEX_WORK_ROOT": str(work_root),
+                },
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 7, msg=result.stderr)
+            self.assertEqual(existing_index.read_text(encoding="utf-8"), "old-index\n")
+            self.assertEqual(list(work_root.iterdir()), [])
 
     def test_main_decompress_mode_rejects_unknown_extension(self):
         """Decompression mode rejects unsupported compressed RDF extensions."""
@@ -2436,8 +3442,90 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertEqual(len(runner_commands), 1)
             self.assertIn("target=/work", " ".join(runner_commands[0]))
             self.assertIn("--methods hdt", " ".join(runner_commands[0]))
+            self.assertIn("--allow-index-failures", runner_commands[0])
             self.assertFalse((out_dir / "sample" / ".compression_partitioned").exists())
             self.assertTrue((out_dir / "sample" / "sample.hdt").exists())
+
+    def test_main_full_mode_records_cottas_index_warning_and_continues(self):
+        """Full mode succeeds and writes an index-warning report for skipped COTTAS output."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+            out_dir = tmp_path / "out"
+            stdout = StringIO()
+            stderr = StringIO()
+
+            def fake_run(cmd, cwd=None, env=None):
+                if "/opt/vcf-rdfizer/run_conversion.sh" in cmd:
+                    sample_dir = out_dir / "sample"
+                    sample_dir.mkdir(parents=True, exist_ok=True)
+                    (sample_dir / "sample.nt").write_text("<s> <p> <o> .\n")
+                return 0
+
+            def fake_partitioned(**kwargs):
+                warning = {
+                    "format": "cottas",
+                    "stage": "cottas-index",
+                    "status": "index_unavailable",
+                    "artifact_path": str(out_dir / "sample" / "sample.cottas"),
+                    "message": "COTTAS index creation failed",
+                }
+                kwargs["index_warnings"].append(warning)
+                return True, {
+                    "cottas": {
+                        "exit_code": 1,
+                        "output_path": str(out_dir / "sample" / "sample.cottas"),
+                        "output_size_bytes": 0,
+                        "index_status": "failed",
+                        "index_warning": warning,
+                    }
+                }
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with (
+                    mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run),
+                    mock.patch.object(vcf_rdfizer, "check_docker", return_value=True),
+                    mock.patch.object(vcf_rdfizer, "docker_image_exists", return_value=True),
+                    mock.patch.object(vcf_rdfizer, "discover_tsv_triplets", return_value=mocked_triplets()),
+                    mock.patch.object(
+                        vcf_rdfizer,
+                        "run_partitioned_representation_methods_for_rdf_files",
+                        side_effect=fake_partitioned,
+                    ),
+                    redirect_stdout(stdout),
+                    redirect_stderr(stderr),
+                ):
+                    rc = invoke_main(
+                        [
+                            "--input",
+                            str(input_dir),
+                            "--rules",
+                            str(rules_path),
+                            "--rdf-storage-mode",
+                            "plain",
+                            "--rdf-compression",
+                            "none",
+                            "--representations",
+                            "cottas",
+                            "--artifact-compression",
+                            "none",
+                            "--out",
+                            str(out_dir),
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 0)
+            run_metrics_dir = latest_metrics_run_dir(out_dir / "run_metrics")
+            warning_path = run_metrics_dir / "reports" / "index_warnings.json"
+            self.assertTrue(warning_path.exists())
+            self.assertEqual(json.loads(warning_path.read_text())["warning_count"], 1)
+            self.assertIn("Conversion process finished with index warnings.", stdout.getvalue())
+            self.assertIn("index_warnings.json", stdout.getvalue())
+            self.assertTrue((out_dir / "sample" / "sample.nt").exists())
 
     def test_main_full_mode_plain_storage_sets_storage_mode(self):
         """Plain storage passes the canonical storage mode to conversion."""
@@ -2668,7 +3756,7 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertTrue((out_dir / "sample_b" / "sample_b.hdt").exists())
 
             run_metrics_dir = latest_metrics_run_dir(out_dir / "run_metrics")
-            failed_report = run_metrics_dir / "failed_inputs.csv"
+            failed_report = run_metrics_dir / "reports" / "failed_inputs.csv"
             self.assertTrue(failed_report.exists())
             report_text = failed_report.read_text()
             self.assertIn("sample_a", report_text)
@@ -2898,8 +3986,8 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertIn("sample", csv_text)
             self.assertIn("hdt", csv_text)
 
-            json_file = run_metrics_dir / "compression_metrics" / "sample" / f"{run_metrics_dir.name}.json"
-            time_file = run_metrics_dir / "compression_time" / "hdt" / "sample" / f"{run_metrics_dir.name}.txt"
+            json_file = run_metrics_dir / "stages" / "compression" / "sample.json"
+            time_file = run_metrics_dir / "timings" / "compression" / "sample" / "hdt.txt"
             self.assertTrue(json_file.exists())
             self.assertTrue(time_file.exists())
 

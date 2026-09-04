@@ -1,0 +1,34 @@
+PREFIX vcfr: <https://w3id.org/vcf-rdfizer/vocab#>
+
+SELECT ?variantClass (COUNT(DISTINCT ?record) AS ?recordCount)
+WHERE {
+  ?record a vcfr:VCFRecord ; vcfr:ref ?refLiteral ; vcfr:alt ?altLiteral .
+  BIND(UCASE(STR(?refLiteral)) AS ?ref)
+  BIND(UCASE(STR(?altLiteral)) AS ?alt)
+  BIND(
+    IF(?alt = ".", "NO_ALT",
+      IF(CONTAINS(?alt, ","), "MULTIALLELIC",
+        IF(
+          ?alt = "*" || CONTAINS(?alt, "[") || CONTAINS(?alt, "]") ||
+          (STRSTARTS(?alt, "<") && STRENDS(?alt, ">")),
+          "SYMBOLIC_OR_BREAKEND",
+          IF(
+            !REGEX(?ref, "^[ACGTN]+$") || !REGEX(?alt, "^[ACGTN]+$"),
+            "OTHER",
+            IF(
+              STRLEN(?ref) = 1 && STRLEN(?alt) = 1,
+              "SNV",
+              IF(
+                STRLEN(?ref) = STRLEN(?alt),
+                "MNV_OR_EQUAL_LENGTH_SUBSTITUTION",
+                IF(STRLEN(?ref) < STRLEN(?alt), "INSERTION_SHAPE", "DELETION_SHAPE")
+              )
+            )
+          )
+        )
+      )
+    ) AS ?variantClass
+  )
+}
+GROUP BY ?variantClass
+ORDER BY ?variantClass

@@ -1,0 +1,11 @@
+PREFIX vcfr: <https://w3id.org/vcf-rdfizer/vocab#>
+
+SELECT ?filterStatus ?filterLexical (COUNT(DISTINCT ?record) AS ?recordCount)
+WHERE {
+  ?record a vcfr:VCFRecord ; vcfr:hasCall ?call .
+  ?call vcfr:filter ?filterLiteral .
+  BIND(STR(?filterLiteral) AS ?filterLexical)
+  BIND(IF(?filterLexical = "PASS", "PASS", IF(?filterLexical = ".", "NOT_APPLIED", "FAILED")) AS ?filterStatus)
+}
+GROUP BY ?filterStatus ?filterLexical
+ORDER BY ?filterStatus ?filterLexical

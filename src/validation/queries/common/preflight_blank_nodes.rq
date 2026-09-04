@@ -1,0 +1,18 @@
+PREFIX vcfr: <https://w3id.org/vcf-rdfizer/vocab#>
+
+# Blank nodes anywhere in the graph.
+#
+# Every class in the VCF-RDFizer vocabulary declares an vcfr:iriTemplate, so a
+# blank node means a term map produced no IRI. That is always a defect here:
+# blank-node identity is scoped to the file, so the record and value digests
+# could not address such a node, and neither could anything downstream that
+# merges or re-serializes the graph.
+#
+# A predicate cannot be a blank node in RDF, so only subject and object are
+# examined.
+SELECT ?s ?p ?o
+WHERE {
+  ?s ?p ?o .
+  FILTER(ISBLANK(?s) || ISBLANK(?o))
+}
+LIMIT 100

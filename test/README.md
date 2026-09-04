@@ -24,10 +24,62 @@ This repository uses `unittest` (Python standard library) to isolate orchestrati
   - Verifies output normalization to `.nt`.
   - Verifies unified metrics CSV row creation and schema consistency.
 
-- `test/test_compression_unit.py`
-  - Replaces `gzip`, `brotli`, and `rdf2hdt` with fake executables for the standalone helper.
-  - Verifies helper compression artifact generation and metrics row update.
-  - Verifies no-op behavior (no compression outputs, metrics still updated).
+- `test/test_partitioned_compression_unit.py` and `test/test_cottas_tool.py`
+  - Exercise the container-side chunking, merge, and COTTAS adapter logic.
+
+- `test/test_rules_helper_unit.py`
+  - Verifies the `vcf-rdfizer-rules` contract checks (source paths, column
+    references, sample-representation compatibility, helper-table warnings).
+  - Pins the documented TSV column lists to the headers `src/vcf_as_tsv.sh`
+    actually writes, so the two cannot drift apart.
+
+- `test/test_validation_mutation_unit.py` (+ `validation_fixtures.py`,
+  `validation_mutations.py`)
+  - Mutation testing for the semantic validation suite: corrupts a correct
+    graph in 42 named ways and asserts which corruptions the validator
+    detects, producing a reproducible mutation score (currently 76/78).
+  - Requires `rdflib` (test-only, in the `dev` extra); the tests skip cleanly
+    without it. See `docs/validation-methodology.md`.
+  - The fixture derives the VCF, the RDF graph and the parser oracle from one
+    declarative spec, and builds its graph with the project's own emitters, so
+    the two halves cannot drift apart.
+
+- `test/cross_engine_agreement.py`
+  - Not a unittest module: run inside the image to assert every validation
+    query returns identical values under all four engines (Comunica, QLever,
+    native HDT, native COTTAS), across both representations.
+  - Also runs the shipped validation decision under each engine, so an engine
+    must agree with the Python oracle and not merely with the other engines.
+  - Pass a comma-separated subset as the first argument to narrow it.
+
+- `test/test_validation_logic_unit.py`
+  - Mutation tests over the validator's pure comparison layer, run on the host
+    without cyvcf2 or Docker.
+  - Records both what a validation `PASS` detects and the coverage gaps it does
+    not, so closing a gap fails a test rather than passing unnoticed.
+
+- `test/test_validation_engines_unit.py`
+  - Verifies artifact format detection and decode paths (`.nt`, `.nt.gz`,
+    `.nt.br`, `.hdt`, `.cottas[.gz|.br]`) with the container tools faked.
+  - Verifies Comunica and QLever engine construction, QLever's
+    index/serve/teardown lifecycle and overridable command lines, and the
+    wrapper's validation-target resolution.
+
+- `test/test_validation_benchmark_unit.py`
+  - Verifies multi-engine selection (`--validation-engine a,b` and `all`) in
+    both the host wrapper and the container runner, and that the two layers
+    cannot drift apart on which engines exist.
+  - Verifies the native HDT/COTTAS engines: reusing the run's own artifact
+    versus building one, Comunica's `hdt@<path>` typed-source prefix, and that
+    a failing query is reported rather than raised.
+  - Verifies the benchmark report and its long-format CSV, and the
+    cross-engine agreement comparison.
+
+- `test/test_gzip_size_unit.py`
+  - Verifies uncompressed-size measurement for BGZF, single-member gzip, and
+    concatenated members, each against a full-inflate ground truth.
+  - Verifies that an unresolvable file falls back rather than reporting a wrong
+    size, including the 32-bit `ISIZE` wrap and multi-member trailers.
 
 ## CI matrix behavior
 

@@ -24,6 +24,7 @@ requirements:
     - wheel
   run:
     - python >={{ python_min }}
+    - rich >=13.7.0
 
 test:
   requires:
