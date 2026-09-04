@@ -24,10 +24,20 @@ This repository uses `unittest` (Python standard library) to isolate orchestrati
   - Verifies output normalization to `.nt`.
   - Verifies unified metrics CSV row creation and schema consistency.
 
-- `test/test_compression_unit.py`
-  - Replaces `gzip`, `brotli`, and `rdf2hdt` with fake executables for the standalone helper.
-  - Verifies helper compression artifact generation and metrics row update.
-  - Verifies no-op behavior (no compression outputs, metrics still updated).
+- `test/test_partitioned_compression_unit.py` and `test/test_cottas_tool.py`
+  - Exercise the container-side chunking, merge, and COTTAS adapter logic.
+
+- `test/test_rules_helper_unit.py`
+  - Verifies the `vcf-rdfizer-rules` contract checks (source paths, column
+    references, sample-representation compatibility, helper-table warnings).
+  - Pins the documented TSV column lists to the headers `src/vcf_as_tsv.sh`
+    actually writes, so the two cannot drift apart.
+
+- `test/test_gzip_size_unit.py`
+  - Verifies uncompressed-size measurement for BGZF, single-member gzip, and
+    concatenated members, each against a full-inflate ground truth.
+  - Verifies that an unresolvable file falls back rather than reporting a wrong
+    size, including the 32-bit `ISIZE` wrap and multi-member trailers.
 
 ## CI matrix behavior
 

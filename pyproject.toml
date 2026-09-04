@@ -34,6 +34,7 @@ Issues = "https://github.com/ecrum19/VCF-RDFizer/issues"
 
 [project.scripts]
 vcf-rdfizer = "vcf_rdfizer:main"
+vcf-rdfizer-rules = "vcf_rdfizer_rules:main"
 
 [project.optional-dependencies]
 dev = [
@@ -42,7 +43,7 @@ dev = [
 ]
 
 [tool.setuptools]
-py-modules = ["vcf_rdfizer"]
+py-modules = ["vcf_rdfizer", "vcf_rdfizer_gzip", "vcf_rdfizer_rules"]
 packages = ["vcf_rdfizer_data", "vcf_rdfizer_data.rules"]
 include-package-data = true
 

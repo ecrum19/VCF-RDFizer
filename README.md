@@ -61,7 +61,7 @@ or pull the prebuilt Docker image directly:
 docker pull ecrum19/vcf-rdfizer:latest
 ```
 
-Release maintainers: see [`RELEASING.md`](RELEASING.md) for the PyPI,
+Release maintainers: see [`scripts/RELEASING.md`](scripts/RELEASING.md) for the PyPI,
 Docker Hub, and conda-forge release procedure.
 
 ## Important CLI Rule
@@ -605,6 +605,25 @@ Within each run directory, VCF-RDFizer writes:
   (`summary.json`, query results, preflight checks, and cleanup evidence) when
   validation is requested
 
+`input_vcf_size_bytes` in `stages/conversion/*.json` and `metrics.csv` is the
+*uncompressed* size of the source VCF, so that ratios are comparable between
+plain and compressed inputs. The accompanying `input_vcf_size_method` records
+how it was obtained:
+
+| Method | Meaning |
+| --- | --- |
+| `stat` | Input was not compressed; the on-disk size is the answer |
+| `bgzf` | Exact, summed from a `bgzip`/BGZF file's block headers with no decompression |
+| `gzip-sample` | Exact; the whole single-member stream fitted in the sampling budget |
+| `gzip-trailer` | Exact; the 32-bit `ISIZE` trailer resolved against the file's measured compression ratio |
+| `inflate` / `inflate-shell` | Fallback full decompression pass, used when the file's structure cannot settle the answer (for example concatenated non-BGZF members) |
+
+Only the fallback costs a full pass over the input. Because indexed `.vcf.gz`
+files from `bcftools`/`tabix`/`htslib` are BGZF, the usual case is measured in
+milliseconds rather than minutes. The same machinery makes `--estimate-size`
+report a real uncompressed input size instead of an assumed expansion factor;
+it says so when it had to fall back to the assumption.
+
 Compression metrics now include per-method:
 
 - `wall_seconds_*`
@@ -734,6 +753,112 @@ finishes.
 
 - default rules file: `rules/default_rules.ttl`
 - rules guide: `rules/README.md`
+
+### Custom RML Mappings
+
+`--rules` accepts any RML mapping, so you can change what RDF the pipeline
+produces without touching the wrapper. A custom mapping has to honour a small
+contract, and `vcf-rdfizer-rules` (installed alongside `vcf-rdfizer`) makes it
+discoverable and checkable:
+
+```bash
+vcf-rdfizer-rules columns
+```
+
+Lists the five TSV sources the pipeline generates and every column each one
+provides, so you know what a mapping can reference.
+
+```bash
+vcf-rdfizer-rules init -o my_rules.ttl
+```
+
+Writes an annotated copy of the shipped default mapping to start from.
+
+```bash
+vcf-rdfizer-rules check my_rules.ttl
+```
+
+Validates the mapping *before* you spend hours on a run. It reports:
+
+- logical-source paths the wrapper cannot rewrite per input,
+- referenced columns no generated TSV provides (typos such as `CHROMOSOME`),
+- which `--sample-representation` values remain usable,
+- whether the mapping forces the large sample helper tables to be materialized.
+
+Exit code is `0` when the mapping is usable and `1` when it is not; add
+`--json` for scripted use. Then run it:
+
+```bash
+vcf-rdfizer --mode full -i ./cohort.vcf.gz --rules my_rules.ttl --rdf-storage-mode plain -o ./results
+```
+
+#### The contract
+
+1. **Keep the five `csvw:url` values exactly as they are.** Full mode processes
+   one VCF at a time and rewrites those literal strings to the per-input file
+   names (`/data/tsv/records.tsv` becomes `/data/tsv/<sample>.records.tsv`, and
+   so on). Any other path is left untouched and will not resolve.
+
+   | Logical source | Contents |
+   | --- | --- |
+   | `/data/tsv/records.tsv` | One row per VCF data line |
+   | `/data/tsv/header_lines.tsv` | One row per `##` header line |
+   | `/data/tsv/file_metadata.tsv` | One row summarising the source VCF |
+   | `/data/tsv/sample_calls.tsv` | Helper: one row per variant x sample |
+   | `/data/tsv/sample_format_values.tsv` | Helper: one row per variant x sample x FORMAT key |
+
+2. **Only reference columns the pipeline writes.** `vcf-rdfizer-rules columns`
+   is authoritative; a unit test pins those lists to what `src/vcf_as_tsv.sh`
+   actually emits, so they cannot drift.
+
+3. **Think before consuming the two helper tables.** The four built-in sample
+   maps are recognised by the wrapper, which then keeps those tables
+   header-only and streams the genotype RDF itself. A mapping that consumes
+   them in any other way forces them to be materialized in full - the largest
+   intermediate the pipeline can produce - and is rejected in
+   `--sample-representation condensed`, which would otherwise emit both
+   genotype representations at once. `check` warns about this explicitly.
+
+The last column of `records.tsv` is the whitespace-joined sample ids from the
+`#CHROM` line (or `SAMPLES` when the VCF declares none), so its *name* varies
+per input and it cannot be referenced by a fixed name. Genotype RDF is emitted
+by the wrapper from that column instead; see
+[`docs/sample-representation-guide.md`](docs/sample-representation-guide.md).
+
+## Repository Layout
+
+VCF-RDFizer is deliberately split into a thin host-side CLI and a set of
+container-side stages. Nothing on the host walks the RDF itself; it plans work,
+launches Docker, and reads back the JSON/CSV reports each stage writes.
+
+| Path | Role |
+| --- | --- |
+| `vcf_rdfizer.py` | Host CLI: argument validation, output-collision planning, Docker orchestration, metrics assembly, mode dispatch. Also emits the multi-sample genotype RDF (see below). |
+| `vcf_rdfizer_rules.py` | `vcf-rdfizer-rules` CLI: scaffold, document, and validate custom RML mappings. |
+| `vcf_rdfizer_gzip.py` | Uncompressed size of a gzip/BGZF VCF without decompressing it. Used by the host preflight estimate and, inside the image, by `run_conversion.sh`. |
+| `src/vcf_as_tsv.sh` | VCF -> per-input `records`/`header_lines`/`file_metadata` TSV, in one `awk` pass. |
+| `src/run_conversion.sh` | Runs RMLStreamer, normalizes Spark part files, merges them into one `.nt`/`.nt.gz` aggregate, records conversion metrics. |
+| `src/partitioned_compression.py` | Record-safe RDF chunking plus chunked HDT/COTTAS generation and pairwise merge, inside an ephemeral Docker volume. |
+| `src/cottas_tool.py` | COTTAS `convert` / `merge` / `reindex` / `decompress` adapter over `pycottas`, with a bounded-memory streaming merge. |
+| `src/ensure_hdt_index.sh` | Java-free canonical `.hdt.index.v1-1` sidecar generation via `hdtc`, with restore-on-failure. |
+| `src/validate_compression.py` | Round-trip check: decode a `.hdt`/`.cottas` artifact and compare its triple count against the source. |
+| `src/validation/` | Semantic VCF-vs-RDF validation: `cyvcf2`/`bcftools` oracle, SPARQL queries per representation, comparison report. |
+| `rules/default_rules.ttl` | Default RML mapping (also shipped as package data in `vcf_rdfizer_data/`). |
+| `test/` | `unittest` suite; the shell/pipeline tests stub `java`, `docker`, and friends so no real external tool is needed. |
+| `scripts/release.py` | Version bump + release metadata automation (see `scripts/RELEASING.md`). |
+
+Genotype RDF is the one deliberate exception to "all data processing happens in
+the container": `append_expanded_sample_rdf` and `append_condensed_sample_rdf`
+in `vcf_rdfizer.py` append it directly to the aggregate, because the equivalent
+RML maps would first have to materialize variants x samples (x FORMAT keys)
+helper TSV rows. See [`docs/sample-representation-guide.md`](docs/sample-representation-guide.md).
+
+Further reading:
+
+- [`docs/validation.md`](docs/validation.md) - semantic validation design and query set
+- [`docs/sample-representation-guide.md`](docs/sample-representation-guide.md) - emitted genotype shapes
+- [`changelog.md`](changelog.md) - dated change history
+- [`ACKNOWLEDGEMENTS.md`](ACKNOWLEDGEMENTS.md) - funding and attribution
 
 ## Troubleshooting
 

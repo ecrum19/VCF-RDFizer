@@ -2,6 +2,18 @@
 
 This directory contains RML mappings used by the conversion pipeline.
 
+Writing your own mapping? Use the `vcf-rdfizer-rules` CLI, which documents the
+available TSV columns, scaffolds a starting point, and validates a mapping
+against the wrapper's contract before you spend a run on it:
+
+```bash
+vcf-rdfizer-rules columns          # what a mapping can reference
+vcf-rdfizer-rules init -o my.ttl   # annotated copy of default_rules.ttl
+vcf-rdfizer-rules check my.ttl     # validate before running the pipeline
+```
+
+See "Custom RML Mappings" in the top-level `README.md` for the full contract.
+
 ## Files
 
 - `default_rules.ttl`

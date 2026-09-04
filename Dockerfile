@@ -114,6 +114,9 @@ COPY THIRD_PARTY_NOTICES.md /usr/share/licenses/vcf-rdfizer/THIRD_PARTY_NOTICES.
 COPY src/*.sh /opt/vcf-rdfizer/
 COPY src/*.py /opt/vcf-rdfizer/
 COPY src/validation/ /opt/vcf-rdfizer/validation/
+# Shared, dependency-free helper used by both the host CLI and the in-container
+# conversion runner, so it lives at the repository root rather than in src/.
+COPY vcf_rdfizer_gzip.py /opt/vcf-rdfizer/
 
 RUN chmod +x /opt/vcf-rdfizer/*.sh \
   && chmod +x /usr/local/bin/rdf2hdt \

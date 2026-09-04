@@ -1250,70 +1250,6 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertEqual(method_results["hdt"]["exit_code"], 0)
             self.assertTrue(rdf_path.exists())
 
-    def test_plan_partitioned_hdt_chunks_groups_small_inputs_and_splits_large_ones(self):
-        """Partition planning coalesces small RDF parts and line-splits oversized ones."""
-        with tempfile.TemporaryDirectory() as td:
-            tmp_path = Path(td)
-            rdf_dir = tmp_path / "rdf"
-            chunk_dir = tmp_path / "chunks"
-            rdf_dir.mkdir()
-
-            small_a = rdf_dir / "part-a.nt"
-            small_b = rdf_dir / "part-b.nt"
-            large = rdf_dir / "part-c.nt"
-            small_a.write_text("<a> <p> <o> .\n")
-            small_b.write_text("<b> <p> <o> .\n")
-            large.write_text((" <c> <p> <o> .\n".lstrip()) * 8)
-
-            chunk_inputs, plan = vcf_rdfizer.plan_partitioned_hdt_chunks(
-                [small_a, small_b, large],
-                chunk_dir,
-                target_bytes=40,
-                min_bytes=10,
-                max_bytes=60,
-            )
-
-            self.assertGreaterEqual(len(chunk_inputs), 2)
-            self.assertEqual(plan["source_file_count"], 3)
-            self.assertEqual(plan["chunk_count"], len(chunk_inputs))
-            self.assertTrue(all(path.exists() for path in chunk_inputs))
-            first_chunk_text = chunk_inputs[0].read_text()
-            self.assertIn("<a> <p> <o> .", first_chunk_text)
-            self.assertIn("<b> <p> <o> .", first_chunk_text)
-
-    def test_record_safe_chunk_planner_reads_gzip_and_writes_boundary_guide(self):
-        """Gzip-backed chunking preserves complete records and records exact ranges."""
-        with tempfile.TemporaryDirectory() as td:
-            tmp_path = Path(td)
-            source = tmp_path / "aggregate.nt.gz"
-            source_payload = (
-                b"<s1> <p> <o1> .\n"
-                b"<s2> <p> <o2> .\n"
-                b"<s3> <p> <o3> .\n"
-            )
-            import gzip
-
-            with gzip.open(source, "wb") as handle:
-                handle.write(source_payload)
-
-            chunk_dir = tmp_path / "chunks"
-            guide = tmp_path / "chunks.json"
-            chunk_paths, plan = vcf_rdfizer.plan_record_safe_rdf_chunks(
-                [source],
-                chunk_dir,
-                target_bytes=20,
-                min_bytes=10,
-                max_bytes=30,
-                guide_path=guide,
-            )
-
-            self.assertTrue(guide.exists())
-            self.assertEqual(plan["record_count"], 3)
-            self.assertEqual(plan["chunk_count"], len(chunk_paths))
-            self.assertEqual(b"".join(path.read_bytes() for path in chunk_paths), source_payload)
-            self.assertTrue(all(path.read_bytes().endswith(b"\n") for path in chunk_paths))
-            self.assertEqual(json.loads(guide.read_text())["chunks"], plan["chunks"])
-
     def test_run_partitioned_hdt_methods_merges_chunks_and_generates_index(self):
         """Partitioned HDT/COTTAS pipelines share chunks in one container."""
         with tempfile.TemporaryDirectory() as td:
@@ -2691,6 +2627,40 @@ class WrapperUnitTests(VerboseTestCase):
                 row = next(csv.DictReader(handle))
             self.assertEqual(row["validation_status"], "PASS")
             self.assertEqual(row["validation_exit_code"], "0")
+
+    def test_main_validation_mode_reports_existing_results_without_traceback(self):
+        """A populated results directory exits 2 with a message, not an exception."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            vcf_path = tmp_path / "sample.vcf"
+            vcf_path.write_text("##fileformat=VCFv4.2\n#CHROM\tPOS\n")
+            rdf_path = tmp_path / "sample.nt.gz"
+            with gzip.open(rdf_path, "wt", encoding="utf-8") as handle:
+                handle.write("<s> <p> <o> .\n")
+            metrics_dir = tmp_path / "metrics"
+            existing = metrics_dir / "reports" / "validation" / "sample"
+            existing.mkdir(parents=True)
+            (existing / "summary.json").write_text("{}", encoding="utf-8")
+
+            stderr = StringIO()
+            with mock.patch.object(
+                vcf_rdfizer, "metrics_run_directory", return_value=metrics_dir
+            ), redirect_stderr(stderr):
+                rc = invoke_main(
+                    [
+                        "--mode",
+                        "validation",
+                        "--input",
+                        str(vcf_path),
+                        "--rdf",
+                        str(rdf_path),
+                        "--out",
+                        str(tmp_path / "out"),
+                    ]
+                )
+
+            self.assertEqual(rc, 2)
+            self.assertIn("Refusing to overwrite existing validation results", stderr.getvalue())
 
     def test_run_validation_mode_accepts_plain_nt_for_full_runs(self):
         """The shared validation runner selects --rdf-nt for a plain aggregate."""

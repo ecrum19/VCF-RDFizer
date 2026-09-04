@@ -11,12 +11,51 @@ This module orchestrates the end-to-end Dockerized pipeline:
 
 The implementation is intentionally split into small helpers so failures can be
 diagnosed at a specific stage and future workflow changes stay localized.
+
+Division of labour
+------------------
+This file is the *host* side and stays free of heavy data processing: it plans
+work, launches containers, and reads their reports back. Everything that walks
+the RDF itself lives in the image (``src/``):
+
+- ``src/vcf_as_tsv.sh``             VCF -> per-input records/header/metadata TSV
+- ``src/run_conversion.sh``         RMLStreamer run + part merge into one aggregate
+- ``src/partitioned_compression.py``  record-safe chunking, HDT/COTTAS merge
+- ``src/cottas_tool.py``            COTTAS convert/merge/reindex/decompress
+- ``src/validate_compression.py``   round-trip triple-count check per artifact
+- ``src/validation/``               semantic VCF-vs-RDF SPARQL validation
+
+The one deliberate exception is genotype RDF emission (see the "Multi-sample
+(genotype) representations" section): doing it through RML would require
+materializing variants x samples helper tables first.
+
+Section map (search for the banner comments)
+--------------------------------------------
+Command execution and Docker environment helpers .. `run`, `CommandLogger`,
+    `ProgressSession`, `check_docker`
+Input discovery and naming helpers ................ `resolve_input_snapshot`
+General formatting and file-system utility helpers  `format_bytes`, `ensure_dir`
+Triple counting and run-level metrics reporting ... `count_triples_in_nt_files`
+Console summaries, artifact naming, ... ........... `planned_output_paths`
+Destructive filesystem operations ................. `remove_*_with_docker_fallback`
+Preflight input collection and disk estimation .... `estimate_pipeline_sizes`
+Per-input TSV discovery ........................... `discover_tsv_triplets`
+Multi-sample (genotype) representations ........... `append_expanded_sample_rdf`,
+    `append_condensed_sample_rdf`, `SampleRecordStream`
+RML mapping rendering and Docker image resolution . `render_rules_for_triplet`
+Compression plan parsing and strategy selection ... `build_compression_methods`
+Run metrics layout: naming, manifest, and summary . `write_run_manifest`
+Metrics serialization helpers ..................... `update_metrics_csv_*`
+Mode runners ...................................... `run_full_mode`,
+    `run_tsv_mode`, `run_compress_mode`, `run_decompress_mode`,
+    `run_index_mode`, `run_validation_mode`, `main`
 """
 
 import argparse
 import csv
 import gzip
 import importlib.resources as importlib_resources
+import io
 import json
 import os
 import re
@@ -30,6 +69,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote_plus
+
+try:
+    import vcf_rdfizer_gzip
+except ImportError:  # pragma: no cover - shipped alongside this module
+    vcf_rdfizer_gzip = None
 
 try:
     from rich.console import Console
@@ -267,6 +311,9 @@ VCFR_NAMESPACE = "https://w3id.org/vcf-rdfizer/vocab#"
 RDF_TYPE_URI = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
 XSD_POSITIVE_INTEGER_URI = "http://www.w3.org/2001/XMLSchema#positiveInteger"
 SAMPLE_RDF_BUFFER_BYTES = 8 * 1024 * 1024
+# An N-Triples subject is always an IRI reference or a blank node label, so a
+# line starting with one of these bytes and ending in " ." is a statement.
+_NTRIPLES_SUBJECT_STARTS = (b"<", b"_")
 SAMPLE_REPRESENTATION_CHOICES = {"expanded", "condensed"}
 # This is an internal rules-compatibility value, not a third public
 # representation. It means that custom helper TSV rows must be materialized.
@@ -686,7 +733,16 @@ def run(cmd, cwd=None, env=None):
             stderr=subprocess.DEVNULL,
         )
         return _ACTIVE_PROGRESS.wait_for_process(process)
-    return subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True).returncode
+    # Only the exit code is returned, so discard the streams at the fd level.
+    # `capture_output=True` would buffer an entire container's output in memory
+    # before throwing it away.
+    return subprocess.run(
+        cmd,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ).returncode
 
 
 def docker_cmd_prefix(*, use_sudo: bool | None = None):
@@ -873,28 +929,6 @@ def list_vcfs_in_dir(path: Path):
     return files
 
 
-def resolve_input(input_path: Path):
-    """Legacy input resolver (single mount + container input path)."""
-    if not input_path.exists():
-        raise ValueError(f"Input path not found: {input_path}")
-
-    if input_path.is_file():
-        if not is_vcf_file(input_path):
-            raise ValueError("Input file must end with .vcf or .vcf.gz")
-        input_dir = input_path.parent
-        container_input = f"/data/in/{input_path.name}"
-        return input_dir, container_input
-
-    if input_path.is_dir():
-        vcfs = list_vcfs_in_dir(input_path)
-        if not vcfs:
-            raise ValueError("No .vcf or .vcf.gz files found in the input directory")
-        container_input = "/data/in"
-        return input_path, container_input
-
-    raise ValueError("Input path must be a file or a directory")
-
-
 def vcf_output_prefix(path: Path) -> str:
     """Derive stable sample prefix from VCF filename."""
     name = path.name
@@ -997,261 +1031,54 @@ def find_hdt_index_sidecar(hdt_path: Path) -> Path | None:
     return None
 
 
-def write_nt_chunk(chunk_path: Path, source_paths: list[Path]) -> int:
-    """Concatenate one or more RDF files into a chunk-local `.nt` input."""
-    ensure_dir(chunk_path.parent)
-    total_bytes = 0
-    with chunk_path.open("w", encoding="utf-8") as out_handle:
-        for source_path in source_paths:
-            with source_path.open("r", encoding="utf-8", errors="replace") as in_handle:
-                for line in in_handle:
-                    out_handle.write(line)
-                    total_bytes += len(line.encode("utf-8"))
-    return total_bytes
+def open_rdf_binary(path: Path):
+    """Open plain or gzip line-oriented RDF for buffered binary line iteration.
 
-
-def split_nt_file_for_hdt(
-    source_path: Path,
-    chunk_dir: Path,
-    *,
-    target_bytes: int,
-    max_bytes: int,
-) -> list[Path]:
-    """Split an oversized RDF file into line-preserving chunk files for HDT conversion."""
-    ensure_dir(chunk_dir)
-    chunk_paths: list[Path] = []
-    chunk_handle = None
-    chunk_path = None
-    chunk_size = 0
-
-    def open_chunk(index: int):
-        path = chunk_dir / f"{source_path.stem}.split-{index:05d}.nt"
-        return path, path.open("w", encoding="utf-8")
-
-    try:
-        with source_path.open("r", encoding="utf-8", errors="replace") as in_handle:
-            chunk_index = 0
-            for line in in_handle:
-                line_size = len(line.encode("utf-8"))
-                if chunk_handle is None:
-                    chunk_path, chunk_handle = open_chunk(chunk_index)
-                    chunk_paths.append(chunk_path)
-                    chunk_size = 0
-                    chunk_index += 1
-                elif chunk_size > 0 and (
-                    chunk_size >= target_bytes or chunk_size + line_size > max_bytes
-                ):
-                    chunk_handle.close()
-                    chunk_path, chunk_handle = open_chunk(chunk_index)
-                    chunk_paths.append(chunk_path)
-                    chunk_size = 0
-                    chunk_index += 1
-
-                chunk_handle.write(line)
-                chunk_size += line_size
-    finally:
-        if chunk_handle is not None and not chunk_handle.closed:
-            chunk_handle.close()
-
-    return chunk_paths or [source_path]
-
-
-def iter_rdf_binary_lines(path: Path):
-    """Yield RDF records from plain or gzip-compressed line-oriented RDF."""
-    opener = gzip.open if path.name.endswith(".gz") else Path.open
-    with opener(path, "rb") as handle:
-        for line in handle:
-            yield line
-
-
-def plan_record_safe_rdf_chunks(
-    source_paths: list[Path],
-    chunk_dir: Path,
-    *,
-    target_bytes: int,
-    min_bytes: int,
-    max_bytes: int,
-    guide_path: Path | None = None,
-) -> tuple[list[Path], dict]:
-    """Create bounded RDF chunks without splitting a line-level statement.
-
-    The guide is written as boundaries are discovered during this single
-    sequential pass. A separate pre-scan would read/decompress the complete
-    aggregate twice, so the guide and chunk files are produced together.
-    Logical offsets are uncompressed offsets and therefore work for both plain
-    and gzip-backed aggregate sources.
+    ``GzipFile.readline`` is markedly slower than a ``BufferedReader`` wrapped
+    around the same stream, which matters when the caller walks every record of
+    a cohort-scale aggregate.
     """
-    if not source_paths:
-        return [], {"source_file_count": 0, "chunk_count": 0, "chunk_input_bytes": 0}
-    if target_bytes <= 0 or min_bytes <= 0 or max_bytes <= 0:
-        raise ValueError("RDF chunk sizes must be positive.")
-    if min_bytes > target_bytes or target_bytes > max_bytes:
-        raise ValueError("RDF chunk sizes must satisfy min <= target <= max.")
-
-    ensure_dir(chunk_dir)
-    chunk_paths: list[Path] = []
-    guide_chunks: list[dict] = []
-    chunk_handle = None
-    chunk_path = None
-    chunk_size = 0
-    chunk_start_offset = 0
-    chunk_start_record = 0
-    logical_offset = 0
-    record_count = 0
-    total_bytes = 0
-    chunk_index = 0
-
-    def close_chunk():
-        nonlocal chunk_handle, chunk_path, chunk_size
-        if chunk_handle is None or chunk_path is None:
-            return
-        chunk_handle.close()
-        chunk_paths.append(chunk_path)
-        guide_chunks.append(
-            {
-                "chunk_id": len(guide_chunks),
-                "path": str(chunk_path),
-                "start_record": chunk_start_record,
-                "end_record": record_count,
-                "start_uncompressed_byte": chunk_start_offset,
-                "end_uncompressed_byte": logical_offset,
-                "record_count": record_count - chunk_start_record,
-                "payload_bytes": chunk_size,
-            }
-        )
-        chunk_handle = None
-        chunk_path = None
-        chunk_size = 0
-
-    try:
-        for source_path in source_paths:
-            for line in iter_rdf_binary_lines(source_path):
-                if not line.endswith(b"\n"):
-                    raise ValueError(
-                        f"RDF source contains a non-line-terminated record: {source_path}"
-                    )
-                line_size = len(line)
-                if chunk_handle is None:
-                    chunk_path = chunk_dir / f"chunk-{chunk_index:05d}.nt"
-                    chunk_index += 1
-                    chunk_handle = chunk_path.open("wb")
-                    chunk_start_offset = logical_offset
-                    chunk_start_record = record_count
-                elif chunk_size > 0 and (
-                    (chunk_size >= target_bytes and chunk_size >= min_bytes)
-                    or chunk_size + line_size > max_bytes
-                ):
-                    close_chunk()
-                    chunk_path = chunk_dir / f"chunk-{chunk_index:05d}.nt"
-                    chunk_index += 1
-                    chunk_handle = chunk_path.open("wb")
-                    chunk_start_offset = logical_offset
-                    chunk_start_record = record_count
-
-                chunk_handle.write(line)
-                chunk_size += line_size
-                logical_offset += line_size
-                total_bytes += line_size
-                record_count += 1
-    finally:
-        close_chunk()
-
-    plan = {
-        "source_file_count": len(source_paths),
-        "source_paths": [str(path) for path in source_paths],
-        "chunk_count": len(chunk_paths),
-        "chunk_input_bytes": total_bytes,
-        "record_count": record_count,
-        "target_chunk_bytes": target_bytes,
-        "min_chunk_bytes": min_bytes,
-        "max_chunk_bytes": max_bytes,
-        "chunks": guide_chunks,
-    }
-    if guide_path is not None:
-        ensure_dir(guide_path.parent)
-        plan["guide_path"] = str(guide_path)
-        guide_path.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
-    return chunk_paths, plan
+    if path.name.endswith(".gz"):
+        return io.BufferedReader(gzip.open(path, "rb"))
+    return path.open("rb")
 
 
-def plan_partitioned_hdt_chunks(
-    rdf_paths: list[Path],
-    chunk_dir: Path,
-    *,
-    target_bytes: int,
-    min_bytes: int,
-    max_bytes: int,
-) -> tuple[list[Path], dict]:
-    """Plan chunk-local `.nt` inputs for partitioned HDT generation.
+def is_triple_line(line: bytes) -> bool:
+    """Return whether a serialized line represents an N-Triples statement.
 
-    The goal is to keep HDT conversion work units small enough to be fast,
-    while also avoiding the pathological "many tiny HDTs" case. Existing RDF
-    part files are treated as the first split boundary, and only oversized
-    parts are re-split on line boundaries.
+    This mirrors the container-side predicate in ``validate_compression.py`` and
+    ``partitioned_compression.py`` so a host-side fallback count can never
+    disagree with the authoritative count produced inside Docker. The leading
+    check short-circuits the ordinary ``<subject> ... .`` line without
+    allocating a stripped copy of it.
     """
-    ensure_dir(chunk_dir)
-
-    prepared_inputs: list[tuple[Path, int]] = []
-    for rdf_path in rdf_paths:
-        size = int(file_size_bytes(rdf_path) or 0)
-        if size <= max_bytes:
-            prepared_inputs.append((rdf_path, size))
-            continue
-        for split_path in split_nt_file_for_hdt(
-            rdf_path,
-            chunk_dir / "_split_inputs",
-            target_bytes=target_bytes,
-            max_bytes=max_bytes,
-        ):
-            prepared_inputs.append((split_path, int(file_size_bytes(split_path) or 0)))
-
-    chunk_groups: list[list[tuple[Path, int]]] = []
-    current_group: list[tuple[Path, int]] = []
-    current_size = 0
-    for path, size in prepared_inputs:
-        if not current_group:
-            current_group = [(path, size)]
-            current_size = size
-            continue
-        if current_size < min_bytes or current_size + size <= target_bytes:
-            current_group.append((path, size))
-            current_size += size
-            continue
-        chunk_groups.append(current_group)
-        current_group = [(path, size)]
-        current_size = size
-    if current_group:
-        chunk_groups.append(current_group)
-
-    chunk_inputs: list[Path] = []
-    chunk_input_bytes = 0
-    for chunk_index, group in enumerate(chunk_groups):
-        chunk_path = chunk_dir / f"chunk-{chunk_index:05d}.nt"
-        chunk_input_bytes += write_nt_chunk(chunk_path, [path for path, _size in group])
-        chunk_inputs.append(chunk_path)
-
-    plan = {
-        "source_file_count": len(rdf_paths),
-        "prepared_input_count": len(prepared_inputs),
-        "chunk_count": len(chunk_inputs),
-        "chunk_input_bytes": chunk_input_bytes,
-    }
-    return chunk_inputs, plan
+    if line.endswith(b".\n") and line[:1] in _NTRIPLES_SUBJECT_STARTS:
+        return True
+    stripped = line.strip()
+    return bool(stripped) and not stripped.startswith(b"#") and stripped.endswith(b".")
 
 
+# ---------------------------------------------------------------------------
+# Triple counting and run-level metrics reporting
+# The container stages own the authoritative counts; the helpers here read
+# them back and provide host-side fallbacks.
+# ---------------------------------------------------------------------------
 def count_triples_in_nt_files(paths: list[Path]) -> int | None:
-    """Count triples in RDF line-oriented files as a fallback when metrics are missing."""
+    """Count triples in RDF line-oriented files as a fallback when metrics are missing.
+
+    The scan stays at the byte level: decoding a cohort-scale aggregate to
+    ``str`` only to run a regex per line costs several times more than the
+    read itself.
+    """
     total = 0
     matched_any = False
-    pattern = re.compile(r"^\s*[^#].*\.\s*$")
     for path in paths:
         if not path.exists() or not path.is_file():
             continue
         try:
-            opener = gzip.open if path.name.endswith(".gz") else Path.open
-            with opener(path, "rt", encoding="utf-8", errors="replace") as handle:
+            with open_rdf_binary(path) as handle:
                 for line in handle:
-                    if pattern.match(line):
+                    if is_triple_line(line):
                         total += 1
                         matched_any = True
         except OSError:
@@ -1433,6 +1260,9 @@ def write_index_warnings_report(*, metrics_dir: Path, run_id: str, warnings: lis
     return report_path
 
 
+# ---------------------------------------------------------------------------
+# Console summaries, artifact naming, and output-collision planning
+# ---------------------------------------------------------------------------
 def print_nt_hdt_summary(
     *,
     output_root: Path,
@@ -1615,6 +1445,11 @@ def compression_method_label_for_path(path: Path, method: str) -> str:
     return labels.get(method, method)
 
 
+# ---------------------------------------------------------------------------
+# Destructive filesystem operations
+# Container stages can leave artifacts owned by another uid, so every
+# deletion retries inside the image before it is reported as a failure.
+# ---------------------------------------------------------------------------
 def remove_file_with_docker_fallback(
     *,
     path: Path,
@@ -1755,6 +1590,9 @@ def cleanup_interrupted_full_run(
     return removed, failed
 
 
+# ---------------------------------------------------------------------------
+# Preflight input collection and disk-footprint estimation
+# ---------------------------------------------------------------------------
 def existing_parent(path: Path) -> Path:
     """Return the closest existing parent path (used for disk free-space anchor)."""
     cur = path
@@ -1783,20 +1621,42 @@ def collect_input_vcfs(input_path: Path):
     return []
 
 
+def uncompressed_vcf_bytes(vcf: Path) -> tuple[float, str]:
+    """Return ``(uncompressed_bytes, method)`` for one VCF input.
+
+    A gzip input's real uncompressed size is read from its structure when that
+    is possible without inflating it (see :mod:`vcf_rdfizer_gzip`); otherwise
+    this falls back to the coarse expansion factor rather than spending a full
+    decompression pass on a preflight estimate.
+    """
+    size = vcf.stat().st_size
+    if not vcf.name.endswith(".vcf.gz"):
+        return float(size), "stat"
+    if vcf_rdfizer_gzip is not None:
+        try:
+            measured, method = vcf_rdfizer_gzip.uncompressed_size_without_inflating(vcf)
+        except OSError:
+            measured, method = None, "unknown"
+        # A `.vcf.gz` whose content is not really gzip reports method "stat";
+        # that is not a measurement of anything, so keep the conservative
+        # expansion factor rather than under-stating a disk-space warning.
+        if measured is not None and method != "stat":
+            return float(measured), method
+    return size * COMPRESSED_VCF_EXPANSION_FACTOR, "estimated"
+
+
 def estimate_pipeline_sizes(vcf_files, out_dir: Path):
     """Estimate rough TSV/RDF footprint for preflight disk-space warnings."""
     input_bytes = 0
     est_tsv_bytes = 0
     est_rdf_low_bytes = 0
     est_rdf_high_bytes = 0
+    methods: set[str] = set()
 
     for vcf in vcf_files:
-        size = vcf.stat().st_size
-        input_bytes += size
-        if vcf.name.endswith(".vcf.gz"):
-            expanded_vcf = size * COMPRESSED_VCF_EXPANSION_FACTOR
-        else:
-            expanded_vcf = float(size)
+        input_bytes += vcf.stat().st_size
+        expanded_vcf, method = uncompressed_vcf_bytes(vcf)
+        methods.add(method)
 
         est_tsv_bytes += expanded_vcf * TSV_OVERHEAD_FACTOR
         est_rdf_low_bytes += expanded_vcf * RDF_EXPANSION_LOW_FACTOR
@@ -1812,11 +1672,15 @@ def estimate_pipeline_sizes(vcf_files, out_dir: Path):
         "rdf_high_bytes": int(est_rdf_high_bytes),
         "free_disk_bytes": int(free_disk_bytes),
         "disk_anchor": out_anchor,
+        # "estimated" means at least one gzip input fell back to the coarse
+        # expansion factor; anything else means every input size was measured.
+        "input_size_methods": sorted(methods),
+        "uncompressed_input_estimated": "estimated" in methods,
     }
 
 
 # ---------------------------------------------------------------------------
-# Mapping/rules and Docker image management helpers
+# Per-input TSV discovery
 # ---------------------------------------------------------------------------
 def slugify(value: str) -> str:
     """Normalize a value for safe filesystem naming."""
@@ -1854,6 +1718,13 @@ def discover_tsv_triplets(tsv_dir: Path):
     )
 
 
+# ---------------------------------------------------------------------------
+# Multi-sample (genotype) representations
+# Expanded and condensed genotype RDF is emitted here rather than by
+# RMLStreamer: the equivalent RML maps would first have to materialize
+# variants x samples (x FORMAT keys) helper TSV rows.
+# See docs/sample-representation-guide.md for the emitted shapes.
+# ---------------------------------------------------------------------------
 def write_sample_support_headers(sample_calls_tsv: Path, sample_format_tsv: Path):
     """Create empty sample helper tables with their canonical TSV headers."""
     sample_calls_tsv.parent.mkdir(parents=True, exist_ok=True)
@@ -1943,8 +1814,20 @@ def _sample_id_to_uri_id(sample_id: str, fallback_index: int) -> str:
     return candidate or f"sample_{fallback_index}"
 
 
+# Characters that ``quote_plus(..., safe="*-._")`` leaves untouched. Sample
+# ids, FORMAT keys, and numeric row ids are almost always drawn from this set,
+# so the fast path below skips percent-encoding entirely for them.
+_URI_COMPONENT_PASSTHROUGH_RE = re.compile(r"[A-Za-z0-9*\-._]*\Z")
+# Characters that require N-Triples escaping. VCF genotype/FORMAT payloads
+# essentially never contain them, so the common case avoids five str.replace
+# scans of the value.
+_NTRIPLES_ESCAPE_RE = re.compile(r'[\\"\n\r\t]')
+
+
 def _rml_uri_component(value: str) -> str:
     """Match RMLStreamer's Java URLEncoder-based template substitution."""
+    if _URI_COMPONENT_PASSTHROUGH_RE.match(value) is not None:
+        return value
     encoded = quote_plus(value, safe="*-._", encoding="utf-8", errors="strict")
     # urllib follows current RFC rules and always leaves '~' unescaped, whereas
     # java.net.URLEncoder (used by RMLStreamer 2.5.0) encodes it.
@@ -1953,6 +1836,8 @@ def _rml_uri_component(value: str) -> str:
 
 def _ntriples_string_literal(value: str) -> str:
     """Serialize an RDF 1.1 plain/xsd:string literal for N-Triples."""
+    if _NTRIPLES_ESCAPE_RE.search(value) is None:
+        return f'"{value}"'
     escaped = (
         value.replace("\\", "\\\\")
         .replace('"', '\\"')
@@ -2001,6 +1886,10 @@ class SampleRecordStream:
         self._reader = None
         self._header: list[str] = []
         self._pending_row: list[str] | None = None
+        # A cohort VCF repeats the same FORMAT string on nearly every record.
+        # Cache the derived key tuple (and its duplicate check) per distinct
+        # FORMAT/width combination instead of rebuilding it per record.
+        self._format_key_cache: dict[tuple[str, int], tuple[str, ...]] = {}
 
     def __enter__(self):
         _set_max_csv_field_size()
@@ -2087,17 +1976,21 @@ class SampleRecordStream:
             [len(declared_format_keys), *(len(values) for values in raw_sample_values)],
             default=0,
         )
-        format_keys = tuple(
-            declared_format_keys[index]
-            if index < len(declared_format_keys) and declared_format_keys[index]
-            else f"FIELD_{index + 1}"
-            for index in range(total_fields)
-        )
-        if len(set(format_keys)) != len(format_keys):
-            raise ValueError(
-                f"record {row_id or '(unknown)'} contains duplicate FORMAT keys: "
-                + ":".join(format_keys)
+        cache_key = (format_raw, total_fields)
+        format_keys = self._format_key_cache.get(cache_key)
+        if format_keys is None:
+            format_keys = tuple(
+                declared_format_keys[index]
+                if index < len(declared_format_keys) and declared_format_keys[index]
+                else f"FIELD_{index + 1}"
+                for index in range(total_fields)
             )
+            if len(set(format_keys)) != len(format_keys):
+                raise ValueError(
+                    f"record {row_id or '(unknown)'} contains duplicate FORMAT keys: "
+                    + ":".join(format_keys)
+                )
+            self._format_key_cache[cache_key] = format_keys
 
         sample_values = tuple(
             tuple(values[index] if index < len(values) else "" for index in range(total_fields))
@@ -2118,11 +2011,15 @@ def _append_rdf_atomically(rdf_path: Path, stats: dict, producer):
     opener = gzip.open if rdf_path.name.endswith(".gz") else Path.open
     output_handle = None
     buffer = bytearray()
+    # ``emit`` runs once per emitted triple (billions of times for a cohort
+    # aggregate), so the counter is a local int and only reaches ``stats``
+    # once the producer has finished.
+    emitted = 0
 
     def emit(line: str):
-        nonlocal buffer
+        nonlocal buffer, emitted
         buffer.extend(line.encode("utf-8"))
-        stats["triples"] += 1
+        emitted += 1
         if len(buffer) >= SAMPLE_RDF_BUFFER_BYTES:
             output_handle.write(buffer)
             buffer = bytearray()
@@ -2130,6 +2027,7 @@ def _append_rdf_atomically(rdf_path: Path, stats: dict, producer):
     try:
         output_handle = opener(rdf_path, "ab")
         producer(emit)
+        stats["triples"] += emitted
         if buffer:
             output_handle.write(buffer)
         output_handle.close()
@@ -2182,25 +2080,47 @@ def append_expanded_sample_rdf(
                 f"<{file_uri}> <{VCFR_NAMESPACE}representationProfile> "
                 f"<{VCFR_NAMESPACE}ExpandedRepresentation> .\n"
             )
+            # Sample columns and their serialized sampleId literal are fixed for
+            # the whole file; FORMAT keys are drawn from a handful of distinct
+            # values. Encoding them once per file instead of once per
+            # record/sample removes the dominant cost of this loop.
+            sample_prefixes = [
+                (
+                    _rml_uri_component(column.uri_id),
+                    _ntriples_literal(column.sample_id),
+                )
+                for column in record_stream.columns
+            ]
+            format_components: dict[str, str] = {}
+            sample_call_count = 0
+            format_value_count = 0
+
             for record in record_stream:
                 row_component = _rml_uri_component(record.row_id)
                 call_uri = f"{file_uri}#call/{row_component}"
+                format_keys = record.format_keys
+                record_sample_values = record.sample_values
 
-                for sample_index, sample_column in enumerate(record_stream.columns):
-                    sample_component = _rml_uri_component(sample_column.uri_id)
-                    sample_uri = f"file://{source_component}#sample/{row_component}/{sample_component}"
+                for sample_index, (sample_component, sample_id_literal) in enumerate(
+                    sample_prefixes
+                ):
+                    sample_uri = f"{file_uri}#sample/{row_component}/{sample_component}"
+                    sample_values = record_sample_values[sample_index]
 
                     emit(f"<{call_uri}> <{VCFR_NAMESPACE}hasSampleCall> <{sample_uri}> .\n")
                     emit(f"<{sample_uri}> <{RDF_TYPE_URI}> <{VCFR_NAMESPACE}SampleCall> .\n")
                     emit(
                         f"<{sample_uri}> <{VCFR_NAMESPACE}sampleId> "
-                        f"{_ntriples_literal(sample_column.sample_id)} .\n"
+                        f"{sample_id_literal} .\n"
                     )
-                    stats["sample_calls"] += 1
+                    sample_call_count += 1
 
-                    for format_index, format_key in enumerate(record.format_keys):
-                        format_value = record.sample_values[sample_index][format_index]
-                        format_component = _rml_uri_component(format_key)
+                    for format_index, format_key in enumerate(format_keys):
+                        format_value = sample_values[format_index]
+                        format_component = format_components.get(format_key)
+                        if format_component is None:
+                            format_component = _rml_uri_component(format_key)
+                            format_components[format_key] = format_component
                         format_uri = f"{sample_uri}/fmt/{format_component}"
                         emit(f"<{sample_uri}> <{VCFR_NAMESPACE}hasFormatValue> <{format_uri}> .\n")
                         emit(f"<{format_uri}> <{RDF_TYPE_URI}> <{VCFR_NAMESPACE}FormatFieldValue> .\n")
@@ -2209,13 +2129,15 @@ def append_expanded_sample_rdf(
                                 f"<{format_uri}> <{VCFR_NAMESPACE}fieldValue> "
                                 f"{_ntriples_literal(format_value)} .\n"
                             )
-                        stats["format_values"] += 1
+                        format_value_count += 1
 
                 stats["records"] += 1
+                stats["sample_calls"] = sample_call_count
+                stats["format_values"] = format_value_count
                 if progress_interval_records > 0 and stats["records"] % progress_interval_records == 0:
                     print(
                         "    * Sample RDF streaming: "
-                        f"{stats['records']:,} variants, {stats['sample_calls']:,} calls",
+                        f"{stats['records']:,} variants, {sample_call_count:,} calls",
                         flush=True,
                     )
 
@@ -2348,6 +2270,8 @@ def append_condensed_sample_rdf(
             file_uri = f"file://{source_component}"
             sample_set_uri = f"{file_uri}#samples"
             emitted_definitions: set[str] = set()
+            # FORMAT keys repeat on every record; encode each distinct key once.
+            format_components: dict[str, str] = {}
 
             emit(
                 f"<{file_uri}> <{VCFR_NAMESPACE}representationProfile> "
@@ -2386,7 +2310,10 @@ def append_condensed_sample_rdf(
                 stats["matrices"] += 1
 
                 for format_index, format_key in enumerate(record.format_keys):
-                    format_component = _rml_uri_component(format_key)
+                    format_component = format_components.get(format_key)
+                    if format_component is None:
+                        format_component = _rml_uri_component(format_key)
+                        format_components[format_key] = format_component
                     vector_uri = f"{matrix_uri}/fmt/{format_component}"
                     definition = definitions.get(format_key)
                     if definition is None:
@@ -2569,6 +2496,9 @@ def build_sample_support_tsvs(records_tsv: Path, sample_calls_tsv: Path, sample_
                         )
 
 
+# ---------------------------------------------------------------------------
+# RML mapping rendering and Docker image resolution
+# ---------------------------------------------------------------------------
 def render_rules_for_triplet(
     template_rules: Path,
     output_rules: Path,
@@ -2647,6 +2577,12 @@ def resolve_image_ref(image: str, image_version: str | None):
     return f"{image}:{image_version}", True
 
 
+# ---------------------------------------------------------------------------
+# Compression plan parsing and strategy selection
+# The public CLI takes three orthogonal options (--rdf-compression,
+# --representations, --artifact-compression); they are translated here into
+# the flat internal stage names used by the execution helpers.
+# ---------------------------------------------------------------------------
 def parse_compression_methods(raw: str):
     """Parse internal compression stage names used by the execution helpers."""
     value = (raw or "").strip()
@@ -2773,6 +2709,9 @@ def should_use_partitioned_hdt(
     return mode == "full" and rdf_storage_mode in RDF_STORAGE_MODES
 
 
+# ---------------------------------------------------------------------------
+# Run metrics layout: naming, manifest, and summary
+# ---------------------------------------------------------------------------
 def safe_metrics_name(value: str) -> str:
     """Sanitize names used in metrics artifact filenames."""
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("_")
@@ -3910,7 +3849,6 @@ def run_compression_methods_for_rdf(
     cottas_failure_warning: dict | None = None
     metrics_output_name = output_name or target_out_dir.name
     safe_output_name = safe_metrics_name(metrics_output_name)
-    safe_rdf_name = safe_metrics_name(rdf_path.name)
     auxiliary_stage_results: dict[str, dict] = {}
 
     def run_container_command(
@@ -4131,16 +4069,9 @@ def run_compression_methods_for_rdf(
                 artifact_container=hdt_container,
             )
             if not valid:
-                if allow_index_failure:
-                    cottas_failure_warning = record_index_warning(
-                        index_format="cottas",
-                        artifact_path=cottas_path,
-                        stage="cottas-index",
-                        message=report.get(
-                            "error",
-                            "existing COTTAS validation/index check failed",
-                        ),
-                    )
+                # ``validate_container_artifact`` already downgrades a
+                # recoverable HDT index problem to a warning and returns True,
+                # so reaching this point means the artifact itself is unusable.
                 return False
             method_results["hdt"]["validation"] = report
             if report.get("index_status"):
@@ -4527,8 +4458,7 @@ def run_containerized_partitioned_representation_methods(
             "--mount",
             f"type=volume,source={volume_name},target=/work",
         ]
-        if source_mount is not None:
-            command.extend(["-v", source_mount])
+        command.extend(["-v", source_mount])
         command.extend(
             [
                 "-v",
@@ -4725,7 +4655,6 @@ def run_full_mode(
     *,
     input_mount_dir: Path,
     container_inputs: list[str],
-    input_metrics_target: str,
     expected_prefixes: list[str],
     rules_path: Path,
     out_dir: Path,
@@ -5412,95 +5341,64 @@ def run_full_mode(
                 continue
             rdf_storage_removed = not any(path.exists() for path in raw_rdf_files)
 
-        if raw_rdf_files:
-            output_root = out_dir / output_name
-            raw_total_size = sum(raw_size_before_cleanup_by_file.values())
+        # Full mode always produces exactly one aggregate per input.
+        output_root = out_dir / output_name
+        raw_total_size = sum(raw_size_before_cleanup_by_file.values())
 
-            if validation_failed:
-                raw_note = "retained after validation failure"
-            elif keep_rmlstreamer_rdf_output:
-                raw_note = "retained via --keep-rmlstreamer-rdf-output"
-            elif rdf_storage_removed and remove_rdf_storage_output:
-                raw_note = "removed via --remove-rdf-storage-output"
-            elif rdf_storage_removed and selected_methods:
-                raw_note = "removed after successful compression"
-            elif selected_methods and rdf_storage_mode == "space-optimized" and "gzip" in selected_methods:
-                raw_note = "retained because it is also the selected gzip artifact"
-            elif selected_methods:
-                raw_note = "retained"
-            else:
-                raw_note = "kept (compression methods set to none)"
+        if validation_failed:
+            raw_note = "retained after validation failure"
+        elif keep_rmlstreamer_rdf_output:
+            raw_note = "retained via --keep-rmlstreamer-rdf-output"
+        elif rdf_storage_removed and remove_rdf_storage_output:
+            raw_note = "removed via --remove-rdf-storage-output"
+        elif rdf_storage_removed and selected_methods:
+            raw_note = "removed after successful compression"
+        elif selected_methods and rdf_storage_mode == "space-optimized" and "gzip" in selected_methods:
+            raw_note = "retained because it is also the selected gzip artifact"
+        elif selected_methods:
+            raw_note = "retained"
+        else:
+            raw_note = "kept (compression methods set to none)"
 
-            first_path = raw_rdf_files[0]
-            print(f"    * Output directory: {output_root}")
-            print(f"      - RDF aggregate: {first_path.name}")
-            raw_text = format_bytes(raw_total_size)
-            print(
-                f"      - {rdf_label_for_path(first_path)}: {raw_text} "
-                f"({raw_note})"
-            )
+        first_path = raw_rdf_files[0]
+        print(f"    * Output directory: {output_root}")
+        print(f"      - RDF aggregate: {first_path.name}")
+        raw_text = format_bytes(raw_total_size)
+        print(
+            f"      - {rdf_label_for_path(first_path)}: {raw_text} "
+            f"({raw_note})"
+        )
 
-            if selected_methods:
-                for method in selected_methods:
-                    if use_partitioned_compression and method in PARTITIONED_COMPRESSION_METHODS:
-                        result = partitioned_representation_results.get(method)
-                        label = compression_method_label_for_path(first_path, method)
-                        if not result or int(result.get("exit_code", 1)) != 0:
-                            print(f"      - {label}: not generated")
-                        else:
-                            print(
-                                f"      - {label}: {format_bytes(int(result.get('output_size_bytes') or 0))} "
-                                f"({result.get('output_path', '')})"
-                            )
-                        continue
-                    method_total = 0
-                    method_count = 0
-                    for raw_rdf_path in raw_rdf_files:
-                        result = method_results_by_file.get(raw_rdf_path.name, {}).get(method)
-                        if not result or int(result.get("exit_code", 1)) != 0:
-                            continue
-                        method_total += int(result.get("output_size_bytes") or 0)
-                        method_count += 1
-
+        if selected_methods:
+            for method in selected_methods:
+                if use_partitioned_compression and method in PARTITIONED_COMPRESSION_METHODS:
+                    result = partitioned_representation_results.get(method)
                     label = compression_method_label_for_path(first_path, method)
-                    if method_count == 0:
+                    if not result or int(result.get("exit_code", 1)) != 0:
                         print(f"      - {label}: not generated")
                     else:
-                        print(f"      - {label}: {format_bytes(method_total)}")
-            else:
-                print("      - Compression: none selected")
-                print(f"      - Final RDF size (no compression): {format_bytes(raw_total_size)}")
-        else:
-            for raw_rdf_path in raw_rdf_files:
-                hdt_path = (out_dir / output_name) / f"{raw_rdf_path.stem}.hdt"
-                rdf_size = file_size_bytes(raw_rdf_path)
-                nt_note = None
-                method_results = method_results_by_file.get(raw_rdf_path.name, {})
-                if raw_rdf_path.exists() and keep_rmlstreamer_rdf_output:
-                    nt_note = "retained via --keep-rmlstreamer-rdf-output"
-                elif raw_rdf_path.exists() and selected_methods and rdf_storage_mode == "space-optimized" and "gzip" in selected_methods:
-                    nt_note = "retained because it is also the selected gzip artifact"
-                elif not raw_rdf_path.exists() and remove_rdf_storage_output:
-                    nt_note = "removed via --remove-rdf-storage-output"
-                elif not raw_rdf_path.exists() and selected_methods:
-                    nt_note = "removed after successful compression"
-                elif not raw_rdf_path.exists() and not selected_methods:
-                    nt_note = "kept (compression methods set to none)"
+                        print(
+                            f"      - {label}: {format_bytes(int(result.get('output_size_bytes') or 0))} "
+                            f"({result.get('output_path', '')})"
+                        )
+                    continue
+                method_total = 0
+                method_count = 0
+                for raw_rdf_path in raw_rdf_files:
+                    result = method_results_by_file.get(raw_rdf_path.name, {}).get(method)
+                    if not result or int(result.get("exit_code", 1)) != 0:
+                        continue
+                    method_total += int(result.get("output_size_bytes") or 0)
+                    method_count += 1
+
+                label = compression_method_label_for_path(first_path, method)
+                if method_count == 0:
+                    print(f"      - {label}: not generated")
                 else:
-                    nt_note = "retained"
-                print_nt_hdt_summary(
-                    output_root=out_dir / output_name,
-                    nt_path=raw_rdf_path,
-                    hdt_path=hdt_path,
-                    indent="    ",
-                    nt_note=nt_note,
-                    nt_size_override=rdf_size,
-                    selected_methods=selected_methods,
-                    method_results=method_results,
-                )
-            if not selected_methods:
-                total_raw_size = sum(raw_size_before_cleanup_by_file.values())
-                print(f"    * Final RDF size (no compression): {format_bytes(total_raw_size)}")
+                    print(f"      - {label}: {format_bytes(method_total)}")
+        else:
+            print("      - Compression: none selected")
+            print(f"      - Final RDF size (no compression): {format_bytes(raw_total_size)}")
 
         if not keep_tsv:
             # Cleanup only the triplet generated for this input iteration.
@@ -6541,7 +6439,7 @@ def main():
             (
                 input_mount_dir,
                 container_inputs,
-                input_metrics_target,
+                _input_metrics_target,
                 expected_prefixes,
             ) = resolve_input_snapshot(input_path)
             if args.rules is None:
@@ -6787,10 +6685,15 @@ def main():
         if validation_results_dir.exists() and (
             not validation_results_dir.is_dir() or any(validation_results_dir.iterdir())
         ):
-            raise ValueError(
-                f"Refusing to overwrite existing validation results: {validation_results_dir}. "
+            # This runs after the argument-validation try/except above, so it
+            # must report the same way that block does instead of surfacing an
+            # uncaught traceback.
+            eprint(
+                f"Error: Refusing to overwrite existing validation results: "
+                f"{validation_results_dir}. "
                 "Choose --validation-id or --out with a new destination."
             )
+            return 2
     manifest_options = {
         "requested_image": args.image,
         "requested_image_version": args.image_version,
@@ -6814,7 +6717,7 @@ def main():
         "validation_rdf_gzip": str(validation_rdf_gzip_path) if mode == "validation" else None,
     }
     try:
-        manifest_path = write_run_manifest(
+        write_run_manifest(
             metrics_dir=metrics_dir,
             run_id=run_id,
             timestamp=timestamp,
@@ -6842,6 +6745,11 @@ def main():
             "    - Estimated RDF N-Triples size: "
             f"{format_bytes(estimate['rdf_low_bytes'])} to {format_bytes(estimate['rdf_high_bytes'])}"
         )
+        if estimate["uncompressed_input_estimated"]:
+            print(
+                "      (a gzip input's uncompressed size could not be read from its "
+                "structure, so its expansion was assumed)"
+            )
         print(
             f"    - Free disk space at {estimate['disk_anchor']}: {format_bytes(estimate['free_disk_bytes'])}"
         )
@@ -6979,7 +6887,6 @@ def main():
             return run_full_mode(
                 input_mount_dir=input_mount_dir,
                 container_inputs=container_inputs,
-                input_metrics_target=input_metrics_target,
                 expected_prefixes=expected_prefixes,
                 rules_path=rules_path,
                 out_dir=out_dir,

@@ -77,21 +77,35 @@ TSV_OUTPUT_PATH=${TSV_OUTPUT_PATH:-}
 METRICS_HEADER="run_id,timestamp,output_name,output_dir,exit_code_java,wall_seconds_java,user_seconds_java,sys_seconds_java,max_rss_kb_java,input_mapping_size_bytes,input_vcf_size_bytes,output_dir_size_bytes,output_triples,jar,mapping_file,output_path,exit_code_tsv,wall_seconds_tsv,user_seconds_tsv,sys_seconds_tsv,max_rss_kb_tsv,tsv_output_size_bytes,tsv_output_path"
 
 
+# Detect the local `stat` dialect once. `stat_size` is called for every
+# RMLStreamer part on every progress tick, so probing the dialect per call
+# doubles the number of processes this script spawns for no benefit.
+STAT_FILE_FLAVOR=""
+detect_stat_file_flavor() {
+  if [[ -n "$STAT_FILE_FLAVOR" ]]; then
+    return
+  fi
+  if stat -c%s . >/dev/null 2>&1; then
+    STAT_FILE_FLAVOR="gnu"
+  elif stat -f%z . >/dev/null 2>&1; then
+    STAT_FILE_FLAVOR="bsd"
+  else
+    STAT_FILE_FLAVOR="wc"
+  fi
+}
+
 # Return byte size for file or directory (GNU + BSD compatible).
 stat_size() {
   local path="$1"
 
   # --- CASE 1: Regular file ---
   if [[ -f "$path" ]]; then
-    # Linux (GNU coreutils)
-    if stat -c%s "$path" >/dev/null 2>&1; then
-      stat -c%s "$path"
-    # macOS/BSD
-    elif stat -f%z "$path" >/dev/null 2>&1; then
-      stat -f%z "$path"
-    else
-      wc -c < "$path" | tr -d ' '
-    fi
+    detect_stat_file_flavor
+    case "$STAT_FILE_FLAVOR" in
+      gnu) stat -c%s "$path" ;;
+      bsd) stat -f%z "$path" ;;
+      *) wc -c < "$path" | tr -d ' ' ;;
+    esac
     return
   fi
 
@@ -139,48 +153,57 @@ progress_emit() {
 
 # RMLStreamer writes part files while it runs. Summing their metadata once per
 # second gives useful throughput feedback without reading or counting RDF.
-part_bytes() {
-  local total=0
-  local file size
+# One directory walk fills both the byte total and the part count, and the
+# leading-dot test uses parameter expansion rather than a `basename` process.
+PART_BYTES=0
+PART_COUNT=0
+scan_parts() {
+  local file name size
+  PART_BYTES=0
+  PART_COUNT=0
   shopt -s nullglob
   for file in "$PARTS_DIR"/*; do
-    if [[ ! -f "$file" || "$(basename "$file")" == .* ]]; then
+    name="${file##*/}"
+    if [[ ! -f "$file" || "$name" == .* ]]; then
       continue
     fi
     size=$(stat_size "$file")
-    total=$((total + size))
+    PART_BYTES=$((PART_BYTES + size))
+    PART_COUNT=$((PART_COUNT + 1))
   done
   shopt -u nullglob
-  echo "$total"
-}
-
-part_count() {
-  local total=0
-  local file
-  shopt -s nullglob
-  for file in "$PARTS_DIR"/*; do
-    if [[ -f "$file" && "$(basename "$file")" != .* ]]; then
-      total=$((total + 1))
-    fi
-  done
-  shopt -u nullglob
-  echo "$total"
 }
 
 # Report comparable input VCF bytes.
 # - .vcf    -> on-disk bytes
 # - .vcf.gz -> decompressed bytes
 # - dir     -> sum of normalized sizes for contained .vcf/.vcf.gz files
-normalized_vcf_size() {
+#
+# `vcf_rdfizer_gzip.py` answers this from the file's own structure for BGZF
+# (what bgzip/bcftools/tabix emit) and for ordinary single-member gzip, so the
+# common case costs milliseconds instead of a full decompression pass. It falls
+# back to inflating internally when the structure cannot settle the answer, and
+# the shell falls back to `gzip -dc` if the helper is unavailable. The method
+# used is recorded alongside the size so the metric stays auditable.
+VCF_SIZE_HELPER=${VCF_SIZE_HELPER:-/opt/vcf-rdfizer/vcf_rdfizer_gzip.py}
+
+# Prints "<bytes> <method>". Callers run this in a command substitution, so the
+# method has to travel out with the value rather than through a global.
+vcf_size_with_method() {
   local path="$1"
   local total=0
+  local method="" entry entry_size entry_method measured
 
   if [[ -f "$path" ]]; then
     if [[ "$path" == *.vcf.gz ]]; then
-      gzip -dc "$path" | wc -c | tr -d ' '
+      if [[ -f "$VCF_SIZE_HELPER" ]] && measured=$(python3 "$VCF_SIZE_HELPER" --print-method "$path" 2>/dev/null); then
+        printf '%s\n' "$measured"
+        return
+      fi
+      printf '%s inflate-shell\n' "$(gzip -dc "$path" | wc -c | tr -d ' ')"
       return
     fi
-    stat_size "$path"
+    printf '%s stat\n' "$(stat_size "$path")"
     return
   fi
 
@@ -190,15 +213,29 @@ normalized_vcf_size() {
       if [[ ! -f "$file" ]]; then
         continue
       fi
-      size=$(normalized_vcf_size "$file")
-      total=$((total + size))
+      entry=$(vcf_size_with_method "$file")
+      entry_size="${entry%% *}"
+      entry_method="${entry#* }"
+      total=$((total + entry_size))
+      if [[ -z "$method" ]]; then
+        method="$entry_method"
+      elif [[ "$method" != "$entry_method" ]]; then
+        method="mixed"
+      fi
     done
     shopt -u nullglob
-    echo "$total"
+    printf '%s %s\n' "$total" "${method:-none}"
     return
   fi
 
-  echo 0
+  printf '0 none\n'
+}
+
+# Backwards-compatible size-only accessor for direct callers of this script.
+normalized_vcf_size() {
+  local result
+  result=$(vcf_size_with_method "$1")
+  printf '%s\n' "${result%% *}"
 }
 
 have_gnu_time() { [[ -x /usr/bin/time ]] && /usr/bin/time --version >/dev/null 2>&1; }
@@ -219,17 +256,31 @@ hash_file_sha256() {
 }
 
 # Count triples via non-comment RDF lines ending in '.'.
+#
+# `grep -c` counts in one process and, in the C locale, works byte-wise instead
+# of validating UTF-8 for every line. On a cohort-scale aggregate this is
+# several times faster than piping through `awk` or `wc -l`, and it is the last
+# unavoidable full pass over the RDF output. `grep` exits 1 when nothing
+# matched, so the `|| true` sits inside the pipeline's last stage to keep a
+# genuine `gzip` failure visible under `set -o pipefail`.
+TRIPLE_LINE_REGEX='^[[:space:]]*[^#].*\.[[:space:]]*$'
+
+count_triple_lines() {
+  local path="$1"
+  if [[ "$path" == *.gz ]]; then
+    gzip -dc "$path" | { LC_ALL=C grep -cE "$TRIPLE_LINE_REGEX" || true; }
+    return
+  fi
+  { LC_ALL=C grep -cE "$TRIPLE_LINE_REGEX" "$path" || true; }
+}
+
 count_triples_json() {
   local path="$1"
   local total=0
 
   if [[ -f "$path" ]]; then
     local count
-    if [[ "$path" == *.gz ]]; then
-      count=$(gzip -dc "$path" | awk '/^[[:space:]]*[^#].*\.[[:space:]]*$/ { count++ } END { print count + 0 }')
-    else
-      count=$( (grep -E '^[[:space:]]*[^#].*\.[[:space:]]*$' "$path" || true) | wc -l | tr -d ' ' )
-    fi
+    count=$(count_triple_lines "$path")
     echo "{"
     printf "  \"%s\": %s,\n" "$path" "$count"
     printf "  \"TOTAL\": %s\n" "$count"
@@ -243,7 +294,7 @@ count_triples_json() {
   for f in "$path"/*; do
     if [[ -f "$f" ]]; then
       local count
-      count=$( (grep -E '^[[:space:]]*[^#].*\.[[:space:]]*$' "$f" || true) | wc -l | tr -d ' ' )
+      count=$(count_triple_lines "$f")
       total=$((total + count))
       printf "  \"%s\": %s,\n" "$f" "$count"
     fi
@@ -257,12 +308,14 @@ count_triples_json() {
 # Replace plain VCF null marker literals (`"."`) with typed null literals.
 # Ontology alignment:
 #   "."  ->  "."^^vcfr:Null
-annotate_null_literals_nt() {
-  local nt_path="$1"
-  local tmp_path
-  tmp_path="$(mktemp "${nt_path}.nullfix.XXXXXX")"
-  sed -E 's/"\."([[:space:]]+\.)/"."^^<https:\/\/w3id.org\/vcf-rdfizer\/vocab#Null>\1/g' "$nt_path" > "$tmp_path"
-  mv "$tmp_path" "$nt_path"
+#
+# The rewrite is per-line and has no cross-line context, so it is applied to
+# each RMLStreamer part as it is streamed into the aggregate. Running it as a
+# separate pass over the finished aggregate instead would read and rewrite the
+# complete RDF output a second time.
+NULL_LITERAL_SED='s/"\."([[:space:]]+\.)/"."^^<https:\/\/w3id.org\/vcf-rdfizer\/vocab#Null>\1/g'
+annotate_null_literals_stream() {
+  sed -E "$NULL_LITERAL_SED" "$1"
 }
 
 
@@ -306,7 +359,9 @@ fi
 
 # ---------- Pre-run ----------
 IN_SIZE=$(stat_size "$IN")
-VCF_SIZE=$(normalized_vcf_size "$IN_VCF")
+VCF_SIZE_INFO=$(vcf_size_with_method "$IN_VCF")
+VCF_SIZE="${VCF_SIZE_INFO%% *}"
+VCF_SIZE_METHOD="${VCF_SIZE_INFO#* }"
 
 # ---------- Run RMLStreamer with timing ----------
 EXIT_CODE=0
@@ -323,14 +378,16 @@ if [[ -n "$PROGRESS_FILE" ]]; then
   run_rmlstreamer &
   RMLSTREAMER_PID=$!
   while kill -0 "$RMLSTREAMER_PID" >/dev/null 2>&1; do
-    progress_emit "rmlstreamer" "heartbeat" "$(part_bytes)" null bytes "$(part_count)"
+    scan_parts
+    progress_emit "rmlstreamer" "heartbeat" "$PART_BYTES" null bytes "$PART_COUNT"
     sleep 1
   done
   wait "$RMLSTREAMER_PID" || EXIT_CODE=$?
+  scan_parts
   if (( EXIT_CODE == 0 )); then
-    progress_emit "rmlstreamer" "complete" "$(part_bytes)" null bytes "$(part_count)"
+    progress_emit "rmlstreamer" "complete" "$PART_BYTES" null bytes "$PART_COUNT"
   else
-    progress_emit "rmlstreamer" "failed" "$(part_bytes)" null bytes "$(part_count)"
+    progress_emit "rmlstreamer" "failed" "$PART_BYTES" null bytes "$PART_COUNT"
   fi
 else
   run_rmlstreamer || EXIT_CODE=$?
@@ -383,10 +440,9 @@ if [[ "$RDF_STORAGE_MODE" == "space-optimized" ]]; then
       fi
       printf "%s\n" "$PART_HASH" >> "$SEEN_HASH_FILE"
       printf "%s\t%s\n" "$PART_HASH" "$PART_NT" >> "$SEEN_MAP_FILE"
-      annotate_null_literals_nt "$PART_NT"
       # Concatenated gzip members form one valid sequential gzip stream while
       # allowing each completed RMLStreamer part to be deleted immediately.
-      gzip -c "$PART_NT" >> "$MERGED_TMP"
+      annotate_null_literals_stream "$PART_NT" | gzip -c >> "$MERGED_TMP"
       rm -f "$PART_NT"
       PART_INDEX=$((PART_INDEX + 1))
       progress_emit "rdf-aggregate" "part" "$PART_INDEX" "$PART_TOTAL" parts "$PART_INDEX"
@@ -418,7 +474,7 @@ if [[ "$RDF_STORAGE_MODE" == "space-optimized" ]]; then
       fi
       printf "%s\n" "$PART_HASH" >> "$SEEN_HASH_FILE"
       printf "%s\t%s\n" "$PART_HASH" "$PART_NT" >> "$SEEN_MAP_FILE"
-      cat "$PART_NT" >> "$MERGED_NT"
+      annotate_null_literals_stream "$PART_NT" >> "$MERGED_NT"
       rm -f "$PART_NT"
       PART_INDEX=$((PART_INDEX + 1))
       progress_emit "rdf-aggregate" "part" "$PART_INDEX" "$PART_TOTAL" parts "$PART_INDEX"
@@ -438,17 +494,6 @@ fi
 
 rm -rf "$PARTS_DIR"
 trap - EXIT
-
-# Apply ontology-compliant null datatype annotation to produced RDF files.
-if [[ -f "$OUTPUT_PATH" && "$OUTPUT_PATH" != *.gz ]]; then
-  annotate_null_literals_nt "$OUTPUT_PATH"
-elif [[ -d "$OUTPUT_PATH" ]]; then
-  shopt -s nullglob
-  for RDF_NT in "$OUTPUT_PATH"/*.nt; do
-    annotate_null_literals_nt "$RDF_NT"
-  done
-  shopt -u nullglob
-fi
 
 OUT_SIZE=$(stat_size "$OUTPUT_PATH")
 TRIPLES_JSON=$(count_triples_json "$OUTPUT_PATH")
@@ -490,6 +535,7 @@ cat > "$METRICS_JSON" <<EOF
     "input_path": "$IN",
     "input_size_bytes": $IN_SIZE,
     "input_vcf_size_bytes": $VCF_SIZE,
+    "input_vcf_size_method": "$VCF_SIZE_METHOD",
     "output_path": "$OUTPUT_PATH",
     "output_size_bytes": $OUT_SIZE,
     "output_triples": $TRIPLES_JSON
