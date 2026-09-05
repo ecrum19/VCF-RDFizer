@@ -439,11 +439,12 @@ report-only and the run rests on the aggregate comparisons alone. That is
 correct behaviour, not a bug, but it means a custom mapping is validated more
 weakly than the default one.
 
-**Condensed graphs are not ontology-backed.** The condensed representation uses
-17 terms the published vocabulary does not define, so SHACL cannot meaningfully
-check it and dereferencing those terms returns nothing. The list is in
-[`vcf-coverage.md`](vcf-coverage.md); closing it is work in the vocabulary
-repository.
+**Condensed SHACL coverage depends on the vocabulary's next release.** The
+condensed representation used 17 terms the published vocabulary did not define,
+so SHACL could not meaningfully check it. All 17 are defined in vocabulary
+v1.1.0, which also ships condensed shapes, but a third-party consumer only sees
+them once that version is published. See
+[`vcf-coverage.md`](vcf-coverage.md#vocabulary-alignment).
 
 **A high mutation score is a lower bound on blindness, not a proof.** It says
 "almost every corruption we thought to write down is caught". Corruptions nobody
