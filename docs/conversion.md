@@ -204,11 +204,14 @@ The vocabulary's `vcfr:missingValuePolicy` says a missing token should be
 reports a plain `"."` literal as an anomaly, and `--strict-conformance` promotes
 that from a report to a failure.
 
-This policy currently **conflicts with the published SHACL shapes** for
-`ref`/`alt`/`chrom`, which constrain those to `sh:datatype xsd:string`. A record
-with `ALT=.` therefore cannot satisfy both. The conflict is documented in
-[`vcf-coverage.md`](vcf-coverage.md#an-open-conflict-inside-the-vocabulary) and
-needs a decision in the vocabulary repository, not here.
+This policy **conflicted with the published SHACL shapes** for `alt`, which
+constrained it to `sh:datatype xsd:string` so that a record with `ALT=.` could
+satisfy neither. Vocabulary v1.1.0 resolves it by drawing the boundary the
+policy was missing: ALT and ID admit the missing token in VCF 4.5 and their
+shapes now accept `xsd:string` or `vcfr:Null`, while CHROM, POS and REF are
+required, have no missing form, and keep an exact datatype. The conversion
+already followed the policy and is unchanged. See
+[`vcf-coverage.md`](vcf-coverage.md#vocabulary-alignment).
 
 ## 8. What conversion does *not* do
 

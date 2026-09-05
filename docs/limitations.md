@@ -164,17 +164,19 @@ argv is recorded in every report so a future divergence is diagnosable.
 
 ## 7. Vocabulary
 
-**Condensed graphs are not ontology-backed.** The tool emits 17 terms that
-`https://w3id.org/vcf-rdfizer/vocab#` does not define, all belonging to the
-condensed representation. Dereferencing any of them returns nothing. This is the
-one remaining publication blocker, and the work is in the vocabulary repository.
+**Condensed vocabulary coverage lands with the vocabulary's next release.** The
+tool emits 17 condensed-representation terms that `vcf-rdfizer/vocab#` did not
+define; all are defined in the vocabulary repository as of v1.1.0, together with
+SHACL shapes for the profile. Until that version is published to
+`https://w3id.org/vcf-rdfizer/vocab#`, those terms still do not dereference for
+a third-party consumer.
 
-**The published SHACL shapes contradict the missing-value policy.**
-`vcfr:missingValuePolicy` says a missing token should be `"."^^vcfr:Null`, while
-`VCFRecordShape` constrains `vcfr:alt` to `sh:datatype xsd:string`. A record with
-`ALT=.` cannot satisfy both. The conversion follows the missing-value policy.
-The vocabulary needs a decision; see
-[`vcf-coverage.md`](vcf-coverage.md#an-open-conflict-inside-the-vocabulary).
+**The SHACL / missing-value contradiction is resolved** in the same release.
+`vcfr:alt` and `vcfr:recordId` now accept `xsd:string` or `vcfr:Null`, matching
+where VCF 4.5 actually permits the missing token, while CHROM, POS and REF stay
+exact because they have no missing form. The conversion already followed the
+policy and needs no change. See
+[`vcf-coverage.md`](vcf-coverage.md#vocabulary-alignment).
 
 **Condensed mode has no query-time decoder.** Reconstructing sample *i*'s value
 means splitting a tab-separated literal, which SPARQL cannot do portably. The

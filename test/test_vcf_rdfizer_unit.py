@@ -271,6 +271,23 @@ def latest_metrics_run_dir(metrics_root: Path) -> Path:
     return run_dirs[-1][1]
 
 
+
+def stable_progress_env():
+    """Pin the ambient progress opt-outs for one test.
+
+    ``progress_events_enabled()`` and ``progress_ui_enabled()`` both consult
+    ``CI`` and ``VCF_RDFIZER_NO_PROGRESS``, so any assertion about progress
+    behaviour written on a developer machine silently inverts under GitHub
+    Actions, which sets ``CI=true``. Every test that asserts on progress has to
+    pin both variables; use this rather than repeating the dict, and see
+    ``test_validation_omits_progress_sidecar_under_ci`` for the other side of
+    the contract.
+    """
+    return mock.patch.dict(
+        os.environ, {"VCF_RDFIZER_NO_PROGRESS": "", "CI": ""}, clear=False
+    )
+
+
 class WrapperUnitTests(VerboseTestCase):
     def test_metrics_directory_uses_recognizable_input_label(self):
         """Metrics runs keep the full input stem alongside their timestamp."""
@@ -323,11 +340,7 @@ class WrapperUnitTests(VerboseTestCase):
         previous_progress_setting = vcf_rdfizer._PROGRESS_ALLOWED
         try:
             vcf_rdfizer._PROGRESS_ALLOWED = True
-            with tempfile.TemporaryDirectory() as td, mock.patch.dict(
-                os.environ,
-                {"VCF_RDFIZER_NO_PROGRESS": "", "CI": ""},
-                clear=False,
-            ), mock.patch.object(vcf_rdfizer, "Progress", None), mock.patch.object(
+            with tempfile.TemporaryDirectory() as td, stable_progress_env(), mock.patch.object(vcf_rdfizer, "Progress", None), mock.patch.object(
                 vcf_rdfizer, "Console", None
             ):
                 progress_path = Path(td) / "partitioned.jsonl"
@@ -364,11 +377,7 @@ class WrapperUnitTests(VerboseTestCase):
             vcf_rdfizer._PROGRESS_ALLOWED = False
             vcf_rdfizer._PROGRESS_EVENTS_ALLOWED = True
             vcf_rdfizer._QUIET = True
-            with tempfile.TemporaryDirectory() as td, mock.patch.dict(
-                os.environ,
-                {"VCF_RDFIZER_NO_PROGRESS": "", "CI": ""},
-                clear=False,
-            ), mock.patch.object(vcf_rdfizer, "Progress", None), mock.patch.object(
+            with tempfile.TemporaryDirectory() as td, stable_progress_env(), mock.patch.object(vcf_rdfizer, "Progress", None), mock.patch.object(
                 vcf_rdfizer, "Console", None
             ):
                 progress_path = Path(td) / "validation.jsonl"
@@ -395,8 +404,13 @@ class WrapperUnitTests(VerboseTestCase):
             vcf_rdfizer._PROGRESS_EVENTS_ALLOWED = previous_events
             vcf_rdfizer._QUIET = previous_quiet
 
-    def test_validation_forwards_progress_sidecar_and_quiet_flag(self):
-        """Validation uses the shared sidecar protocol and propagates --quiet."""
+    def _run_validation_mode_capturing_commands(self):
+        """Invoke ``run_validation_mode`` with Docker stubbed; return (rc, argv list).
+
+        The sidecar decision is made inside the call, so a caller that cares
+        about ``CI`` must pin the environment *around* this helper rather than
+        before it.
+        """
         previous_allowed = vcf_rdfizer._PROGRESS_ALLOWED
         previous_events = vcf_rdfizer._PROGRESS_EVENTS_ALLOWED
         previous_quiet = vcf_rdfizer._QUIET
@@ -418,9 +432,9 @@ class WrapperUnitTests(VerboseTestCase):
                     commands.append(cmd)
                     return 0
 
-                with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), redirect_stdout(
-                    StringIO()
-                ):
+                with mock.patch.object(
+                    vcf_rdfizer, "run", side_effect=fake_run
+                ), redirect_stdout(StringIO()):
                     rc = vcf_rdfizer.run_validation_mode(
                         vcf_path=vcf_path,
                         rdf_path=rdf_path,
@@ -434,19 +448,41 @@ class WrapperUnitTests(VerboseTestCase):
                         filter_oracle="auto",
                         wrapper_log_path=tmp_path / "wrapper.log",
                     )
-
-                self.assertEqual(rc, 0)
-                self.assertEqual(len(commands), 1)
-                command = commands[0]
-                self.assertIn("--progress-path", command)
-                self.assertIn(
-                    "/data/metrics/.progress/validation-sample.jsonl", command
-                )
-                self.assertIn("--quiet", command)
+                return rc, commands
         finally:
             vcf_rdfizer._PROGRESS_ALLOWED = previous_allowed
             vcf_rdfizer._PROGRESS_EVENTS_ALLOWED = previous_events
             vcf_rdfizer._QUIET = previous_quiet
+
+    def test_validation_forwards_progress_sidecar_and_quiet_flag(self):
+        """Validation uses the shared sidecar protocol and propagates --quiet."""
+        with stable_progress_env():
+            rc, commands = self._run_validation_mode_capturing_commands()
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(commands), 1)
+        command = commands[0]
+        self.assertIn("--progress-path", command)
+        self.assertIn("/data/metrics/.progress/validation-sample.jsonl", command)
+        self.assertIn("--quiet", command)
+
+    def test_validation_omits_progress_sidecar_under_ci(self):
+        """CI keeps captured logs clean: no sidecar is requested, --quiet still is."""
+        with mock.patch.dict(
+            os.environ,
+            {"VCF_RDFIZER_NO_PROGRESS": "", "CI": "true"},
+            clear=False,
+        ):
+            rc, commands = self._run_validation_mode_capturing_commands()
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(commands), 1)
+        command = commands[0]
+        # No consumer renders the sidecar under CI, and ProgressSession unlinks
+        # it on exit, so the wrapper does not ask the container to write one.
+        self.assertNotIn("--progress-path", command)
+        # --quiet is independent of the sidecar decision and must survive it.
+        self.assertIn("--quiet", command)
 
     def test_validation_runner_emits_query_progress_in_quiet_mode(self):
         """The container validator still writes lifecycle events when stdout is quiet."""

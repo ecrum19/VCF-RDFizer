@@ -11,28 +11,32 @@ block something else, not by effort.
 
 ## Blocking publication
 
-### 1. Vocabulary coverage for the condensed representation
+### 1. Vocabulary coverage for the condensed representation — **done, pending release**
 
-The conversion emits 17 terms that `https://w3id.org/vcf-rdfizer/vocab#` does
+The conversion emitted 17 terms that `https://w3id.org/vcf-rdfizer/vocab#` did
 not define — `CohortCallMatrix`, `FormatValueVector`, `SampleSet`, `VCFSample`,
-`VCFTextVector`, `representationProfile`, `sampleIndex` and the rest. They do
-not dereference, so **condensed graphs are not ontology-backed**.
+`VCFTextVector`, `representationProfile`, `sampleIndex` and the rest — so
+condensed graphs were not ontology-backed.
 
-The work is in the vocabulary repository, not here. Until it lands, the
-condensed representation is usable but not citable as linked data.
-Full list: [`vcf-coverage.md`](vcf-coverage.md#vocabulary-alignment).
+All 17 are now defined in the vocabulary repository (v1.1.0), with two
+superclasses giving the enumerations a range, SHACL shapes for the condensed
+profile, and a worked example. What remains is publication: the terms only
+dereference for a third-party consumer once v1.1.0 is deployed to the w3id
+namespace. Nothing further is required in this repository.
+Detail: [`vcf-coverage.md`](vcf-coverage.md#vocabulary-alignment).
 
-### 2. The SHACL / missing-value contradiction
+### 2. The SHACL / missing-value contradiction — **resolved**
 
-`vcfr:missingValuePolicy` requires `"."^^vcfr:Null` for a missing token;
-`VCFRecordShape` constrains `vcfr:alt` to `sh:datatype xsd:string`. A record with
-`ALT=.` cannot satisfy both, so it is impossible for the tool to be conformant.
+`vcfr:missingValuePolicy` required `"."^^vcfr:Null` for a missing token while
+`VCFRecordShape` constrained `vcfr:alt` to `sh:datatype xsd:string`, so a record
+with `ALT=.` could satisfy neither and the tool could not be conformant.
 
-The fix is a decision in the vocabulary: either relax the `alt`/`ref`/`chrom`
-shapes to `sh:or([xsd:string] [vcfr:Null])` — as the `qual` shape already does —
-or drop the missing-value policy for those fields. The conversion currently
-follows the policy.
-[Detail](vcf-coverage.md#an-open-conflict-inside-the-vocabulary).
+Vocabulary v1.1.0 resolves it by stating where VCF actually permits the token:
+`alt` and `recordId` now accept `xsd:string` or `vcfr:Null`, as `qual` already
+did, while `chrom`, `pos` and `ref` keep an exact datatype because they are
+required and have no missing form. The conversion already followed the policy,
+so no change was needed here.
+Detail: [`vcf-coverage.md`](vcf-coverage.md#vocabulary-alignment).
 
 ## Known defects
 

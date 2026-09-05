@@ -1,5 +1,103 @@
 # Changelog
 
+## 2026-09-05 — Fix a unit test that inverted under CI
+
+`shell+pipeline-unit` failed on all three OS matrix legs of the `dev` -> `main`
+merge (ubuntu-latest, ubuntu-22.04, macos-latest) while passing on developer
+machines. One test, three red checks.
+
+### Fixed
+
+- `test_validation_forwards_progress_sidecar_and_quiet_flag` asserted that
+  `run_validation_mode` forwards `--progress-path` to the container. It does —
+  but `progress_events_enabled()` returns `False` whenever `CI` is set, and
+  GitHub Actions sets `CI=true`, so the sidecar is deliberately not requested
+  there. The test pinned `_PROGRESS_ALLOWED`, `_PROGRESS_EVENTS_ALLOWED` and
+  `_QUIET` but not the environment, so it tested a different code path in CI
+  than the one it was written for. Reproducible locally with
+  `CI=true python -m unittest discover -s test -p "test_*_unit.py"`.
+
+  The tool's behaviour is correct and unchanged: the sidecar exists only to
+  drive the terminal display and `ProgressSession.__exit__` unlinks it, so
+  suppressing it where nothing renders costs nothing.
+
+### Changed
+
+- `stable_progress_env()` replaces the `{"VCF_RDFIZER_NO_PROGRESS": "", "CI": ""}`
+  dict that two sibling progress tests already carried inline. The third test
+  omitted it, which is how this happened; a named helper with the reason in its
+  docstring makes the requirement visible to the next test author.
+- The validation-command setup is factored into
+  `_run_validation_mode_capturing_commands()`, shared by both sides of the
+  contract.
+
+### Added
+
+- `test_validation_omits_progress_sidecar_under_ci` pins the CI behaviour that
+  was previously only implicit: no `--progress-path` is requested, and `--quiet`
+  still is. Verified as a real guard by removing the `CI` check from
+  `progress_events_enabled()` and confirming the test fails.
+
+## 2026-09-05 — Vocabulary alignment for the condensed representation (upstream)
+
+The two open items in [`docs/roadmap.md`](docs/roadmap.md) under "Blocking
+publication" are closed. Both were work in the
+[vocabulary repository](https://github.com/ecrum19/VCF-RDFizer-vocabulary),
+released there as **v1.1.0**; **no change was needed in this repository**, and
+this entry records what the conversion may now rely on.
+
+### Condensed graphs are ontology-backed
+
+The conversion emitted 17 terms the vocabulary did not define — `SampleSet`,
+`VCFSample`, `CohortCallMatrix`, `FormatValueVector`, `representationProfile`,
+`sampleIndex`, `encodedValues` and the rest — so a condensed graph could not be
+dereferenced or meaningfully SHACL-checked. All 17 are now defined, with two
+superclasses (`RepresentationProfile`, `VectorEncoding`) giving the enumerations
+a range, plus SHACL shapes for the profile and a worked example that is the
+expanded example's own record in the other profile.
+
+The condensed shapes constrain what positional decoding depends on: exactly one
+`sampleIndex` per sample, a sample set on every matrix, and an encoding and
+FORMAT declaration on every vector. Ten targeted corruptions of a condensed
+graph are each reported as a violation, so the shapes are load-bearing.
+
+`--shacl-shapes` therefore now covers `--sample-representation condensed`, which
+it previously could not.
+
+### The missing-value contradiction is resolved
+
+`vcfr:missingValuePolicy` required `"."^^vcfr:Null` for a missing token while
+`VCFRecordShape` constrained `vcfr:alt` to `sh:datatype xsd:string`, so a record
+with `ALT=.` could satisfy neither and the tool could not be conformant on any
+VCF containing one.
+
+The fix draws the boundary the policy was missing rather than relaxing every
+field: ALT and ID admit the missing token in VCF 4.5, so their shapes now accept
+`xsd:string` or `vcfr:Null` as `qual` already did; CHROM, POS and REF are
+required and have no missing form, so their shapes stay exact — a `.` there is
+malformed input and should still be reported. The policy also now states that a
+missing value inside a `FormatValueVector` stays a `.` character at its sample's
+position, rather than becoming a typed literal that would break alignment.
+
+The conversion already followed the policy, so it needs no change. Reproduced
+against the 1.0.1 shapes before the fix and confirmed gone after.
+
+### Caveat
+
+The terms only dereference for a third-party consumer once vocabulary v1.1.0 is
+published to `https://w3id.org/vcf-rdfizer/vocab#`. Until then the definitions
+exist but are not yet live, which is why the docs below say "pending release"
+rather than "done".
+
+### Documentation
+
+- [`docs/vcf-coverage.md`](docs/vcf-coverage.md) — the "Vocabulary alignment"
+  section now records both gaps as closed, with what was verified.
+- [`docs/roadmap.md`](docs/roadmap.md) — both publication blockers marked done.
+- [`docs/limitations.md`](docs/limitations.md),
+  [`docs/conversion.md`](docs/conversion.md),
+  [`docs/validation.md`](docs/validation.md) updated to match.
+
 ## 2026-09-04 — Multi-engine validation, native HDT/COTTAS querying, and benchmarking
 
 Validation was one engine against one N-Triples file. It is now up to four

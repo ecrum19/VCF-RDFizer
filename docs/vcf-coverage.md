@@ -109,8 +109,15 @@ a subclass would put a term in the graph that the vocabulary does not define.
 
 ## Vocabulary alignment
 
-The tool emits 17 terms that `https://w3id.org/vcf-rdfizer/vocab#` does **not**
-define — all belonging to the condensed representation:
+Both gaps recorded here have been closed in the vocabulary repository
+(`https://github.com/ecrum19/VCF-RDFizer-vocabulary`, v1.1.0). They are kept
+below because the fix is only live for consumers once that version is published
+to `https://w3id.org/vcf-rdfizer/vocab#`.
+
+### Condensed terms are now defined
+
+The conversion emitted 17 terms the vocabulary did not define, all belonging to
+the condensed representation, so **condensed graphs were not ontology-backed**:
 
 `CohortCallMatrix`, `CondensedRepresentation`, `ExpandedRepresentation`,
 `FormatValueVector`, `SampleSet`, `VCFSample`, `VCFTextVector`,
@@ -118,27 +125,41 @@ define — all belonging to the condensed representation:
 `hasSample`, `hasSampleSet`, `representationProfile`, `sampleIndex`,
 `sampleName`, `valueEncoding`
 
-Dereferencing any of these returns nothing, so **condensed graphs are not
-ontology-backed**. This is the one remaining publication blocker and is work in
-the vocabulary repository, not here.
+All 17 are now defined, along with two superclasses (`RepresentationProfile`,
+`VectorEncoding`) that give the two enumerations a range. The vocabulary also
+ships SHACL shapes for the condensed profile, constraining what positional
+decoding depends on: exactly one `sampleIndex` per sample, a sample set on every
+matrix, and an encoding and FORMAT declaration on every vector.
 
-### An open conflict inside the vocabulary
+Verified: the project's own expanded and condensed fixture graphs conform
+against the new shapes, and ten targeted corruptions of a condensed graph
+(dropped index, duplicated index, untyped index, missing encoding, missing
+declaration, missing values, missing sample set, unknown profile, empty sample
+set, missing name) are each reported as a violation.
 
-Running SHACL surfaced a contradiction between two parts of the published
-vocabulary that the tool cannot satisfy simultaneously:
+### The SHACL / missing-value contradiction is resolved
 
-- `vcfr:missingValuePolicy` says a missing token SHOULD be `"."^^vcfr:Null`.
-- `VCFRecordShape` constrains `vcfr:alt` to `sh:datatype xsd:string`.
+Running SHACL had surfaced a contradiction between two parts of the published
+vocabulary that the tool could not satisfy simultaneously:
 
-A record with `ALT=.` therefore violates the shape no matter which rule the
-conversion follows. The tool currently follows the missing-value policy. This
-needs a decision in the vocabulary: either relax the `alt`/`ref`/`chrom` shapes
-to `sh:or([xsd:string] [vcfr:Null])`, as the `qual` shape already does, or drop
-the missing-value policy for those fields.
+- `vcfr:missingValuePolicy` said a missing token SHOULD be `"."^^vcfr:Null`.
+- `VCFRecordShape` constrained `vcfr:alt` to `sh:datatype xsd:string`.
 
-Two shape violations found the same way have already been fixed here: QUAL is
-now `xsd:decimal`/`vcfr:Null` rather than a plain literal, and `##fileDate` is
-typed `xsd:date` when its form allows.
+A record with `ALT=.` therefore violated the shape no matter which rule the
+conversion followed. The resolution draws the boundary the policy was missing
+rather than relaxing every field: **ALT and ID admit the missing token in VCF
+4.5, so their shapes now accept `xsd:string` or `vcfr:Null`**, as `qual` already
+did. **CHROM, POS and REF are required and have no missing form**, so their
+shapes stay exact — a `.` in one of them is malformed input, and the shape
+should say so. The policy text now states that boundary explicitly, and adds
+that a missing value inside a `FormatValueVector` stays a `.` character at its
+sample's position rather than becoming a typed literal.
+
+The tool needs no change: it already followed the missing-value policy.
+
+Two shape violations found the same way had already been fixed here: QUAL is
+`xsd:decimal`/`vcfr:Null` rather than a plain literal, and `##fileDate` is typed
+`xsd:date` when its form allows.
 
 ---
 
