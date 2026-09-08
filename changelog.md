@@ -1,5 +1,34 @@
 # Changelog
 
+## 2026-09-08 — Fix the six failing unit-test jobs in CI
+
+Every `unit-tests` job failed on push: `wrapper-unit` on three OSes and
+`shell+pipeline-unit` on three more. All six had one cause.
+
+### Fixed
+
+- **`tests.yml` never installed the project's dependencies.** The jobs ran
+  `setup-python` and went straight to `unittest discover` against a bare
+  checkout, so `rdflib` was absent. `vcf_rdfizer.main()` imports
+  `vcf_rdfizer_link` to build its argument parser, that module imports
+  `vcf_rdfizer_linking.inputs`, and that does a module-level
+  `from rdflib import …` — so **even `--help` raised `ModuleNotFoundError`**,
+  and every test that invokes `main()` errored. Locally the same bare-checkout
+  run produces 66 errors across both job types.
+
+  `rdflib` is a *required* runtime dependency in `pyproject.toml`, not an
+  optional extra, so a bare checkout was testing a configuration no installed
+  copy has. The sibling `validation-mutation.yml` workflow already installed it;
+  `tests.yml` was simply missing the step.
+
+  The three test jobs now run `python -m pip install -e .`, which pulls exactly
+  what `pyproject.toml` declares and cannot drift from it, while the tests still
+  execute against the checkout. `package-smoke` was unaffected — it installs a
+  wheel and gets the dependencies that way.
+
+  Verified by reproducing CI in a clean virtualenv: `pip install -e .` followed
+  by both job commands.
+
 ## 2026-09-08 — Verify against the published VCF Core 2.0.0
 
 VCF Core is published at **2.0.0**, covering VCF 4.1 through 4.5. This checks
