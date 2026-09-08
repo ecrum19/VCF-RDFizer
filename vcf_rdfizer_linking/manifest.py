@@ -9,12 +9,51 @@ import re
 from string import Formatter
 from urllib.parse import quote, urlsplit
 
-from rdflib import Graph, Literal, Namespace, RDF, URIRef
 
-VCFL = Namespace("https://w3id.org/vcf-rdfizer/linking#")
+class _LazyNamespace:
+    """An rdflib Namespace that is not built until a term is asked for.
+
+    rdflib is a required dependency of the data-linking feature, but the CLI
+    imports this module while merely building its argument parser -- so a
+    checkout without the dependency installed could not print ``--help``, let
+    alone run a conversion that does no linking at all. Deferring the import to
+    the first term lookup keeps every non-linking code path working, and makes
+    the failure land where the feature is actually used.
+
+    Term access behaves exactly as ``rdflib.Namespace``: attribute and item
+    lookup both return a ``URIRef``, and ``str()`` gives the namespace IRI.
+    """
+
+    __slots__ = ("_iri", "_namespace")
+
+    def __init__(self, iri: str):
+        self._iri = iri
+        self._namespace = None
+
+    def _resolve(self):
+        if self._namespace is None:
+            from rdflib import Namespace
+
+            self._namespace = Namespace(self._iri)
+        return self._namespace
+
+    def __getattr__(self, name):
+        return getattr(self._resolve(), name)
+
+    def __getitem__(self, name):
+        return self._resolve()[name]
+
+    def __str__(self):
+        return self._iri
+
+    def __repr__(self):
+        return f"_LazyNamespace({self._iri!r})"
+
+
+VCFL = _LazyNamespace("https://w3id.org/vcf-rdfizer/linking#")
 # The converter's own linking vocabulary keeps its namespace; only the
 # conversion target moved to VCF Core.
-VCFC = Namespace("https://w3id.org/vcf-core/vocab#")
+VCFC = _LazyNamespace("https://w3id.org/vcf-core/vocab#")
 #: Retained alias: the linking stage reads back converted RDF, so it must
 #: use whatever namespace the emitters wrote.
 VCFR = VCFC
@@ -69,6 +108,10 @@ def load_manifest(directory: Path) -> Manifest:
     directory = directory.expanduser().resolve()
     if directory.is_file():
         directory = directory.parent
+    # rdflib is needed only to read a manifest, which is the point at which the
+    # data-linking feature is genuinely in use.
+    from rdflib import Graph, Literal, RDF, URIRef  # noqa: F401
+
     graph = Graph()
     try:
         graph.parse(directory / "linker.ttl", format="turtle")

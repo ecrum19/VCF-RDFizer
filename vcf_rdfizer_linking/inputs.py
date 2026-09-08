@@ -7,8 +7,6 @@ from pathlib import Path
 import sqlite3
 import tempfile
 
-from rdflib import Literal, RDF, URIRef
-from rdflib.plugins.parsers.ntriples import W3CNTriplesParser
 
 from .manifest import VCFR
 
@@ -96,6 +94,10 @@ def read_rdf(path: Path):
     Follow hasRecord/hasCall edges rather than guessing a subject from its IRI.
     Genotype triples are parsed but never retained. RDFLib owns term decoding.
     """
+    # Deferred so the module imports without rdflib: the CLI loads it while
+    # building its argument parser, long before any linking runs.
+    from rdflib import Literal, RDF, URIRef
+    from rdflib.plugins.parsers.ntriples import W3CNTriplesParser
     if not path.is_file() or not path.name.endswith((".nt", ".nt.gz")):
         raise ValueError("Link input must be an existing .nt or .nt.gz file")
     keep = {str(VCFR[name]) for name in ("hasRecord", "hasCall", "referenceGenome", "chrom", "pos", "ref", "alt", "recordId", "infoRaw")}

@@ -14,7 +14,15 @@ import unittest
 from unittest import mock
 from urllib.error import HTTPError
 
-from rdflib import Graph, Literal, RDF, URIRef
+# These tests exercise data linking itself, which requires rdflib. The rest of
+# the suite runs without it, so this module skips rather than erroring the whole
+# discovery run -- the same pattern test_validation_mutation_unit.py uses.
+try:
+    import rdflib
+    from rdflib import Graph, Literal, RDF, URIRef
+except ModuleNotFoundError:  # pragma: no cover - exercised only without rdflib
+    rdflib = None
+    Graph = Literal = RDF = URIRef = None
 
 import vcf_rdfizer
 import vcf_rdfizer_link
@@ -66,6 +74,7 @@ class FakeClock:
         self.now += seconds
 
 
+@unittest.skipIf(rdflib is None, "rdflib is required for the linking tests")
 class LinkingTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

@@ -13,6 +13,13 @@ from urllib.request import build_opener, Request, url2pathname
 from .session import NoRedirects
 
 
+#: Where linker reference downloads and cached HTTP responses live. It sits in
+#: this module rather than in ``runner`` because the argument parser needs it as
+#: a default, and ``runner`` imports rdflib -- which would make merely printing
+#: ``--help`` require the data-linking dependency.
+DEFAULT_CACHE = Path.home() / ".cache" / "vcf-rdfizer" / "linkers"
+
+
 def digest_file(path):
     digest = hashlib.sha256()
     with path.open("rb") as handle:

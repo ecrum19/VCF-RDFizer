@@ -1,5 +1,49 @@
 # Changelog
 
+## 2026-09-08 — Run without the data-linking dependency
+
+Running the tool from a checkout raised `ModuleNotFoundError: No module named
+'rdflib'` before it could do anything at all — including print `--help`, or run
+a conversion that does no linking.
+
+`vcf_rdfizer.main()` imports the data-linking CLI to build its argument parser.
+That module imported `vcf_rdfizer_linking.{inputs,manifest,runner}`, each of
+which imported `rdflib` at module level, so the dependency of one optional
+feature gated every mode. The tool is Docker-first and routinely run from a
+clone, where nothing installs Python dependencies.
+
+### Fixed
+
+- **`rdflib` is now imported where it is used, not where the module loads.** All
+  of its use was already inside functions: `read_rdf` in `inputs`,
+  `run_linkers` in `runner`, and `load_manifest` in `manifest`. The imports moved
+  into those three functions.
+- **The linking namespaces build lazily.** `manifest.VCFL` and `manifest.VCFC`
+  were module-level `rdflib.Namespace` constants, the one genuine module-level
+  use. `_LazyNamespace` defers construction to the first term lookup and is
+  otherwise identical: attribute and item access both return a `URIRef`, and
+  `str()` gives the namespace IRI.
+- **Requesting linking without the dependency now explains itself.** Both entry
+  points — `--link` in full mode and `--mode link` — report
+  `data linking requires the 'rdflib' package … install with 'pip install -e .'`
+  through the normal error path, instead of a traceback.
+
+`DEFAULT_CACHE` moved from `runner` to `reference`, which has no rdflib
+dependency, because the argument parser offers it as a default; `runner`
+re-exports it so existing importers are unaffected.
+
+`test_linking_unit.py` now skips when rdflib is absent instead of failing the
+whole discovery run, matching the pattern `test_validation_mutation_unit.py`
+already used. Those tests exercise linking itself, so they genuinely need it.
+
+Measured on a bare checkout: **66 errors before, 0 after** (116 skipped). With
+rdflib installed the suite is unchanged at 419 passing, so linking itself is
+untouched.
+
+Every non-linking mode now runs from a bare checkout. Linking itself is
+unchanged and still requires `rdflib`, which remains a declared runtime
+dependency in `pyproject.toml`.
+
 ## 2026-09-08 — Fix the six failing unit-test jobs in CI
 
 Every `unit-tests` job failed on push: `wrapper-unit` on three OSes and

@@ -16,6 +16,25 @@ from vcf_rdfizer_linking.reference import acquire_reference, check_assembly, Int
 from vcf_rdfizer_linking.runner import DEFAULT_CACHE, LinkRunError, run_linkers, run_stage
 
 
+def _require_rdflib():
+    """Fail with an actionable message when the linking dependency is absent.
+
+    rdflib is a declared runtime dependency, but the tool is routinely run from
+    a checkout, where nothing installs it. Every other mode works without it;
+    this turns the ModuleNotFoundError that only linking would hit into an
+    instruction.
+    """
+    try:
+        import rdflib  # noqa: F401
+    except ModuleNotFoundError:
+        raise ValueError(
+            "data linking requires the 'rdflib' package, which is not "
+            "installed. Install the project's dependencies with "
+            "'python -m pip install -e .' from the repository, or "
+            "'python -m pip install rdflib'. Every other mode runs without it."
+        ) from None
+
+
 def add_link_arguments(parser):
     parser.add_argument("--link", help="Comma-separated linker IDs (full/link modes)")
     parser.add_argument("--linker-path", action="append", default=[], help="Additional linker search directory (repeatable)")
@@ -28,6 +47,7 @@ def add_link_arguments(parser):
 
 def selected_linkers(args):
     import re
+    _require_rdflib()
     manifests = select(args.link or "", args.linker_path)
     if args.links_contact_email:
         if not re.fullmatch(r"[^\s<>@]+@[^\s<>@]+\.[^\s<>@]+", args.links_contact_email):
@@ -46,6 +66,9 @@ def run_posthoc(args):
     from vcf_rdfizer import (RunTracker, metrics_run_directory, metrics_run_label,
                              write_run_manifest, write_run_summary, rdf_output_basename)
     try:
+        # Inside the guard so a missing dependency is reported the same way as
+        # any other bad invocation, rather than as a traceback.
+        _require_rdflib()
         if not args.rdf or not args.link:
             raise ValueError("--mode link requires --rdf and --link")
         rdf = Path(args.rdf).expanduser().resolve()

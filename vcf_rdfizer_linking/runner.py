@@ -13,7 +13,6 @@ import sqlite3
 import tempfile
 import time
 
-from rdflib import Literal, RDF, URIRef, XSD
 
 from . import Link, LinkKey, LinkerContext
 from .inputs import Source
@@ -21,7 +20,9 @@ from .manifest import VCFL, absolute_iri, template_object
 from .reference import IntervalIndex, acquire_reference, check_assembly
 from .session import CachedSession, NetworkPolicy, atomic_bytes
 
-DEFAULT_CACHE = Path.home() / ".cache" / "vcf-rdfizer" / "linkers"
+# Re-exported from .reference, which has no rdflib dependency, so the CLI can
+# offer it as an argument default without importing this module.
+from .reference import DEFAULT_CACHE  # noqa: F401
 PROV_TIME = "http://www.w3.org/ns/prov#generatedAtTime"
 
 
@@ -84,6 +85,9 @@ def run_linkers(records, manifests, output: Path | None, *, cache_dir=DEFAULT_CA
     Dry-run writes no persistent artifacts, imports no resolver code, and never
     fetches a reference. It resolves local tiers and reports Tier 3 batch plans.
     """
+    # Deferred so the module imports without rdflib: the CLI loads it while
+    # building its argument parser, long before any linking runs.
+    from rdflib import Literal, RDF, URIRef, XSD
     started = time.monotonic()
     report = {"status": "running", "records": 0, "triples": 0, "appended_bytes": 0,
               "output": str(output) if output else None, "dry_run": dry_run, "linkers": [], "preview": []}
