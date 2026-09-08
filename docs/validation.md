@@ -500,11 +500,13 @@ report-only and the run rests on the aggregate comparisons alone. That is
 correct behaviour, not a bug, but it means a custom mapping is validated more
 weakly than the default one.
 
-**Condensed graphs are not ontology-backed.** The condensed representation uses
-17 terms the published vocabulary does not define, so SHACL cannot meaningfully
-check it and dereferencing those terms returns nothing. The list is in
-[`vcf-coverage.md`](vcf-coverage.md); closing it is work in the vocabulary
-repository.
+**SHACL conformance is checked by hand, not by this suite.** Both
+representation profiles are fully ontology-backed as of published VCF Core
+2.0.0, and the converter's output validates against the complete profile set —
+portable, SPARQL, consistency and all five version overlays — with zero
+violations. That check is currently a manual step rather than a test; wiring it
+in is tracked in
+[`validation-migration-notes.md`](validation-migration-notes.md).
 
 **A high mutation score is a lower bound on blindness, not a proof.** It says
 "almost every corruption we thought to write down is caught". Corruptions nobody
