@@ -15,6 +15,7 @@ build:
   script: {{ PYTHON }} -m pip install . -vv
   entry_points:
     - vcf-rdfizer=vcf_rdfizer:main
+    - vcf-rdfizer-link=vcf_rdfizer_link:main
 
 requirements:
   host:
@@ -25,14 +26,20 @@ requirements:
   run:
     - python >={{ python_min }}
     - rich >=13.7.0
+    - rdflib >=7.0.0
 
 test:
   requires:
     - python {{ python_min }}
   commands:
     - vcf-rdfizer --help
+    - vcf-rdfizer-link list
   imports:
     - vcf_rdfizer
+    # The vocabulary terms, VCF-version model and lexical parsers. Importing it
+    # here catches a packaging miss that would otherwise only surface at
+    # conversion time, since vcf_rdfizer imports it at module load.
+    - vcf_rdfizer_vocab
 
 about:
   home: https://github.com/ecrum19/VCF-RDFizer

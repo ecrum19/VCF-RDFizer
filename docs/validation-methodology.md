@@ -94,7 +94,7 @@ clean result.
 
 The SHACL layer earned its place immediately: it found three conformance
 violations the other two could not see, two of which were fixed (QUAL typed as
-a plain literal instead of `xsd:decimal`/`vcfr:Null`; `##fileDate` untyped
+a plain literal instead of `xsd:decimal`/`vcfc:Null`; `##fileDate` untyped
 instead of `xsd:date`) and one of which is a contradiction inside the
 vocabulary itself, recorded in [`vcf-coverage.md`](vcf-coverage.md).
 

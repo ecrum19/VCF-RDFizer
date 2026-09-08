@@ -68,12 +68,21 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import quote_plus
 
 try:
     import vcf_rdfizer_gzip
 except ImportError:  # pragma: no cover - shipped alongside this module
     vcf_rdfizer_gzip = None
+
+import vcf_rdfizer_vocab as vocab
+from vcf_rdfizer_vocab import (
+    CONTIG_ATTRIBUTES,
+    HEADER_LINE_CLASSES,
+    VCFC_NAMESPACE,
+    VCF_VALUE_TYPE_INDIVIDUALS,
+    file_date_object,
+    parse_info_entries,
+)
 
 try:
     from rich.console import Console
@@ -119,6 +128,12 @@ CONVERSION_METRICS_HEADER = [
     "timestamp",
     "output_name",
     "output_dir",
+    # The VCF specification version this input was converted under, and how it
+    # was chosen. Benchmarks group by these: the version selects the SHACL
+    # overlay, the tuple semantics and which FORMAT families exist, so a run's
+    # cost and graph size are not comparable across versions without them.
+    "vcf_version",
+    "vcf_version_source",
     "exit_code_java",
     "wall_seconds_java",
     "user_seconds_java",
@@ -303,28 +318,31 @@ CANONICAL_SAMPLE_RULE_MARKERS = (
 )
 CANONICAL_SAMPLE_RULE_FRAGMENTS = (
     'rr:template "file://{SOURCE_FILE}#call/{ROW_ID}"',
-    "rr:predicate vcfr:hasSampleCall",
+    "rr:predicate vcfc:hasSampleCall",
     'rr:template "file://{SOURCE_FILE}#sample/{ROW_ID}/{SAMPLE_URI_ID}"',
-    "rr:class vcfr:SampleCall",
-    "rr:predicate vcfr:sampleId",
+    "rr:class vcfc:SampleCall",
+    "rr:predicate vcfc:sampleId",
     'rml:reference "SAMPLE_ID"',
-    "rr:predicate vcfr:hasFormatValue",
+    "rr:predicate vcfc:hasFormatValue",
     'rr:template "file://{SOURCE_FILE}#sample/{ROW_ID}/{SAMPLE_URI_ID}/fmt/{FORMAT_KEY}"',
-    "rr:class vcfr:FormatFieldValue",
-    "rr:predicate vcfr:fieldValue",
+    "rr:class vcfc:FormatFieldValue",
+    "rr:predicate vcfc:fieldValue",
     'rml:reference "FORMAT_VALUE"',
 )
-VCFR_NAMESPACE = "https://w3id.org/vcf-rdfizer/vocab#"
-RDF_TYPE_URI = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
-XSD_POSITIVE_INTEGER_URI = "http://www.w3.org/2001/XMLSchema#positiveInteger"
+RDF_TYPE_URI = vocab.RDF_TYPE_URI
+#: Ordinals are serialized as xsd:integer, not xsd:positiveInteger: the SHACL
+#: profiles constrain every one of them with sh:datatype xsd:integer, and that
+#: constraint compares the datatype IRI exactly. See vcf_rdfizer_vocab.
+XSD_ORDINAL_URI = vocab.XSD_ORDINAL_URI
 SAMPLE_RDF_BUFFER_BYTES = 8 * 1024 * 1024
 # An N-Triples subject is always an IRI reference or a blank node label, so a
 # line starting with one of these bytes and ending in " ." is a statement.
 _NTRIPLES_SUBJECT_STARTS = (b"<", b"_")
 SAMPLE_REPRESENTATION_CHOICES = {"expanded", "condensed"}
 # How the INFO column is represented. "raw" is the historical behaviour (an
-# opaque vcfr:infoRaw string). "structured" additionally emits one
-# vcfr:InfoFieldValue per record and key, which is what makes INFO queryable.
+# opaque vcfc:infoRaw string). "structured" additionally emits one
+# vcfc:InfoFieldValue per record and key, plus the allele layer and the
+# vcfc:FieldValueItem decomposition, which is what makes INFO queryable.
 INFO_REPRESENTATION_CHOICES = ("raw", "structured")
 DEFAULT_INFO_REPRESENTATION = "structured"
 # Semantic validation accepts any artifact the pipeline can produce. Anything
@@ -377,7 +395,7 @@ DEFAULT_VALIDATION_TARGETS = "aggregate"
 # This is an internal rules-compatibility value, not a third public
 # representation. It means that custom helper TSV rows must be materialized.
 SAMPLE_HELPER_STRATEGY_MATERIALIZED = "expanded"
-METRICS_LAYOUT_VERSION = 2
+METRICS_LAYOUT_VERSION = 3
 
 
 # ---------------------------------------------------------------------------
@@ -1873,45 +1891,19 @@ def _sample_id_to_uri_id(sample_id: str, fallback_index: int) -> str:
     return candidate or f"sample_{fallback_index}"
 
 
-# Characters that ``quote_plus(..., safe="*-._")`` leaves untouched. Sample
-# ids, FORMAT keys, and numeric row ids are almost always drawn from this set,
-# so the fast path below skips percent-encoding entirely for them.
-_URI_COMPONENT_PASSTHROUGH_RE = re.compile(r"[A-Za-z0-9*\-._]*\Z")
-# Characters that require N-Triples escaping. VCF genotype/FORMAT payloads
-# essentially never contain them, so the common case avoids five str.replace
-# scans of the value.
-_NTRIPLES_ESCAPE_RE = re.compile(r'[\\"\n\r\t]')
+# The serialization helpers live in vcf_rdfizer_vocab so the parsers there can
+# use them; these names stay because the emitters below and the unit tests
+# reference them.
+_rml_uri_component = vocab.rml_uri_component
+_ntriples_string_literal = vocab.ntriples_string_literal
+_ntriples_literal = vocab.ntriples_literal
+_ntriples_typed_literal = vocab.ntriples_typed_literal
+_ordinal_literal = vocab.ordinal_literal
 
 
-def _rml_uri_component(value: str) -> str:
-    """Match RMLStreamer's Java URLEncoder-based template substitution."""
-    if _URI_COMPONENT_PASSTHROUGH_RE.match(value) is not None:
-        return value
-    encoded = quote_plus(value, safe="*-._", encoding="utf-8", errors="strict")
-    # urllib follows current RFC rules and always leaves '~' unescaped, whereas
-    # java.net.URLEncoder (used by RMLStreamer 2.5.0) encodes it.
-    return encoded.replace("+", "%20").replace("~", "%7E")
-
-
-def _ntriples_string_literal(value: str) -> str:
-    """Serialize an RDF 1.1 plain/xsd:string literal for N-Triples."""
-    if _NTRIPLES_ESCAPE_RE.search(value) is None:
-        return f'"{value}"'
-    escaped = (
-        value.replace("\\", "\\\\")
-        .replace('"', '\\"')
-        .replace("\n", "\\n")
-        .replace("\r", "\\r")
-        .replace("\t", "\\t")
-    )
-    return f'"{escaped}"'
-
-
-def _ntriples_literal(value: str) -> str:
-    literal = _ntriples_string_literal(value)
-    if value == ".":
-        literal += f"^^<{VCFR_NAMESPACE}Null>"
-    return literal
+def _vocab(local_name: str) -> str:
+    """Absolute IRI of one VCF Core term."""
+    return f"{VCFC_NAMESPACE}{local_name}"
 
 
 @dataclass(frozen=True)
@@ -1929,12 +1921,20 @@ class ParsedSampleRecord:
 
     source_file: str
     row_id: str
-    #: Raw QUAL and INFO columns, needed by the record-detail emitter.
+    #: Raw fixed-field columns the record-detail emitter needs: the three whose
+    #: datatype depends on the row (ID, QUAL, FILTER), the INFO payload, and
+    #: CHROM/REF/ALT, which the allele layer decomposes.
     qual: str
     info: str
     format_keys: tuple[str, ...]
     sample_payloads: tuple[str, ...]
     sample_values: tuple[tuple[str, ...], ...]
+    chrom: str = ""
+    pos: str = ""
+    record_id: str = ""
+    ref: str = ""
+    alt: str = ""
+    filter_value: str = ""
 
 
 class SampleRecordStream:
@@ -2020,7 +2020,13 @@ class SampleRecordStream:
                 f"'{source_file}'"
             )
         row_id = row[1] if len(row) > 1 else ""
+        chrom_raw = row[2] if len(row) > 2 else ""
+        pos_raw = row[3] if len(row) > 3 else ""
+        record_id_raw = row[4] if len(row) > 4 else ""
+        ref_raw = row[5] if len(row) > 5 else ""
+        alt_raw = row[6] if len(row) > 6 else ""
         qual_raw = row[7] if len(row) > 7 else ""
+        filter_raw = row[8] if len(row) > 8 else ""
         info_raw = row[9] if len(row) > 9 else ""
         format_raw = row[10] if len(row) > 10 else ""
         samples_raw = row[-1] if len(row) >= 12 else ""
@@ -2068,6 +2074,12 @@ class SampleRecordStream:
             format_keys=format_keys,
             sample_payloads=tuple(sample_payloads),
             sample_values=sample_values,
+            chrom=chrom_raw,
+            pos=pos_raw,
+            record_id=record_id_raw,
+            ref=ref_raw,
+            alt=alt_raw,
+            filter_value=filter_raw,
         )
 
 
@@ -2111,22 +2123,272 @@ def _append_rdf_atomically(rdf_path: Path, stats: dict, producer):
         raise
 
 
+def _emit_sample_set(emit, *, file_uri: str, columns, stats: dict) -> str:
+    """Emit the file's ordered sample columns once, and return the set IRI.
+
+    ``vcfc:SampleSet`` and ``vcfc:VCFSample`` are file-scoped, not profile-
+    scoped: the condensed profile needs the set to interpret its vectors, and
+    the expanded profile uses it to give each ``vcfc:SampleCall`` a reusable
+    identity through ``vcfc:forSample`` instead of relying on repeated
+    ``vcfc:sampleId`` literals. Emitting it in both profiles does not mix them,
+    because what the SPARQL profile forbids mixing is per-sample calls and
+    cohort matrices, not the sample set itself.
+
+    The ``#CHROM`` column header line also gains ``vcfc:hasGenotypeColumns``
+    here, because the sample columns live in the records TSV header rather than
+    in any row of the header-lines table.
+    """
+    if not columns:
+        # A sites-only VCF declares no sample columns. vcfc:SampleSetShape
+        # requires at least one vcfc:hasSample, so an empty set would be worse
+        # than no set at all; vcfc:hasSampleSet is optional on the file.
+        return ""
+    sample_set_uri = f"{file_uri}#samples"
+    column_header_uri = f"{file_uri}#header/columns"
+    emit(f"<{file_uri}> <{_vocab('hasSampleSet')}> <{sample_set_uri}> .\n")
+    emit(f"<{sample_set_uri}> <{RDF_TYPE_URI}> <{_vocab('SampleSet')}> .\n")
+    for column in columns:
+        sample_uri = f"{sample_set_uri}/{_rml_uri_component(column.uri_id)}"
+        emit(f"<{sample_set_uri}> <{_vocab('hasSample')}> <{sample_uri}> .\n")
+        emit(f"<{sample_uri}> <{RDF_TYPE_URI}> <{_vocab('VCFSample')}> .\n")
+        emit(
+            f"<{sample_uri}> <{_vocab('sampleName')}> "
+            f"{_ntriples_string_literal(column.sample_id)} .\n"
+        )
+        emit(
+            f"<{sample_uri}> <{_vocab('sampleIndex')}> "
+            f"{_ordinal_literal(column.index)} .\n"
+        )
+        emit(
+            f"<{column_header_uri}> <{_vocab('hasGenotypeColumns')}> "
+            f"<{sample_uri}> .\n"
+        )
+        stats["samples"] += 1
+    return sample_set_uri
+
+
+def _emit_format_field_definition(
+    emit,
+    *,
+    definition: "FormatDefinition",
+    field_id: str,
+    emitted: set,
+    stats: dict | None = None,
+) -> str:
+    """Emit one ``vcfc:FormatFieldDefinition`` the first time its key is seen."""
+    if definition.uri in emitted:
+        return definition.uri
+    emitted.add(definition.uri)
+    emit(
+        f"<{definition.uri}> <{RDF_TYPE_URI}> "
+        f"<{_vocab('FormatFieldDefinition')}> .\n"
+    )
+    # A key declared by a '##FORMAT' line already has its ID/Number/Type/
+    # Description from the header emitter, at this very IRI; emitting them
+    # again would duplicate every one of those triples.
+    if definition.synthesized:
+        _emit_field_definition_attributes(
+            emit,
+            definition.uri,
+            field_id=field_id,
+            number=definition.field_number,
+            # A FORMAT field may not be a Flag, so an undeclared key defaults
+            # to String rather than inheriting the INFO fallback.
+            value_type=definition.value_type or "String",
+            description=definition.description,
+        )
+    if stats is not None:
+        stats["format_definitions"] += 1
+    return definition.uri
+
+
+def _synthesized_format_definition(file_uri: str, format_key: str, component: str) -> "FormatDefinition":
+    """Build a definition for a FORMAT key the header never declared."""
+    return FormatDefinition(
+        uri=f"{file_uri}#header/format/{component}",
+        field_number=".",
+        description=f"Synthesized definition for undeclared FORMAT key {format_key}",
+        value_type="String",
+        synthesized=True,
+    )
+
+
+def _emit_genotype(
+    emit,
+    *,
+    sample_uri: str,
+    record_uri: str,
+    value: str,
+    alt_count: int,
+    stats: dict,
+) -> None:
+    """Emit the parsed GT of one sample call.
+
+    A GT that is absent or outside the vcfc:GenotypeString lexical space
+    produces no Genotype resource: the value is still present as the FORMAT
+    field's ``vcfc:fieldValue``, and inventing a Genotype for it would create a
+    resource that fails ``vcfc:GenotypeShape``.
+    """
+    parsed = vocab.parse_genotype(value)
+    if parsed is None:
+        return
+    genotype_uri = f"{sample_uri}/genotype"
+    emit(f"<{sample_uri}> <{_vocab('hasGenotype')}> <{genotype_uri}> .\n")
+    emit(f"<{genotype_uri}> <{RDF_TYPE_URI}> <{_vocab('Genotype')}> .\n")
+    emit(
+        f"<{genotype_uri}> <{_vocab('genotypeString')}> "
+        f"{_ntriples_typed_literal(parsed.genotype_string, vocab.GENOTYPE_STRING_DATATYPE_URI)} .\n"
+    )
+    emit(
+        f"<{genotype_uri}> <{_vocab('ploidy')}> "
+        f"{_ordinal_literal(parsed.ploidy)} .\n"
+    )
+    emit(
+        f"<{genotype_uri}> <{_vocab('phasingStatus')}> "
+        f"<{_vocab('Phased' if parsed.is_phased else 'Unphased')}> .\n"
+    )
+    for call in parsed.calls:
+        call_uri = f"{genotype_uri}/call/{call.call_index}"
+        emit(f"<{genotype_uri}> <{_vocab('hasAlleleCall')}> <{call_uri}> .\n")
+        emit(
+            f"<{call_uri}> <{RDF_TYPE_URI}> "
+            f"<{_vocab('GenotypeAlleleCall')}> .\n"
+        )
+        emit(
+            f"<{call_uri}> <{_vocab('callIndex')}> "
+            f"{_ordinal_literal(call.call_index)} .\n"
+        )
+        emit(
+            f"<{call_uri}> <{_vocab('isNoCall')}> "
+            f'"{"true" if call.is_no_call else "false"}"^^<{XSD_BOOLEAN_URI}> .\n'
+        )
+        if call.allele_index is not None and call.allele_index <= alt_count:
+            emit(
+                f"<{call_uri}> <{_vocab('calledAllele')}> "
+                f"<{record_uri}/allele/{call.allele_index}> .\n"
+            )
+        stats["genotype_calls"] += 1
+    stats["genotypes"] += 1
+
+
+def _emit_phase_set(emit, *, sample_uri: str, phase_fields: dict, stats: dict) -> None:
+    """Emit the PS/PSL/PSO/PSQ phase-set carrier of one sample call."""
+    identifier = phase_fields.get("PS")
+    name = phase_fields.get("PSL")
+    if vocab.is_missing(identifier) and vocab.is_missing(name):
+        return
+    phase_set_uri = f"{sample_uri}/phaseset"
+    genotype_uri = f"{sample_uri}/genotype"
+    emit(f"<{genotype_uri}> <{_vocab('inPhaseSet')}> <{phase_set_uri}> .\n")
+    emit(f"<{phase_set_uri}> <{RDF_TYPE_URI}> <{_vocab('PhaseSet')}> .\n")
+    if not vocab.is_missing(identifier):
+        emit(
+            f"<{phase_set_uri}> <{_vocab('phaseSetId')}> "
+            f"{_ntriples_string_literal(identifier)} .\n"
+        )
+    if not vocab.is_missing(name):
+        emit(
+            f"<{phase_set_uri}> <{_vocab('phaseSetName')}> "
+            f"{_ntriples_string_literal(name)} .\n"
+        )
+    ordinal = phase_fields.get("PSO")
+    if not vocab.is_missing(ordinal) and ordinal.lstrip("-").isdigit():
+        emit(
+            f"<{phase_set_uri}> <{_vocab('phaseSetOrdinal')}> "
+            f"{_ntriples_typed_literal(ordinal, XSD_INTEGER_URI)} .\n"
+        )
+    quality = phase_fields.get("PSQ")
+    if not vocab.is_missing(quality):
+        emit(
+            f"<{phase_set_uri}> <{_vocab('phaseSetQuality')}> "
+            f"{_ntriples_literal(quality)} .\n"
+        )
+    stats["phase_sets"] += 1
+
+
+def _emit_local_allele_set(
+    emit, *, sample_uri: str, record_uri: str, value: str, alt_count: int, stats: dict
+) -> None:
+    """Emit the LAA local-allele subset declared for one sample."""
+    indices = [index for index in vocab.parse_local_allele_indices(value) if index <= alt_count]
+    if not indices:
+        return
+    set_uri = f"{sample_uri}/localalleles"
+    genotype_uri = f"{sample_uri}/genotype"
+    emit(f"<{genotype_uri}> <{_vocab('hasLocalAlleleSet')}> <{set_uri}> .\n")
+    emit(f"<{set_uri}> <{RDF_TYPE_URI}> <{_vocab('LocalAlleleSet')}> .\n")
+    for local_index, allele_index in enumerate(indices, start=1):
+        allele_uri = f"{record_uri}/allele/{allele_index}"
+        emit(f"<{set_uri}> <{_vocab('hasLocalAllele')}> <{allele_uri}> .\n")
+        emit(
+            f"<{allele_uri}> <{_vocab('localAlleleIndex')}> "
+            f"{_ordinal_literal(local_index)} .\n"
+        )
+    stats["local_allele_sets"] += 1
+
+
+def _emit_base_modification(
+    emit, *, sample_uri: str, modification, value: str, stats: dict
+) -> None:
+    """Emit the vcfc:BaseModification carrier for one M/DPM/ADM FORMAT key."""
+    if vocab.is_missing(value):
+        return
+    modification_uri = f"{sample_uri}/basemod/{_rml_uri_component(modification.key)}"
+    emit(
+        f"<{modification_uri}> <{RDF_TYPE_URI}> "
+        f"<{_vocab('BaseModification')}> .\n"
+    )
+    emit(
+        f"<{modification_uri}> <{_vocab('modifiedResidue')}> "
+        f"<{modification.residue_uri}> .\n"
+    )
+    # VCF 4.5 gives the base-modification FORMAT families a per-base offset;
+    # without an explicit one, position 0 is the modified base named by the key.
+    emit(
+        f"<{modification_uri}> <{_vocab('modifiedBaseOffset')}> "
+        f"{_ordinal_literal(0)} .\n"
+    )
+    emit(
+        f"<{modification_uri}> <{_vocab(modification.value_property)}> "
+        f"{_ntriples_literal(value)} .\n"
+    )
+    stats["base_modifications"] += 1
+
+
 def append_expanded_sample_rdf(
     records_tsv: Path,
     rdf_path: Path,
+    header_lines_tsv: Path | None = None,
     *,
+    version: "vocab.VCFVersion | None" = None,
     progress_interval_records: int = 10_000,
 ) -> dict:
-    """Append the expanded SampleCall/FormatFieldValue representation.
+    """Append the expanded per-sample representation.
 
-    This produces the same canonical SampleCall and FormatFieldValue triples as
-    the default RML maps without materializing V*S and V*S*F helper TSV rows.
+    Produces the canonical SampleCall and FormatFieldValue resources without
+    materializing the V*S and V*S*F helper TSV rows, and adds the genotype layer
+    the vocabulary defines for this profile: the parsed GT of each sample as a
+    ``vcfc:Genotype`` with one ``vcfc:GenotypeAlleleCall`` per position, the
+    FT sample filter, the PS/PSL phase set, the LAA local-allele subset, the
+    copy-number and haplotype fields, and the M/DPM/ADM base modifications.
+
+    The genotype layer is expanded-only by design. Decomposing GT per sample is
+    exactly the per-sample materialization the condensed profile exists to
+    avoid, so the condensed emitter keeps those values inside their vectors.
     """
     stats = {
         "representation": "expanded",
         "records": 0,
+        "samples": 0,
         "sample_calls": 0,
         "format_values": 0,
+        "format_definitions": 0,
+        "genotypes": 0,
+        "genotype_calls": 0,
+        "phase_sets": 0,
+        "local_allele_sets": 0,
+        "base_modifications": 0,
+        "value_items": 0,
         "triples": 0,
         "appended_bytes": 0,
     }
@@ -2135,17 +2397,32 @@ def append_expanded_sample_rdf(
     if not rdf_path.is_file():
         raise FileNotFoundError(f"RDF aggregate not found for sample streaming: {rdf_path}")
 
+    version = version or vocab.FALLBACK_VERSION
+    definitions = (
+        _load_format_definitions(header_lines_tsv)
+        if header_lines_tsv is not None
+        else {}
+    )
+
     with SampleRecordStream(records_tsv) as record_stream:
-        if not record_stream.columns or not record_stream.source_file:
+        if not record_stream.source_file:
             return stats
 
         def produce(emit):
             source_component = _rml_uri_component(record_stream.source_file)
             file_uri = f"file://{source_component}"
+            # The profile is declared even for a sites-only VCF.
+            # vcfc:RepresentationProfileShape requires exactly one on every
+            # vcfc:VCFFile, and a file with no genotype columns has no genotype
+            # data to condense, so the expanded profile is the honest claim.
             emit(
-                f"<{file_uri}> <{VCFR_NAMESPACE}representationProfile> "
-                f"<{VCFR_NAMESPACE}ExpandedRepresentation> .\n"
+                f"<{file_uri}> <{_vocab('representationProfile')}> "
+                f"<{_vocab('ExpandedRepresentation')}> .\n"
             )
+            _emit_sample_set(
+                emit, file_uri=file_uri, columns=record_stream.columns, stats=stats
+            )
+
             # Sample columns and their serialized sampleId literal are fixed for
             # the whole file; FORMAT keys are drawn from a handful of distinct
             # values. Encoding them once per file instead of once per
@@ -2158,14 +2435,24 @@ def append_expanded_sample_rdf(
                 for column in record_stream.columns
             ]
             format_components: dict[str, str] = {}
+            emitted_definitions: set[str] = set()
+            # Base-modification FORMAT keys are pattern-defined, so each distinct
+            # key is classified once rather than per sample and record.
+            base_modifications: dict[str, object] = {}
             sample_call_count = 0
             format_value_count = 0
 
             for record in record_stream:
                 row_component = _rml_uri_component(record.row_id)
                 call_uri = f"{file_uri}#call/{row_component}"
+                record_uri = f"{file_uri}#record/{row_component}"
                 format_keys = record.format_keys
                 record_sample_values = record.sample_values
+                alt_count = (
+                    0
+                    if vocab.is_missing(record.alt)
+                    else len(record.alt.split(","))
+                )
 
                 for sample_index, (sample_component, sample_id_literal) in enumerate(
                     sample_prefixes
@@ -2173,14 +2460,19 @@ def append_expanded_sample_rdf(
                     sample_uri = f"{file_uri}#sample/{row_component}/{sample_component}"
                     sample_values = record_sample_values[sample_index]
 
-                    emit(f"<{call_uri}> <{VCFR_NAMESPACE}hasSampleCall> <{sample_uri}> .\n")
-                    emit(f"<{sample_uri}> <{RDF_TYPE_URI}> <{VCFR_NAMESPACE}SampleCall> .\n")
+                    emit(f"<{call_uri}> <{_vocab('hasSampleCall')}> <{sample_uri}> .\n")
+                    emit(f"<{sample_uri}> <{RDF_TYPE_URI}> <{_vocab('SampleCall')}> .\n")
                     emit(
-                        f"<{sample_uri}> <{VCFR_NAMESPACE}sampleId> "
+                        f"<{sample_uri}> <{_vocab('sampleId')}> "
                         f"{sample_id_literal} .\n"
+                    )
+                    emit(
+                        f"<{sample_uri}> <{_vocab('forSample')}> "
+                        f"<{file_uri}#samples/{sample_component}> .\n"
                     )
                     sample_call_count += 1
 
+                    phase_fields: dict[str, str] = {}
                     for format_index, format_key in enumerate(format_keys):
                         format_value = sample_values[format_index]
                         format_component = format_components.get(format_key)
@@ -2188,14 +2480,113 @@ def append_expanded_sample_rdf(
                             format_component = _rml_uri_component(format_key)
                             format_components[format_key] = format_component
                         format_uri = f"{sample_uri}/fmt/{format_component}"
-                        emit(f"<{sample_uri}> <{VCFR_NAMESPACE}hasFormatValue> <{format_uri}> .\n")
-                        emit(f"<{format_uri}> <{RDF_TYPE_URI}> <{VCFR_NAMESPACE}FormatFieldValue> .\n")
+
+                        definition = definitions.get(format_key)
+                        if definition is None:
+                            definition = _synthesized_format_definition(
+                                file_uri, format_key, format_component
+                            )
+                            definitions[format_key] = definition
+                        _emit_format_field_definition(
+                            emit,
+                            definition=definition,
+                            field_id=format_key,
+                            emitted=emitted_definitions,
+                            stats=stats,
+                        )
+
+                        emit(f"<{sample_uri}> <{_vocab('hasFormatValue')}> <{format_uri}> .\n")
+                        emit(
+                            f"<{format_uri}> <{RDF_TYPE_URI}> "
+                            f"<{_vocab('FormatFieldValue')}> .\n"
+                        )
+                        emit(
+                            f"<{format_uri}> <{_vocab('declaredBy')}> "
+                            f"<{definition.uri}> .\n"
+                        )
                         if format_value:
                             emit(
-                                f"<{format_uri}> <{VCFR_NAMESPACE}fieldValue> "
+                                f"<{format_uri}> <{_vocab('fieldValue')}> "
                                 f"{_ntriples_literal(format_value)} .\n"
                             )
+                            if alt_count:
+                                _emit_value_items(
+                                    emit,
+                                    parent_uri=format_uri,
+                                    field_key=format_key,
+                                    value=format_value,
+                                    number=definition.field_number,
+                                    allele_uris={
+                                        index: f"{record_uri}/allele/{index}"
+                                        for index in range(alt_count + 1)
+                                    },
+                                    version=version,
+                                    stats=stats,
+                                )
                         format_value_count += 1
+
+                        if not format_value:
+                            continue
+                        if format_key == "GT":
+                            _emit_genotype(
+                                emit,
+                                sample_uri=sample_uri,
+                                record_uri=record_uri,
+                                value=format_value,
+                                alt_count=alt_count,
+                                stats=stats,
+                            )
+                        elif format_key == "FT":
+                            emit(
+                                f"<{sample_uri}> <{_vocab('sampleFilter')}> "
+                                f"{_ntriples_literal(format_value)} .\n"
+                            )
+                        elif format_key in vocab.PHASE_SET_FORMAT_KEYS:
+                            phase_fields[format_key] = format_value
+                        elif format_key == "LAA" and version.local_alleles:
+                            _emit_local_allele_set(
+                                emit,
+                                sample_uri=sample_uri,
+                                record_uri=record_uri,
+                                value=format_value,
+                                alt_count=alt_count,
+                                stats=stats,
+                            )
+                        elif format_key in vocab.COPY_NUMBER_FORMAT_KEYS:
+                            emit(
+                                f"<{sample_uri}> "
+                                f"<{_vocab(vocab.COPY_NUMBER_FORMAT_KEYS[format_key])}> "
+                                f"{_ntriples_literal(format_value)} .\n"
+                            )
+                        elif format_key in vocab.HAPLOTYPE_FORMAT_KEYS:
+                            if format_value.lstrip("-").isdigit():
+                                emit(
+                                    f"<{sample_uri}> "
+                                    f"<{_vocab(vocab.HAPLOTYPE_FORMAT_KEYS[format_key])}> "
+                                    f"{_ntriples_typed_literal(format_value, XSD_INTEGER_URI)} .\n"
+                                )
+                        elif version.base_modifications:
+                            if format_key not in base_modifications:
+                                base_modifications[format_key] = (
+                                    vocab.parse_base_modification_key(format_key)
+                                )
+                            modification = base_modifications[format_key]
+                            if modification is not None:
+                                _emit_base_modification(
+                                    emit,
+                                    sample_uri=sample_uri,
+                                    modification=modification,
+                                    value=format_value,
+                                    stats=stats,
+                                )
+
+                    if phase_fields:
+                        _emit_phase_set(
+                            emit,
+                            sample_uri=sample_uri,
+                            phase_fields=phase_fields,
+                            stats=stats,
+                        )
 
                 stats["records"] += 1
                 stats["sample_calls"] = sample_call_count
@@ -2213,20 +2604,24 @@ def append_expanded_sample_rdf(
 def append_canonical_sample_rdf(
     records_tsv: Path,
     rdf_path: Path,
+    header_lines_tsv: Path | None = None,
     *,
+    version: "vocab.VCFVersion | None" = None,
     progress_interval_records: int = 10_000,
 ) -> dict:
     """Backward-compatible name for the expanded sample RDF emitter."""
     return append_expanded_sample_rdf(
         records_tsv,
         rdf_path,
+        header_lines_tsv,
+        version=version,
         progress_interval_records=progress_interval_records,
     )
 
 
 @dataclass(frozen=True)
 class FormatDefinition:
-    """Structured attributes and RDF identity for one FORMAT declaration."""
+    """Structured attributes and RDF identity for one INFO/FORMAT declaration."""
 
     uri: str
     field_number: str
@@ -2234,46 +2629,21 @@ class FormatDefinition:
     #: The declared VCF Type (Integer/Float/Flag/Character/String). Defaults to
     #: String so an undeclared field still has a usable value type.
     value_type: str = "String"
+    #: ##INFO recommends Source and Version; the SHACL profile warns when a
+    #: concrete INFO declaration omits them.
+    source: str | None = None
+    version: str | None = None
+    #: True when no '##' line declared this key and the definition was invented
+    #: so the value still has something to cite. A declared definition is owned
+    #: by the header emitter, which emits its ID/Number/Type/Description from
+    #: the header line; emitting them again here would duplicate every triple.
+    synthesized: bool = False
 
 
-def _parse_structured_header_fields(value: str) -> dict[str, str]:
-    """Parse comma-delimited VCF header attributes while respecting quotes."""
-    inner = value.strip()
-    if inner.startswith("<") and inner.endswith(">"):
-        inner = inner[1:-1]
-
-    tokens: list[str] = []
-    token: list[str] = []
-    in_quotes = False
-    escaped = False
-    for character in inner:
-        if escaped:
-            token.append(character)
-            escaped = False
-        elif character == "\\" and in_quotes:
-            token.append(character)
-            escaped = True
-        elif character == '"':
-            token.append(character)
-            in_quotes = not in_quotes
-        elif character == "," and not in_quotes:
-            tokens.append("".join(token))
-            token = []
-        else:
-            token.append(character)
-    tokens.append("".join(token))
-
-    fields: dict[str, str] = {}
-    for item in tokens:
-        if "=" not in item:
-            continue
-        key, raw_value = item.split("=", 1)
-        parsed_value = raw_value.strip()
-        if len(parsed_value) >= 2 and parsed_value[0] == parsed_value[-1] == '"':
-            parsed_value = parsed_value[1:-1]
-            parsed_value = parsed_value.replace('\\"', '"').replace("\\\\", "\\")
-        fields[key.strip()] = parsed_value
-    return fields
+#: Kept as module-level names because the emitters and the unit tests use them.
+_parse_structured_header_fields = vocab.parse_structured_header_fields
+_parse_structured_header_attributes = vocab.parse_structured_header_attributes
+_typed_info_object = vocab.typed_field_object
 
 
 def _load_field_definitions(
@@ -2283,7 +2653,7 @@ def _load_field_definitions(
 
     Serves both ``##FORMAT`` and ``##INFO`` declarations, which share the
     ``<ID=,Number=,Type=,Description=>`` syntax and the same vocabulary shape
-    (``vcfr:FieldDefinition`` with ``fieldId``/``fieldNumber``/``fieldType``).
+    (``vcfc:FieldDefinition`` with ``fieldId``/``fieldNumber``/``fieldType``).
     """
     definitions: dict[str, FormatDefinition] = {}
     if not header_lines_tsv.is_file():
@@ -2310,6 +2680,8 @@ def _load_field_definitions(
                         or f"{wanted} field {field_id} (source declaration has no Description)"
                     ),
                     value_type=fields.get("Type") or "String",
+                    source=fields.get("Source"),
+                    version=fields.get("Version"),
                 ),
             )
     return definitions
@@ -2320,134 +2692,160 @@ def _load_format_definitions(header_lines_tsv: Path) -> dict[str, FormatDefiniti
     return _load_field_definitions(header_lines_tsv, "FORMAT")
 
 
-#: Maps a declared VCF INFO/FORMAT Type to its vocabulary value-type class.
-VCF_VALUE_TYPE_CLASSES = {
-    "Integer": "IntegerType",
-    "Float": "FloatType",
-    "Flag": "FlagType",
-    "Character": "CharacterType",
-    "String": "StringType",
-}
-#: Typed value predicates used when a single-valued field declares a numeric or
-#: flag type. Multi-valued fields (Number=A/R/G/.) keep only the lexical value,
-#: because the vocabulary gives one InfoFieldValue node per key.
-XSD_INTEGER_URI = "http://www.w3.org/2001/XMLSchema#integer"
-XSD_DECIMAL_URI = "http://www.w3.org/2001/XMLSchema#decimal"
-XSD_BOOLEAN_URI = "http://www.w3.org/2001/XMLSchema#boolean"
+def _load_assembly_line_uri(header_lines_tsv: Path) -> str | None:
+    """Return the IRI of the ``##assembly`` header line, if the file has one.
 
-
-def parse_info_entries(info: str) -> list[tuple[str, str | None]]:
-    """Split an INFO column into ``(key, value)`` pairs.
-
-    An entry without ``=`` is a Flag: a presence assertion with no value, which
-    the vocabulary models as ``vcfr:fieldValueBoolean true``.
+    A bracketed CHROM names a contig from that assembly FASTA, so the assembly
+    contig cites the line that located it.
     """
-    if info in ("", "."):
-        return []
-    entries: list[tuple[str, str | None]] = []
-    for item in info.split(";"):
-        if not item:
-            continue
-        key, separator, value = item.partition("=")
-        entries.append((key, value if separator else None))
-    return entries
-
-
-def _typed_info_object(value: str, declared_type: str) -> tuple[str, str] | None:
-    """Return ``(predicate_local_name, literal)`` for a typed single value."""
-    if "," in value or value == ".":
+    if not header_lines_tsv.is_file():
         return None
-    try:
-        if declared_type == "Integer":
-            return "fieldValueInteger", f'"{int(value)}"^^<{XSD_INTEGER_URI}>'
-        if declared_type == "Float":
-            # Serialize the source lexical form rather than a reparsed float, so
-            # the graph never gains or loses precision relative to the VCF.
-            float(value)
-            return "fieldValueDecimal", f'"{value}"^^<{XSD_DECIMAL_URI}>'
-    except ValueError:
-        # A value that contradicts its declared type is kept as a plain literal
-        # rather than dropped; the conversion must not silently lose data.
-        return None
+    _set_max_csv_field_size()
+    with header_lines_tsv.open(newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle, delimiter="\t"):
+            if (row.get("HEADER_KEY") or "").strip().lower() != "assembly":
+                continue
+            source_component = _rml_uri_component(row.get("SOURCE_FILE") or "")
+            index_component = _rml_uri_component(row.get("HEADER_INDEX") or "")
+            return f"file://{source_component}#header/line/{index_component}"
     return None
 
 
+def _load_contig_line_uris(header_lines_tsv: Path) -> dict[str, str]:
+    """Map each declared contig ID to the IRI of its ``##contig`` header line.
+
+    ``vcfc:chromosome`` links a record to the contig declaration its CHROM value
+    names, which is what the SPARQL profile's POS-versus-contig-length check
+    traverses.
+    """
+    contigs: dict[str, str] = {}
+    if not header_lines_tsv.is_file():
+        return contigs
+    _set_max_csv_field_size()
+    with header_lines_tsv.open(newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle, delimiter="\t"):
+            if (row.get("HEADER_KEY") or "").strip().lower() != "contig":
+                continue
+            fields = _parse_structured_header_fields(row.get("HEADER_VALUE") or "")
+            contig_id = (fields.get("ID") or "").strip()
+            if not contig_id:
+                continue
+            source_component = _rml_uri_component(row.get("SOURCE_FILE") or "")
+            index_component = _rml_uri_component(row.get("HEADER_INDEX") or "")
+            contigs.setdefault(
+                contig_id,
+                f"file://{source_component}#header/line/{index_component}",
+            )
+    return contigs
+
+
+#: Retained name for the VCF Type individuals. Since vocabulary 3.0.0 these are
+#: owl:NamedIndividual members of vcfc:VCFValueType rather than classes, so they
+#: only ever appear as the object of vcfc:fieldType.
+VCF_VALUE_TYPE_CLASSES = VCF_VALUE_TYPE_INDIVIDUALS
+
+XSD_INTEGER_URI = vocab.XSD_INTEGER_URI
+XSD_DECIMAL_URI = vocab.XSD_DECIMAL_URI
+XSD_BOOLEAN_URI = vocab.XSD_BOOLEAN_URI
+XSD_DATE_URI = vocab.XSD_DATE_URI
+XSD_ANY_URI = vocab.XSD_ANY_URI
+FILE_DATE_PATTERNS = vocab.FILE_DATE_PATTERNS
+
+
 # How the VCF meta-information block is represented. "basic" is the historical
-# behaviour: every '##' line becomes an untyped vcfr:HeaderLine carrying its raw
+# behaviour: every '##' line becomes an untyped vcfc:HeaderLine carrying its raw
 # key and value. "structured" additionally types each line with the vocabulary's
-# subclass and lifts the attributes of FILTER, ALT and contig declarations into
-# their own properties, so the header becomes queryable rather than just present.
+# subclass, emits the ordered vcfc:HeaderAttribute resources that
+# vcfc:StructuredHeaderLineShape requires, and lifts the INFO, FORMAT, FILTER,
+# ALT, contig, META, SAMPLE and PEDIGREE attributes into their own properties,
+# so the header becomes queryable rather than just present.
+#
+# Only "structured" produces a graph that satisfies the published SHACL
+# profiles: a header line typed with one of the structured subclasses must
+# carry at least one vcfc:hasAttribute, and "basic" emits no subclass at all.
 HEADER_REPRESENTATION_CHOICES = ("basic", "structured")
 DEFAULT_HEADER_REPRESENTATION = "structured"
 
-#: '##' key (lower-cased) -> the vocabulary subclass for that line.
-HEADER_LINE_CLASSES = {
-    "fileformat": "FileFormatHeaderLine",
-    "filedate": "FileDateHeaderLine",
-    "source": "SourceHeaderLine",
-    "reference": "ReferenceHeaderLine",
-    "info": "INFOHeaderLine",
-    "format": "FORMATHeaderLine",
-    "filter": "FILTERHeaderLine",
-    "alt": "ALTHeaderLine",
-    "contig": "ContigHeaderLine",
-}
-#: contig attribute -> vocabulary predicate.
-CONTIG_ATTRIBUTES = {
-    "length": "contigLength",
-    "md5": "contigMd5",
-    "assembly": "contigAssembly",
-}
+# Which VCF specification version the conversion should follow. "auto" reads it
+# from the input's own ##fileformat line, which VCF requires to be the first
+# line of the file, so the default needs nothing from the user. An explicit
+# version is an override for a file whose declaration is missing or wrong.
+VCF_VERSION_CHOICES = ("auto", *sorted(vocab.VCF_VERSIONS))
+DEFAULT_VCF_VERSION = "auto"
 
 
-XSD_DATE_URI = "http://www.w3.org/2001/XMLSchema#date"
-#: ##fileDate has no mandated format. These are the two forms seen in practice
-#: that map unambiguously onto xsd:date, which the SHACL shape requires.
-FILE_DATE_PATTERNS = (
-    (re.compile(r"^(\d{4})(\d{2})(\d{2})$"), "{0}-{1}-{2}"),
-    (re.compile(r"^(\d{4})-(\d{2})-(\d{2})$"), "{0}-{1}-{2}"),
-)
+def _emit_field_definition_attributes(
+    emit,
+    line_uri: str,
+    *,
+    field_id: str,
+    number: str,
+    value_type: str | None,
+    description: str | None,
+) -> None:
+    """Emit the ID/Number/Type/Description quartet shared by field definitions.
 
-
-def file_date_object(value: str) -> str | None:
-    """Serialize ##fileDate as xsd:date when its form allows, else lexically.
-
-    Returns None for an absent value so no triple is emitted, matching RML's
-    behaviour for an empty reference.
+    ``vcfc:fieldNumber`` keeps the source token losslessly. ``vcfc:fieldArity``
+    is added for a symbolic token and ``vcfc:fieldNumberInteger`` for a fixed
+    count; the SPARQL profile requires the arity individual's code to equal the
+    fieldNumber token, so both are derived from the same string.
     """
-    value = (value or "").strip()
-    if not value or value == ".":
-        return None
-    for pattern, template in FILE_DATE_PATTERNS:
-        match = pattern.match(value)
-        if match:
-            return f'"{template.format(*match.groups())}"^^<{XSD_DATE_URI}>'
-    # An unrecognized form is preserved verbatim rather than dropped; the SHACL
-    # layer reports it as non-conformant.
-    return _ntriples_string_literal(value)
+    emit(
+        f"<{line_uri}> <{_vocab('fieldId')}> "
+        f"{_ntriples_string_literal(field_id)} .\n"
+    )
+    emit(
+        f"<{line_uri}> <{_vocab('fieldNumber')}> "
+        f"{_ntriples_string_literal(number)} .\n"
+    )
+    arity = vocab.arity_individual(number)
+    if arity is not None:
+        emit(f"<{line_uri}> <{_vocab('fieldArity')}> <{_vocab(arity)}> .\n")
+    fixed_count = vocab.number_as_integer(number)
+    if fixed_count is not None:
+        emit(
+            f"<{line_uri}> <{_vocab('fieldNumberInteger')}> "
+            f"{_ordinal_literal(fixed_count)} .\n"
+        )
+    if value_type:
+        individual = VCF_VALUE_TYPE_INDIVIDUALS.get(value_type, "StringType")
+        emit(f"<{line_uri}> <{_vocab('fieldType')}> <{_vocab(individual)}> .\n")
+    if description is not None:
+        emit(
+            f"<{line_uri}> <{_vocab('fieldDescription')}> "
+            f"{_ntriples_string_literal(description)} .\n"
+        )
 
 
 def append_header_representation_rdf(
     header_lines_tsv: Path,
     rdf_path: Path,
 ) -> dict:
-    """Append typed header lines and structured FILTER/ALT/contig declarations.
+    """Append the structured VCF meta-information representation.
 
-    The default mapping emits every '##' line as an untyped ``vcfr:HeaderLine``
-    with a raw key and value. The vocabulary already defines a subclass per line
-    type and dedicated properties for the FILTER, ALT and contig attributes;
-    this emits them, which is what makes the meta-information block queryable.
+    The RML mapping emits every '##' line as an untyped ``vcfc:HeaderLine`` with
+    its raw key, value and line index. Everything that lives inside the
+    angle-bracketed value is added here: the line's vocabulary subclass, one
+    ordered ``vcfc:HeaderAttribute`` per source attribute, and the dedicated
+    properties for INFO, FORMAT, FILTER, ALT, contig, META, SAMPLE and PEDIGREE
+    declarations.
 
     Emitted directly rather than through RML because the attributes live inside
-    a single ``<ID=...,length=...>`` value that RML cannot decompose.
+    a single ``<ID=...,length=...>`` cell that RML cannot decompose, and because
+    several of them (contig length, contig URL, assembly URL) need a datatype
+    that the raw string does not carry.
     """
     stats = {
         "representation": "header",
         "header_lines": 0,
         "typed_lines": 0,
+        "attributes": 0,
+        "field_definitions": 0,
         "filter_definitions": 0,
         "alt_definitions": 0,
         "contigs": 0,
+        "sample_declarations": 0,
+        "pedigree_relations": 0,
         "file_dates": 0,
         "triples": 0,
         "appended_bytes": 0,
@@ -2465,6 +2863,17 @@ def append_header_representation_rdf(
         source_file = rows[0].get("SOURCE_FILE", "") if rows else ""
         file_uri = f"file://{_rml_uri_component(source_file)}"
         contig_count = 0
+        # ##SAMPLE declares a subject that ##PEDIGREE lines refer to by ID, so
+        # both mint the same IRI for one declared sample.
+        declaration_uris: dict[str, str] = {}
+
+        def declaration_uri(identifier: str) -> str:
+            existing = declaration_uris.get(identifier)
+            if existing is None:
+                existing = f"{file_uri}#header/sample/{_rml_uri_component(identifier)}"
+                declaration_uris[identifier] = existing
+            return existing
+
         for row in rows:
             key = (row.get("HEADER_KEY") or "").strip()
             value = row.get("HEADER_VALUE") or ""
@@ -2472,95 +2881,663 @@ def append_header_representation_rdf(
             line_uri = f"file://{_rml_uri_component(row.get('SOURCE_FILE') or '')}" \
                        f"#header/line/{index_component}"
             stats["header_lines"] += 1
+            key_lower = key.lower()
 
-            line_class = HEADER_LINE_CLASSES.get(key.lower())
+            line_class = HEADER_LINE_CLASSES.get(key_lower)
+            structured = vocab.is_structured_header_value(value)
             if line_class is None:
-                # An unrecognized '##' key keeps only the base HeaderLine type
-                # the mapping already emitted; inventing a subclass for it would
-                # put a term in the graph that the vocabulary does not define.
-                continue
-            emit(f"<{line_uri}> <{RDF_TYPE_URI}> <{VCFR_NAMESPACE}{line_class}> .\n")
+                # An unrecognized '##' key still belongs to one of the two VCF
+                # meta-information forms. Typing it keeps it queryable without
+                # inventing a subclass the vocabulary does not define. An
+                # unstructured line is only typed when it has a value, because
+                # vcfc:UnstructuredHeaderLineShape requires one.
+                if structured:
+                    line_class = "StructuredHeaderLine"
+                elif value:
+                    line_class = "UnstructuredHeaderLine"
+                else:
+                    continue
+            emit(f"<{line_uri}> <{RDF_TYPE_URI}> <{_vocab(line_class)}> .\n")
             stats["typed_lines"] += 1
 
-            if key.lower() not in {"filter", "alt", "contig"}:
+            if not structured:
+                if key_lower == "assembly" and value:
+                    emit(
+                        f"<{line_uri}> <{_vocab('assemblyUrl')}> "
+                        f"{_ntriples_typed_literal(value, XSD_ANY_URI)} .\n"
+                    )
+                elif key_lower == "pedigreedb" and value:
+                    emit(
+                        f"<{line_uri}> <{_vocab('pedigreeDbUrl')}> "
+                        f"{_ntriples_typed_literal(value, XSD_ANY_URI)} .\n"
+                    )
                 continue
-            fields = _parse_structured_header_fields(value)
+
+            # vcfc:StructuredHeaderLineShape requires at least one attribute on
+            # every structured line, so these are emitted for all of them, not
+            # only the ones with dedicated properties below.
+            attributes = _parse_structured_header_attributes(value)
+            for position, (attribute_key, attribute_value) in enumerate(attributes, start=1):
+                attribute_uri = f"{line_uri}/attribute/{position}"
+                emit(f"<{line_uri}> <{_vocab('hasAttribute')}> <{attribute_uri}> .\n")
+                emit(
+                    f"<{attribute_uri}> <{RDF_TYPE_URI}> "
+                    f"<{_vocab('HeaderAttribute')}> .\n"
+                )
+                emit(
+                    f"<{attribute_uri}> <{_vocab('attributeKey')}> "
+                    f"{_ntriples_string_literal(attribute_key)} .\n"
+                )
+                emit(
+                    f"<{attribute_uri}> <{_vocab('attributeValue')}> "
+                    f"{_ntriples_string_literal(attribute_value)} .\n"
+                )
+                emit(
+                    f"<{attribute_uri}> <{_vocab('attributeIndex')}> "
+                    f"{_ordinal_literal(position)} .\n"
+                )
+                stats["attributes"] += 1
+
+            fields = dict(attributes)
             identifier = (fields.get("ID") or "").strip()
-            if not identifier:
-                continue
             description = fields.get("Description")
 
-            if key.lower() == "filter":
-                emit(f"<{line_uri}> <{RDF_TYPE_URI}> <{VCFR_NAMESPACE}FilterDefinition> .\n")
+            if key_lower in {"info", "format"}:
+                if not identifier:
+                    continue
+                _emit_field_definition_attributes(
+                    emit,
+                    line_uri,
+                    field_id=identifier,
+                    number=fields.get("Number") or ".",
+                    value_type=fields.get("Type") or "String",
+                    description=(
+                        description
+                        or f"{key.upper()} field {identifier} "
+                        "(source declaration has no Description)"
+                    ),
+                )
+                if key_lower == "info":
+                    for attribute, predicate in vocab.INFO_EXTRA_ATTRIBUTES.items():
+                        attribute_value = fields.get(attribute)
+                        if attribute_value:
+                            emit(
+                                f"<{line_uri}> <{_vocab(predicate)}> "
+                                f"{_ntriples_string_literal(attribute_value)} .\n"
+                            )
+                stats["field_definitions"] += 1
+            elif key_lower == "filter":
+                if not identifier:
+                    continue
                 emit(
-                    f"<{line_uri}> <{VCFR_NAMESPACE}filterId> "
+                    f"<{line_uri}> <{_vocab('filterId')}> "
                     f"{_ntriples_string_literal(identifier)} .\n"
+                )
+                emit(
+                    f"<{line_uri}> <{_vocab('fieldDescription')}> "
+                    f"{_ntriples_string_literal(description or f'FILTER {identifier}')} .\n"
                 )
                 stats["filter_definitions"] += 1
-            elif key.lower() == "alt":
-                emit(f"<{line_uri}> <{RDF_TYPE_URI}> <{VCFR_NAMESPACE}AltDefinition> .\n")
+            elif key_lower == "alt":
+                if not identifier:
+                    continue
                 emit(
-                    f"<{line_uri}> <{VCFR_NAMESPACE}altId> "
+                    f"<{line_uri}> <{_vocab('altId')}> "
                     f"{_ntriples_string_literal(identifier)} .\n"
                 )
+                emit(
+                    f"<{line_uri}> <{_vocab('fieldDescription')}> "
+                    f"{_ntriples_string_literal(description or f'ALT {identifier}')} .\n"
+                )
                 stats["alt_definitions"] += 1
-            else:
+            elif key_lower == "contig":
+                if not identifier:
+                    continue
                 contig_count += 1
                 stats["contigs"] += 1
                 emit(
-                    f"<{line_uri}> <{VCFR_NAMESPACE}contigId> "
+                    f"<{line_uri}> <{_vocab('contigId')}> "
                     f"{_ntriples_string_literal(identifier)} .\n"
                 )
-                for attribute, predicate in CONTIG_ATTRIBUTES.items():
+                for attribute, (predicate, datatype) in CONTIG_ATTRIBUTES.items():
                     attribute_value = fields.get(attribute)
-                    if attribute_value:
+                    if not attribute_value:
+                        continue
+                    if datatype == XSD_INTEGER_URI and not attribute_value.lstrip("-").isdigit():
+                        # A non-numeric length is preserved lexically rather
+                        # than dropped; the SHACL layer reports it.
                         emit(
-                            f"<{line_uri}> <{VCFR_NAMESPACE}{predicate}> "
+                            f"<{line_uri}> <{_vocab(predicate)}> "
                             f"{_ntriples_string_literal(attribute_value)} .\n"
                         )
-                continue
-
-            if description:
-                emit(
-                    f"<{line_uri}> <{VCFR_NAMESPACE}fieldDescription> "
-                    f"{_ntriples_string_literal(description)} .\n"
+                        continue
+                    emit(
+                        f"<{line_uri}> <{_vocab(predicate)}> "
+                        f"{_ntriples_typed_literal(attribute_value, datatype)} .\n"
+                    )
+            elif key_lower == "meta":
+                if not identifier:
+                    continue
+                _emit_field_definition_attributes(
+                    emit,
+                    line_uri,
+                    field_id=identifier,
+                    number=fields.get("Number") or ".",
+                    # vcfc:MetaDefinitionShape excludes Flag, which VCF also
+                    # forbids for a ##META attribute.
+                    value_type=fields.get("Type") or "String",
+                    description=description,
                 )
+                for allowed in _parse_meta_values(fields.get("Values")):
+                    emit(
+                        f"<{line_uri}> <{_vocab('metaAllowedValue')}> "
+                        f"{_ntriples_string_literal(allowed)} .\n"
+                    )
+                stats["field_definitions"] += 1
+            elif key_lower == "sample":
+                if not identifier:
+                    continue
+                subject_uri = declaration_uri(identifier)
+                emit(f"<{line_uri}> <{_vocab('declaresSample')}> <{subject_uri}> .\n")
+                emit(
+                    f"<{subject_uri}> <{RDF_TYPE_URI}> "
+                    f"<{_vocab('SampleDeclaration')}> .\n"
+                )
+                stats["sample_declarations"] += 1
+            elif key_lower == "pedigree":
+                emitted_relation = False
+                for attribute_key, attribute_value in attributes:
+                    if attribute_key == "ID" or not attribute_value:
+                        continue
+                    ancestor_uri = declaration_uri(attribute_value)
+                    predicate = vocab.PEDIGREE_ROLE_PROPERTIES.get(
+                        attribute_key, "pedigreeAncestor"
+                    )
+                    emit(f"<{line_uri}> <{_vocab(predicate)}> <{ancestor_uri}> .\n")
+                    emit(
+                        f"<{ancestor_uri}> <{RDF_TYPE_URI}> "
+                        f"<{_vocab('SampleDeclaration')}> .\n"
+                    )
+                    emit(
+                        f"<{line_uri}> <{_vocab('ancestorRole')}> "
+                        f"{_ntriples_string_literal(attribute_key)} .\n"
+                    )
+                    emitted_relation = True
+                if emitted_relation:
+                    stats["pedigree_relations"] += 1
 
         for row in rows:
             if (row.get("HEADER_KEY") or "").strip().lower() != "filedate":
                 continue
             date_object = file_date_object(row.get("HEADER_VALUE") or "")
             if date_object is not None:
-                emit(f"<{file_uri}> <{VCFR_NAMESPACE}fileDate> {date_object} .\n")
+                emit(f"<{file_uri}> <{_vocab('fileDate')}> {date_object} .\n")
                 stats["file_dates"] += 1
             break
 
         if contig_count:
             emit(
-                f"<{file_uri}> <{VCFR_NAMESPACE}contigCount> "
-                f'"{contig_count}"^^<{XSD_INTEGER_URI}> .\n'
+                f"<{file_uri}> <{_vocab('contigCount')}> "
+                f"{_ordinal_literal(contig_count)} .\n"
             )
 
     return _append_rdf_atomically(rdf_path, stats, produce)
 
 
-def _qual_object(value: str) -> str:
-    """Serialize QUAL as the SHACL shape requires: xsd:decimal, or vcfr:Null.
+def _parse_meta_values(raw: str | None) -> list[str]:
+    """Split a ##META ``Values=[a, b, c]`` list into its members."""
+    if not raw:
+        return []
+    inner = raw.strip()
+    if inner.startswith("[") and inner.endswith("]"):
+        inner = inner[1:-1]
+    return [item.strip() for item in inner.split(",") if item.strip()]
 
-    The shape is ``sh:or([sh:datatype xsd:decimal] [sh:datatype vcfr:Null])``,
-    which RML cannot satisfy because the datatype depends on the row. A value
-    that is neither numeric nor the missing token is kept as a plain literal
-    rather than dropped: a non-conformant graph is more useful than a lossy one,
-    and the SHACL layer reports it.
+
+_qual_object = vocab.qual_object
+
+
+def _emit_allele_layer(
+    emit,
+    *,
+    record_uri: str,
+    alleles: list,
+    alt_definitions: dict[str, str],
+    stats: dict,
+) -> dict[int, str]:
+    """Emit the record's ordered REF/ALT allele resources.
+
+    Returns allele index -> allele IRI so the INFO value items, the SV carriers
+    and the per-sample genotype calls can all join the same resources. The index
+    is record-global: 0 for REF, then 1..n in source ALT order, which is exactly
+    the join key VCF Number=A and Number=R define.
     """
-    if value in ("", "."):
-        return f'"."^^<{VCFR_NAMESPACE}Null>'
-    try:
-        float(value)
-    except ValueError:
-        return _ntriples_string_literal(value)
-    # Serialize the source lexical form so no precision is gained or lost.
-    return f'"{value}"^^<{XSD_DECIMAL_URI}>'
+    allele_uris: dict[int, str] = {}
+    for allele in alleles:
+        allele_uri = f"{record_uri}/allele/{allele.index}"
+        allele_uris[allele.index] = allele_uri
+        if allele.index == 0:
+            emit(f"<{record_uri}> <{_vocab('hasReferenceAllele')}> <{allele_uri}> .\n")
+            allele_class = "ReferenceAllele"
+        else:
+            emit(f"<{record_uri}> <{_vocab('hasAltAllele')}> <{allele_uri}> .\n")
+            allele_class = "AltAllele"
+        emit(f"<{allele_uri}> <{RDF_TYPE_URI}> <{_vocab(allele_class)}> .\n")
+        emit(
+            f"<{allele_uri}> <{_vocab('alleleIndex')}> "
+            f"{_ordinal_literal(allele.index)} .\n"
+        )
+        emit(
+            f"<{allele_uri}> <{_vocab('alleleValue')}> "
+            f"{_ntriples_literal(allele.value)} .\n"
+        )
+        emit(f"<{allele_uri}> <{_vocab('alleleKind')}> <{_vocab(allele.kind)}> .\n")
+        stats["alleles"] += 1
+
+        if allele.symbolic_id:
+            definition_uri = alt_definitions.get(allele.symbolic_id)
+            if definition_uri is not None:
+                emit(
+                    f"<{allele_uri}> <{_vocab('declaredByAlt')}> "
+                    f"<{definition_uri}> .\n"
+                )
+        if allele.symbolic_type:
+            emit(
+                f"<{allele_uri}> <{_vocab('svType')}> "
+                f"<{_vocab(allele.symbolic_type)}> .\n"
+            )
+        # vcfc:TandemRepeatAllele and vcfc:ReferenceBlock are deliberately not
+        # assigned here. Both shapes require a property that only the record's
+        # INFO can supply -- repeatSequenceCount from RN, referenceBlockLength
+        # from END -- so _emit_sv_layer types those alleles once it has them.
+        if allele.breakend is not None:
+            _emit_breakend(emit, allele_uri, allele.breakend)
+            stats["breakends"] += 1
+    return allele_uris
+
+
+def _emit_breakend(emit, allele_uri: str, breakend) -> None:
+    """Emit the parsed components of one breakend ALT expression."""
+    emit(f"<{allele_uri}> <{RDF_TYPE_URI}> <{_vocab('Breakend')}> .\n")
+    if breakend.orientation is not None:
+        emit(
+            f"<{allele_uri}> <{_vocab('breakendOrientation')}> "
+            f"<{_vocab(breakend.orientation)}> .\n"
+        )
+    if breakend.replacement:
+        emit(
+            f"<{allele_uri}> <{_vocab('breakendReplacementString')}> "
+            f"{_ntriples_typed_literal(breakend.replacement, vocab.BREAKEND_STRING_DATATYPE_URI)} .\n"
+        )
+    if breakend.is_single:
+        emit(
+            f"<{allele_uri}> <{_vocab('isSingleBreakend')}> "
+            f'"true"^^<{XSD_BOOLEAN_URI}> .\n'
+        )
+
+
+def _emit_value_items(
+    emit,
+    *,
+    parent_uri: str,
+    field_key: str,
+    value: str,
+    number: str,
+    allele_uris: dict[int, str],
+    version: "vocab.VCFVersion",
+    stats: dict,
+) -> None:
+    """Decompose a comma-separated payload into indexed vcfc:FieldValueItems.
+
+    A field is decomposed when its items have a meaning per position. That is
+    usually decided by the declared Number -- A, R, LA, LR (one per allele), G,
+    LG (one per genotype), P (one per GT allele) -- but the version's flattened
+    tuple keys are positional too, even though the specification declares them
+    ``Number=.``: the version overlay checks their item count against the ALT
+    count, so their items have to be materialized.
+
+    Which keys those are, and whether the tuple repeats per ALT allele, is
+    version-dependent. CIPOS is one pair for the whole record in VCF 4.1-4.3 and
+    one pair per ALT from 4.4; CILEN and CICN only become tuple keys in 4.4.
+
+    Once any item of a field is materialized, all of them must be, contiguously
+    indexed from zero -- vcfc:ValueItemCountShape checks exactly that.
+    """
+    if not version.is_positional(field_key, number):
+        return
+    items = vocab.split_value_items(value)
+    if not items:
+        return
+    tuple_arity = version.tuple_arity(field_key)
+    for item_index, item in enumerate(items):
+        item_uri = f"{parent_uri}/value/{item_index}"
+        emit(f"<{parent_uri}> <{_vocab('hasValueItem')}> <{item_uri}> .\n")
+        emit(f"<{item_uri}> <{RDF_TYPE_URI}> <{_vocab('FieldValueItem')}> .\n")
+        emit(
+            f"<{item_uri}> <{_vocab('valueIndex')}> "
+            f"{_ordinal_literal(item_index)} .\n"
+        )
+        emit(f"<{item_uri}> <{_vocab('itemValue')}> {_ntriples_literal(item)} .\n")
+        if tuple_arity is not None:
+            emit(
+                f"<{item_uri}> <{_vocab('tupleArity')}> "
+                f"{_ordinal_literal(tuple_arity)} .\n"
+            )
+        link = version.value_item_link(field_key, number, item_index)
+        if link.allele_index is not None:
+            allele_uri = allele_uris.get(link.allele_index)
+            if allele_uri is not None:
+                emit(f"<{item_uri}> <{_vocab('forAllele')}> <{allele_uri}> .\n")
+        elif link.genotype_index is not None:
+            emit(
+                f"<{item_uri}> <{_vocab('forGenotypeIndex')}> "
+                f"{_ordinal_literal(link.genotype_index)} .\n"
+            )
+        elif link.gt_allele_index is not None:
+            emit(
+                f"<{item_uri}> <{_vocab('forGTAlleleIndex')}> "
+                f"{_ordinal_literal(link.gt_allele_index)} .\n"
+            )
+        stats["value_items"] += 1
+
+
+def _emit_sv_layer(
+    emit,
+    *,
+    record_uri: str,
+    pos: str,
+    info_map: dict[str, str | None],
+    allele_uris: dict[int, str],
+    alleles_by_index: dict[int, object],
+    version: "vocab.VCFVersion",
+    stats: dict,
+) -> None:
+    """Attach the reserved SV INFO keys to the alleles they describe.
+
+    Called once per record with the whole INFO map rather than per key, because
+    several of these carriers need more than one key to be well formed: a
+    vcfc:VariantEvent needs both EVENT and EVENTTYPE, a reference block needs
+    both END and POS, and a tandem repeat needs RN before its RUS/RUL/RUC/RB
+    values mean anything.
+
+    That coupling matters because the vocabulary's properties carry rdfs:domain
+    axioms. Emitting vcfc:endPosition on an allele infers vcfc:ReferenceBlock
+    for it under RDFS, which then requires vcfc:referenceBlockLength -- so a
+    carrier is only emitted when the record supplies everything its shape needs.
+    """
+    alt_uris = {index: uri for index, uri in allele_uris.items() if index >= 1}
+    if not alt_uris:
+        return
+
+    for key, predicate in vocab.SV_FLAG_INFO_KEYS.items():
+        if key in info_map:
+            for allele_uri in alt_uris.values():
+                emit(
+                    f"<{allele_uri}> <{_vocab(predicate)}> "
+                    f'"true"^^<{XSD_BOOLEAN_URI}> .\n'
+                )
+
+    for key, predicate in vocab.SV_ALLELE_INFO_KEYS.items():
+        value = info_map.get(key)
+        if value is None:
+            continue
+        for offset, item in enumerate(vocab.split_value_items(value), start=1):
+            allele_uri = alt_uris.get(offset)
+            if allele_uri is not None:
+                emit(
+                    f"<{allele_uri}> <{_vocab(predicate)}> "
+                    f"{_ntriples_literal(item)} .\n"
+                )
+
+    claims = info_map.get("SVCLAIM")
+    if claims is not None:
+        for offset, item in enumerate(vocab.split_value_items(claims), start=1):
+            allele_uri = alt_uris.get(offset)
+            claim = vocab.SV_CLAIMS.get(item.strip().upper())
+            if allele_uri is not None and claim is not None:
+                emit(f"<{allele_uri}> <{_vocab('svClaim')}> <{_vocab(claim)}> .\n")
+
+    _emit_reference_block(
+        emit,
+        pos=pos,
+        end=info_map.get("END"),
+        alt_uris=alt_uris,
+        alleles_by_index=alleles_by_index,
+        stats=stats,
+    )
+    _emit_variant_event(
+        emit,
+        record_uri=record_uri,
+        event=info_map.get("EVENT"),
+        event_type=info_map.get("EVENTTYPE"),
+        alt_uris=alt_uris,
+        version=version,
+        stats=stats,
+    )
+    _emit_tandem_repeats(
+        emit, info_map=info_map, alt_uris=alt_uris,
+        alleles_by_index=alleles_by_index, stats=stats,
+    )
+
+    for key in (*vocab.FALDO_INTERVAL_INFO_KEYS, *vocab.CONFIDENCE_INTERVAL_INFO_KEYS):
+        value = info_map.get(key)
+        if value is None:
+            continue
+        if version.tuple_arity(key) is None:
+            # CILEN and CICN do not exist before VCF 4.4. A file that uses the
+            # name anyway keeps it as an ordinary INFO value rather than being
+            # given a carrier this version does not define.
+            continue
+        _emit_confidence_intervals(
+            emit, key=key, value=value, alt_uris=alt_uris,
+            version=version, stats=stats,
+        )
+
+
+def _emit_reference_block(
+    emit, *, pos: str, end: str | None, alt_uris: dict, alleles_by_index: dict, stats: dict
+) -> None:
+    """Close a gVCF reference block with its END position and derived length.
+
+    Only the ``<*>``/``<NON_REF>`` allele is a reference block. VCF also uses
+    END on symbolic SV records, but the vocabulary has no generic END property
+    there: the extent of such an allele is carried by SVLEN and the CI keys, so
+    END stays in its INFO value alone rather than being forced onto a class it
+    does not belong to.
+    """
+    if end is None or not end.lstrip("-").isdigit():
+        return
+    for index, allele_uri in alt_uris.items():
+        allele = alleles_by_index.get(index)
+        if allele is None or allele.kind != "UnspecifiedAllele":
+            continue
+        emit(f"<{allele_uri}> <{RDF_TYPE_URI}> <{_vocab('ReferenceBlock')}> .\n")
+        emit(
+            f"<{allele_uri}> <{_vocab('endPosition')}> "
+            f"{_ntriples_typed_literal(end, XSD_INTEGER_URI)} .\n"
+        )
+        if pos.isdigit():
+            # VCF 4.5 reference blocks are inclusive of both endpoints.
+            length = max(int(end) - int(pos) + 1, 0)
+            emit(
+                f"<{allele_uri}> <{_vocab('referenceBlockLength')}> "
+                f"{_ordinal_literal(length)} .\n"
+            )
+        emit(
+            f"<{allele_uri}> <{_vocab('isReferenceBlockStart')}> "
+            f'"true"^^<{XSD_BOOLEAN_URI}> .\n'
+        )
+        stats["reference_blocks"] += 1
+
+
+def _emit_variant_event(
+    emit,
+    *,
+    record_uri: str,
+    event: str | None,
+    event_type: str | None,
+    alt_uris: dict,
+    version: "vocab.VCFVersion",
+    stats: dict,
+) -> None:
+    """Group a record, or each of its ALT alleles, into a named EVENT.
+
+    EVENT changed arity in VCF 4.4. Before that it is ``Number=1``: one event
+    for the whole record, and EVENTTYPE does not exist. From 4.4 both are
+    ``Number=A``: one event per ALT allele, in source order, so the link hangs
+    off the allele rather than the record.
+
+    ``vcfc:VariantEventShape`` requires exactly one ``vcfc:eventType``, so an
+    event resource is only minted when a reserved EVENTTYPE code is available to
+    give it one. In a pre-4.4 file there is none, so EVENT stays an ordinary
+    INFO value rather than becoming a resource that fails its shape.
+    """
+    if not event:
+        return
+    if not version.event_types or not event_type:
+        return
+
+    events = vocab.split_value_items(event)
+    types = vocab.split_value_items(event_type)
+    if not version.events_per_alt:
+        events, types = events[:1], types[:1]
+
+    for offset, name in enumerate(events):
+        if vocab.is_missing(name):
+            continue
+        code = types[offset] if offset < len(types) else None
+        individual = (
+            vocab.EVENT_TYPES.get(code.strip().upper()) if code else None
+        )
+        if individual is None:
+            continue
+        event_uri = f"{record_uri}/event/{_rml_uri_component(name)}"
+        subject = record_uri
+        if version.events_per_alt:
+            allele_uri = alt_uris.get(offset + 1)
+            if allele_uri is None:
+                continue
+            subject = allele_uri
+        emit(f"<{subject}> <{_vocab('inEvent')}> <{event_uri}> .\n")
+        emit(f"<{event_uri}> <{RDF_TYPE_URI}> <{_vocab('VariantEvent')}> .\n")
+        emit(f"<{event_uri}> <{_vocab('eventType')}> <{_vocab(individual)}> .\n")
+        stats["variant_events"] += 1
+
+
+def _emit_tandem_repeats(
+    emit, *, info_map: dict, alt_uris: dict, alleles_by_index: dict, stats: dict
+) -> None:
+    """Emit the RN/RUS/RUL/RUC/RB repeat structure of a <CNV:TR> allele.
+
+    RN gives the number of repeat sequences per ALT allele and is what makes an
+    allele a ``vcfc:TandemRepeatAllele``: without it the remaining keys have no
+    grouping, and the class's required ``vcfc:repeatSequenceCount`` would be
+    missing. The repeat-sequence values are flat comma lists across all alleles,
+    so RN also supplies the stride into them.
+    """
+    counts = vocab.split_value_items(info_map.get("RN") or "")
+    if not counts:
+        return
+    consumed = 0
+    for offset, count_token in enumerate(counts, start=1):
+        allele_uri = alt_uris.get(offset)
+        allele = alleles_by_index.get(offset)
+        if allele_uri is None or not count_token.isdigit():
+            continue
+        count = int(count_token)
+        if allele is not None and allele.symbolic_type != "SymbolicTandemRepeat":
+            consumed += count
+            continue
+        emit(
+            f"<{allele_uri}> <{RDF_TYPE_URI}> "
+            f"<{_vocab('TandemRepeatAllele')}> .\n"
+        )
+        emit(
+            f"<{allele_uri}> <{_vocab('repeatSequenceCount')}> "
+            f"{_ordinal_literal(count)} .\n"
+        )
+        for position in range(count):
+            sequence_uri = f"{allele_uri}/repeat/{position + 1}"
+            emit(
+                f"<{allele_uri}> <{_vocab('hasRepeatSequence')}> "
+                f"<{sequence_uri}> .\n"
+            )
+            emit(
+                f"<{sequence_uri}> <{RDF_TYPE_URI}> "
+                f"<{_vocab('RepeatSequence')}> .\n"
+            )
+            emit(
+                f"<{sequence_uri}> <{_vocab('repeatSequenceIndex')}> "
+                f"{_ordinal_literal(position + 1)} .\n"
+            )
+            for key, predicate in vocab.REPEAT_SEQUENCE_INFO_KEYS.items():
+                items = vocab.split_value_items(info_map.get(key) or "")
+                flat_index = consumed + position
+                if flat_index < len(items):
+                    emit(
+                        f"<{sequence_uri}> <{_vocab(predicate)}> "
+                        f"{_ntriples_literal(items[flat_index])} .\n"
+                    )
+            stats["repeat_sequences"] += 1
+        consumed += count
+        stats["tandem_repeats"] += 1
+
+
+def _emit_confidence_intervals(
+    emit, *, key: str, value: str, alt_uris: dict, version: "vocab.VCFVersion", stats: dict
+) -> None:
+    """Emit the (lower, upper) pairs of a CI* INFO key.
+
+    CIPOS and CIEND use a FALDO InRangePosition, as the SV module specifies; the
+    remaining CI keys use a vcfc:ConfidenceInterval.
+
+    Before VCF 4.4 the list holds exactly one pair describing the record, so
+    every ALT allele of a multi-allelic record shares it. From 4.4 the list
+    holds one pair per ALT allele in source order, and each allele gets its own.
+    """
+    items = vocab.split_value_items(value)
+    for offset, allele_index in enumerate(sorted(alt_uris)):
+        # A pre-4.4 record has a single pair, so every allele reads items 0-1.
+        pair = offset if version.tuples_per_alt else 0
+        lower = items[pair * 2] if pair * 2 < len(items) else None
+        upper = items[pair * 2 + 1] if pair * 2 + 1 < len(items) else None
+        if lower is None or upper is None:
+            break
+        allele_uri = alt_uris[allele_index]
+        interval_uri = f"{allele_uri}/ci/{key}"
+        if key in vocab.FALDO_INTERVAL_INFO_KEYS:
+            predicate = vocab.FALDO_INTERVAL_INFO_KEYS[key]
+            emit(f"<{allele_uri}> <{_vocab(predicate)}> <{interval_uri}> .\n")
+            emit(
+                f"<{interval_uri}> <{RDF_TYPE_URI}> "
+                f"<{vocab.FALDO_NAMESPACE}InRangePosition> .\n"
+            )
+            emit(
+                f"<{interval_uri}> <{vocab.FALDO_NAMESPACE}begin> "
+                f"{vocab.numeric_literal(lower)} .\n"
+            )
+            emit(
+                f"<{interval_uri}> <{vocab.FALDO_NAMESPACE}end> "
+                f"{vocab.numeric_literal(upper)} .\n"
+            )
+        else:
+            predicate = vocab.CONFIDENCE_INTERVAL_INFO_KEYS[key]
+            emit(f"<{allele_uri}> <{_vocab(predicate)}> <{interval_uri}> .\n")
+            emit(
+                f"<{interval_uri}> <{RDF_TYPE_URI}> "
+                f"<{_vocab('ConfidenceInterval')}> .\n"
+            )
+            # vcfc:ConfidenceIntervalShape puts both bounds through
+            # vcfc:NumericLiteralShape, so a plain string will not do.
+            emit(
+                f"<{interval_uri}> <{_vocab('ciLower')}> "
+                f"{vocab.numeric_literal(lower)} .\n"
+            )
+            emit(
+                f"<{interval_uri}> <{_vocab('ciUpper')}> "
+                f"{vocab.numeric_literal(upper)} .\n"
+            )
+        stats["confidence_intervals"] += 1
 
 
 def append_record_detail_rdf(
@@ -2570,24 +3547,25 @@ def append_record_detail_rdf(
     *,
     emit_qual: bool = True,
     emit_info: bool = True,
+    emit_alleles: bool = True,
+    version: "vocab.VCFVersion | None" = None,
     progress_interval_records: int = 10_000,
 ) -> dict:
     """Append per-record detail the RML mapping cannot express.
 
-    Covers QUAL (whose datatype depends on the value) and the structured INFO
-    representation (which would otherwise need a materialized helper table of
-    variants x INFO keys). Both are per-record, so they share one pass over
-    ``records.tsv``.
+    Three groups of things land here, all of them per-record, so they share one
+    pass over ``records.tsv``:
 
-    The default mapping emits INFO only as an opaque ``vcfr:infoRaw`` string.
-    This adds the structured form the vocabulary already defines - one
-    ``vcfr:InfoFieldValue`` per record and key, at the IRI template the
-    vocabulary declares - so INFO becomes queryable rather than just present.
-
-    Emitted directly rather than through RML for the same reason the genotype
-    representations are: RML would need a materialized helper table of
-    variants x INFO keys, and it cannot switch value datatype on a declared
-    ``Type``.
+    * The fixed fields whose datatype depends on the row -- ID, ALT, QUAL and
+      FILTER. Each may be the VCF missing token, which the vocabulary requires
+      as ``"."^^vcfc:Null``, and RML cannot switch datatype per row.
+    * The allele layer: ``vcfc:ReferenceAllele`` and ``vcfc:AltAllele``
+      resources parsed out of REF and ALT, with their index, kind, symbolic
+      type and breakend components, plus the ``vcfc:chromosome`` link to the
+      contig declaration named by CHROM.
+    * The structured INFO representation: one ``vcfc:InfoFieldValue`` per record
+      and key, its ``vcfc:FieldValueItem`` decomposition for Number=A/R/G/P
+      fields, and the SV carriers the reserved INFO keys imply.
     """
     stats = {
         "representation": "record-detail",
@@ -2595,6 +3573,17 @@ def append_record_detail_rdf(
         "qual_values": 0,
         "info_values": 0,
         "info_definitions": 0,
+        "alleles": 0,
+        "breakends": 0,
+        "value_items": 0,
+        "variant_events": 0,
+        "confidence_intervals": 0,
+        "reference_blocks": 0,
+        "tandem_repeats": 0,
+        "repeat_sequences": 0,
+        "contig_links": 0,
+        "assembly_contigs": 0,
+        "assembly_contig_links": 0,
         "triples": 0,
         "appended_bytes": 0,
     }
@@ -2603,7 +3592,16 @@ def append_record_detail_rdf(
     if not rdf_path.is_file():
         raise FileNotFoundError(f"RDF aggregate not found for INFO streaming: {rdf_path}")
 
+    version = version or vocab.FALLBACK_VERSION
     definitions = _load_field_definitions(header_lines_tsv, "INFO")
+    contig_line_uris = _load_contig_line_uris(header_lines_tsv) if emit_alleles else {}
+    assembly_line_uri = _load_assembly_line_uri(header_lines_tsv) if emit_alleles else None
+    alt_definition_uris = {
+        identifier: definition.uri
+        for identifier, definition in _load_field_definitions(
+            header_lines_tsv, "ALT"
+        ).items()
+    }
 
     with SampleRecordStream(records_tsv) as record_stream:
         if not record_stream.source_file:
@@ -2613,6 +3611,7 @@ def append_record_detail_rdf(
             source_component = _rml_uri_component(record_stream.source_file)
             file_uri = f"file://{source_component}"
             emitted_definitions: set[str] = set()
+            emitted_assembly_contigs: set[str] = set()
             key_components: dict[str, str] = {}
             value_count = 0
             definition_count = 0
@@ -2620,14 +3619,90 @@ def append_record_detail_rdf(
             qual_count = 0
             for record in record_stream:
                 row_component = _rml_uri_component(record.row_id)
+                record_uri = f"{file_uri}#record/{row_component}"
                 call_uri = f"{file_uri}#call/{row_component}"
+
+                # ID and ALT are record-level; FILTER and QUAL are call-level.
+                # All four are emitted here so the missing token is typed.
+                emit(
+                    f"<{record_uri}> <{_vocab('recordId')}> "
+                    f"{_ntriples_literal(record.record_id or '.')} .\n"
+                )
+                emit(
+                    f"<{record_uri}> <{_vocab('alt')}> "
+                    f"{_ntriples_literal(record.alt or '.')} .\n"
+                )
+                emit(
+                    f"<{call_uri}> <{_vocab('filter')}> "
+                    f"{_ntriples_literal(record.filter_value or '.')} .\n"
+                )
+                emit(
+                    f"<{call_uri}> <{_vocab('infoRaw')}> "
+                    f"{_ntriples_literal(record.info or '.')} .\n"
+                )
                 if emit_qual:
                     emit(
-                        f"<{call_uri}> <{VCFR_NAMESPACE}qual> "
+                        f"<{call_uri}> <{_vocab('qual')}> "
                         f"{_qual_object(record.qual)} .\n"
                     )
                     qual_count += 1
-                for key, value in (parse_info_entries(record.info) if emit_info else ()):
+
+                allele_uris: dict[int, str] = {}
+                alleles_by_index: dict[int, object] = {}
+                if emit_alleles:
+                    # VCF 4.5 lets CHROM name a breakpoint-assembly contig in
+                    # angle brackets instead of a declared reference sequence.
+                    # The two are mutually exclusive: the vocabulary's
+                    # consistency profile rejects a bracketed CHROM that also
+                    # resolves to a ##contig declaration.
+                    assembly_id = vocab.parse_bracketed_chrom(record.chrom)
+                    if assembly_id is not None:
+                        assembly_uri = (
+                            f"{file_uri}#assembly/contig/"
+                            f"{_rml_uri_component(assembly_id)}"
+                        )
+                        emit(
+                            f"<{record_uri}> <{_vocab('chromAssemblyContig')}> "
+                            f"<{assembly_uri}> .\n"
+                        )
+                        if assembly_uri not in emitted_assembly_contigs:
+                            emitted_assembly_contigs.add(assembly_uri)
+                            emit(
+                                f"<{assembly_uri}> <{RDF_TYPE_URI}> "
+                                f"<{_vocab('AssemblyContig')}> .\n"
+                            )
+                            emit(
+                                f"<{assembly_uri}> <{_vocab('assemblyContigId')}> "
+                                f"{_ntriples_string_literal(assembly_id)} .\n"
+                            )
+                            if assembly_line_uri is not None:
+                                emit(
+                                    f"<{assembly_uri}> "
+                                    f"<{_vocab('declaredInAssembly')}> "
+                                    f"<{assembly_line_uri}> .\n"
+                                )
+                            stats["assembly_contigs"] += 1
+                        stats["assembly_contig_links"] += 1
+                    else:
+                        contig_uri = contig_line_uris.get(record.chrom)
+                        if contig_uri is not None:
+                            emit(
+                                f"<{record_uri}> <{_vocab('chromosome')}> "
+                                f"<{contig_uri}> .\n"
+                            )
+                            stats["contig_links"] += 1
+                    parsed_alleles = vocab.parse_alt_alleles(record.ref, record.alt)
+                    alleles_by_index = {a.index: a for a in parsed_alleles}
+                    allele_uris = _emit_allele_layer(
+                        emit,
+                        record_uri=record_uri,
+                        alleles=parsed_alleles,
+                        alt_definitions=alt_definition_uris,
+                        stats=stats,
+                    )
+
+                info_entries = parse_info_entries(record.info) if emit_info else []
+                for key, value in info_entries:
                     key_component = key_components.get(key)
                     if key_component is None:
                         key_component = _rml_uri_component(key)
@@ -2638,66 +3713,83 @@ def append_record_detail_rdf(
                     if definition is None:
                         definition = FormatDefinition(
                             uri=f"{file_uri}#header/info/{key_component}",
-                            field_number=".",
+                            field_number="0" if value is None else ".",
                             description=(
                                 f"Synthesized definition for undeclared INFO key {key}"
                             ),
                             value_type="Flag" if value is None else "String",
+                            synthesized=True,
                         )
                     if definition.uri not in emitted_definitions:
                         emitted_definitions.add(definition.uri)
                         definition_count += 1
-                        type_class = VCF_VALUE_TYPE_CLASSES.get(
-                            definition.value_type, "StringType"
-                        )
                         emit(
                             f"<{definition.uri}> <{RDF_TYPE_URI}> "
-                            f"<{VCFR_NAMESPACE}InfoFieldDefinition> .\n"
+                            f"<{_vocab('InfoFieldDefinition')}> .\n"
                         )
-                        emit(
-                            f"<{definition.uri}> <{VCFR_NAMESPACE}fieldId> "
-                            f"{_ntriples_string_literal(key)} .\n"
-                        )
-                        emit(
-                            f"<{definition.uri}> <{VCFR_NAMESPACE}fieldNumber> "
-                            f"{_ntriples_string_literal(definition.field_number)} .\n"
-                        )
-                        emit(
-                            f"<{definition.uri}> <{VCFR_NAMESPACE}fieldDescription> "
-                            f"{_ntriples_string_literal(definition.description)} .\n"
-                        )
-                        emit(
-                            f"<{definition.uri}> <{VCFR_NAMESPACE}fieldType> "
-                            f"<{VCFR_NAMESPACE}{type_class}> .\n"
-                        )
+                        # A key declared by a '##INFO' line already has its
+                        # ID/Number/Type/Description from the header emitter, at
+                        # this very IRI. Only an invented definition needs them.
+                        if definition.synthesized:
+                            _emit_field_definition_attributes(
+                                emit,
+                                definition.uri,
+                                field_id=key,
+                                number=definition.field_number,
+                                value_type=definition.value_type,
+                                description=definition.description,
+                            )
 
-                    emit(f"<{call_uri}> <{VCFR_NAMESPACE}hasInfoValue> <{info_uri}> .\n")
+                    emit(f"<{call_uri}> <{_vocab('hasInfoValue')}> <{info_uri}> .\n")
                     emit(
                         f"<{info_uri}> <{RDF_TYPE_URI}> "
-                        f"<{VCFR_NAMESPACE}InfoFieldValue> .\n"
+                        f"<{_vocab('InfoFieldValue')}> .\n"
                     )
                     emit(
-                        f"<{info_uri}> <{VCFR_NAMESPACE}declaredBy> "
+                        f"<{info_uri}> <{_vocab('declaredBy')}> "
                         f"<{definition.uri}> .\n"
                     )
                     if value is None:
                         emit(
-                            f"<{info_uri}> <{VCFR_NAMESPACE}fieldValueBoolean> "
+                            f"<{info_uri}> <{_vocab('fieldValueBoolean')}> "
                             f'"true"^^<{XSD_BOOLEAN_URI}> .\n'
                         )
                     else:
                         emit(
-                            f"<{info_uri}> <{VCFR_NAMESPACE}fieldValue> "
+                            f"<{info_uri}> <{_vocab('fieldValue')}> "
                             f"{_ntriples_literal(value)} .\n"
                         )
                         typed = _typed_info_object(value, definition.value_type)
                         if typed is not None:
                             predicate, literal = typed
                             emit(
-                                f"<{info_uri}> <{VCFR_NAMESPACE}{predicate}> "
+                                f"<{info_uri}> <{_vocab(predicate)}> "
                                 f"{literal} .\n"
                             )
+                        if allele_uris:
+                            _emit_value_items(
+                                emit,
+                                parent_uri=info_uri,
+                                field_key=key,
+                                value=value,
+                                number=definition.field_number,
+                                allele_uris=allele_uris,
+                                version=version,
+                                stats=stats,
+                            )
                     value_count += 1
+
+                if allele_uris and info_entries:
+                    _emit_sv_layer(
+                        emit,
+                        record_uri=record_uri,
+                        pos=record.pos,
+                        info_map=dict(info_entries),
+                        allele_uris=allele_uris,
+                        alleles_by_index=alleles_by_index,
+                        version=version,
+                        stats=stats,
+                    )
 
                 stats["records"] += 1
                 stats["qual_values"] = qual_count
@@ -2721,9 +3813,24 @@ def append_condensed_sample_rdf(
     header_lines_tsv: Path,
     rdf_path: Path,
     *,
+    emit_sample_data_raw: bool = False,
     progress_interval_records: int = 10_000,
 ) -> dict:
-    """Append sample-ordered cohort matrices and FORMAT value vectors."""
+    """Append sample-ordered cohort matrices and FORMAT value vectors.
+
+    This profile deliberately stops at the vector. The vocabulary defines
+    ``vcfc:encodedValues`` as a compact payload rather than a set of
+    independently asserted values, so the genotype, phase-set, local-allele and
+    base-modification resources that the expanded emitter derives per sample are
+    not produced here: doing so would reintroduce the per-sample growth the
+    condensed profile exists to avoid. Every value remains recoverable by
+    decoding a vector against its FORMAT definition and the matrix SampleSet.
+
+    ``emit_sample_data_raw`` additionally stores each record's genotype columns
+    verbatim on the matrix. It is off by default because the FORMAT vectors
+    already preserve the semantic values, and the raw copy roughly doubles the
+    condensed payload.
+    """
     stats = {
         "representation": "condensed",
         "records": 0,
@@ -2741,38 +3848,23 @@ def append_condensed_sample_rdf(
 
     definitions = _load_format_definitions(header_lines_tsv)
     with SampleRecordStream(records_tsv) as record_stream:
-        if not record_stream.columns or not record_stream.source_file:
+        if not record_stream.source_file:
             return stats
 
         def produce(emit):
             source_component = _rml_uri_component(record_stream.source_file)
             file_uri = f"file://{source_component}"
-            sample_set_uri = f"{file_uri}#samples"
             emitted_definitions: set[str] = set()
             # FORMAT keys repeat on every record; encode each distinct key once.
             format_components: dict[str, str] = {}
 
             emit(
-                f"<{file_uri}> <{VCFR_NAMESPACE}representationProfile> "
-                f"<{VCFR_NAMESPACE}CondensedRepresentation> .\n"
+                f"<{file_uri}> <{_vocab('representationProfile')}> "
+                f"<{_vocab('CondensedRepresentation')}> .\n"
             )
-            emit(f"<{file_uri}> <{VCFR_NAMESPACE}hasSampleSet> <{sample_set_uri}> .\n")
-            emit(f"<{sample_set_uri}> <{RDF_TYPE_URI}> <{VCFR_NAMESPACE}SampleSet> .\n")
-
-            for sample_column in record_stream.columns:
-                sample_component = _rml_uri_component(sample_column.uri_id)
-                sample_uri = f"{sample_set_uri}/{sample_component}"
-                emit(f"<{sample_set_uri}> <{VCFR_NAMESPACE}hasSample> <{sample_uri}> .\n")
-                emit(f"<{sample_uri}> <{RDF_TYPE_URI}> <{VCFR_NAMESPACE}VCFSample> .\n")
-                emit(
-                    f"<{sample_uri}> <{VCFR_NAMESPACE}sampleName> "
-                    f"{_ntriples_string_literal(sample_column.sample_id)} .\n"
-                )
-                emit(
-                    f"<{sample_uri}> <{VCFR_NAMESPACE}sampleIndex> "
-                    f'"{sample_column.index}"^^<{XSD_POSITIVE_INTEGER_URI}> .\n'
-                )
-                stats["samples"] += 1
+            sample_set_uri = _emit_sample_set(
+                emit, file_uri=file_uri, columns=record_stream.columns, stats=stats
+            )
 
             for record in record_stream:
                 if not record.format_keys:
@@ -2780,12 +3872,20 @@ def append_condensed_sample_rdf(
                 row_component = _rml_uri_component(record.row_id)
                 call_uri = f"{file_uri}#call/{row_component}"
                 matrix_uri = f"{call_uri}/matrix"
-                emit(f"<{call_uri}> <{VCFR_NAMESPACE}hasCallMatrix> <{matrix_uri}> .\n")
-                emit(f"<{matrix_uri}> <{RDF_TYPE_URI}> <{VCFR_NAMESPACE}CohortCallMatrix> .\n")
+                emit(f"<{call_uri}> <{_vocab('hasCallMatrix')}> <{matrix_uri}> .\n")
                 emit(
-                    f"<{matrix_uri}> <{VCFR_NAMESPACE}appliesToSampleSet> "
+                    f"<{matrix_uri}> <{RDF_TYPE_URI}> "
+                    f"<{_vocab('CohortCallMatrix')}> .\n"
+                )
+                emit(
+                    f"<{matrix_uri}> <{_vocab('appliesToSampleSet')}> "
                     f"<{sample_set_uri}> .\n"
                 )
+                if emit_sample_data_raw:
+                    emit(
+                        f"<{matrix_uri}> <{_vocab('sampleDataRaw')}> "
+                        f"{_ntriples_string_literal(chr(9).join(record.sample_payloads))} .\n"
+                    )
                 stats["matrices"] += 1
 
                 for format_index, format_key in enumerate(record.format_keys):
@@ -2796,52 +3896,39 @@ def append_condensed_sample_rdf(
                     vector_uri = f"{matrix_uri}/fmt/{format_component}"
                     definition = definitions.get(format_key)
                     if definition is None:
-                        definition = FormatDefinition(
-                            uri=f"{file_uri}#header/format/{format_component}",
-                            field_number=".",
-                            description=(
-                                f"Synthesized definition for undeclared FORMAT key {format_key}"
-                            ),
+                        definition = _synthesized_format_definition(
+                            file_uri, format_key, format_component
                         )
-                    definition_uri = definition.uri
-                    if definition_uri not in emitted_definitions:
-                        emit(
-                            f"<{definition_uri}> <{RDF_TYPE_URI}> "
-                            f"<{VCFR_NAMESPACE}FormatFieldDefinition> .\n"
-                        )
-                        emit(
-                            f"<{definition_uri}> <{VCFR_NAMESPACE}fieldId> "
-                            f"{_ntriples_string_literal(format_key)} .\n"
-                        )
-                        emit(
-                            f"<{definition_uri}> <{VCFR_NAMESPACE}fieldNumber> "
-                            f"{_ntriples_string_literal(definition.field_number)} .\n"
-                        )
-                        emit(
-                            f"<{definition_uri}> <{VCFR_NAMESPACE}fieldDescription> "
-                            f"{_ntriples_string_literal(definition.description)} .\n"
-                        )
-                        emitted_definitions.add(definition_uri)
-                        stats["format_definitions"] += 1
+                        definitions[format_key] = definition
+                    definition_uri = _emit_format_field_definition(
+                        emit,
+                        definition=definition,
+                        field_id=format_key,
+                        emitted=emitted_definitions,
+                        stats=stats,
+                    )
 
                     encoded_values = "\t".join(
                         values[format_index] or "." for values in record.sample_values
                     )
                     emit(
-                        f"<{matrix_uri}> <{VCFR_NAMESPACE}hasFormatValueVector> "
+                        f"<{matrix_uri}> <{_vocab('hasFormatValueVector')}> "
                         f"<{vector_uri}> .\n"
                     )
-                    emit(f"<{vector_uri}> <{RDF_TYPE_URI}> <{VCFR_NAMESPACE}FormatValueVector> .\n")
                     emit(
-                        f"<{vector_uri}> <{VCFR_NAMESPACE}declaredBy> "
+                        f"<{vector_uri}> <{RDF_TYPE_URI}> "
+                        f"<{_vocab('FormatValueVector')}> .\n"
+                    )
+                    emit(
+                        f"<{vector_uri}> <{_vocab('declaredBy')}> "
                         f"<{definition_uri}> .\n"
                     )
                     emit(
-                        f"<{vector_uri}> <{VCFR_NAMESPACE}valueEncoding> "
-                        f"<{VCFR_NAMESPACE}VCFTextVector> .\n"
+                        f"<{vector_uri}> <{_vocab('valueEncoding')}> "
+                        f"<{_vocab('VCFTextVector')}> .\n"
                     )
                     emit(
-                        f"<{vector_uri}> <{VCFR_NAMESPACE}encodedValues> "
+                        f"<{vector_uri}> <{_vocab('encodedValues')}> "
                         f"{_ntriples_string_literal(encoded_values)} .\n"
                     )
                     stats["format_vectors"] += 1
@@ -2863,17 +3950,23 @@ def emit_record_detail(
     records_tsv: Path,
     header_lines_tsv: Path,
     rdf_path: Path,
+    version: "vocab.VCFVersion | None" = None,
 ) -> dict | None:
-    """Append QUAL and, when selected, the structured INFO representation.
+    """Append the record detail, and when selected the structured INFO form.
 
-    QUAL is always emitted: the RML mapping cannot type it per row, so this is
-    the only place it can come from.
+    ID, ALT, QUAL, FILTER and INFO raw are always emitted: the RML mapping
+    cannot type the missing token per row, so this is the only place they can
+    come from. The allele layer travels with the structured INFO representation,
+    because the Number=A/R/G value items are joined to the allele resources it
+    mints.
     """
     if info_representation not in INFO_REPRESENTATION_CHOICES:
         raise ValueError(f"unknown INFO representation: {info_representation}")
+    structured = info_representation == "structured"
     return append_record_detail_rdf(
         records_tsv, header_lines_tsv, rdf_path,
-        emit_qual=True, emit_info=info_representation == "structured",
+        emit_qual=True, emit_info=structured, emit_alleles=structured,
+        version=version,
     )
 
 
@@ -2883,12 +3976,15 @@ def emit_sample_representation(
     records_tsv: Path,
     header_lines_tsv: Path,
     rdf_path: Path,
+    version: "vocab.VCFVersion | None" = None,
 ) -> dict | None:
     """Execute the workflow's sole direct RDF emitter, if it has one."""
     if workflow.emitter is None:
         return None
     if workflow.emitter == "expanded":
-        return append_expanded_sample_rdf(records_tsv, rdf_path)
+        return append_expanded_sample_rdf(
+            records_tsv, rdf_path, header_lines_tsv, version=version
+        )
     if workflow.emitter == "condensed":
         return append_condensed_sample_rdf(records_tsv, header_lines_tsv, rdf_path)
     raise RuntimeError(f"unknown sample RDF emitter: {workflow.emitter}")
@@ -2902,6 +3998,8 @@ def update_conversion_metrics_after_sample_stream(
     rdf_path: Path,
     total_triples: int,
     sample_stats: dict,
+    vcf_version: str | None = None,
+    vcf_version_source: str | None = None,
 ):
     """Bring conversion JSON/CSV metrics in sync after direct sample emission."""
     safe_name = safe_metrics_name(output_name)
@@ -2922,6 +4020,9 @@ def update_conversion_metrics_after_sample_stream(
             payload["sample_representation"] = sample_stats
             # Retained for consumers of pre-condensed conversion metrics.
             payload["sample_streaming"] = sample_stats
+            if vcf_version is not None:
+                payload["vcf_version"] = vcf_version
+                payload["vcf_version_source"] = vcf_version_source
             metrics_json.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         except (OSError, json.JSONDecodeError):
             pass
@@ -2939,6 +4040,9 @@ def update_conversion_metrics_after_sample_stream(
             if row.get("run_id") == run_id and row.get("output_name") == output_name:
                 row["output_triples"] = str(int(total_triples))
                 row["output_dir_size_bytes"] = str(output_size)
+                if vcf_version is not None and "vcf_version" in fieldnames:
+                    row["vcf_version"] = vcf_version
+                    row["vcf_version_source"] = vcf_version_source or ""
                 changed = True
         if changed:
             with metrics_csv.open("w", newline="", encoding="utf-8") as handle:
@@ -2998,6 +4102,12 @@ def build_sample_support_tsvs(records_tsv: Path, sample_calls_tsv: Path, sample_
 # ---------------------------------------------------------------------------
 # RML mapping rendering and Docker image resolution
 # ---------------------------------------------------------------------------
+#: The mapping's placeholder for the optional per-version file subclass. It is
+#: rewritten per input, the same way the TSV paths are, so one mapping stays the
+#: single source of truth instead of five near-identical per-version copies.
+VCF_VERSION_CLASS_SENTINEL = "vcfc:VCFVersionFile"
+
+
 def render_rules_for_triplet(
     template_rules: Path,
     output_rules: Path,
@@ -3006,15 +4116,54 @@ def render_rules_for_triplet(
     metadata_name: str,
     sample_calls_name: str,
     sample_format_name: str,
+    vcf_version: "vocab.VCFVersion | None" = None,
 ):
-    """Render per-input mapping rules by substituting TSV placeholders."""
+    """Render per-input mapping rules by substituting TSV placeholders.
+
+    ``vcf_version`` additionally resolves the version sentinel to that version's
+    optional ``vcfc:VCF4xFile`` subclass, which activates its SHACL overlay
+    gate. Passing None resolves the sentinel to ``vcfc:VCFFile``, which the
+    subject map already asserts: an unrecognized version therefore produces the
+    version-neutral graph rather than a claim the vocabulary cannot check.
+
+    A custom mapping without the sentinel is unaffected; the substitution simply
+    finds nothing.
+    """
     text = template_rules.read_text()
     text = text.replace('/data/tsv/records.tsv', f'/data/tsv/{records_name}')
     text = text.replace('/data/tsv/header_lines.tsv', f'/data/tsv/{headers_name}')
     text = text.replace('/data/tsv/file_metadata.tsv', f'/data/tsv/{metadata_name}')
     text = text.replace('/data/tsv/sample_calls.tsv', f'/data/tsv/{sample_calls_name}')
     text = text.replace('/data/tsv/sample_format_values.tsv', f'/data/tsv/{sample_format_name}')
+    version_class = (
+        f"vcfc:{vcf_version.file_class}" if vcf_version is not None else "vcfc:VCFFile"
+    )
+    text = text.replace(VCF_VERSION_CLASS_SENTINEL, version_class)
     output_rules.write_text(text)
+
+
+def read_declared_vcf_version(metadata_tsv: Path) -> tuple["vocab.VCFVersion", bool, str]:
+    """Detect the VCF version from an input's ``##fileformat`` line.
+
+    VCF requires ``##fileformat`` to be the first line of the file, and
+    ``src/vcf_as_tsv.sh`` already lifts it into ``file_metadata.tsv``, so
+    detection costs one small read and never needs the user to supply anything.
+
+    Returns the version to convert with, whether it was recognized, and the raw
+    declared token for reporting. An unrecognized version -- absent, malformed,
+    or VCFv4.0, for which VCF Core claims no conformance overlay -- falls back to
+    the newest supported version so no representable content is dropped, and is
+    reported rather than silently assumed.
+    """
+    declared = ""
+    if metadata_tsv.is_file():
+        _set_max_csv_field_size()
+        with metadata_tsv.open(newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle, delimiter="\t"):
+                declared = (row.get("FILE_FORMAT") or "").strip()
+                break
+    version, recognized = vocab.resolve_vcf_version(declared)
+    return version, recognized, declared
 
 
 def resolve_default_rules_path(repo_root: Path) -> Path:
@@ -3316,6 +4465,55 @@ def update_run_manifest(metrics_dir: Path, **updates) -> None:
         pass
 
 
+def _validation_index(metrics_dir: Path) -> list[dict]:
+    """Point at every artifact one validation target produced.
+
+    The reports are spread across three trees by design -- the stage JSON with
+    the other stages, the detail beside the other reports, the raw engine output
+    under it -- which makes them hard to find when a run is being diagnosed
+    rather than analysed. This collects them per target.
+    """
+    stage_dir = metrics_dir / "stages" / "validation"
+    if not stage_dir.is_dir():
+        return []
+    entries: list[dict] = []
+    for stage_path in sorted(stage_dir.glob("*.json")):
+        target_id = stage_path.stem
+        results_dir = metrics_dir / "reports" / "validation" / target_id
+        entry = {
+            "validation_id": target_id,
+            "stage_report": stage_path.relative_to(metrics_dir).as_posix(),
+            "results_dir": (
+                results_dir.relative_to(metrics_dir).as_posix()
+                if results_dir.is_dir() else None
+            ),
+        }
+        try:
+            stage = json.loads(stage_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            stage = {}
+        entry["status"] = stage.get("status")
+        entry["engine"] = stage.get("engine")
+        entry["validation_target"] = stage.get("validation_target")
+        entry["wall_seconds"] = (stage.get("timing") or {}).get("wall_seconds")
+        for label, name in (
+            ("summary", "summary.json"),
+            ("benchmark", "benchmark.json"),
+            ("benchmark_csv", "benchmark.csv"),
+        ):
+            candidate = results_dir / name
+            entry[label] = (
+                candidate.relative_to(metrics_dir).as_posix()
+                if candidate.is_file() else None
+            )
+        engines_dir = results_dir / "engines"
+        entry["engines"] = sorted(
+            child.name for child in engines_dir.iterdir() if child.is_dir()
+        ) if engines_dir.is_dir() else []
+        entries.append(entry)
+    return entries
+
+
 def write_run_summary(
     *,
     metrics_dir: Path,
@@ -3363,6 +4561,10 @@ def write_run_summary(
         },
         "stage_reports": stage_reports,
         "reports": reports,
+        # Validation writes a per-stage JSON, a detailed report directory and a
+        # benchmark CSV per target, which is a lot of places to look. Name them
+        # explicitly rather than leaving them to be found among the globs above.
+        "validation": _validation_index(metrics_dir),
         "logs": [
             path.relative_to(metrics_dir).as_posix()
             for path in sorted((metrics_dir / "logs").rglob("*"))
@@ -5188,6 +6390,7 @@ def run_full_mode(
     sample_workflow: SampleWorkflow,
     info_representation: str = DEFAULT_INFO_REPRESENTATION,
     header_representation: str = DEFAULT_HEADER_REPRESENTATION,
+    vcf_version: str = DEFAULT_VCF_VERSION,
     run_validation: bool = False,
     validation_artifacts: list[str] | None = None,
     validation_engine: str | list[str] = DEFAULT_VALIDATION_ENGINE,
@@ -5209,8 +6412,14 @@ def run_full_mode(
     timestamp: str,
     wrapper_log_path: Path,
     run_tracker: RunTracker | None = None,
+    linking_manifests: list | None = None,
+    linking_options: dict | None = None,
 ):
     """Execute full pipeline: per-input TSV -> RDF -> compression -> validation."""
+    linking_options = dict(linking_options or {})
+    if linking_manifests:
+        from vcf_rdfizer_linking.session import NetworkPolicy
+        linking_options["policy"] = NetworkPolicy(linking_manifests)
     pipeline_label = "TSV -> RDF -> compression"
     if run_validation:
         pipeline_label += " -> validation"
@@ -5392,6 +6601,41 @@ def run_full_mode(
         triplet["sample_calls"] = sample_calls_tsv
         triplet["sample_format_values"] = sample_format_tsv
         safe_prefix = slugify(prefix)
+
+        # The VCF version is detected per input, not per run: a directory may
+        # hold files of different versions, and each one's mapping and emitters
+        # have to follow its own ##fileformat line.
+        detected_version, version_recognized, declared_version = (
+            read_declared_vcf_version(triplet["metadata"])
+        )
+        if vcf_version == "auto":
+            active_version = detected_version if version_recognized else None
+        else:
+            active_version = vocab.VCF_VERSIONS[vcf_version]
+        effective_version = active_version or vocab.FALLBACK_VERSION
+
+        if vcf_version != "auto":
+            if version_recognized and detected_version.short != vcf_version:
+                print(
+                    f"    ! VCF version overridden: file declares "
+                    f"{detected_version.token}, converting as "
+                    f"{effective_version.token}"
+                )
+            else:
+                print(f"    * VCF version: {effective_version.token} (forced)")
+        elif version_recognized:
+            print(f"    * VCF version: {effective_version.token} (detected)")
+        else:
+            # VCFv4.0 and anything malformed land here. VCF Core claims no
+            # conformance overlay for those, so no version class is emitted and
+            # the newest supported rules are used, which is stated rather than
+            # assumed silently.
+            shown = declared_version or "no ##fileformat line"
+            print(
+                f"    ! VCF version not recognized ({shown}); converting with "
+                f"{effective_version.token} rules and no version class"
+            )
+
         generated_rules = generated_rules_dir / f"{safe_prefix}.rules.ttl"
         render_rules_for_triplet(
             rules_path,
@@ -5401,6 +6645,7 @@ def run_full_mode(
             triplet["metadata"].name,
             triplet["sample_calls"].name,
             triplet["sample_format_values"].name,
+            vcf_version=active_version,
         )
 
         output_name = safe_prefix or slugify(out_name)
@@ -5557,6 +6802,7 @@ def run_full_mode(
                     records_tsv=triplet["records"],
                     header_lines_tsv=triplet["headers"],
                     rdf_path=raw_rdf_files[0],
+                    version=effective_version,
                 )
             except Exception as exc:
                 fail_current(
@@ -5612,6 +6858,7 @@ def run_full_mode(
                     records_tsv=triplet["records"],
                     header_lines_tsv=triplet["headers"],
                     rdf_path=raw_rdf_files[0],
+                    version=effective_version,
                 )
             except Exception as exc:
                 fail_current(
@@ -5629,6 +6876,19 @@ def run_full_mode(
                     f"declarations: {info_stats['info_definitions']:,}"
                 )
 
+        if linking_manifests:
+            from vcf_rdfizer_linking.runner import run_stage
+            print("    * Linking: " + ", ".join(m.id for m in linking_manifests))
+            try:
+                run_stage(
+                    raw_rdf_files[0], linking_manifests,
+                    out_dir / output_name / f"{output_name}.links.nt",
+                    metrics_dir=metrics_dir, tracker=run_tracker, **linking_options,
+                )
+            except Exception as exc:
+                fail_current("data-linking", str(exc))
+                continue
+
         if triples_produced is None:
             triples_produced = count_triples_in_nt_files(raw_rdf_files)
         if header_stats is not None:
@@ -5643,6 +6903,12 @@ def run_full_mode(
                 rdf_path=raw_rdf_files[0],
                 total_triples=triples_produced,
                 sample_stats=sample_stats,
+                vcf_version=effective_version.token,
+                vcf_version_source=(
+                    "declared" if vcf_version == "auto" and version_recognized
+                    else "forced" if vcf_version != "auto"
+                    else "fallback"
+                ),
             )
         if triples_produced is not None:
             saw_triple_counts = True
@@ -6699,6 +7965,7 @@ def run_validation_mode(
     engine_args: list[str] = ["--engine", ",".join(engine_list)]
     for flag, key in (
         ("--query-timeout", "query_timeout"),
+        ("--validation-time-budget", "validation_time_budget"),
         ("--qlever-memory-gb", "qlever_memory_gb"),
         ("--qlever-port", "qlever_port"),
         ("--qlever-startup-timeout", "qlever_startup_timeout"),
@@ -6706,6 +7973,8 @@ def run_validation_mode(
         value = options.get(key)
         if value is not None:
             engine_args.extend([flag, str(value)])
+    if options.get("continue_after_query_timeout"):
+        engine_args.append("--continue-after-query-timeout")
     for flag, key in (
         ("--qlever-index-arg", "qlever_index_args"),
         ("--qlever-server-arg", "qlever_server_args"),
@@ -6729,7 +7998,10 @@ def run_validation_mode(
         "-v",
         f"{str(rdf_path.parent)}:/data/rdf:ro",
         "-v",
-        f"{str(results_dir)}:/data/validation",
+        # Resolved, like every other mount here: Docker reads a relative
+        # source as a *named volume*, so an unresolved path would silently send
+        # the reports into a volume instead of onto the host.
+        f"{str(results_dir.resolve())}:/data/validation",
         "-v",
         f"{str(metrics_dir.resolve())}:/data/metrics",
         *shacl_mount,
@@ -6925,9 +8197,9 @@ def main():
     parser.add_argument(
         "-m",
         "--mode",
-        choices=["full", "compress", "decompress", "tsv", "index", "validation"],
+        choices=["full", "compress", "decompress", "tsv", "index", "validation", "link"],
         default="full",
-        help="Run mode: full pipeline, TSV benchmark, compression, decompression, validation, or index-only regeneration",
+        help="Run mode: full pipeline, TSV benchmark, compression, decompression, validation, data linking, or index-only regeneration",
     )
     parser.add_argument(
         "-i",
@@ -6991,13 +8263,30 @@ def main():
         ),
     )
     parser.add_argument(
+        "--vcf-version",
+        choices=VCF_VERSION_CHOICES,
+        default=DEFAULT_VCF_VERSION,
+        help=(
+            "VCF specification version to convert against. auto (the default) "
+            "reads each input's ##fileformat line, so nothing has to be "
+            "supplied; an explicit version overrides that for a file whose "
+            "declaration is missing or wrong. The version selects the "
+            "vcfc:VCF4xFile subclass in the mapping and the version-dependent "
+            "emitter behaviour (which INFO keys flatten a tuple, whether that "
+            "tuple repeats per ALT allele, and whether the local-allele and "
+            "base-modification FORMAT families exist). VCF 4.0 has no "
+            "conformance overlay and converts with no version class"
+        ),
+    )
+    parser.add_argument(
         "--info-representation",
         choices=INFO_REPRESENTATION_CHOICES,
         default=DEFAULT_INFO_REPRESENTATION,
         help=(
             "INFO column representation: structured also emits one "
-            "vcfr:InfoFieldValue per record and key alongside the raw string, "
-            "making INFO queryable; raw keeps only vcfr:infoRaw "
+            "vcfc:InfoFieldValue per record and key alongside the raw string, "
+            "along with the allele layer and per-allele value items, making "
+            "INFO queryable; raw keeps only vcfc:infoRaw "
             f"(default: {DEFAULT_INFO_REPRESENTATION})"
         ),
     )
@@ -7161,7 +8450,7 @@ def main():
         action="store_true",
         help=(
             "Fail validation when a missing token is serialized as a plain '.' "
-            "literal instead of '.'^^vcfr:Null (reported but non-fatal by default)"
+            "literal instead of '.'^^vcfc:Null (reported but non-fatal by default)"
         ),
     )
     parser.add_argument(
@@ -7192,6 +8481,25 @@ def main():
         "--validation-query-timeout",
         default=None,
         help="Per-query timeout in seconds for validation (default: engine default)",
+    )
+    parser.add_argument(
+        "--validation-time-budget",
+        default=None,
+        help=(
+            "Wall-clock ceiling in seconds for one engine's whole validation "
+            "query set (0 = no ceiling, the default). A backstop for queries "
+            "that are slow but never individually time out"
+        ),
+    )
+    parser.add_argument(
+        "--validation-continue-after-query-timeout",
+        action="store_true",
+        help=(
+            "Keep running an engine's remaining validation queries after one "
+            "exceeds the per-query timeout. Off by default: a timeout means "
+            "the engine cannot answer this graph in the time allowed, and each "
+            "remaining query costs another full timeout"
+        ),
     )
     parser.add_argument(
         "--qlever-memory-gb",
@@ -7235,7 +8543,12 @@ def main():
         action="store_true",
         help="Explicitly remove the aggregate .nt/.nt.gz output after successful compression",
     )
+    from vcf_rdfizer_link import add_link_arguments, run_options, run_posthoc, selected_linkers
+    add_link_arguments(parser)
     args = parser.parse_args()
+    if args.mode not in {"full", "link"} and (args.link or args.linker_path or args.offline or args.links_cache_only or args.assembly or args.links_contact_email):
+        eprint("Error: linking options require --mode full or --mode link")
+        return 2
 
     global _PROGRESS_ALLOWED, _PROGRESS_EVENTS_ALLOWED, _QUIET
     _QUIET = bool(args.quiet)
@@ -7244,6 +8557,9 @@ def main():
     # available to the wrapper log/metrics machinery.
     _PROGRESS_ALLOWED = not (args.no_progress or args.quiet)
     _PROGRESS_EVENTS_ALLOWED = not args.no_progress
+
+    if args.mode == "link":
+        return run_posthoc(args)
 
     if args.build and args.no_build:
         eprint("Error: --build and --no-build are mutually exclusive.")
@@ -7269,7 +8585,10 @@ def main():
     validation_engines: list[str] = [DEFAULT_VALIDATION_ENGINE]
     validation_engine_options: dict = {}
     shacl_shapes_path: Path | None = None
+    linking_manifests = []
     try:
+        if args.link:
+            linking_manifests = selected_linkers(args)
         for option_name, key in (
             ("--validation-query-timeout", "query_timeout"),
             ("--qlever-memory-gb", "qlever_memory_gb"),
@@ -7281,6 +8600,16 @@ def main():
                 validation_engine_options[key] = parse_positive_int(
                     raw_value, name=option_name
                 )
+        if args.validation_time_budget is not None:
+            # 0 is meaningful: no ceiling.
+            budget = int(args.validation_time_budget)
+            if budget < 0:
+                raise ValueError(
+                    "--validation-time-budget must be zero or a positive integer"
+                )
+            validation_engine_options["validation_time_budget"] = budget
+        if args.validation_continue_after_query_timeout:
+            validation_engine_options["continue_after_query_timeout"] = True
         if args.qlever_index_arg:
             validation_engine_options["qlever_index_args"] = list(args.qlever_index_arg)
         if args.qlever_server_arg:
@@ -7391,6 +8720,10 @@ def main():
                     methods=full_methods,
                     partitioned=full_uses_partitioning,
                 )
+                if linking_manifests:
+                    output_plans[f"input {index} ({prefix})"].add(
+                        out_dir / output_name / f"{output_name}.links.nt"
+                    )
             validate_no_output_collisions(output_plans)
         elif args.run_validation:
             raise ValueError("--validate/--run-validation is only valid in --mode full")
@@ -7592,11 +8925,14 @@ def main():
             )
             return 2
     manifest_options = {
+        "link": [m.id for m in linking_manifests],
+        "linking_options": {k: str(v) if isinstance(v, Path) else v for k, v in run_options(args).items()} if linking_manifests else None,
         "requested_image": args.image,
         "requested_image_version": args.image_version,
         "sample_representation": args.sample_representation if mode == "full" else None,
         "info_representation": args.info_representation if mode == "full" else None,
         "header_representation": args.header_representation if mode == "full" else None,
+        "vcf_version": args.vcf_version if mode == "full" else None,
         "rdf_storage_mode": args.rdf_storage_mode if mode == "full" else None,
         "compression_methods": (
             full_methods if mode == "full" else methods if mode == "compress" else []
@@ -7801,6 +9137,9 @@ def main():
                 sample_workflow=sample_workflow,
                 info_representation=args.info_representation,
                 header_representation=args.header_representation,
+                vcf_version=args.vcf_version,
+                linking_manifests=linking_manifests,
+                linking_options=run_options(args),
                 run_validation=args.run_validation,
                 validation_artifacts=validation_artifacts,
                 validation_engine=validation_engines,

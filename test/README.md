@@ -4,6 +4,15 @@ This repository uses `unittest` (Python standard library) to isolate orchestrati
 
 ## What is covered
 
+- `test/test_linking_unit.py`
+  - Exercises all three shipped linkers with known-answer token and interval
+    cases, the actual Ensembl resolver over fake HTTP, offline cache replay,
+    budgets/retries/host pacing, digest and assembly refusal, and atomic output.
+  - Covers unordered/plain/gzip RDF, existing subject identity, full/post-hoc
+    wiring, discovery, scaffolding and previews. No Docker or public API calls.
+  - These checks do not change the core semantic mutation score; plug-in
+    SPARQL/mutation auto-discovery remains planned. See `docs/datalinking.md`.
+
 - `test/test_vcf_rdfizer_unit.py`
   - Verifies wrapper control flow for the 5-step pipeline.
   - Verifies image/version resolution behavior and error handling.
@@ -38,8 +47,9 @@ This repository uses `unittest` (Python standard library) to isolate orchestrati
   - Mutation testing for the semantic validation suite: corrupts a correct
     graph in 42 named ways and asserts which corruptions the validator
     detects, producing a reproducible mutation score (currently 76/78).
-  - Requires `rdflib` (test-only, in the `dev` extra); the tests skip cleanly
-    without it. See `docs/validation-methodology.md`.
+  - Requires `rdflib` (now a runtime dependency for linking); the tests still
+    skip cleanly without it in source-only environments. See
+    `docs/validation-methodology.md`.
   - The fixture derives the VCF, the RDF graph and the parser oracle from one
     declarative spec, and builds its graph with the project's own emitters, so
     the two halves cannot drift apart.

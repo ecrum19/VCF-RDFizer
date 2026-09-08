@@ -21,10 +21,9 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
-VCFR = "https://w3id.org/vcf-rdfizer/vocab#"
+VCFC = "https://w3id.org/vcf-core/vocab#"
 RDF_TYPE = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
 XSD_INTEGER = "http://www.w3.org/2001/XMLSchema#integer"
-XSD_POSITIVE_INTEGER = "http://www.w3.org/2001/XMLSchema#positiveInteger"
 
 def _runner():
     """Load the shipped validation runner (it lives outside the package path)."""
@@ -44,6 +43,12 @@ FILE_FORMAT = "VCFv4.2"
 FILE_DATE = "20260101"
 SOURCE_SOFTWARE = "vcf-rdfizer-fixture"
 REFERENCE_GENOME = "GRCh38"
+#: The optional vcfc subclass the mapping's version sentinel resolves to for
+#: this fixture's declared version. Derived rather than hard-coded so changing
+#: FILE_FORMAT above changes the expected graph with it.
+VERSION_FILE_CLASS = f"VCF{FILE_FORMAT.removeprefix('VCFv').replace('.', '')}File"
+#: The bare version, as vcf_rdfizer_vocab.VCF_VERSIONS keys it.
+FIXTURE_VERSION = FILE_FORMAT.removeprefix("VCFv")
 
 #: ``##`` meta-information lines, in file order. The ``#CHROM`` line is not one
 #: of these; ``header_count`` below counts only the ``##`` lines.
@@ -163,7 +168,7 @@ def header_lines_tsv_text() -> str:
 def _literal(value: str) -> str:
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
     if value == ".":
-        return f'"{escaped}"^^<{VCFR}Null>'
+        return f'"{escaped}"^^<{VCFC}Null>'
     return f'"{escaped}"'
 
 
@@ -184,46 +189,57 @@ def _info_entries(record: "FixtureRecord") -> list[tuple[str, str | None]]:
 def base_triples(*, include_qual: bool = True, include_info: bool = True) -> list[str]:
     """The triples RMLStreamer produces from `default_rules.ttl`.
 
-    ``include_qual`` is on because the shipped mapping now emits ``vcfr:qual``;
-    turning it off models the pre-fix mapping, which is how the harness shows
-    that dropping QUAL is now detected. ``include_info`` models the structured
-    INFO representation.
+    This has to track the shipped mapping, and the division it follows is one
+    rule: RML carries every field whose RDF datatype is the same for every row.
+    ID, ALT, QUAL, FILTER and INFO are therefore *not* here -- each may be the
+    VCF missing token, which the vocabulary requires as ``"."^^vcfc:Null``, so
+    the wrapper's own emitter produces them and ``build_graph`` appends them.
+
+    ``include_qual`` and ``include_info`` are kept because the harness uses them
+    to model a graph missing those emitter outputs, which is how it shows that
+    dropping them is detected.
     """
     file_uri = f"file://{SOURCE_FILE}"
     header_uri = f"{file_uri}#header"
+    columns_uri = f"{file_uri}#header/columns"
     out = [
-        f"<{file_uri}> <{RDF_TYPE}> <{VCFR}VCFFile> .",
-        f"<{file_uri}> <{VCFR}fileFormat> {_literal(FILE_FORMAT)} .",
-        f"<{file_uri}> <{VCFR}sourceSoftware> {_literal(SOURCE_SOFTWARE)} .",
-        f"<{file_uri}> <{VCFR}referenceGenome> {_literal(REFERENCE_GENOME)} .",
+        f"<{file_uri}> <{RDF_TYPE}> <{VCFC}VCFFile> .",
+        # The mapping's version sentinel, resolved per input to the subclass for
+        # the version the file declares. The fixture declares VCFv4.2.
+        f"<{file_uri}> <{RDF_TYPE}> <{VCFC}{VERSION_FILE_CLASS}> .",
+        f"<{file_uri}> <{VCFC}fileFormat> {_literal(FILE_FORMAT)} .",
+        f"<{file_uri}> <{VCFC}sourceSoftware> {_literal(SOURCE_SOFTWARE)} .",
+        f"<{file_uri}> <{VCFC}referenceGenome> {_literal(REFERENCE_GENOME)} .",
 
-        f"<{file_uri}> <{VCFR}hasHeader> <{header_uri}> .",
-        f"<{header_uri}> <{RDF_TYPE}> <{VCFR}VCFHeader> .",
+        f"<{file_uri}> <{VCFC}hasHeader> <{header_uri}> .",
+        f"<{header_uri}> <{RDF_TYPE}> <{VCFC}VCFHeader> .",
+        # The mandatory #CHROM line. Its ordered sample columns are attached by
+        # the wrapper, because they live in the records TSV header.
+        f"<{header_uri}> <{VCFC}hasColumnHeader> <{columns_uri}> .",
+        f"<{columns_uri}> <{RDF_TYPE}> <{VCFC}ColumnHeaderLine> .",
     ]
     for index, (key, value) in enumerate(HEADER_LINES, start=1):
         line_uri = f"{file_uri}#header/line/{index}"
         out += [
-            f"<{header_uri}> <{VCFR}hasHeaderLine> <{line_uri}> .",
-            f"<{line_uri}> <{RDF_TYPE}> <{VCFR}HeaderLine> .",
-            f"<{line_uri}> <{VCFR}headerKey> {_literal(key)} .",
-            f"<{line_uri}> <{VCFR}headerValue> {_literal(value)} .",
+            f"<{header_uri}> <{VCFC}hasHeaderLine> <{line_uri}> .",
+            f"<{line_uri}> <{RDF_TYPE}> <{VCFC}HeaderLine> .",
+            f"<{line_uri}> <{VCFC}headerKey> {_literal(key)} .",
+            f"<{line_uri}> <{VCFC}headerValue> {_literal(value)} .",
+            f'<{line_uri}> <{VCFC}lineIndex> "{index}"^^<{XSD_INTEGER}> .',
         ]
     for record in RECORDS:
         record_uri = f"{file_uri}#record/{record.row_id}"
         call_uri = f"{file_uri}#call/{record.row_id}"
         out += [
-            f"<{file_uri}> <{VCFR}hasRecord> <{record_uri}> .",
-            f"<{record_uri}> <{RDF_TYPE}> <{VCFR}VCFRecord> .",
-            f"<{record_uri}> <{VCFR}chrom> {_literal(record.chrom)} .",
-            f'<{record_uri}> <{VCFR}pos> "{record.pos}"^^<{XSD_INTEGER}> .',
-            f"<{record_uri}> <{VCFR}recordId> {_literal(record.record_id)} .",
-            f"<{record_uri}> <{VCFR}ref> {_literal(record.ref)} .",
-            f"<{record_uri}> <{VCFR}alt> {_literal(record.alt)} .",
-            f"<{record_uri}> <{VCFR}hasCall> <{call_uri}> .",
-            f"<{call_uri}> <{RDF_TYPE}> <{VCFR}VariantCall> .",
-            f"<{call_uri}> <{VCFR}filter> {_literal(record.filter_value)} .",
-            f"<{call_uri}> <{VCFR}infoRaw> {_literal(record.info)} .",
-            f"<{call_uri}> <{VCFR}formatRaw> {_literal(':'.join(record.format_keys))} .",
+            f"<{file_uri}> <{VCFC}hasRecord> <{record_uri}> .",
+            f"<{record_uri}> <{RDF_TYPE}> <{VCFC}VCFRecord> .",
+            f"<{record_uri}> <{VCFC}chrom> {_literal(record.chrom)} .",
+            f'<{record_uri}> <{VCFC}pos> "{record.pos}"^^<{XSD_INTEGER}> .',
+            f"<{record_uri}> <{VCFC}ref> {_literal(record.ref)} .",
+            f'<{record_uri}> <{VCFC}recordIndex> "{record.row_id}"^^<{XSD_INTEGER}> .',
+            f"<{record_uri}> <{VCFC}hasCall> <{call_uri}> .",
+            f"<{call_uri}> <{RDF_TYPE}> <{VCFC}VariantCall> .",
+            f"<{call_uri}> <{VCFC}formatRaw> {_literal(':'.join(record.format_keys))} .",
         ]
     return out
 
@@ -256,14 +272,21 @@ def build_graph(
             "\n".join(base_triples(include_qual=include_qual, include_info=include_info)) + "\n",
             encoding="utf-8",
         )
-        if include_qual or include_info:
-            vcf_rdfizer.append_record_detail_rdf(
-                records_tsv, headers_tsv, graph,
-                emit_qual=include_qual, emit_info=include_info,
+        # The fixture declares a VCF version; the emitters follow it exactly as
+        # a real conversion does, so version-dependent behaviour is exercised
+        # rather than assumed.
+        version = vcf_rdfizer.vocab.VCF_VERSIONS[FIXTURE_VERSION]
+        vcf_rdfizer.append_record_detail_rdf(
+            records_tsv, headers_tsv, graph,
+            emit_qual=include_qual, emit_info=include_info,
+            emit_alleles=include_info, version=version,
+            progress_interval_records=0,
+        )
+        if representation == "expanded":
+            vcf_rdfizer.append_expanded_sample_rdf(
+                records_tsv, graph, headers_tsv, version=version,
                 progress_interval_records=0,
             )
-        if representation == "expanded":
-            vcf_rdfizer.append_expanded_sample_rdf(records_tsv, graph, progress_interval_records=0)
         else:
             vcf_rdfizer.append_condensed_sample_rdf(
                 records_tsv, headers_tsv, graph, progress_interval_records=0
@@ -348,42 +371,80 @@ def _format_shape() -> dict:
     }
 
 
-def _header_shape() -> dict:
-    """Header counters the census needs, derived with the shipped parser."""
+def _declared_numbers(header_key: str) -> dict[str, str]:
+    """Map each declared INFO or FORMAT ID to its Number token."""
     runner = _runner()
-    classes: Counter[str] = Counter()
-    filters = alts = contigs = described = 0
-    attributes: Counter[str] = Counter()
+    numbers: dict[str, str] = {}
     for key, value in HEADER_LINES:
-        class_name = runner.HEADER_LINE_CLASSES.get(key.lower())
-        if class_name is None:
-            continue
-        classes[class_name] += 1
-        if key.lower() not in {"filter", "alt", "contig"}:
+        if key.upper() != header_key:
             continue
         fields = runner.parse_structured_header_fields(value)
-        if not (fields.get("ID") or "").strip():
+        ident = (fields.get("ID") or "").strip()
+        if ident:
+            numbers.setdefault(ident, fields.get("Number") or ".")
+    return numbers
+
+
+def _declared_ids(header_key: str) -> set[str]:
+    """The set of IDs declared by one structured header key."""
+    runner = _runner()
+    ids: set[str] = set()
+    for key, value in HEADER_LINES:
+        if key.upper() != header_key:
             continue
-        if key.lower() == "contig":
-            contigs += 1
-            for attribute in ("length", "md5", "assembly"):
-                if fields.get(attribute):
-                    attributes[attribute] += 1
-            continue
-        if key.lower() == "filter":
-            filters += 1
-        else:
-            alts += 1
-        if fields.get("Description"):
-            described += 1
-    return {
-        "headerLineClassCounts": dict(classes),
-        "filterDefinitionCount": filters,
-        "altDefinitionCount": alts,
-        "contigCount": contigs,
-        "contigAttributeCounts": dict(attributes),
-        "describedDefinitionCount": described,
-    }
+        ident = (runner.parse_structured_header_fields(value).get("ID") or "").strip()
+        if ident:
+            ids.add(ident)
+    return ids
+
+
+def _record_rows() -> list[list[str]]:
+    """The raw VCF data columns, as the runner's oracle sees them."""
+    return [
+        [record.chrom, str(record.pos), record.record_id, record.ref, record.alt,
+         record.qual, record.filter_value, record.info,
+         ":".join(record.format_keys), *record.sample_payloads]
+        for record in RECORDS
+    ]
+
+
+def _header_shape() -> dict:
+    """Header counters, derived by the shipped runner rather than restated.
+
+    The census asserts an exact inventory, so this has to cover every family the
+    header emitter produces. Delegating keeps the fixture and the container
+    oracle on one implementation.
+    """
+    runner = _runner()
+    shape = dict(runner.emitted_header_counters(list(HEADER_LINES)))
+    shape["headerValueCount"] = sum(1 for _key, value in HEADER_LINES if value != "")
+    return shape
+
+
+def _synthesized_definition_numbers() -> dict:
+    """Delegated to the runner, so the two oracles cannot disagree."""
+    return dict(_runner().synthesized_definition_numbers(
+        _record_rows(),
+        declared_info=set(_declared_numbers("INFO")),
+        declared_format=set(_declared_numbers("FORMAT")),
+    ))
+
+
+def _record_shape() -> dict:
+    """Allele, value-item, SV and genotype counters, derived the same way."""
+    runner = _runner()
+    return dict(runner.emitted_record_counters(
+        _record_rows(),
+        list(SAMPLES),
+        version=runner.vocab.VCF_VERSIONS[FIXTURE_VERSION],
+        contig_ids=_declared_ids("CONTIG"),
+        alt_declaration_ids=_declared_ids("ALT"),
+        has_assembly_line=any(
+            key.lower() == "assembly" and value for key, value in HEADER_LINES
+        ),
+        info_numbers=_declared_numbers("INFO"),
+        format_numbers=_declared_numbers("FORMAT"),
+    ))
 
 
 def _info_shape() -> dict:
@@ -486,7 +547,6 @@ def parser_summary(
         "singleAltRecordCount": single_alt,
         "q06EligibleSiteCount": q06_eligible,
         "headerLineCount": len(HEADER_LINES),
-        "headerValueCount": sum(1 for _key, value in HEADER_LINES if value != ""),
         **_format_shape(),
         **_info_shape(),
         "fileFormat": FILE_FORMAT,
@@ -494,6 +554,8 @@ def parser_summary(
         "sourceSoftware": SOURCE_SOFTWARE,
         "fileDate": FILE_DATE,
         **_header_shape(),
+        **_record_shape(),
+        **_synthesized_definition_numbers(),
         "q07_file_metadata": {
             "fileFormat": FILE_FORMAT,
             "referenceGenome": REFERENCE_GENOME,

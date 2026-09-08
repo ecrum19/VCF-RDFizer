@@ -18,6 +18,7 @@ everything lives beneath it:
     <sample>.hdt  +  <sample>.hdt.index.v1-1
     <sample>.cottas
     <sample>.hdt.gz | .cottas.br | ...
+    <sample>.links.nt                         optional --link side-graph
   run_metrics/<INPUT_LABEL>__<RUN_ID>/       per-run reports and logs
   .intermediate/tsv/                         hidden intermediates
   decompressed/                              --mode decompress default target
@@ -27,6 +28,11 @@ The directory name and every artifact basename come from the source filename
 with its recognized VCF/RDF/representation suffix removed. `--mode compress` on
 `test-larger.nt` and on `test-larger.nt.gz` therefore both write into
 `<out>/test-larger/`.
+
+`--mode link` is host-only and writes `<out>/<name>.links.nt`, with the usual
+`run_metrics/` directory. Full mode writes its linkset beside the aggregate
+inside `<out>/<sample>/`. Side-graph triples are excluded from the base
+conversion's triple counts. See [Data linking](datalinking.md).
 
 **Collision policy.** Before Docker starts, the wrapper computes every artifact
 the run intends to write and fails if any already exists. It never overwrites a
@@ -60,16 +66,39 @@ recognisable without opening a timestamp-named folder.
 | --- | --- |
 | `run.json` | Source identity, resolved input paths, requested configuration, image selection |
 | `summary.json` | Final status, wrapper wall time, summary rows, and an index of every stage report and log |
-| `metrics.csv` | Analysis-ready per-output table |
+| `metrics.csv` | Analysis-ready per-output table, including `vcf_version` and `vcf_version_source` |
 | `tsv_metrics.csv` | TSV-mode benchmark table |
 | `wrapper_execution_times.csv` | Host-side stage timings |
 | `logs/wrapper.log`, `logs/progress.log` | Command log and progress history |
 | `timings/<stage>/…` | Raw GNU `time -v` output from inside the relevant container |
 | `stages/tsv/`, `stages/conversion/`, `stages/compression/`, `stages/compression_operations/`, `stages/decompression/`, `stages/index/`, `stages/validation/` | Structured per-stage results |
 | `stages/partitioned/<sample>.json` | Full handoff from the partitioned-compression container |
+| `stages/linking/<sample>.links.json` | Linker counts, reference/response digests, network accounting and success/failure; also collected in `run.json` |
 | `reports/index_warnings.json` | Degraded-index events |
 | `reports/failed_inputs.csv` | Inputs abandoned during a multi-file run |
 | `reports/validation/<validation-id>/` | Detailed semantic-validation reports |
+
+**Finding a validation run.** Its artifacts are spread across three trees by
+design — the stage JSON with the other stages, the detail beside the other
+reports, the raw engine output under that — which is convenient for analysis and
+awkward when diagnosing. `summary.json` therefore carries a `validation` array
+naming all of them per target:
+
+```json
+{"validation": [{
+  "validation_id": "chr20",
+  "status": "PASS", "engine": "qlever", "validation_target": "aggregate",
+  "wall_seconds": 812.4,
+  "stage_report": "stages/validation/chr20.json",
+  "results_dir":  "reports/validation/chr20",
+  "summary":      "reports/validation/chr20/summary.json",
+  "benchmark_csv":"reports/validation/chr20/benchmark.csv",
+  "engines": ["comunica", "qlever"]
+}]}
+```
+
+Start there rather than globbing. A target validated against a non-aggregate
+artifact is suffixed: `chr20__hdt`.
 
 `compression_operations/` preserves the per-RDF operation and round-trip
 validation reports; `compression/` is the final output-level summary over them.
@@ -80,6 +109,20 @@ results, the generated chunk plan, workspace free-space samples, CPU time, peak
 RSS, exit codes, and bounded `stderr` diagnostics — **and it survives the
 deletion of the temporary Docker volume**, which is what makes a failed
 cohort-scale run diagnosable at all.
+
+**Recording the VCF version.** `metrics.csv` and
+`stages/conversion/*.json` carry `vcf_version` (the specification version the
+input was converted under, e.g. `VCFv4.4`) and `vcf_version_source`:
+
+| `vcf_version_source` | Meaning |
+| --- | --- |
+| `declared` | Read from the input's own `##fileformat` line |
+| `forced` | `--vcf-version` overrode the declaration |
+| `fallback` | The declaration was missing, malformed, or a version with no conformance overlay (VCF 4.0); the newest supported rules were used and no `vcfc:VCF4xFile` class was emitted |
+
+Benchmarks should group by these. The version selects the SHACL overlay, the
+flattened-tuple semantics and which FORMAT families exist, so conversion cost
+and graph size are not comparable across versions without them.
 
 ## 3. Input size accounting
 

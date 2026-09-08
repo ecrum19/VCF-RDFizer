@@ -271,6 +271,23 @@ def latest_metrics_run_dir(metrics_root: Path) -> Path:
     return run_dirs[-1][1]
 
 
+
+def _vocabulary_registry_path() -> Path | None:
+    """Locate the published VCF Core version registry, if it is available."""
+    override = os.environ.get("VCF_CORE_VOCABULARY_DIR")
+    candidates = [Path(override)] if override else []
+    repo_root = Path(__file__).resolve().parents[1]
+    candidates += [
+        repo_root.parent / "vcf-core-vocabulary",
+        repo_root.parent / "vcf-rdfizer-vocabulary",
+    ]
+    for candidate in candidates:
+        registry = candidate / "ontology" / "versions" / "registry.json"
+        if registry.is_file():
+            return registry
+    return None
+
+
 class WrapperUnitTests(VerboseTestCase):
     def test_metrics_directory_uses_recognizable_input_label(self):
         """Metrics runs keep the full input stem alongside their timestamp."""
@@ -1701,21 +1718,44 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertEqual(stats["records"], 1)
             self.assertEqual(stats["sample_calls"], 2)
             self.assertEqual(stats["format_values"], 4)
-            self.assertEqual(stats["triples"], 19)
+            # One GT per sample, each diploid.
+            self.assertEqual(stats["genotypes"], 2)
+            self.assertEqual(stats["genotype_calls"], 4)
             rdf_lines = rdf_path.read_text(encoding="utf-8").splitlines()
-            self.assertEqual(len(rdf_lines), 20)
+            self.assertEqual(len(rdf_lines), stats["triples"] + 1)
             self.assertIn(
-                "<file://sample.vcf> <https://w3id.org/vcf-rdfizer/vocab#representationProfile> "
-                "<https://w3id.org/vcf-rdfizer/vocab#ExpandedRepresentation> .",
+                "<file://sample.vcf> <https://w3id.org/vcf-core/vocab#representationProfile> "
+                "<https://w3id.org/vcf-core/vocab#ExpandedRepresentation> .",
                 rdf_lines,
             )
             self.assertIn(
-                "<file://sample.vcf#call/2> <https://w3id.org/vcf-rdfizer/vocab#hasSampleCall> "
+                "<file://sample.vcf#call/2> <https://w3id.org/vcf-core/vocab#hasSampleCall> "
                 "<file://sample.vcf#sample/2/SAMPLE-A> .",
                 rdf_lines,
             )
+            # The expanded profile gives each call a reusable sample identity in
+            # addition to its sampleId literal.
             self.assertIn(
-                '"."^^<https://w3id.org/vcf-rdfizer/vocab#Null> .',
+                "<file://sample.vcf#sample/2/SAMPLE-A> <https://w3id.org/vcf-core/vocab#forSample> "
+                "<file://sample.vcf#samples/SAMPLE-A> .",
+                rdf_lines,
+            )
+            # GT is parsed into an ordered genotype, and its no-call positions
+            # are marked rather than given a fabricated allele.
+            self.assertIn(
+                "<file://sample.vcf#sample/2/SAMPLE-A/genotype> "
+                "<https://w3id.org/vcf-core/vocab#genotypeString> "
+                '"0/1"^^<https://w3id.org/vcf-core/vocab#GenotypeString> .',
+                rdf_lines,
+            )
+            self.assertIn(
+                "<file://sample.vcf#sample/2/SAMPLE_B/genotype/call/0> "
+                "<https://w3id.org/vcf-core/vocab#isNoCall> "
+                '"true"^^<http://www.w3.org/2001/XMLSchema#boolean> .',
+                rdf_lines,
+            )
+            self.assertIn(
+                '"."^^<https://w3id.org/vcf-core/vocab#Null> .',
                 rdf_lines[-1],
             )
 
@@ -1746,9 +1786,18 @@ class WrapperUnitTests(VerboseTestCase):
 
             self.assertEqual(stats["sample_calls"], 2504)
             self.assertEqual(stats["format_values"], 2504)
-            self.assertEqual(stats["triples"], 1 + (2504 * 6))
+            self.assertEqual(stats["samples"], 2504)
+            # The payload is not in the GT lexical space, so no Genotype is
+            # invented for it; the value stays as the FORMAT field's literal.
+            self.assertEqual(stats["genotypes"], 0)
+            # 3 file-level triples (profile, hasSampleSet, SampleSet type) and 6
+            # for the single synthesized FORMAT definition, then per sample: 5
+            # for the VCFSample and its column-header link, 4 for the SampleCall
+            # and 4 for its one FORMAT value.
+            expected = 3 + 6 + (2504 * 13)
+            self.assertEqual(stats["triples"], expected)
             with gzip.open(rdf_path, "rt", encoding="utf-8") as handle:
-                self.assertEqual(sum(1 for _line in handle), 2 + (2504 * 6))
+                self.assertEqual(sum(1 for _line in handle), expected + 1)
 
     def test_sample_support_strategy_preserves_custom_helper_consumers(self):
         """Only the exact canonical helper maps use direct RDF streaming."""
@@ -1823,19 +1872,290 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertEqual(stats["matrices"], 1)
             self.assertEqual(stats["format_vectors"], 3)
             self.assertEqual(stats["format_definitions"], 3)
-            self.assertEqual(stats["triples"], 45)
             rdf_text = rdf_path.read_text(encoding="utf-8")
+            self.assertEqual(len(rdf_text.splitlines()), stats["triples"] + 1)
             self.assertIn("vocab#CondensedRepresentation", rdf_text)
             self.assertIn("vocab#SampleSet", rdf_text)
-            self.assertIn("#samples/S3> <https://w3id.org/vcf-rdfizer/vocab#sampleIndex>", rdf_text)
+            # Ordinals are xsd:integer so they satisfy the SHACL profiles, which
+            # constrain every one of them with sh:datatype xsd:integer.
+            self.assertIn(
+                "#samples/S3> <https://w3id.org/vcf-core/vocab#sampleIndex> "
+                '"3"^^<http://www.w3.org/2001/XMLSchema#integer>',
+                rdf_text,
+            )
             self.assertIn("#call/7/matrix/fmt/GT", rdf_text)
             self.assertIn('"0/1\\t./.\\t1/1"', rdf_text)
             self.assertIn('"30,12\\t.\\t."', rdf_text)
+            # A vector cites its declaration at the header line's own IRI.
             self.assertIn("#header/line/1> .", rdf_text)
-            self.assertIn("vocab#fieldNumber> \"1\"", rdf_text)
-            self.assertIn("vocab#fieldDescription> \"Genotype\"", rdf_text)
+            self.assertIn(
+                "vocab#FormatFieldDefinition>", rdf_text,
+                "the vector's declaration must be typed",
+            )
+            # The declaration's ID/Number/Type/Description belong to the header
+            # emitter, which owns that IRI. Emitting them here too produced two
+            # copies of every one of those triples, which the validation
+            # suite's duplicate-triple preflight rejects.
+            for owned in ("vocab#fieldId>", "vocab#fieldNumber>",
+                          "vocab#fieldType>", "vocab#fieldDescription>"):
+                self.assertNotIn(owned, rdf_text, owned)
             self.assertNotIn("vocab#hasSampleCall", rdf_text)
             self.assertNotIn("vocab#FormatFieldValue", rdf_text)
+            # The condensed profile keeps genotype values inside their vectors,
+            # so no per-sample Genotype is derived. (hasGenotypeColumns, on the
+            # #CHROM line, is a different property and is expected.)
+            self.assertNotIn("vocab#hasGenotype>", rdf_text)
+            self.assertIn("vocab#hasGenotypeColumns>", rdf_text)
+
+    def test_version_model_matches_the_published_registry(self):
+        """The converter's version table must agree with the vocabulary's own.
+
+        VCF Core publishes ``ontology/versions/registry.json`` as the single
+        source of truth for its version-scoped artifacts: the SHACL overlays,
+        the reserved-key snapshots and the VCF4xFile classes are all generated
+        from it. The converter keeps its own dependency-free copy of the same
+        facts so it works without the vocabulary checked out; this pins the two
+        together so a new VCF version, or a corrected arity, cannot land on one
+        side alone.
+
+        Skipped when the vocabulary is not available. Point
+        VCF_CORE_VOCABULARY_DIR at a checkout to run it.
+        """
+        registry_path = _vocabulary_registry_path()
+        if registry_path is None:
+            self.skipTest(
+                "VCF Core vocabulary not found; set VCF_CORE_VOCABULARY_DIR to "
+                "a checkout to cross-check the version model"
+            )
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        vocab = vcf_rdfizer.vocab
+
+        published = {entry["id"] for entry in registry["versions"]}
+        self.assertEqual(
+            published, set(vocab.VCF_VERSIONS),
+            "the converter and the vocabulary disagree about which VCF "
+            "versions are supported",
+        )
+        # The newest published version is what an unrecognized file falls back
+        # to, so that has to track the registry too.
+        self.assertEqual(vocab.FALLBACK_VERSION.short, registry["current"])
+
+        for entry in registry["versions"]:
+            version = vocab.VCF_VERSIONS[entry["id"]]
+            with self.subTest(version=entry["id"]):
+                self.assertEqual(version.token, entry["code"])
+                self.assertEqual(version.file_class, entry["className"])
+                self.assertEqual(
+                    version.leading_phase_indicator, entry["leadingPhaseIndicator"]
+                )
+                # "perAlt" means a tuple repeats once per ALT allele; "fixed"
+                # means one tuple describes the whole record.
+                self.assertEqual(
+                    version.tuples_per_alt, entry["svTupleScope"] == "perAlt"
+                )
+
+                # numberCodes lists regex alternatives; "[0-9]+" and "[.]" are
+                # the integer and missing forms the model handles separately.
+                for scope, is_format in (("info", False), ("format", True)):
+                    codes = {
+                        code for code in entry["numberCodes"][scope]
+                        if code != "[0-9]+"
+                    }
+                    codes = {"." if code == "[.]" else code for code in codes}
+                    allowed = {
+                        code for code in vocab.ARITY_INDIVIDUALS
+                        if version.allows_number(code, is_format=is_format)
+                    }
+                    self.assertEqual(
+                        allowed, codes,
+                        f"{scope} Number codes disagree for {entry['id']}",
+                    )
+
+                expected_tuples = {
+                    key: group["width"]
+                    for group in entry["svTuples"] for key in group["keys"]
+                }
+                self.assertEqual(
+                    version.tuple_keys, expected_tuples,
+                    f"flattened-tuple keys disagree for {entry['id']}",
+                )
+
+    def test_vcf_version_is_detected_from_the_fileformat_line(self):
+        """Auto-detection reads ##fileformat; nothing has to be supplied."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            for declared, expected_short, expected_recognized in (
+                ("VCFv4.1", "4.1", True),
+                ("VCFv4.3", "4.3", True),
+                ("VCFv4.5", "4.5", True),
+                # VCF Core claims no 4.0 conformance overlay, so 4.0 is not
+                # recognized and no version class may be claimed for it.
+                ("VCFv4.0", "4.5", False),
+                ("", "4.5", False),
+                ("nonsense", "4.5", False),
+            ):
+                metadata = tmp_path / f"{expected_short}-{declared or 'none'}.tsv"
+                metadata.write_text(
+                    "SOURCE_FILE\tFILE_FORMAT\tFILE_DATE\tSOURCE_SOFTWARE\t"
+                    "REFERENCE_GENOME\tHEADER_COUNT\tRECORD_COUNT\n"
+                    f"x.vcf\t{declared}\t\t\t\t1\t1\n",
+                    encoding="utf-8",
+                )
+                version, recognized, raw = vcf_rdfizer.read_declared_vcf_version(metadata)
+                self.assertEqual(version.short, expected_short, declared)
+                self.assertEqual(recognized, expected_recognized, declared)
+                self.assertEqual(raw, declared)
+
+    def test_rules_rendering_resolves_the_version_class_sentinel(self):
+        """The mapping's version sentinel becomes the input's own file class."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            template = tmp_path / "template.ttl"
+            template.write_text(
+                "rr:class vcfc:VCFFile ;\n    rr:class vcfc:VCFVersionFile\n",
+                encoding="utf-8",
+            )
+
+            rendered = tmp_path / "v43.ttl"
+            vcf_rdfizer.render_rules_for_triplet(
+                template, rendered, "r.tsv", "h.tsv", "m.tsv", "sc.tsv", "sf.tsv",
+                vcf_version=vcf_rdfizer.vocab.VCF_VERSIONS["4.3"],
+            )
+            self.assertIn("rr:class vcfc:VCF43File", rendered.read_text())
+            self.assertNotIn("VCFVersionFile", rendered.read_text())
+
+            # An unrecognized version resolves to the base class the subject map
+            # already asserts, so the graph never claims a gate that cannot be
+            # checked and never gains a term the vocabulary does not define.
+            neutral = tmp_path / "neutral.ttl"
+            vcf_rdfizer.render_rules_for_triplet(
+                template, neutral, "r.tsv", "h.tsv", "m.tsv", "sc.tsv", "sf.tsv",
+                vcf_version=None,
+            )
+            text = neutral.read_text()
+            self.assertNotIn("VCFVersionFile", text)
+            self.assertEqual(text.count("rr:class vcfc:VCFFile"), 2)
+
+    def test_confidence_intervals_follow_the_version_tuple_rule(self):
+        """CIPOS is one pair per record before VCF 4.4 and one per ALT after."""
+        vocab = vcf_rdfizer.vocab
+        early, late = vocab.VCF_VERSIONS["4.3"], vocab.VCF_VERSIONS["4.4"]
+
+        # Both treat CIPOS as a materialized tuple, so its items are emitted
+        # even though 4.4 declares it Number=. -- the overlay counts them.
+        self.assertTrue(early.is_positional("CIPOS", "2"))
+        self.assertTrue(late.is_positional("CIPOS", "."))
+
+        # Before 4.4 an item has a position but no allele to point at.
+        self.assertTrue(early.value_item_link("CIPOS", "2", 0).is_empty)
+        # From 4.4 items 0-1 belong to ALT 1 and items 2-3 to ALT 2.
+        self.assertEqual(
+            [late.value_item_link("CIPOS", ".", i).allele_index for i in range(4)],
+            [1, 1, 2, 2],
+        )
+
+        # CILEN and CICN are not tuple keys before 4.4 at all.
+        self.assertIsNone(early.tuple_arity("CILEN"))
+        self.assertEqual(late.tuple_arity("CILEN"), 2)
+
+    def test_version_gates_number_codes_and_format_families(self):
+        """Number codes and the LA/M families arrived in specific versions."""
+        vocab = vcf_rdfizer.vocab
+        v41, v42, v44, v45 = (
+            vocab.VCF_VERSIONS[s] for s in ("4.1", "4.2", "4.4", "4.5")
+        )
+        # Number=R arrived in 4.2, P in 4.4, and LA/LR/LG/M in 4.5.
+        self.assertFalse(v41.allows_number("R", is_format=True))
+        self.assertTrue(v42.allows_number("R", is_format=True))
+        self.assertFalse(v42.allows_number("P", is_format=True))
+        self.assertTrue(v44.allows_number("P", is_format=True))
+        self.assertFalse(v44.allows_number("M", is_format=True))
+        self.assertTrue(v45.allows_number("M", is_format=True))
+        # A plain integer count is legal in every version.
+        self.assertTrue(v41.allows_number("2", is_format=False))
+
+        self.assertFalse(v44.local_alleles)
+        self.assertTrue(v45.local_alleles)
+        self.assertFalse(v44.base_modifications)
+        self.assertTrue(v45.base_modifications)
+        # EVENT is one per record before 4.4 and one per ALT after; EVENTTYPE
+        # does not exist before 4.4 at all.
+        self.assertFalse(v42.events_per_alt)
+        self.assertFalse(v42.event_types)
+        self.assertTrue(v44.events_per_alt)
+        self.assertTrue(v44.event_types)
+
+    def test_expanded_emitter_omits_families_the_version_lacks(self):
+        """A 4.4 file gets no base modifications and no local-allele set."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            records_tsv = tmp_path / "s.records.tsv"
+            records_tsv.write_text(
+                "SOURCE_FILE\tROW_ID\tCHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\t"
+                "INFO\tFORMAT\tS1\n"
+                "s.vcf\t1\t1\t100\t.\tA\tG\t50\tPASS\t.\tGT:LAA:M27551C\t"
+                "0/1:1:0.8\n",
+                encoding="utf-8",
+            )
+            vocab = vcf_rdfizer.vocab
+
+            for short, expect_families in (("4.4", False), ("4.5", True)):
+                rdf_path = tmp_path / f"{short}.nt"
+                rdf_path.write_text("<b> <p> <o> .\n", encoding="utf-8")
+                stats = vcf_rdfizer.append_expanded_sample_rdf(
+                    records_tsv, rdf_path, None,
+                    version=vocab.VCF_VERSIONS[short],
+                    progress_interval_records=0,
+                )
+                expected = 1 if expect_families else 0
+                self.assertEqual(stats["local_allele_sets"], expected, short)
+                self.assertEqual(stats["base_modifications"], expected, short)
+                # The raw FORMAT values are present either way; only the
+                # derived resources the version does not define are withheld.
+                text = rdf_path.read_text(encoding="utf-8")
+                self.assertIn('vocab#fieldValue> "1"', text)
+                self.assertIn('vocab#fieldValue> "0.8"', text)
+
+
+    def test_declared_field_definitions_are_emitted_exactly_once(self):
+        """The header emitter owns a declared definition; value emitters cite it.
+
+        Both used to emit ID/Number/Type/Description at the same header-line
+        IRI, so every declared INFO and FORMAT key produced a duplicate of each
+        of those triples.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            records_tsv = tmp_path / "s.records.tsv"
+            records_tsv.write_text(
+                "SOURCE_FILE\tROW_ID\tCHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\t"
+                "INFO\tFORMAT\tS1\n"
+                "s.vcf\t1\t1\t100\t.\tA\tG\t50\tPASS\tDP=7\tGT:DP\t0/1:7\n",
+                encoding="utf-8",
+            )
+            headers_tsv = tmp_path / "s.header_lines.tsv"
+            headers_tsv.write_text(
+                "SOURCE_FILE\tHEADER_INDEX\tHEADER_KEY\tHEADER_VALUE\tRAW_LINE\n"
+                "s.vcf\t1\tfileformat\tVCFv4.5\tx\n"
+                "s.vcf\t2\tINFO\t<ID=DP,Number=1,Type=Integer,Description=Depth>\tx\n"
+                "s.vcf\t3\tFORMAT\t<ID=GT,Number=1,Type=String,Description=Genotype>\tx\n"
+                "s.vcf\t4\tFORMAT\t<ID=DP,Number=1,Type=Integer,Description=Depth>\tx\n",
+                encoding="utf-8",
+            )
+            rdf_path = tmp_path / "s.nt"
+            rdf_path.write_text("", encoding="utf-8")
+
+            vcf_rdfizer.append_expanded_sample_rdf(
+                records_tsv, rdf_path, headers_tsv, progress_interval_records=0
+            )
+            vcf_rdfizer.append_header_representation_rdf(headers_tsv, rdf_path)
+            vcf_rdfizer.append_record_detail_rdf(
+                records_tsv, headers_tsv, rdf_path, progress_interval_records=0
+            )
+
+            lines = [l for l in rdf_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+            duplicates = {line for line in lines if lines.count(line) > 1}
+            self.assertEqual(duplicates, set(), "duplicate triples emitted")
 
     def test_structured_format_header_parser_preserves_quoted_commas(self):
         """FORMAT descriptions with commas and escaped quotes remain one attribute."""
@@ -2015,7 +2335,7 @@ class WrapperUnitTests(VerboseTestCase):
         self.assertEqual(exc.exception.code, 0)
         text = out_buf.getvalue()
         self.assertIn("Examples:", text)
-        self.assertIn("-m {full,compress,decompress,tsv,index,validation}", text)
+        self.assertIn("-m {full,compress,decompress,tsv,index,validation,link}", text)
         self.assertIn("-i INPUT", text)
         self.assertIn("--keep-rmlstreamer-rdf-output", text)
         self.assertIn("--remove-rdf-storage-output", text)

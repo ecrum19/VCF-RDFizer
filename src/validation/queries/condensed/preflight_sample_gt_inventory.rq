@@ -1,4 +1,4 @@
-PREFIX vcfr: <https://w3id.org/vcf-rdfizer/vocab#>
+PREFIX vcfc: <https://w3id.org/vcf-core/vocab#>
 
 SELECT
   (COUNT(DISTINCT ?sample) AS ?sampleCount)
@@ -6,11 +6,11 @@ SELECT
   (COUNT(DISTINCT ?gtVector) AS ?gtVectorCount)
 WHERE {
   OPTIONAL {
-    ?sampleSet a vcfr:SampleSet ; vcfr:hasSample ?sample .
-    ?sample vcfr:sampleName ?sampleId .
+    ?sampleSet a vcfc:SampleSet ; vcfc:hasSample ?sample .
+    ?sample vcfc:sampleName ?sampleId .
   }
   OPTIONAL {
-    ?gtVector a vcfr:FormatValueVector ; vcfr:declaredBy ?definition ; vcfr:encodedValues ?encoded .
-    ?definition vcfr:fieldId "GT" .
+    ?gtVector a vcfc:FormatValueVector ; vcfc:declaredBy ?definition ; vcfc:encodedValues ?encoded .
+    ?definition vcfc:fieldId "GT" .
   }
 }

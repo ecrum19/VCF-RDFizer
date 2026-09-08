@@ -171,9 +171,9 @@ class NativeArtifactEngineTests(VerboseTestCase):
 
             def fake_run(command, **kwargs):
                 recorded["command"] = command
-                return mock.Mock(returncode=0)
+                return 0, None
 
-            with mock.patch.object(V.subprocess, "run", side_effect=fake_run):
+            with mock.patch.object(V, "run_query_process", side_effect=fake_run):
                 envelope = engine.execute("q01", query)
 
         self.assertEqual(recorded["command"][1], f"hdt@{tmp_path / 'cohort.hdt'}")

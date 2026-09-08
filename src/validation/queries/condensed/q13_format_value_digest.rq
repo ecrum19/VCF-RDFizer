@@ -1,4 +1,4 @@
-PREFIX vcfr: <https://w3id.org/vcf-rdfizer/vocab#>
+PREFIX vcfc: <https://w3id.org/vcf-core/vocab#>
 
 # The condensed equivalent of the expanded per-cell FORMAT digest.
 #
@@ -7,7 +7,7 @@ PREFIX vcfr: <https://w3id.org/vcf-rdfizer/vocab#>
 # per-cell nodes of the expanded shape.
 SELECT ?bucket (COUNT(*) AS ?valueCount)
 WHERE {
-  ?value a vcfr:FormatValueVector ; vcfr:encodedValues ?lexLiteral .
+  ?value a vcfc:FormatValueVector ; vcfc:encodedValues ?lexLiteral .
   BIND(STR(?lexLiteral) AS ?lex)
   BIND(SUBSTR(SHA256(CONCAT(STR(?value), "\u001F", STR(?lex))), 1, 2) AS ?bucket)
 }

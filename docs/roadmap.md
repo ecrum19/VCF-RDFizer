@@ -9,30 +9,51 @@ block something else, not by effort.
 
 ---
 
+## Resolved by the move to the VCF Core vocabulary
+
+Both items that previously blocked publication are closed. They are kept here
+briefly because the reasoning is referenced elsewhere.
+
+### ~~1. Vocabulary coverage for the condensed representation~~ — **done**
+
+The 17 condensed-representation terms the conversion emitted without an
+ontology behind them — `CohortCallMatrix`, `FormatValueVector`, `SampleSet`,
+`VCFSample`, `VCFTextVector`, `representationProfile`, `sampleIndex` and the
+rest — are all defined in VCF Core, with SHACL shapes. Condensed graphs are
+ontology-backed and citable as linked data.
+
+### ~~2. The SHACL / missing-value contradiction~~ — **done**
+
+`vcfc:VCFRecordShape` now accepts `xsd:string` or `vcfc:Null` for `vcfc:alt`, so
+a record with `ALT=.` satisfies both the shape and `vcfc:missingValuePolicy`.
+`vcfc:VariantCallShape` likewise accepts the full VCF Float lexical space for
+`qual`.
+
 ## Blocking publication
 
-### 1. Vocabulary coverage for the condensed representation
+### ~~1. The validation suite has not been migrated~~ — **done**
 
-The conversion emits 17 terms that `https://w3id.org/vcf-rdfizer/vocab#` does
-not define — `CohortCallMatrix`, `FormatValueVector`, `SampleSet`, `VCFSample`,
-`VCFTextVector`, `representationProfile`, `sampleIndex` and the rest. They do
-not dereference, so **condensed graphs are not ontology-backed**.
+The suite passes: 415 tests, mutation score 96/113 (85%) across 60 mutations.
+The runner and the wrapper now share one vocabulary module instead of mirroring
+each other, and the census derives every new resource family from the VCF. Ten
+of the eighteen new mutations are recorded gaps, each with what would close it.
+What changed and what remains:
+[`validation-migration-notes.md`](validation-migration-notes.md).
 
-The work is in the vocabulary repository, not here. Until it lands, the
-condensed representation is usable but not citable as linked data.
-Full list: [`vcf-coverage.md`](vcf-coverage.md#vocabulary-alignment).
+### 2. SHACL conformance is not a test
 
-### 2. The SHACL / missing-value contradiction
+Checking the output against the vocabulary's own SHACL profiles found four real
+modelling bugs during the migration, all of the same kind: a resource typed into
+a class whose shape requires a property the record did not supply. That is a
+cheap, strong invariant and it should not be a manual step. It needs `pyshacl`
+and `rdflib` as dev dependencies and access to the vocabulary's `ontology/` and
+`shacl/` directories.
 
-`vcfr:missingValuePolicy` requires `"."^^vcfr:Null` for a missing token;
-`VCFRecordShape` constrains `vcfr:alt` to `sh:datatype xsd:string`. A record with
-`ALT=.` cannot satisfy both, so it is impossible for the tool to be conformant.
+### ~~3. Ordinal datatype inconsistency in the vocabulary~~ — **done**
 
-The fix is a decision in the vocabulary: either relax the `alt`/`ref`/`chrom`
-shapes to `sh:or([xsd:string] [vcfr:Null])` — as the `qual` shape already does —
-or drop the missing-value policy for those fields. The conversion currently
-follows the policy.
-[Detail](vcf-coverage.md#an-open-conflict-inside-the-vocabulary).
+VCF Core now supplies `vcfc:IntegerLiteralShape`, which accepts `xsd:integer`
+and every integer-derived XSD datatype with the bound applied numerically. The
+ontology range and the shapes no longer disagree.
 
 ## Known defects
 
@@ -53,11 +74,11 @@ Small change; it makes the custom-mapping extension point actually usable.
 
 From [`vcf-coverage.md`](vcf-coverage.md#remaining-gaps):
 
-- **`vcfr:contigCount` is counted, not read.** A wrong derived contig total is
+- **`vcfc:contigCount` is counted, not read.** A wrong derived contig total is
   undetected. Needs the value in a comparison, not just the predicate in the
   census.
 - **Header line values are not compared.** `q08` compares how many lines carry
-  each key and `q10` their types; `vcfr:headerValue` itself is only counted. The
+  each key and `q10` their types; `vcfc:headerValue` itself is only counted. The
   structured attributes that matter are already covered.
 
 Both are query-set additions with matching mutation-catalogue entries, so
@@ -68,14 +89,16 @@ closing either one will *fail* the mutation harness until
 
 ### 5. Data linking as a plug-in system
 
-The largest planned addition: let users connect the graph to external resources
-(rsIDs, genes, clinical assertions, frequencies) through declarative,
-distributable linker plugins rather than by patching the tool.
+An initial implementation now connects the graph through declarative,
+distributable linker plug-ins, with examples of all three tiers: dbSNP token
+links, a synthetic GFF3 interval bundle, and an Ensembl API resolver.
 
 Full design, including the three join strategies, the three plugin tiers, the
 network safeguards, the provenance model and the build order, is in
-[`datalinking-design.md`](datalinking-design.md). Nothing is implemented yet;
-the design exists to fix the extension contract before code depends on it.
+[`datalinking-design.md`](datalinking-design.md). The implemented contract and
+commands are in [`datalinking.md`](datalinking.md). Allele joins/normalization,
+link merging, and plug-in validation/mutation auto-discovery remain planned;
+the manifest vocabulary is provisional.
 
 The hardest part is not the plugin system — it is allele normalization
 (§9 of that document), because an under-matching join looks exactly like a true

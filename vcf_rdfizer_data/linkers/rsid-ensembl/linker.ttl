@@ -1,0 +1,21 @@
+@prefix vcfl: <https://w3id.org/vcf-rdfizer/linking#> .
+
+# Tier 3: POST one batch of rsIDs to Ensembl, linking only returned variants.
+# Copy this example and set contactEmail to your own address before live use.
+<#rsIDEnsembl> a vcfl:Linker ;
+    vcfl:id "rsid-ensembl" ;
+    vcfl:version "1.0.0" ;
+    vcfl:title "Service-confirmed rsID to Ensembl" ;
+    vcfl:license "MIT (plug-in code and manifest)" ;
+    vcfl:termsOfUse <https://www.ensembl.org/info/about/legal/disclaimer.html> ;
+    vcfl:endpoint <https://rest.ensembl.org/variation/homo_sapiens> ;
+    vcfl:maxRequestsPerSecond 2 ;
+    vcfl:maxRequestsPerRun 100 ;
+    vcfl:batchSize 100 ;
+    vcfl:contactEmail "replace-me@example.org" ;
+    vcfl:join [ a vcfl:TokenJoin ;
+                vcfl:field "ID" ;
+                vcfl:splitOn ";" ;
+                vcfl:accept "^rs[0-9]+$" ] ;
+    vcfl:emit [ vcfl:subject vcfl:VariantCall ;
+                vcfl:predicate vcfl:sameVariantAs ] .

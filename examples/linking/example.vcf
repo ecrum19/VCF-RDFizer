@@ -1,0 +1,8 @@
+##fileformat=VCFv4.3
+##reference=GRCh38
+##INFO=<ID=RS,Number=.,Type=String,Description="Example identifier tokens">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO
+1	100	rs334	A	G	.	PASS	RS=rs334
+1	190	rs699;rs334	AT	A	.	PASS	RS=rs699,rs334
+1	251	.	C	T	.	PASS	.
+2	20	local-id	G	A	.	PASS	.

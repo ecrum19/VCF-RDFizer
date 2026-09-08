@@ -3,9 +3,17 @@
 @prefix ql:    <http://semweb.mmlab.be/ns/ql#> .
 @prefix csvw:  <http://www.w3.org/ns/csvw#> .
 @prefix xsd:   <http://www.w3.org/2001/XMLSchema#> .
-@prefix vcfr:  <https://w3id.org/vcf-rdfizer/vocab#> .
+@prefix vcfc:  <https://w3id.org/vcf-core/vocab#> .
 
-# Default VCF-RDFizer RML rules.
+# Default VCF-RDFizer RML rules, targeting the VCF Core vocabulary.
+#
+# Namespace
+# ---------
+# The target is https://w3id.org/vcf-core/vocab# (prefix vcfc:), which replaces
+# the retired https://w3id.org/vcf-rdfizer/vocab# (prefix vcfr:). The retired
+# namespace is not redirected: it serves a deprecation document in which every
+# former term is linked to its successor. No version IRI is pinned; these rules
+# target the namespace, whose release cadence is independent of the converter's.
 #
 # Expected TSV inputs produced by src/vcf_as_tsv.sh:
 # - /data/tsv/<sample>.file_metadata.tsv
@@ -14,12 +22,60 @@
 # - /data/tsv/<sample>.sample_calls.tsv (header-only compatibility source)
 # - /data/tsv/<sample>.sample_format_values.tsv (header-only compatibility source)
 # The wrapper rewrites the template paths below for each input sample.
-# The wrapper selects exactly one direct sample emitter: expanded SampleCall /
-# FormatFieldValue triples, or condensed SampleSet / CohortCallMatrix /
-# FormatValueVector triples. The helper tables stay header-only in either mode.
+#
+# What is here and what is not
+# ----------------------------
+# The division is a single rule: this mapping carries every field whose RDF
+# datatype is the same for every row, and the wrapper's direct N-Triples
+# emitters carry everything else. RML cannot choose an object datatype per row,
+# and it cannot decompose one source cell into several resources without a
+# materialized helper table whose size is the product of its dimensions.
+#
+# Emitted by the wrapper, not here:
+# - ID, ALT, QUAL, FILTER and INFO. Each may be the VCF missing token, which the
+#   vocabulary requires as "."^^vcfc:Null rather than a plain string, so the
+#   datatype depends on the row.
+# - fileDate. The published shape requires xsd:date, but ##fileDate has no
+#   mandated format in the VCF specification, so the value must be inspected.
+# - The structured header representation: header-line subclasses, the
+#   vcfc:HeaderAttribute resources that vcfc:StructuredHeaderLineShape requires
+#   on every ##INFO/##FORMAT/##FILTER/##ALT/##contig/##META/##SAMPLE/##PEDIGREE
+#   line, and the INFO/FORMAT/FILTER/ALT/contig/META declaration properties.
+#   These all live inside one angle-bracketed cell.
+# - The allele layer: vcfc:ReferenceAllele and vcfc:AltAllele resources with
+#   their index, kind, symbolic type and breakend components, parsed out of the
+#   REF and ALT columns.
+# - The structured INFO representation, its vcfc:FieldValueItem decomposition,
+#   and the SV carriers derived from reserved INFO keys.
+# - Genotype data. The wrapper selects exactly one direct sample emitter:
+#   expanded SampleCall / FormatFieldValue / Genotype triples, or condensed
+#   SampleSet / CohortCallMatrix / FormatValueVector triples. The helper tables
+#   stay header-only in either mode.
+#
+# Ordinals
+# --------
+# vcfc:lineIndex and vcfc:recordIndex are typed xsd:integer, not
+# xsd:positiveInteger. The SHACL profiles constrain every ordinal with
+# sh:datatype xsd:integer plus a sh:minInclusive bound, and a SHACL datatype
+# constraint compares the datatype IRI exactly. An xsd:integer literal
+# satisfies both the shape and the ontology's xsd:positiveInteger range, since
+# the value 1 belongs to that value space however it is written.
+#
+# VCF versions
+# ------------
+# VCF Core supplies one SHACL overlay per VCF version, each scoped by the file's
+# vcfc:fileFormat. Most of this mapping is version-neutral, because the fixed
+# columns and the header-line structure do not change between 4.1 and 4.5. The
+# one version-dependent thing RML can carry is the optional vcfc:VCF4xFile
+# subclass on the file subject, which is the sentinel in <#VCFFileMap> below.
+#
+# The version-dependent *semantics* -- which INFO keys flatten a tuple, whether
+# that tuple repeats per ALT allele, and whether the local-allele and
+# base-modification FORMAT families exist -- are decompositions of one source
+# cell, so they live in the wrapper's emitters like every other decomposition.
 #
 # Output format:
-# - The default conversion now targets triples (N-Triples) without named graph terms.
+# - The default conversion targets triples (N-Triples) without named graph terms.
 
 <#VCFFileMap>
   a rr:TriplesMap ;
@@ -37,22 +93,30 @@
   ] ;
   rr:subjectMap [
     rr:template "file://{SOURCE_FILE}" ;
-    rr:class vcfr:VCFFile
+    rr:class vcfc:VCFFile ;
+    # Version overlay. The wrapper rewrites this sentinel per input to the
+    # optional subclass for the version the file's ##fileformat line declares
+    # -- vcfc:VCF41File through vcfc:VCF45File -- which activates that version's
+    # SHACL gate. When the version has no conformance overlay (VCFv4.0, or a
+    # missing or malformed line) the sentinel is rewritten to vcfc:VCFFile,
+    # which is already asserted above, so the graph never claims a version gate
+    # it cannot support and never gains an undefined term.
+    rr:class vcfc:VCFVersionFile
   ] ;
   rr:predicateObjectMap [
-    rr:predicate vcfr:hasHeader ;
+    rr:predicate vcfc:hasHeader ;
     rr:objectMap [ rr:template "file://{SOURCE_FILE}#header" ]
   ] ;
   rr:predicateObjectMap [
-    rr:predicate vcfr:fileFormat ;
+    rr:predicate vcfc:fileFormat ;
     rr:objectMap [ rml:reference "FILE_FORMAT" ]
   ] ;
   rr:predicateObjectMap [
-    rr:predicate vcfr:sourceSoftware ;
+    rr:predicate vcfc:sourceSoftware ;
     rr:objectMap [ rml:reference "SOURCE_SOFTWARE" ]
   ] ;
   rr:predicateObjectMap [
-    rr:predicate vcfr:referenceGenome ;
+    rr:predicate vcfc:referenceGenome ;
     rr:objectMap [ rml:reference "REFERENCE_GENOME" ]
   ] .
 
@@ -72,9 +136,34 @@
   ] ;
   rr:subjectMap [
     rr:template "file://{SOURCE_FILE}#header" ;
-    rr:class vcfr:VCFHeader
+    rr:class vcfc:VCFHeader
   ] ;
-  .
+  rr:predicateObjectMap [
+    rr:predicate vcfc:hasColumnHeader ;
+    rr:objectMap [ rr:template "file://{SOURCE_FILE}#header/columns" ]
+  ] .
+
+# The mandatory #CHROM line. Its ordered sample columns are attached by the
+# wrapper with vcfc:hasGenotypeColumns, because they live in the records TSV
+# header rather than in a row of any source table.
+<#ColumnHeaderLineMap>
+  a rr:TriplesMap ;
+  rml:logicalSource [
+    rml:source [
+      a csvw:Table ;
+      csvw:url "/data/tsv/file_metadata.tsv" ;
+      csvw:dialect [
+        a csvw:Dialect ;
+        csvw:delimiter "\t" ;
+        csvw:headerRowCount 1
+      ]
+    ] ;
+    rml:referenceFormulation ql:CSV
+  ] ;
+  rr:subjectMap [
+    rr:template "file://{SOURCE_FILE}#header/columns" ;
+    rr:class vcfc:ColumnHeaderLine
+  ] .
 
 # NOTE:
 # Use explicit link maps (template-based) instead of parentTriplesMap joins.
@@ -97,7 +186,7 @@
     rr:template "file://{SOURCE_FILE}"
   ] ;
   rr:predicateObjectMap [
-    rr:predicate vcfr:hasRecord ;
+    rr:predicate vcfc:hasRecord ;
     rr:objectMap [
       rr:template "file://{SOURCE_FILE}#record/{ROW_ID}"
     ]
@@ -121,12 +210,16 @@
     rr:template "file://{SOURCE_FILE}#header"
   ] ;
   rr:predicateObjectMap [
-    rr:predicate vcfr:hasHeaderLine ;
+    rr:predicate vcfc:hasHeaderLine ;
     rr:objectMap [
       rr:template "file://{SOURCE_FILE}#header/line/{HEADER_INDEX}"
     ]
   ] .
 
+# Every '##' line as a base vcfc:HeaderLine. The wrapper adds the subclass, the
+# ordered vcfc:HeaderAttribute resources and the declaration properties.
+# vcfc:lineIndex is what the SPARQL SHACL profile uses to check that header
+# indices are unique and that ##fileformat is line 1.
 <#HeaderLineMap>
   a rr:TriplesMap ;
   rml:logicalSource [
@@ -143,17 +236,24 @@
   ] ;
   rr:subjectMap [
     rr:template "file://{SOURCE_FILE}#header/line/{HEADER_INDEX}" ;
-    rr:class vcfr:HeaderLine
+    rr:class vcfc:HeaderLine
   ] ;
   rr:predicateObjectMap [
-    rr:predicate vcfr:headerKey ;
+    rr:predicate vcfc:headerKey ;
     rr:objectMap [ rml:reference "HEADER_KEY" ]
   ] ;
   rr:predicateObjectMap [
-    rr:predicate vcfr:headerValue ;
+    rr:predicate vcfc:headerValue ;
     rr:objectMap [ rml:reference "HEADER_VALUE" ]
+  ] ;
+  rr:predicateObjectMap [
+    rr:predicate vcfc:lineIndex ;
+    rr:objectMap [ rml:reference "HEADER_INDEX" ; rr:datatype xsd:integer ]
   ] .
 
+# CHROM, POS and REF are the three fixed fields VCF 4.5 forbids from being the
+# missing token, so their datatype is fixed for every row and they belong here.
+# ID and ALT may be missing and are emitted by the wrapper.
 <#VCFRecordMap>
   a rr:TriplesMap ;
   rml:logicalSource [
@@ -170,33 +270,32 @@
   ] ;
   rr:subjectMap [
     rr:template "file://{SOURCE_FILE}#record/{ROW_ID}" ;
-    rr:class vcfr:VCFRecord
+    rr:class vcfc:VCFRecord
   ] ;
   rr:predicateObjectMap [
-    rr:predicate vcfr:chrom ;
+    rr:predicate vcfc:chrom ;
     rr:objectMap [ rml:reference "CHROM" ]
   ] ;
   rr:predicateObjectMap [
-    rr:predicate vcfr:pos ;
+    rr:predicate vcfc:pos ;
     rr:objectMap [ rml:reference "POS" ; rr:datatype xsd:integer ]
   ] ;
   rr:predicateObjectMap [
-    rr:predicate vcfr:recordId ;
-    rr:objectMap [ rml:reference "ID" ]
-  ] ;
-  rr:predicateObjectMap [
-    rr:predicate vcfr:ref ;
+    rr:predicate vcfc:ref ;
     rr:objectMap [ rml:reference "REF" ]
   ] ;
   rr:predicateObjectMap [
-    rr:predicate vcfr:alt ;
-    rr:objectMap [ rml:reference "ALT" ]
+    rr:predicate vcfc:recordIndex ;
+    rr:objectMap [ rml:reference "ROW_ID" ; rr:datatype xsd:integer ]
   ] ;
   rr:predicateObjectMap [
-    rr:predicate vcfr:hasCall ;
+    rr:predicate vcfc:hasCall ;
     rr:objectMap [ rr:template "file://{SOURCE_FILE}#call/{ROW_ID}" ]
   ] .
 
+# FORMAT is the only call-level column whose datatype is fixed: VCF 4.5 defines
+# it as a colon-separated key list with no missing form. QUAL, FILTER and INFO
+# are emitted by the wrapper.
 <#VariantCallMap>
   a rr:TriplesMap ;
   rml:logicalSource [
@@ -213,18 +312,10 @@
   ] ;
   rr:subjectMap [
     rr:template "file://{SOURCE_FILE}#call/{ROW_ID}" ;
-    rr:class vcfr:VariantCall
+    rr:class vcfc:VariantCall
   ] ;
   rr:predicateObjectMap [
-    rr:predicate vcfr:filter ;
-    rr:objectMap [ rml:reference "FILTER" ]
-  ] ;
-  rr:predicateObjectMap [
-    rr:predicate vcfr:infoRaw ;
-    rr:objectMap [ rml:reference "INFO" ]
-  ] ;
-  rr:predicateObjectMap [
-    rr:predicate vcfr:formatRaw ;
+    rr:predicate vcfc:formatRaw ;
     rr:objectMap [ rml:reference "FORMAT" ]
   ] .
 
@@ -246,7 +337,7 @@
     rr:template "file://{SOURCE_FILE}#call/{ROW_ID}"
   ] ;
   rr:predicateObjectMap [
-    rr:predicate vcfr:hasSampleCall ;
+    rr:predicate vcfc:hasSampleCall ;
     rr:objectMap [
       rr:template "file://{SOURCE_FILE}#sample/{ROW_ID}/{SAMPLE_URI_ID}"
     ]
@@ -268,11 +359,17 @@
   ] ;
   rr:subjectMap [
     rr:template "file://{SOURCE_FILE}#sample/{ROW_ID}/{SAMPLE_URI_ID}" ;
-    rr:class vcfr:SampleCall
+    rr:class vcfc:SampleCall
   ] ;
   rr:predicateObjectMap [
-    rr:predicate vcfr:sampleId ;
+    rr:predicate vcfc:sampleId ;
     rr:objectMap [ rml:reference "SAMPLE_ID" ]
+  ] ;
+  rr:predicateObjectMap [
+    rr:predicate vcfc:forSample ;
+    rr:objectMap [
+      rr:template "file://{SOURCE_FILE}#samples/{SAMPLE_URI_ID}"
+    ]
   ] .
 
 <#SampleCallToFormatValueLinkMap>
@@ -293,7 +390,7 @@
     rr:template "file://{SOURCE_FILE}#sample/{ROW_ID}/{SAMPLE_URI_ID}"
   ] ;
   rr:predicateObjectMap [
-    rr:predicate vcfr:hasFormatValue ;
+    rr:predicate vcfc:hasFormatValue ;
     rr:objectMap [
       rr:template "file://{SOURCE_FILE}#sample/{ROW_ID}/{SAMPLE_URI_ID}/fmt/{FORMAT_KEY}"
     ]
@@ -315,9 +412,9 @@
   ] ;
   rr:subjectMap [
     rr:template "file://{SOURCE_FILE}#sample/{ROW_ID}/{SAMPLE_URI_ID}/fmt/{FORMAT_KEY}" ;
-    rr:class vcfr:FormatFieldValue
+    rr:class vcfc:FormatFieldValue
   ] ;
   rr:predicateObjectMap [
-    rr:predicate vcfr:fieldValue ;
+    rr:predicate vcfc:fieldValue ;
     rr:objectMap [ rml:reference "FORMAT_VALUE" ]
   ] .

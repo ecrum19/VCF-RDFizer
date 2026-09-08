@@ -24,6 +24,67 @@ Raptor syntax validation and for the SPARQL queries, and removes any temporary
 decode before the container exits. No decoded RDF is written beneath `--out`;
 only reports are retained.
 
+## Choosing an engine, and what happens when it cannot keep up
+
+**Comunica has no persistent index.** `comunica-sparql-file` parses the whole
+source into an in-memory store, answers one query, and exits — so a run pays
+that parse **once per query**, 27 times. That is fine for a fixture and
+unworkable for a cohort-scale graph, where the parse alone can exceed the
+per-query timeout.
+
+**QLever builds an index once** and answers every query from it. On a large
+graph the index build dominates and the queries are cheap. This is why a graph
+can pass with QLever and time out with Comunica: it is a scale property of the
+engine, not a disagreement about the data.
+
+| Graph size | Recommended |
+| --- | --- |
+| Fixtures, small VCFs | `--validation-engine comunica` (default; no index build) |
+| Anything above a few GiB of N-Triples | `--validation-engine qlever`, or validate the indexed artifact with `--validate-artifacts hdt` |
+
+Above 4 GiB the runner warns before it starts, states the worst case at the
+current timeout, and names the alternatives.
+
+### If validation seems to hang
+
+It is almost certainly an engine that cannot answer the graph inside
+`--validation-query-timeout` (default 3600s). Since this is per query and there
+are 27 of them, a run that answers none of them used to take 27 hours per engine
+per target before reporting anything.
+
+That no longer happens: the first query to exceed the timeout abandons that
+engine's remaining queries, and the report records which query tripped it and
+how many were skipped:
+
+```json
+{"status": "EXECUTION_FAILED",
+ "abandoned": "q01_record_density_1mb exceeded the 3600s per-query timeout; skipped 26 further queries …",
+ "queriesRun": 1, "queriesPlanned": 27}
+```
+
+Options from there:
+
+```bash
+# Index once and query from it, instead of re-parsing per query.
+vcf-rdfizer --mode full -i cohort.vcf.gz --validate --validation-engine qlever -o ./out
+
+# Or validate the HDT artifact, which is already indexed.
+vcf-rdfizer --mode full -i cohort.vcf.gz --validate --validate-artifacts hdt -o ./out
+
+# Or allow longer per query, with a ceiling on the whole engine.
+vcf-rdfizer --mode full -i cohort.vcf.gz --validate \
+  --validation-query-timeout 14400 --validation-time-budget 86400 -o ./out
+```
+
+`--validation-continue-after-query-timeout` restores the old behaviour of
+running every query regardless; it is off by default because the remaining
+queries are no easier than the one that just failed.
+
+Queries run in their own process session, so a timeout kills the engine along
+with its `/usr/bin/time` wrapper. Before that fix the engine survived the
+timeout still holding the whole graph in memory, and enough of those pushed the
+host into swap — which is what made a slow step look like a stuck one.
+
 ## Run it
 
 Use the representation selected when the RDF was created.
@@ -376,7 +437,7 @@ anomaly count. Reports carry both, plus `sampleTruncated`, so a graph with ten
 million anomalies is never confused with one that has a hundred.
 
 `--strict-conformance` promotes a missing-token conformance failure (a plain
-`"."` literal not typed as `vcfr:Null`) from a report-only observation to a
+`"."` literal not typed as `vcfc:Null`) from a report-only observation to a
 validation failure.
 
 ### SHACL
@@ -416,7 +477,7 @@ backed by a named mutation in
 [`test/validation_mutations.py`](../test/validation_mutations.py), so a change
 that closes a gap fails a test rather than passing silently.
 
-**`vcfr:contigCount` is counted, not read.** The census asserts the predicate is
+**`vcfc:contigCount` is counted, not read.** The census asserts the predicate is
 present the expected number of times; nothing compares its *value*. A derived
 contig total that is simply wrong passes. This is the one mutation in the
 catalogue that is still undetected.
@@ -424,7 +485,7 @@ catalogue that is still undetected.
 **Header line values are compared only through their structured form.** The
 attributes that matter - `filterId`, `altId`, `contigId`, contig length/md5/
 assembly, and the INFO/FORMAT declarations - are lifted into their own
-properties and compared. The raw `vcfr:headerValue` literal itself is counted
+properties and compared. The raw `vcfc:headerValue` literal itself is counted
 but never read.
 
 **Multi-valued INFO fields keep only their lexical value.** A `Number=1` INFO

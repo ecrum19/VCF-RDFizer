@@ -307,7 +307,7 @@ count_triples_json() {
 
 # Replace plain VCF null marker literals (`"."`) with typed null literals.
 # Ontology alignment:
-#   "."  ->  "."^^vcfr:Null
+#   "."  ->  "."^^vcfc:Null
 #
 # The rewrite is per-line and has no cross-line context, so it is applied to
 # each RMLStreamer part as it is streamed into the aggregate. Running it as a

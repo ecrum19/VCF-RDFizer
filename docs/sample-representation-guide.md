@@ -45,24 +45,41 @@ that is much more economical for large cohorts.
 ## 2. Expanded representation: one RDF object per sample value
 
 Expanded mode preserves the original, explicit vocabulary model. For every
-variant/sample pair, VCF-RDFizer creates a `vcfr:SampleCall`. For every FORMAT
-field in that pair, it creates a `vcfr:FormatFieldValue`.
+variant/sample pair, VCF-RDFizer creates a `vcfc:SampleCall`. For every FORMAT
+field in that pair, it creates a `vcfc:FormatFieldValue`.
 
 For the example above, the conceptual graph includes resources like these
 (the full output has one line per RDF statement):
 
 ```text
 <file://cohort.vcf#call/1>
-    vcfr:hasSampleCall <file://cohort.vcf#sample/1/SAMPLE_A> .
+    vcfc:hasSampleCall <file://cohort.vcf#sample/1/SAMPLE_A> .
 
 <file://cohort.vcf#sample/1/SAMPLE_A>
-    a vcfr:SampleCall ;
-    vcfr:sampleId "SAMPLE_A" ;
-    vcfr:hasFormatValue <file://cohort.vcf#sample/1/SAMPLE_A/fmt/GT> .
+    a vcfc:SampleCall ;
+    vcfc:sampleId "SAMPLE_A" ;
+    vcfc:forSample <file://cohort.vcf#samples/SAMPLE_A> ;
+    vcfc:hasFormatValue <file://cohort.vcf#sample/1/SAMPLE_A/fmt/GT> ;
+    vcfc:hasGenotype <file://cohort.vcf#sample/1/SAMPLE_A/genotype> .
 
 <file://cohort.vcf#sample/1/SAMPLE_A/fmt/GT>
-    a vcfr:FormatFieldValue ;
-    vcfr:fieldValue "0/1" .
+    a vcfc:FormatFieldValue ;
+    vcfc:declaredBy <file://cohort.vcf#header/line/8> ;
+    vcfc:fieldValue "0/1" .
+
+<file://cohort.vcf#sample/1/SAMPLE_A/genotype>
+    a vcfc:Genotype ;
+    vcfc:genotypeString "0/1"^^vcfc:GenotypeString ;
+    vcfc:ploidy 2 ;
+    vcfc:phasingStatus vcfc:Unphased ;
+    vcfc:hasAlleleCall <file://cohort.vcf#sample/1/SAMPLE_A/genotype/call/0> ,
+                       <file://cohort.vcf#sample/1/SAMPLE_A/genotype/call/1> .
+
+<file://cohort.vcf#sample/1/SAMPLE_A/genotype/call/1>
+    a vcfc:GenotypeAlleleCall ;
+    vcfc:callIndex 1 ;
+    vcfc:isNoCall false ;
+    vcfc:calledAllele <file://cohort.vcf#record/1/allele/1> .
 ```
 
 The same structure is repeated for `DP` and `AD`, and then repeated again for
@@ -73,14 +90,22 @@ The same structure is repeated for `DP` and `AD`, and then repeated again for
 Expanded mode makes each value easy to address directly:
 
 - a consumer can find one sample call without decoding a vector;
-- a consumer can ask for one FORMAT field as one RDF resource;
-- existing consumers that expect `SampleCall` and `FormatFieldValue` can use
-  the graph directly;
-- the sample identifier is attached to every sample-call resource.
+- a consumer can ask for one FORMAT field as one RDF resource, and follow
+  `vcfc:declaredBy` to the `##FORMAT` declaration that defines it;
+- the sample identifier is attached to every sample-call resource, and
+  `vcfc:forSample` additionally gives it a reusable, file-scoped identity, so a
+  sample is a resource rather than a repeated literal;
+- **genotypes are queryable directly.** `GT` is parsed into an ordered
+  `vcfc:Genotype`: a consumer can filter on `vcfc:phasingStatus`, count
+  `vcfc:ploidy`, or join `vcfc:calledAllele` straight to the record's allele
+  resources — without string-matching `"0/1"` or `"0|1"` in SPARQL. `FT`,
+  `PS`/`PSL`, `LAA`, the copy-number and haplotype keys, and the `M`/`DPM`/`ADM`
+  base modifications get their own resources on the same principle.
 
 The VCF file is marked with
-`vcfr:representationProfile vcfr:ExpandedRepresentation`, so a consumer can
-identify the graph shape explicitly.
+`vcfc:representationProfile vcfc:ExpandedRepresentation`, so a consumer can
+identify the graph shape explicitly. The SPARQL SHACL profile enforces that a
+graph never carries both profiles at once.
 
 ### Expanded growth
 
@@ -97,15 +122,18 @@ V × S       SampleCall resources
 V × S × F   FormatFieldValue resources
 ```
 
-In the simplified case where each sample call has three structural statements
-(link, type, and sample ID), and each FORMAT value has three statements (link,
-type, and value), the sample portion of the graph contains approximately:
+In the simplified case where each sample call has four structural statements
+(link, type, sample ID, and `forSample`), and each FORMAT value has four
+statements (link, type, `declaredBy`, and value), the sample portion of the
+graph contains approximately:
 
 ```text
-3 × (V × S) + 3 × (V × S × F)
+4 × (V × S) + 4 × (V × S × F)
 ```
 
-statements, before counting the rest of the VCF graph.
+statements, before counting the parsed genotype layer and the rest of the VCF
+graph. A diploid `GT` adds roughly nine more statements per sample call: five
+for the `vcfc:Genotype` and four for each `vcfc:GenotypeAlleleCall`.
 
 For the worked example (`V=1`, `S=3`, `F=3`):
 
@@ -113,8 +141,15 @@ For the worked example (`V=1`, `S=3`, `F=3`):
 |---|---:|
 | `SampleCall` resources | 3 |
 | `FormatFieldValue` resources | 9 |
-| Approximate sample-related statements | 36 |
+| `Genotype` resources | 3 |
+| `GenotypeAlleleCall` resources | 6 |
+| Approximate sample-related statements | 75 |
+| File-level `SampleSet` + `VCFSample` statements | 18 |
 | Representation-profile statement | 1 |
+
+The genotype layer makes expanded mode more expensive than it was, which sharpens
+rather than changes the trade-off below: expanded mode buys direct queryability
+at a cost that multiplies by both samples and FORMAT fields.
 
 The exact number can vary when values are missing or when custom mappings add
 properties, but the important pattern is the multiplication by both samples
@@ -130,15 +165,15 @@ For the same example, the graph first declares a reusable sample set:
 
 ```text
 <file://cohort.vcf#samples>
-    a vcfr:SampleSet ;
-    vcfr:hasSample <file://cohort.vcf#samples/SAMPLE_A> ;
-    vcfr:hasSample <file://cohort.vcf#samples/SAMPLE_B> ;
-    vcfr:hasSample <file://cohort.vcf#samples/SAMPLE_C> .
+    a vcfc:SampleSet ;
+    vcfc:hasSample <file://cohort.vcf#samples/SAMPLE_A> ;
+    vcfc:hasSample <file://cohort.vcf#samples/SAMPLE_B> ;
+    vcfc:hasSample <file://cohort.vcf#samples/SAMPLE_C> .
 
 <file://cohort.vcf#samples/SAMPLE_A>
-    a vcfr:VCFSample ;
-    vcfr:sampleName "SAMPLE_A" ;
-    vcfr:sampleIndex "1" .
+    a vcfc:VCFSample ;
+    vcfc:sampleName "SAMPLE_A" ;
+    vcfc:sampleIndex "1" .
 ```
 
 The variant then has one cohort matrix. The matrix points back to the sample
@@ -146,14 +181,14 @@ set and has one vector for each FORMAT key:
 
 ```text
 <file://cohort.vcf#call/1/matrix>
-    a vcfr:CohortCallMatrix ;
-    vcfr:appliesToSampleSet <file://cohort.vcf#samples> ;
-    vcfr:hasFormatValueVector <file://cohort.vcf#call/1/matrix/fmt/GT> .
+    a vcfc:CohortCallMatrix ;
+    vcfc:appliesToSampleSet <file://cohort.vcf#samples> ;
+    vcfc:hasFormatValueVector <file://cohort.vcf#call/1/matrix/fmt/GT> .
 
 <file://cohort.vcf#call/1/matrix/fmt/GT>
-    a vcfr:FormatValueVector ;
-    vcfr:valueEncoding vcfr:VCFTextVector ;
-    vcfr:encodedValues "0/1\t0/0\t1/1" .
+    a vcfc:FormatValueVector ;
+    vcfc:valueEncoding vcfc:VCFTextVector ;
+    vcfc:encodedValues "0/1\t0/0\t1/1" .
 ```
 
 The three tab-separated items in `encodedValues` are in `sampleIndex` order:
@@ -170,7 +205,7 @@ it is not treated as a sample separator. If a value is absent, the vector
 uses `.` to keep every sample position aligned.
 
 The file is marked with
-`vcfr:representationProfile vcfr:CondensedRepresentation`.
+`vcfc:representationProfile vcfc:CondensedRepresentation`.
 
 ### What condensed mode provides
 
@@ -186,6 +221,18 @@ The file is marked with
 Condensed mode therefore moves repetition from RDF structure into the literal
 payload of a vector. It is a storage and graph-shape optimization, not a loss
 of genotype information.
+
+**What it does not carry.** Condensed mode stops at the vector: it derives no
+`vcfc:Genotype`, `vcfc:PhaseSet`, `vcfc:LocalAlleleSet` or
+`vcfc:BaseModification`. Those are one resource per sample per record, which is
+precisely the growth this profile exists to prevent. The values are still all
+there — inside the vectors — but a SPARQL engine cannot filter on them without
+a decoder or an application-level vector function. If you need to query
+genotypes directly, that is the argument for expanded mode.
+
+Everything *not* per-sample is identical in both profiles: the header layer, the
+allele layer, structured INFO with its value items, and the SV carriers are all
+emitted the same way.
 
 ### Condensed growth
 
@@ -369,7 +416,7 @@ text values. See the [GeoSPARQL function table](https://graphdb.ontotext.com/doc
 and [GraphDB GeoSPARQL extensions](https://graphdb.ontotext.com/documentation/11.5/sparql-ext-functions-reference.html#geosparql-extension-functions).
 
 Our condensed value is instead a normal RDF string associated with
-`vcfr:VCFTextVector`, for example:
+`vcfc:VCFTextVector`, for example:
 
 ```text
 "0/1\t0/0\t1/1"
@@ -390,13 +437,13 @@ each split item. The implementation is described as using Java's
 could look like this:
 
 ```sparql
-PREFIX vcfr: <https://w3id.org/vcf-rdfizer/vocab#>
+PREFIX vcfc: <https://w3id.org/vcf-core/vocab#>
 PREFIX spif: <http://spinrdf.org/spif#>
 
 SELECT ?vector ?token WHERE {
-  ?vector a vcfr:FormatValueVector ;
-          vcfr:valueEncoding vcfr:VCFTextVector ;
-          vcfr:encodedValues ?encoded .
+  ?vector a vcfc:FormatValueVector ;
+          vcfc:valueEncoding vcfc:VCFTextVector ;
+          vcfc:encodedValues ?encoded .
   ?token spif:split (STR(?encoded) "\t") .
 }
 ```
@@ -415,7 +462,7 @@ generate a sequence of integers, but the reference does not provide a direct
 that `spif:split` alone is not a complete, reliable sample lookup mechanism.
 
 The page also lists RDF-list functions such as `list:index` and
-`list:length`. Those operate on RDF Collections. `vcfr:encodedValues` is a
+`list:length`. Those operate on RDF Collections. `vcfc:encodedValues` is a
 single string literal, not an RDF Collection, so these functions do not apply
 unless the data model is changed to materialize every vector item as list
 structure. That would reintroduce much of the per-item RDF overhead that
@@ -433,7 +480,7 @@ they do not automatically parse a persisted VCF vector literal.
 | `spif:for` | Generate expected sample positions | Helpful support function, but does not pair positions with split tokens |
 | `list:index` / `list:length` | Index RDF Collections | Not applicable to the current string encoding |
 | `helper:tuple` / `helper:iterate` | Work with internal query lists | Not a persisted-vector parser |
-| A custom `vcfr:` vector function | Return value at a sample index | Most direct future SPARQL integration |
+| A custom `vcfc:` vector function | Return value at a sample index | Most direct future SPARQL integration |
 | Application-side parsing | Decode one selected vector after retrieval | Best portable near-term approach |
 
 GraphDB explicitly labels these as extensions beyond the W3C SPARQL
@@ -453,16 +500,16 @@ returns both the position and the value. Conceptually, it could have a
 function or magic-predicate contract like:
 
 ```text
-vcfr:vectorValue(?vector, ?sampleIndex) → ?value
+vcfc:vectorValue(?vector, ?sampleIndex) → ?value
 ```
 
 or:
 
 ```text
-?vector vcfr:valueAt (?sampleIndex ?value)
+?vector vcfc:valueAt (?sampleIndex ?value)
 ```
 
-For a sample-aware form, the function could accept the `vcfr:VCFSample` IRI
+For a sample-aware form, the function could accept the `vcfc:VCFSample` IRI
 instead of an integer, resolve that resource's `sampleIndex`, and then extract
 the matching token. Returning the index as well as the value would make it
 possible to validate that a vector has the expected number of positions.
@@ -523,7 +570,7 @@ Large multi-sample cohort + storage/scale focus  → condensed
 ```
 
 If a consumer is unsure which graph it received, inspect the file’s
-`vcfr:representationProfile` value before querying. That profile is the
+`vcfc:representationProfile` value before querying. That profile is the
 explicit signal that tells the consumer whether sample values are represented
 as individual resources or as ordered vectors.
 

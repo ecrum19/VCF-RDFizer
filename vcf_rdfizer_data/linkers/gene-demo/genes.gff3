@@ -1,0 +1,7 @@
+##gff-version 3
+##sequence-region 1 1 1000
+# Synthetic intervals for testing; these are not biological gene annotations.
+1	VCF-RDFizer-demo	gene	100	200	.	+	.	ID=demo-gene-A
+1	VCF-RDFizer-demo	gene	180	250	.	-	.	ID=demo-gene-B
+1	VCF-RDFizer-demo	exon	190	195	.	+	.	ID=ignored-exon;Parent=demo-gene-A
+2	VCF-RDFizer-demo	gene	10	20	.	+	.	ID=demo-gene-C

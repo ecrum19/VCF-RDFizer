@@ -1,8 +1,8 @@
-PREFIX vcfr: <https://w3id.org/vcf-rdfizer/vocab#>
+PREFIX vcfc: <https://w3id.org/vcf-core/vocab#>
 
 # Blank nodes anywhere in the graph.
 #
-# Every class in the VCF-RDFizer vocabulary declares an vcfr:iriTemplate, so a
+# Every class in the VCF-RDFizer vocabulary declares an vcfc:iriTemplate, so a
 # blank node means a term map produced no IRI. That is always a defect here:
 # blank-node identity is scoped to the file, so the record and value digests
 # could not address such a node, and neither could anything downstream that

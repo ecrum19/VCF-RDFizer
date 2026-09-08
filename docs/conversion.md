@@ -101,48 +101,106 @@ does not change the output, only how many parts are produced before the merge.
 Three classes of triple cannot come from RML, and are appended to the aggregate
 by the host process before compression. See
 [`architecture.md`](architecture.md#4-where-the-split-leaks-and-why) for why.
+The rule is: **RML carries every field whose datatype is the same for every row;
+the wrapper carries everything else** — anything that may be the missing token,
+and anything that has to be decomposed out of a single source cell.
 
-### `emit_record_detail` — QUAL and structured INFO
+### `emit_record_detail` — the row-dependent fixed fields, alleles, INFO
 
-`QUAL` is **always** emitted. The published SHACL shape is
-`sh:or([sh:datatype xsd:decimal] [sh:datatype vcfr:Null])`, and RML cannot pick
-a datatype per row:
+Four fixed fields and the raw INFO string are **always** emitted here, because
+each may be the VCF missing token and the vocabulary requires that as
+`"."^^vcfc:Null`:
+
+| Field | Emitted as |
+| --- | --- |
+| `ID` | the lexical value, or `"."^^vcfc:Null` |
+| `ALT` | the lexical value, or `"."^^vcfc:Null` |
+| `FILTER` | the lexical value, or `"."^^vcfc:Null` |
+| `INFO` (`vcfc:infoRaw`) | the lexical value, or `"."^^vcfc:Null` |
+| `QUAL` | see below |
+
+`QUAL` has its own table because its shape is a disjunction over the whole VCF
+Float lexical space:
 
 | QUAL value | Emitted as |
 | --- | --- |
-| a number | `"<lexical form>"^^xsd:decimal` — the source lexical form, so no precision is gained or lost |
-| `.` or empty | `"."^^vcfr:Null` |
+| a finite number | `"<lexical form>"^^xsd:decimal` — the source lexical form, so no precision is gained or lost |
+| `INF` / `INFINITY` / `NAN`, any case | `"<lexical form>"^^vcfc:VCFFloat` — these are in the VCF Float lexical space but in no XSD numeric one |
+| `.` or empty | `"."^^vcfc:Null` |
 | anything else | a plain string literal, deliberately kept rather than dropped, and reported by the SHACL layer |
 
-`--info-representation structured` (the default) additionally emits one
-`vcfr:InfoFieldValue` per record and key at
-`…#call/{ROW_ID}/info/{KEY}`, linked to the `##INFO` declaration through
-`vcfr:declaredBy`. A single-valued field (`Number=1`) whose declared `Type` is
-`Integer` or `Float` also gets a typed `fieldValueInteger` / `fieldValueDecimal`;
-a `Flag` gets `vcfr:fieldValueBoolean true`. A multi-valued field
-(`Number=A/R/G/.`) keeps only the lexical value, because the vocabulary's IRI
-template gives one node per key, not per value — a real modelling gap, recorded
-in [`limitations.md`](limitations.md).
+`--info-representation structured` (the default) additionally emits:
 
-`--info-representation raw` emits only the opaque `vcfr:infoRaw` string.
+- **The allele layer.** `REF` and each `ALT` item become an ordered
+  `vcfc:ReferenceAllele` / `vcfc:AltAllele` with `alleleIndex` (0 for REF, then
+  1..n in source order), `alleleValue` and `alleleKind`. The kind is the VCF
+  syntactic category: a base sequence, the overlapping-deletion `*`, the missing
+  `.`, an angle-bracketed symbolic ID, the unspecified `<*>`/`<NON_REF>`, or a
+  breakend. A symbolic allele is joined to its `##ALT` declaration with
+  `declaredByAlt` and, when its ID is one of the reserved codes, given a
+  `vcfc:svType`. A breakend is parsed into its orientation, replacement string
+  and mate position. The record is also linked to the contig declaration its
+  `CHROM` names, with `vcfc:chromosome`.
+- **Structured INFO.** One `vcfc:InfoFieldValue` per record and key at
+  `…#call/{ROW_ID}/info/{KEY}`, linked to the `##INFO` declaration through
+  `vcfc:declaredBy`. A single-valued field whose declared `Type` is `Integer` or
+  `Float` also gets a typed `fieldValueInteger` / `fieldValueDecimal`; a `Flag`
+  gets `vcfc:fieldValueBoolean true`.
+- **Value items.** A field whose declared `Number` gives its positions meaning —
+  `A`, `R`, `LA`, `LR` (one per allele), `G`, `LG` (one per genotype), `P` (one
+  per GT allele) — is decomposed into ordered `vcfc:FieldValueItem` resources,
+  each joined to the allele it describes with `vcfc:forAllele`, or carrying its
+  genotype/GT ordinal. Keys that flatten fixed-width tuples (`CIPOS`, `MEINFO`,
+  …) record the width with `vcfc:tupleArity` so a consumer can regroup them.
+  This closes the multi-valued-INFO gap that earlier versions recorded in
+  `limitations.md`.
+- **The SV carriers.** `SVLEN`, `SVCLAIM`, `IMPRECISE`, `NOVEL`, `END`, `EVENT`
+  with `EVENTTYPE`, the confidence intervals (`CIPOS`/`CIEND` through FALDO
+  `InRangePosition`, the rest as `vcfc:ConfidenceInterval`), and the
+  `RN`/`RUS`/`RUL`/`RUC`/`RB` tandem-repeat structure.
+
+Those carriers are emitted once per record, after the INFO values, rather than
+key by key — several of them need more than one key to be well formed. A
+`vcfc:VariantEvent` needs both `EVENT` and `EVENTTYPE`; a reference block needs
+both `END` and `POS`; a tandem repeat needs `RN` before its repeat values have a
+grouping. Where a record does not supply the whole set, the carrier is not
+emitted and the values stay available as ordinary INFO values, rather than
+producing a resource that would fail its SHACL shape.
+
+`--info-representation raw` emits only the opaque `vcfc:infoRaw` string, and
+turns off the allele layer with it (the value items join to the alleles).
 
 ### `append_header_representation_rdf` — structured headers
 
 `--header-representation structured` (the default) types each `##` line with its
-vocabulary subclass (`INFOHeaderLine`, `ContigHeaderLine`, `FilterDefinition`,
-`AltDefinition`, …) and lifts the `<ID=…,Number=…,Type=…,Description=…>`
-attributes into their own properties. The attribute parser respects quoting and
-backslash escapes, so a `Description` containing a comma is handled correctly.
+vocabulary subclass (`INFOHeaderLine`, `ContigHeaderLine`, `FILTERHeaderLine`,
+`ALTHeaderLine`, `MetaHeaderLine`, `SampleHeaderLine`, `PedigreeHeaderLine`,
+`AssemblyHeaderLine`, `PedigreeDBHeaderLine`, …) and lifts its attributes into
+their own properties. The attribute parser respects quoting and backslash
+escapes, so a `Description` containing a comma is handled correctly.
 
-An **unrecognised** `##` key keeps only the base `vcfr:HeaderLine` type.
-Inventing a subclass would put a term in the graph that the vocabulary does not
-define.
+Every **structured** line also gets one ordered `vcfc:HeaderAttribute` per source
+attribute, carrying `attributeKey`, `attributeValue` and a one-based
+`attributeIndex`. This is not optional decoration:
+`vcfc:StructuredHeaderLineShape` requires at least one `vcfc:hasAttribute`, so a
+line typed as one of the structured subclasses without them is non-conformant.
+It also keeps implementation-defined attributes queryable, which the dedicated
+properties alone cannot do.
+
+An **unrecognised** `##` key is still typed as `vcfc:StructuredHeaderLine` or
+`vcfc:UnstructuredHeaderLine` according to its value's form, which keeps it
+queryable without inventing a subclass the vocabulary does not define. An
+unstructured line is only typed when it has a value, because
+`vcfc:UnstructuredHeaderLineShape` requires one.
 
 `##fileDate` is emitted as `xsd:date` when its form is recognisable, and
 verbatim as a plain literal otherwise — again preserved rather than dropped, and
 reported by SHACL.
 
-`--header-representation basic` keeps only the base header-line triples.
+`--header-representation basic` keeps only the base header-line triples the RML
+mapping emits. It is the fastest and smallest header form, but **it does not
+produce a SHACL-conformant graph**, because the structured lines then carry no
+attributes and no subclass.
 
 ### `emit_sample_representation` — genotypes
 
@@ -153,11 +211,107 @@ version:
 
 | Mode | Shape | Growth |
 | --- | --- | --- |
-| `expanded` (default) | one `vcfr:SampleCall` per record × sample, one `vcfr:FormatFieldValue` per FORMAT key | ≈ variants × samples × FORMAT fields |
-| `condensed` | one reusable `vcfr:SampleSet`, one `vcfr:CohortCallMatrix` per call, one `vcfr:FormatValueVector` per FORMAT key holding a tab-separated `vcfr:VCFTextVector` | ≈ samples + variants × FORMAT fields |
+| `expanded` (default) | one `vcfc:SampleCall` per record × sample, one `vcfc:FormatFieldValue` per FORMAT key, and the parsed genotype layer below | ≈ variants × samples × FORMAT fields |
+| `condensed` | one reusable `vcfc:SampleSet`, one `vcfc:CohortCallMatrix` per call, one `vcfc:FormatValueVector` per FORMAT key holding a tab-separated `vcfc:VCFTextVector` | ≈ samples + variants × FORMAT fields |
 
-The file declares which shape it carries via `vcfr:representationProfile`, so a
-consumer can branch on it before querying.
+Both modes emit the file-level `vcfc:SampleSet` and its ordered `vcfc:VCFSample`
+members, and link them from the `#CHROM` `vcfc:ColumnHeaderLine` with
+`vcfc:hasGenotypeColumns`. That is one resource per sample column for the whole
+file, not per record, so it costs nothing at cohort scale — and it gives the
+expanded profile's `SampleCall` a reusable identity through `vcfc:forSample`
+instead of relying on repeated `sampleId` literals.
+
+**Expanded mode additionally parses the per-sample values** into the vocabulary's
+genotype layer: `GT` becomes a `vcfc:Genotype` with `genotypeString`, `ploidy`,
+`phasingStatus` and one `vcfc:GenotypeAlleleCall` per position (each either
+pointing at the allele it called or flagged `isNoCall`); `FT` becomes
+`sampleFilter`; `PS`/`PSL`/`PSO`/`PSQ` become a `vcfc:PhaseSet`; `LAA` becomes a
+`vcfc:LocalAlleleSet`; `CN`/`CNQ`/`CNL`/`CNP` and `HAP`/`AHAP` become their
+copy-number and haplotype properties; and the pattern-defined `M`/`DPM`/`ADM`
+keys become `vcfc:BaseModification` resources pointing at a ChEBI residue.
+
+**Condensed mode deliberately stops at the vector.** Decomposing GT per sample is
+exactly the per-sample materialization the condensed profile exists to avoid.
+Every value stays recoverable by decoding a vector against its FORMAT definition
+and the matrix `SampleSet`.
+
+A `GT` value that is not in the `vcfc:GenotypeString` lexical space produces no
+`Genotype` resource at all — the value remains present as the FORMAT field's
+`fieldValue`, and inventing a genotype for it would create a resource that fails
+`vcfc:GenotypeShape`.
+
+The file declares which shape it carries via `vcfc:representationProfile`, so a
+consumer can branch on it before querying. The SPARQL SHACL profile enforces
+that a graph never mixes the two.
+
+## 4a. VCF versions
+
+VCF Core ships one SHACL overlay per VCF version (4.1 through 4.5), each scoped
+by the file's `vcfc:fileFormat`, plus an optional `vcfc:VCF4xFile` subclass that
+activates that version's gate. The conversion follows the version of each input.
+
+### Detection is automatic
+
+`##fileformat` is required to be the first line of a conforming VCF, and
+[`src/vcf_as_tsv.sh`](../src/vcf_as_tsv.sh) already lifts it into
+`file_metadata.tsv`, so detection costs one small read and needs nothing from
+you. It happens **per input**, not per run: a directory may hold files of
+different versions and each gets its own mapping and emitter behaviour.
+
+`--vcf-version` overrides it, for a file whose declaration is missing or wrong:
+
+```bash
+vcf-rdfizer --mode full -i ./cohort.vcf.gz --vcf-version 4.3 -o ./results
+```
+
+The run log states which version was used and how it was chosen — `(detected)`,
+`(forced)`, or a warning that the declaration was not recognized.
+
+**VCF 4.0 is not recognized.** VCF Core claims no 4.0 conformance overlay, so a
+4.0 file converts with the newest supported rules — nothing representable is
+dropped — but no `vcfc:VCF4xFile` class is emitted, so the graph never claims a
+version gate that cannot be checked. The same applies to a missing or malformed
+`##fileformat` line. All three cases are reported, never assumed silently.
+
+### What the version changes
+
+| | 4.1 | 4.2 | 4.3 | 4.4 | 4.5 |
+| --- | --- | --- | --- | --- | --- |
+| `Number=R` | — | ✓ | ✓ | ✓ | ✓ |
+| `Number=P` (FORMAT) | — | — | — | ✓ | ✓ |
+| `Number=LA/LR/LG/M` (FORMAT) | — | — | — | — | ✓ |
+| `CIPOS`/`CIEND` | one pair per record | one pair per record | one pair per record | one pair per ALT | one pair per ALT |
+| `CILEN`/`CICN` | — | — | — | ✓ | ✓ |
+| `EVENT` | one per record | one per record | one per record | one per ALT | one per ALT |
+| `EVENTTYPE` | — | — | — | ✓ | ✓ |
+| Local alleles (`LAA`) | — | — | — | — | ✓ |
+| Base modifications (`M`/`DPM`/`ADM`) | — | — | — | — | ✓ |
+| Leading GT phase indicator | — | — | — | ✓ | ✓ |
+
+Three consequences in the emitted graph:
+
+- **`vcfc:FieldValueItem` linkage.** Before 4.4 a `CIPOS` list is one pair
+  describing the record, so its items get a `vcfc:valueIndex` and a
+  `vcfc:tupleArity` but no `vcfc:forAllele` — there is no single allele to point
+  at, and each ALT allele of a multi-allelic record shares the interval. From
+  4.4 the list repeats per ALT and each item joins its own allele.
+- **Tuple items are always materialized.** The version overlays count a tuple
+  key's value items against the ALT count, so `CIPOS` and friends are decomposed
+  even though 4.4 and 4.5 declare them `Number=.`, which on its own would say
+  "no positional meaning".
+- **Families a version does not define are not invented.** A `LAA` column in a
+  4.4 file, or an `M27551C` column in a 4.3 file, keeps its raw
+  `vcfc:fieldValue` and gets no `vcfc:LocalAlleleSet` or
+  `vcfc:BaseModification` resource.
+
+### What it does *not* change
+
+The version does not affect parsing leniency. A GT with a leading phase
+indicator in a 4.1 file is still parsed into a `vcfc:Genotype`; the version
+overlay reports it as non-conformant, which is the right division of labour —
+the converter transcribes, the validator judges. The same holds for a `Number=R`
+declaration in a 4.1 file, or a reserved key declared with the wrong arity: the
+graph records what the file says, and SHACL says whether the file was right.
 
 ## 5. The two helper tables
 
@@ -183,13 +337,27 @@ conversion is deterministic and re-running it produces byte-comparable subjects.
 | `HeaderLine` | `file://{SOURCE_FILE}#header/line/{HEADER_INDEX}` |
 | `VCFRecord` | `file://{SOURCE_FILE}#record/{ROW_ID}` |
 | `VariantCall` | `file://{SOURCE_FILE}#call/{ROW_ID}` |
+| `ColumnHeaderLine` | `file://{SOURCE_FILE}#header/columns` |
+| `HeaderAttribute` | `file://{SOURCE_FILE}#header/line/{HEADER_INDEX}/attribute/{N}` |
+| `SampleDeclaration` (`##SAMPLE`/`##PEDIGREE`) | `file://{SOURCE_FILE}#header/sample/{ID}` |
 | `InfoFieldValue` | `file://{SOURCE_FILE}#call/{ROW_ID}/info/{KEY}` |
+| `Allele` (REF at 0, ALT from 1) | `file://{SOURCE_FILE}#record/{ROW_ID}/allele/{N}` |
+| `FieldValueItem` | `<parent value IRI>/value/{N}` |
+| `VariantEvent` | `file://{SOURCE_FILE}#record/{ROW_ID}/event/{EVENT}` |
+| `SampleSet` (both profiles) | `file://{SOURCE_FILE}#samples` |
+| `VCFSample` (both profiles) | `file://{SOURCE_FILE}#samples/{SAMPLE}` |
 | `SampleCall` (expanded) | `file://{SOURCE_FILE}#sample/{ROW_ID}/{SAMPLE}` |
 | `FormatFieldValue` (expanded) | `file://{SOURCE_FILE}#sample/{ROW_ID}/{SAMPLE}/fmt/{KEY}` |
-| `SampleSet` (condensed) | `file://{SOURCE_FILE}#samples` |
-| `VCFSample` (condensed) | `file://{SOURCE_FILE}#samples/{SAMPLE}` |
+| `Genotype` (expanded) | `file://{SOURCE_FILE}#sample/{ROW_ID}/{SAMPLE}/genotype` |
+| `GenotypeAlleleCall` (expanded) | `…/genotype/call/{N}` |
+| `PhaseSet` (expanded) | `file://{SOURCE_FILE}#sample/{ROW_ID}/{SAMPLE}/phaseset` |
 | `CohortCallMatrix` (condensed) | `file://{SOURCE_FILE}#call/{ROW_ID}/matrix` |
 | `FormatValueVector` (condensed) | `file://{SOURCE_FILE}#call/{ROW_ID}/matrix/fmt/{KEY}` |
+
+These follow the `vcfc:iriTemplate` patterns the vocabulary recommends for each
+class. Where the vocabulary declares no template — the allele-layer, genotype
+and SV resources — the IRI is minted beneath the resource it belongs to, so the
+whole graph stays derivable from the filename and the row counter alone.
 
 `{SOURCE_FILE}` is the **basename**, not a path, so a graph does not encode
 where the VCF happened to live. The consequence is that two different VCFs with
@@ -199,16 +367,21 @@ converting, or keep the graphs separate.
 
 ## 7. Missing values
 
-The vocabulary's `vcfr:missingValuePolicy` says a missing token should be
-`"."^^vcfr:Null`, and the conversion follows it. `preflight_missing_token_conformance`
+The vocabulary's `vcfc:missingValuePolicy` says a missing token should be
+`"."^^vcfc:Null`, and the conversion follows it. `preflight_missing_token_conformance`
 reports a plain `"."` literal as an anomaly, and `--strict-conformance` promotes
 that from a report to a failure.
 
-This policy currently **conflicts with the published SHACL shapes** for
-`ref`/`alt`/`chrom`, which constrain those to `sh:datatype xsd:string`. A record
-with `ALT=.` therefore cannot satisfy both. The conflict is documented in
-[`vcf-coverage.md`](vcf-coverage.md#an-open-conflict-inside-the-vocabulary) and
-needs a decision in the vocabulary repository, not here.
+This used to conflict with the published SHACL shapes, which constrained
+`vcfc:alt` to `sh:datatype xsd:string` and so rejected every REF-only and
+gVCF-style record. **The vocabulary fixed that**: `vcfc:VCFRecordShape` now
+accepts `xsd:string` or `vcfc:Null` for `alt`, and `vcfc:VariantCallShape`
+accepts the full VCF Float lexical space for `qual`. Emitting the missing token
+as `vcfc:Null` is now both the policy and the conformant choice.
+
+`CHROM`, `POS` and `REF` are the three fixed fields VCF 4.5 forbids from being
+the missing token, which is exactly why they can stay in the RML mapping while
+`ID`, `ALT`, `QUAL` and `FILTER` cannot.
 
 ## 8. What conversion does *not* do
 
@@ -219,13 +392,21 @@ needs a decision in the vocabulary repository, not here.
   the central problem the [data-linking design](datalinking-design.md) has to
   solve.
 - **No reference checking.** `REF` is not verified against any genome.
-- **No structural-variant modelling.** Symbolic ALTs (`<DEL>`), breakends
-  (`N[chr2:321[`) and `*` are carried as literals. The validation suite
-  classifies them (`SYMBOLIC_OR_BREAKEND`) but the vocabulary gives them no
-  structure, and `INFO` keys such as `END` and `SVTYPE` get no special meaning.
-- **No genotype interpretation.** A `GT` value is a lexical token. Phasing
-  (`|` versus `/`) is preserved in the literal but not modelled.
 - **No cross-file merging.** Each VCF produces its own graph.
+
+Two entries that used to be in this list no longer belong here, because the move
+to the VCF Core vocabulary added both:
+
+- **Structural variants are modelled.** Symbolic ALTs, breakends and `*` are
+  classified by `vcfc:alleleKind`, given a `vcfc:svType` where the identifier is
+  a reserved code, and parsed into their components; `END`, `SVLEN`, `SVCLAIM`,
+  `EVENT`/`EVENTTYPE`, the `CI*` intervals and the tandem-repeat keys all have
+  meaning. The raw literals are still there — the structure is added alongside,
+  not instead.
+- **Genotypes are interpreted** in the expanded profile: `GT` is parsed into
+  ordered allele calls with an explicit `vcfc:phasingStatus`, so `|` versus `/`
+  is modelled rather than only preserved. The condensed profile keeps them
+  lexical by design.
 
 ---
 

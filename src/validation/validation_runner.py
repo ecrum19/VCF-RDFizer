@@ -33,6 +33,7 @@ import platform
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -330,27 +331,37 @@ METADATA_ABSENT = "(absent)"
 # A custom mapping therefore invalidates them, and the wrapper switches the
 # policy to report-only in that case.
 
-VCFR = "https://w3id.org/vcf-rdfizer/vocab#"
-RDF_TYPE = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+# The vocabulary terms, the VCF-version model and the lexical parsers are
+# shared with the wrapper rather than mirrored here. They used to be duplicated,
+# with unit tests asserting the copies stayed identical; one module removes the
+# drift the tests were policing. `Dockerfile` copies it next to this runner, so
+# it imports the same way inside the container and on the host.
+try:
+    import vcf_rdfizer_vocab as vocab
+except ImportError:
+    # In the container the module sits next to this file; in a source checkout
+    # it is at the repository root. Try both before giving up, so the runner
+    # works as a script in either layout.
+    for candidate in (SCRIPT_DIR, SCRIPT_DIR.parent.parent):
+        if (candidate / "vcf_rdfizer_vocab.py").is_file():
+            sys.path.insert(0, str(candidate))
+            break
+    import vcf_rdfizer_vocab as vocab
+
+VCFC = vocab.VCFC_NAMESPACE
+RDF_TYPE = vocab.RDF_TYPE_URI
 
 
 def _nonzero(counts: dict[str, int]) -> dict[str, int]:
     return {key: value for key, value in counts.items() if value}
 
 
+rml_uri_component = vocab.rml_uri_component
+
+
 #: Field separator for the record digest. U+001F cannot appear in a VCF field,
 #: so no shift of a field boundary can make two different records collide. The
 #: query in q11_record_digest.rq writes it as a SPARQL \\u001F escape.
-def rml_uri_component(value: str) -> str:
-    """Encode a template value the way RMLStreamer 2.5.0 does.
-
-    Mirrors ``_rml_uri_component`` in ``vcf_rdfizer.py``; that module is not on
-    the container's import path, and ``test_validation_logic_unit.py`` asserts
-    the two agree so they cannot drift.
-    """
-    encoded = quote_plus(value, safe="*-._", encoding="utf-8", errors="strict")
-    # urllib leaves '~' unescaped; java.net.URLEncoder does not.
-    return encoded.replace("+", "%20").replace("~", "%7E")
 
 
 DIGEST_SEPARATOR = "\u001f"
@@ -366,6 +377,351 @@ def record_digest_bucket(fields: list[str]) -> str:
     return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:DIGEST_BUCKET_CHARS]
 
 
+# ---------------------------------------------------------------------------
+# Emitted-shape counters
+# ---------------------------------------------------------------------------
+#
+# The census asserts an exact inventory: these predicates and classes, with
+# these counts, and nothing else. So every resource family the emitters produce
+# has to be counted here, from the VCF, without reading the graph or the
+# mapping. These two functions are the single derivation: parse_vcf calls them
+# with the columns it read, and the test fixture calls them with the columns it
+# declares, so the container oracle and the fixture oracle cannot disagree.
+#
+# They mirror append_header_representation_rdf and append_record_detail_rdf.
+# Where a decision depends on a shared table (which '##' keys are structured,
+# which INFO keys carry an SV carrier, which Number tokens are positional), the
+# table comes from vcf_rdfizer_vocab rather than being restated.
+
+
+def _count_field_definition(counts: Counter, *, number: str, has_type: bool,
+                            has_description: bool) -> None:
+    """Count the ID/Number/Type/Description quartet of one field definition."""
+    counts["fieldId"] += 1
+    counts["fieldNumber"] += 1
+    if vocab.arity_individual(number) is not None:
+        counts["fieldArity"] += 1
+    if vocab.number_as_integer(number) is not None:
+        counts["fieldNumberInteger"] += 1
+    if has_type:
+        counts["fieldType"] += 1
+    if has_description:
+        counts["fieldDescription"] += 1
+
+
+def emitted_header_counters(header_lines: list[tuple[str, str]]) -> dict[str, Any]:
+    """Counters for everything append_header_representation_rdf emits.
+
+    ``header_lines`` is the ordered ``(key, value)`` list of '##' lines, without
+    the leading '##' and split on the first '='.
+    """
+    classes: Counter[str] = Counter()
+    predicates: Counter[str] = Counter()
+    contigs = 0
+    declarations: set[str] = set()
+
+    for key, value in header_lines:
+        key_lower = key.lower()
+        structured = vocab.is_structured_header_value(value)
+        line_class = HEADER_LINE_CLASSES.get(key_lower)
+        if line_class is None:
+            # An unrecognized key is still one of the two VCF forms. An
+            # unstructured line is only typed when it has a value, because
+            # vcfc:UnstructuredHeaderLineShape requires one.
+            if structured:
+                line_class = "StructuredHeaderLine"
+            elif value:
+                line_class = "UnstructuredHeaderLine"
+            else:
+                continue
+        classes[line_class] += 1
+
+        if not structured:
+            if key_lower == "assembly" and value:
+                predicates["assemblyUrl"] += 1
+            elif key_lower == "pedigreedb" and value:
+                predicates["pedigreeDbUrl"] += 1
+            continue
+
+        attributes = parse_structured_header_attributes(value)
+        classes["HeaderAttribute"] += len(attributes)
+        for name in ("hasAttribute", "attributeKey", "attributeValue", "attributeIndex"):
+            predicates[name] += len(attributes)
+
+        fields = dict(attributes)
+        identifier = (fields.get("ID") or "").strip()
+
+        if key_lower in {"info", "format"}:
+            if not identifier:
+                continue
+            # An absent Description is synthesized, so the property is always
+            # present on an INFO or FORMAT declaration.
+            _count_field_definition(
+                predicates, number=fields.get("Number") or ".",
+                has_type=True, has_description=True,
+            )
+            if key_lower == "info":
+                for attribute, predicate in vocab.INFO_EXTRA_ATTRIBUTES.items():
+                    if fields.get(attribute):
+                        predicates[predicate] += 1
+        elif key_lower == "filter":
+            if identifier:
+                predicates["filterId"] += 1
+                predicates["fieldDescription"] += 1
+        elif key_lower == "alt":
+            if identifier:
+                predicates["altId"] += 1
+                predicates["fieldDescription"] += 1
+        elif key_lower == "contig":
+            if not identifier:
+                continue
+            contigs += 1
+            predicates["contigId"] += 1
+            for attribute, (predicate, _datatype) in vocab.CONTIG_ATTRIBUTES.items():
+                if fields.get(attribute):
+                    predicates[predicate] += 1
+        elif key_lower == "meta":
+            if not identifier:
+                continue
+            _count_field_definition(
+                predicates, number=fields.get("Number") or ".",
+                has_type=True, has_description=fields.get("Description") is not None,
+            )
+            predicates["metaAllowedValue"] += len(_meta_values(fields.get("Values")))
+        elif key_lower == "sample":
+            if identifier:
+                predicates["declaresSample"] += 1
+                if identifier not in declarations:
+                    declarations.add(identifier)
+                    classes["SampleDeclaration"] += 1
+        elif key_lower == "pedigree":
+            for attribute_key, attribute_value in attributes:
+                if attribute_key == "ID" or not attribute_value:
+                    continue
+                predicates[
+                    vocab.PEDIGREE_ROLE_PROPERTIES.get(attribute_key, "pedigreeAncestor")
+                ] += 1
+                predicates["ancestorRole"] += 1
+                if attribute_value not in declarations:
+                    declarations.add(attribute_value)
+                    classes["SampleDeclaration"] += 1
+
+    if contigs:
+        predicates["contigCount"] += 1
+    return {
+        "emittedHeaderClasses": dict(classes),
+        "emittedHeaderPredicates": dict(predicates),
+    }
+
+
+def _meta_values(raw: str | None) -> list[str]:
+    """Split a ##META ``Values=[a, b, c]`` list, as the emitter does."""
+    if not raw:
+        return []
+    inner = raw.strip()
+    if inner.startswith("[") and inner.endswith("]"):
+        inner = inner[1:-1]
+    return [item.strip() for item in inner.split(",") if item.strip()]
+
+
+def emitted_record_counters(
+    rows: list[list[str]],
+    samples: list[str],
+    *,
+    version: Any,
+    contig_ids: set[str],
+    alt_declaration_ids: set[str],
+    has_assembly_line: bool = False,
+    info_numbers: dict[str, str],
+    format_numbers: dict[str, str],
+) -> dict[str, Any]:
+    """Counters for the allele, INFO, value-item, SV and genotype families.
+
+    ``rows`` are the raw tab-split VCF data columns. Everything is derived from
+    those and from the version, exactly as the emitters derive it.
+    """
+    classes: Counter[str] = Counter()
+    predicates: Counter[str] = Counter()
+
+    assembly_contig_ids: set[str] = set()
+    reference_alleles = alt_alleles = 0
+    value_items = value_item_alleles = tuple_items = 0
+    genotypes = genotype_calls = called_alleles = 0
+
+    for row in rows:
+        chrom = row[0] if len(row) > 0 else ""
+        ref = row[3] if len(row) > 3 else ""
+        alt = row[4] if len(row) > 4 else ""
+        info = row[7] if len(row) > 7 else ""
+
+        # A bracketed CHROM names a breakpoint-assembly contig instead of a
+        # declared reference sequence; the two are mutually exclusive.
+        assembly_id = vocab.parse_bracketed_chrom(chrom)
+        if assembly_id is not None:
+            predicates["chromAssemblyContig"] += 1
+            if assembly_id not in assembly_contig_ids:
+                assembly_contig_ids.add(assembly_id)
+                classes["AssemblyContig"] += 1
+                predicates["assemblyContigId"] += 1
+                if has_assembly_line:
+                    predicates["declaredInAssembly"] += 1
+        elif chrom in contig_ids:
+            predicates["chromosome"] += 1
+
+        alleles = vocab.parse_alt_alleles(ref, alt)
+        allele_uris = {allele.index for allele in alleles}
+        alt_count = sum(1 for allele in alleles if allele.index >= 1)
+        for allele in alleles:
+            if allele.index == 0:
+                reference_alleles += 1
+            else:
+                alt_alleles += 1
+            if allele.symbolic_id and allele.symbolic_id in alt_declaration_ids:
+                predicates["declaredByAlt"] += 1
+            if allele.symbolic_type:
+                predicates["svType"] += 1
+            if allele.breakend is not None:
+                classes["Breakend"] += 1
+                if allele.breakend.orientation is not None:
+                    predicates["breakendOrientation"] += 1
+                if allele.breakend.replacement:
+                    predicates["breakendReplacementString"] += 1
+                if allele.breakend.is_single:
+                    predicates["isSingleBreakend"] += 1
+
+        entries = parse_info_entries(info)
+        for key, value in entries:
+            if value is None:
+                continue
+            number = info_numbers.get(key, ".")
+            if not (allele_uris and version.is_positional(key, number)):
+                continue
+            items = vocab.split_value_items(value)
+            value_items += len(items)
+            arity = version.tuple_arity(key)
+            if arity is not None:
+                tuple_items += len(items)
+            for index in range(len(items)):
+                link = version.value_item_link(key, number, index)
+                if link.allele_index is not None and link.allele_index in allele_uris:
+                    value_item_alleles += 1
+                elif link.genotype_index is not None:
+                    predicates["forGenotypeIndex"] += 1
+                elif link.gt_allele_index is not None:
+                    predicates["forGTAlleleIndex"] += 1
+
+        if samples:
+            format_keys = (row[8].split(":") if len(row) > 8 and row[8] else [])
+            payloads = row[9 : 9 + len(samples)]
+            if "GT" in format_keys:
+                gt_index = format_keys.index("GT")
+                for payload in payloads:
+                    fields = payload.split(":") if payload else []
+                    raw_gt = fields[gt_index] if gt_index < len(fields) else ""
+                    parsed = vocab.parse_genotype(raw_gt)
+                    if parsed is None:
+                        continue
+                    genotypes += 1
+                    genotype_calls += len(parsed.calls)
+                    called_alleles += sum(
+                        1 for call in parsed.calls
+                        if call.allele_index is not None and call.allele_index <= alt_count
+                    )
+
+    if reference_alleles:
+        classes["ReferenceAllele"] = reference_alleles
+        predicates["hasReferenceAllele"] = reference_alleles
+    if alt_alleles:
+        classes["AltAllele"] = alt_alleles
+        predicates["hasAltAllele"] = alt_alleles
+    total_alleles = reference_alleles + alt_alleles
+    for name in ("alleleIndex", "alleleValue", "alleleKind"):
+        predicates[name] += total_alleles
+
+    if value_items:
+        classes["FieldValueItem"] += value_items
+        for name in ("hasValueItem", "valueIndex", "itemValue"):
+            predicates[name] += value_items
+        predicates["forAllele"] += value_item_alleles
+        predicates["tupleArity"] += tuple_items
+
+    # The parsed genotype layer is expanded-only, so it is reported separately
+    # and merged by expected_census for that profile alone. Keeping parse_vcf
+    # representation-independent is what lets one parse serve both censuses.
+    genotype_classes: Counter[str] = Counter()
+    genotype_predicates: Counter[str] = Counter()
+    if genotypes:
+        genotype_classes["Genotype"] += genotypes
+        genotype_classes["GenotypeAlleleCall"] += genotype_calls
+        for name in ("hasGenotype", "genotypeString", "ploidy", "phasingStatus"):
+            genotype_predicates[name] += genotypes
+        for name in ("hasAlleleCall", "callIndex", "isNoCall"):
+            genotype_predicates[name] += genotype_calls
+        genotype_predicates["calledAllele"] += called_alleles
+
+    return {
+        "emittedRecordClasses": dict(classes),
+        "emittedRecordPredicates": dict(predicates),
+        "emittedGenotypeClasses": dict(genotype_classes),
+        "emittedGenotypePredicates": dict(genotype_predicates),
+        "alleleCount": total_alleles,
+        "valueItemCount": value_items,
+        "genotypeCount": genotypes,
+        "genotypeAlleleCallCount": genotype_calls,
+    }
+
+
+def synthesized_definition_numbers(
+    rows: list[list[str]], *, declared_info: set[str], declared_format: set[str]
+) -> dict[str, list[str]]:
+    """The Number token of every definition the value emitters have to invent.
+
+    A key declared by a '##INFO' or '##FORMAT' line is owned by the header
+    emitter, which emits its ID/Number/Type/Description at the header line's
+    own IRI. Only an undeclared key gets a definition invented at value time,
+    with Number "0" for a Flag and "." otherwise.
+    """
+    info: list[str] = []
+    format_keys: list[str] = []
+    seen_info: set[str] = set()
+    seen_format: set[str] = set()
+    for row in rows:
+        for key, value in parse_info_entries(row[7] if len(row) > 7 else ""):
+            if key in declared_info or key in seen_info:
+                continue
+            seen_info.add(key)
+            info.append("0" if value is None else ".")
+        declared_keys = row[8].split(":") if len(row) > 8 and row[8] else []
+        payloads = [p.split(":") if p else [] for p in row[9:]]
+        width = max([len(declared_keys), *(len(p) for p in payloads)], default=0)
+        for index in range(width):
+            key = (declared_keys[index]
+                   if index < len(declared_keys) and declared_keys[index]
+                   else f"FIELD_{index + 1}")
+            if key in declared_format or key in seen_format:
+                continue
+            seen_format.add(key)
+            format_keys.append(".")
+    return {"synthesizedInfoNumbers": info, "synthesizedFormatNumbers": format_keys}
+
+
+def _count_definitions(predicates: dict[str, int], numbers: list[str]) -> None:
+    """Count the field* triples of each synthesized field definition.
+
+    A synthesized definition always carries ID, Number, Type and Description,
+    plus the arity individual or the fixed count its Number token implies.
+    """
+    for number in numbers:
+        for name in ("fieldId", "fieldNumber", "fieldType", "fieldDescription"):
+            predicates[f"{VCFC}{name}"] = predicates.get(f"{VCFC}{name}", 0) + 1
+        if vocab.arity_individual(number) is not None:
+            predicates[f"{VCFC}fieldArity"] = predicates.get(f"{VCFC}fieldArity", 0) + 1
+        if vocab.number_as_integer(number) is not None:
+            predicates[f"{VCFC}fieldNumberInteger"] = (
+                predicates.get(f"{VCFC}fieldNumberInteger", 0) + 1
+            )
+
+
 def expected_census(
     parser: dict[str, Any], representation: str, *, info_representation: str = "structured",
     header_representation: str = "structured",
@@ -376,112 +732,140 @@ def expected_census(
     header_lines = parser["headerLineCount"]
 
     classes: dict[str, int] = {
-        f"{VCFR}VCFFile": 1,
-        f"{VCFR}VCFHeader": 1,
-        f"{VCFR}HeaderLine": header_lines,
-        f"{VCFR}VCFRecord": records,
-        f"{VCFR}VariantCall": records,
+        f"{VCFC}VCFFile": 1,
+        f"{VCFC}VCFHeader": 1,
+        f"{VCFC}ColumnHeaderLine": 1,
+        f"{VCFC}HeaderLine": header_lines,
+        f"{VCFC}VCFRecord": records,
+        f"{VCFC}VariantCall": records,
     }
+    # The mapping's version sentinel resolves to the subclass for the version
+    # the file declares, or back to vcfc:VCFFile when the version has no
+    # conformance overlay -- in which case it adds no new class.
+    version = vocab.parse_vcf_version(parser.get("fileFormat"))
+    if version is not None:
+        classes[f"{VCFC}{version.file_class}"] = 1
     predicates: dict[str, int] = {
-        f"{VCFR}hasHeader": 1,
-        f"{VCFR}hasHeaderLine": header_lines,
-        f"{VCFR}headerKey": header_lines,
-        f"{VCFR}headerValue": parser["headerValueCount"],
-        f"{VCFR}hasRecord": records,
-        f"{VCFR}chrom": records,
-        f"{VCFR}pos": records,
-        f"{VCFR}recordId": records,
-        f"{VCFR}ref": records,
-        f"{VCFR}alt": records,
-        f"{VCFR}hasCall": records,
-        f"{VCFR}qual": records,
-        f"{VCFR}filter": records,
-        f"{VCFR}infoRaw": records,
-        f"{VCFR}formatRaw": parser["recordsWithFormatColumn"],
+        f"{VCFC}hasHeader": 1,
+        f"{VCFC}hasColumnHeader": 1,
+        f"{VCFC}hasHeaderLine": header_lines,
+        f"{VCFC}headerKey": header_lines,
+        f"{VCFC}headerValue": parser["headerValueCount"],
+        f"{VCFC}lineIndex": header_lines,
+        f"{VCFC}hasRecord": records,
+        f"{VCFC}chrom": records,
+        f"{VCFC}pos": records,
+        f"{VCFC}ref": records,
+        f"{VCFC}recordIndex": records,
+        f"{VCFC}hasCall": records,
+        # ID, ALT, QUAL, FILTER and INFO moved out of the mapping and into the
+        # wrapper's emitter, because each may be the VCF missing token and RML
+        # cannot type an object per row. They are still one per record.
+        f"{VCFC}recordId": records,
+        f"{VCFC}alt": records,
+        f"{VCFC}qual": records,
+        f"{VCFC}filter": records,
+        f"{VCFC}infoRaw": records,
+        f"{VCFC}formatRaw": parser["recordsWithFormatColumn"],
     }
     # RMLStreamer emits nothing for an absent value, so an undeclared
     # meta-information line contributes no triple rather than an empty one.
     for field, predicate in (
-        ("fileFormat", f"{VCFR}fileFormat"),
-        ("referenceGenome", f"{VCFR}referenceGenome"),
-        ("sourceSoftware", f"{VCFR}sourceSoftware"),
+        ("fileFormat", f"{VCFC}fileFormat"),
+        ("referenceGenome", f"{VCFC}referenceGenome"),
+        ("sourceSoftware", f"{VCFC}sourceSoftware"),
     ):
         predicates[predicate] = 0 if parser[field] == METADATA_ABSENT else 1
 
+    # A sites-only VCF still declares a profile: vcfc:RepresentationProfileShape
+    # requires exactly one on every file, and a file with no genotype columns
+    # has no genotype data to condense.
+    predicates[f"{VCFC}representationProfile"] = 1
     if samples:
-        predicates[f"{VCFR}representationProfile"] = 1
-        if representation == "expanded":
-            classes[f"{VCFR}SampleCall"] = records * samples
-            classes[f"{VCFR}FormatFieldValue"] = parser["formatValueSlots"]
-            predicates[f"{VCFR}hasSampleCall"] = records * samples
-            predicates[f"{VCFR}sampleId"] = records * samples
-            predicates[f"{VCFR}hasFormatValue"] = parser["formatValueSlots"]
-            predicates[f"{VCFR}fieldValue"] = parser["nonEmptyFormatValues"]
-        else:
-            definitions = parser["distinctFormatKeyCount"]
-            classes[f"{VCFR}SampleSet"] = 1
-            classes[f"{VCFR}VCFSample"] = samples
-            classes[f"{VCFR}CohortCallMatrix"] = parser["recordsWithFormatKeys"]
-            classes[f"{VCFR}FormatValueVector"] = parser["formatKeyOccurrences"]
-            classes[f"{VCFR}FormatFieldDefinition"] = definitions
-            predicates[f"{VCFR}hasSampleSet"] = 1
-            predicates[f"{VCFR}hasSample"] = samples
-            predicates[f"{VCFR}sampleName"] = samples
-            predicates[f"{VCFR}sampleIndex"] = samples
-            predicates[f"{VCFR}hasCallMatrix"] = parser["recordsWithFormatKeys"]
-            predicates[f"{VCFR}appliesToSampleSet"] = parser["recordsWithFormatKeys"]
-            predicates[f"{VCFR}hasFormatValueVector"] = parser["formatKeyOccurrences"]
-            predicates[f"{VCFR}declaredBy"] = parser["formatKeyOccurrences"]
-            predicates[f"{VCFR}valueEncoding"] = parser["formatKeyOccurrences"]
-            predicates[f"{VCFR}encodedValues"] = parser["formatKeyOccurrences"]
-            predicates[f"{VCFR}fieldId"] = definitions
-            predicates[f"{VCFR}fieldNumber"] = definitions
-            predicates[f"{VCFR}fieldDescription"] = definitions
+        definitions = parser["distinctFormatKeyCount"]
+        # The reusable sample set is file-scoped, not profile-scoped: both
+        # profiles emit it, and the #CHROM line links to its members.
+        classes[f"{VCFC}SampleSet"] = 1
+        classes[f"{VCFC}VCFSample"] = samples
+        classes[f"{VCFC}FormatFieldDefinition"] = definitions
+        predicates[f"{VCFC}hasSampleSet"] = 1
+        predicates[f"{VCFC}hasSample"] = samples
+        predicates[f"{VCFC}sampleName"] = samples
+        predicates[f"{VCFC}sampleIndex"] = samples
+        predicates[f"{VCFC}hasGenotypeColumns"] = samples
+        # A FORMAT key declared by a '##FORMAT' line gets its
+        # ID/Number/Type/Description from the header emitter, at the same IRI.
+        # Only a key the header never declared needs an invented definition
+        # here, so only those are counted.
+        _count_definitions(predicates, parser.get("synthesizedFormatNumbers", []))
 
-    predicates[f"{VCFR}fileDate"] = 0 if parser["fileDate"] == METADATA_ABSENT else 1
+        if representation == "expanded":
+            for class_name, count in parser.get("emittedGenotypeClasses", {}).items():
+                classes[f"{VCFC}{class_name}"] = classes.get(f"{VCFC}{class_name}", 0) + count
+            for name, count in parser.get("emittedGenotypePredicates", {}).items():
+                predicates[f"{VCFC}{name}"] = predicates.get(f"{VCFC}{name}", 0) + count
+            classes[f"{VCFC}SampleCall"] = records * samples
+            classes[f"{VCFC}FormatFieldValue"] = parser["formatValueSlots"]
+            predicates[f"{VCFC}hasSampleCall"] = records * samples
+            predicates[f"{VCFC}sampleId"] = records * samples
+            predicates[f"{VCFC}forSample"] = records * samples
+            predicates[f"{VCFC}hasFormatValue"] = parser["formatValueSlots"]
+            predicates[f"{VCFC}fieldValue"] = parser["nonEmptyFormatValues"]
+            # Every expanded FORMAT value now cites its declaration.
+            predicates[f"{VCFC}declaredBy"] = (
+                predicates.get(f"{VCFC}declaredBy", 0) + parser["formatValueSlots"]
+            )
+        else:
+            classes[f"{VCFC}CohortCallMatrix"] = parser["recordsWithFormatKeys"]
+            classes[f"{VCFC}FormatValueVector"] = parser["formatKeyOccurrences"]
+            predicates[f"{VCFC}hasCallMatrix"] = parser["recordsWithFormatKeys"]
+            predicates[f"{VCFC}appliesToSampleSet"] = parser["recordsWithFormatKeys"]
+            predicates[f"{VCFC}hasFormatValueVector"] = parser["formatKeyOccurrences"]
+            predicates[f"{VCFC}valueEncoding"] = parser["formatKeyOccurrences"]
+            predicates[f"{VCFC}encodedValues"] = parser["formatKeyOccurrences"]
+            predicates[f"{VCFC}declaredBy"] = (
+                predicates.get(f"{VCFC}declaredBy", 0) + parser["formatKeyOccurrences"]
+            )
+
+    predicates[f"{VCFC}fileDate"] = 0 if parser["fileDate"] == METADATA_ABSENT else 1
 
     if header_representation == "structured":
-        for class_name, count in parser["headerLineClassCounts"].items():
-            classes[f"{VCFR}{class_name}"] = classes.get(f"{VCFR}{class_name}", 0) + count
-        # A FILTER/ALT line carries both its header-line subclass and its
-        # definition class, so it contributes two rdf:type triples.
-        classes[f"{VCFR}FilterDefinition"] = parser["filterDefinitionCount"]
-        classes[f"{VCFR}AltDefinition"] = parser["altDefinitionCount"]
-        predicates[f"{VCFR}filterId"] = parser["filterDefinitionCount"]
-        predicates[f"{VCFR}altId"] = parser["altDefinitionCount"]
-        predicates[f"{VCFR}contigId"] = parser["contigCount"]
-        predicates[f"{VCFR}contigCount"] = 1 if parser["contigCount"] else 0
-        for attribute, predicate in (
-            ("length", "contigLength"), ("md5", "contigMd5"), ("assembly", "contigAssembly"),
-        ):
-            predicates[f"{VCFR}{predicate}"] = parser["contigAttributeCounts"].get(attribute, 0)
-        predicates[f"{VCFR}fieldDescription"] = (
-            predicates.get(f"{VCFR}fieldDescription", 0)
-            + parser["describedDefinitionCount"]
-        )
+        # Every structured-header family is counted once, by
+        # emitted_header_counters, from the same '##' lines the emitter reads.
+        # vcfc:FilterDefinition and vcfc:AltDefinition are no longer asserted:
+        # vcfc:FILTERHeaderLine and vcfc:ALTHeaderLine are subclasses of them in
+        # the vocabulary, so RDFS supplies the type and an explicit triple would
+        # be redundant.
+        for class_name, count in parser["emittedHeaderClasses"].items():
+            classes[f"{VCFC}{class_name}"] = classes.get(f"{VCFC}{class_name}", 0) + count
+        for name, count in parser["emittedHeaderPredicates"].items():
+            predicates[f"{VCFC}{name}"] = predicates.get(f"{VCFC}{name}", 0) + count
 
     if info_representation == "structured":
         values = parser["infoValueCount"]
         definitions = parser["infoDefinitionCount"]
-        classes[f"{VCFR}InfoFieldValue"] = values
-        classes[f"{VCFR}InfoFieldDefinition"] = definitions
-        predicates[f"{VCFR}hasInfoValue"] = values
-        predicates[f"{VCFR}fieldValueBoolean"] = parser["infoFlagCount"]
-        predicates[f"{VCFR}fieldValueInteger"] = parser["infoTypedIntegerCount"]
-        predicates[f"{VCFR}fieldValueDecimal"] = parser["infoTypedDecimalCount"]
-        predicates[f"{VCFR}fieldType"] = definitions
-        # declaredBy and the field* descriptors are shared with the condensed
-        # FORMAT definitions, so accumulate rather than overwrite.
-        for predicate, count in (
-            (f"{VCFR}declaredBy", values),
-            (f"{VCFR}fieldId", definitions),
-            (f"{VCFR}fieldNumber", definitions),
-            (f"{VCFR}fieldDescription", definitions),
-        ):
-            predicates[predicate] = predicates.get(predicate, 0) + count
-        predicates[f"{VCFR}fieldValue"] = (
-            predicates.get(f"{VCFR}fieldValue", 0) + values - parser["infoFlagCount"]
+        classes[f"{VCFC}InfoFieldValue"] = values
+        classes[f"{VCFC}InfoFieldDefinition"] = definitions
+        predicates[f"{VCFC}hasInfoValue"] = values
+        predicates[f"{VCFC}fieldValueBoolean"] = parser["infoFlagCount"]
+        predicates[f"{VCFC}fieldValueInteger"] = parser["infoTypedIntegerCount"]
+        predicates[f"{VCFC}fieldValueDecimal"] = parser["infoTypedDecimalCount"]
+        # declaredBy and the field* descriptors are shared with the FORMAT
+        # definitions, so accumulate rather than overwrite.
+        predicates[f"{VCFC}declaredBy"] = predicates.get(f"{VCFC}declaredBy", 0) + values
+        # As above: only an INFO key with no '##INFO' declaration needs its
+        # definition invented, and only those contribute field* triples here.
+        _count_definitions(predicates, parser.get("synthesizedInfoNumbers", []))
+        predicates[f"{VCFC}fieldValue"] = (
+            predicates.get(f"{VCFC}fieldValue", 0) + values - parser["infoFlagCount"]
         )
+
+        # The allele layer, the value items, the SV carriers and the parsed
+        # genotype layer travel with the structured INFO representation.
+        for class_name, count in parser["emittedRecordClasses"].items():
+            classes[f"{VCFC}{class_name}"] = classes.get(f"{VCFC}{class_name}", 0) + count
+        for name, count in parser["emittedRecordPredicates"].items():
+            predicates[f"{VCFC}{name}"] = predicates.get(f"{VCFC}{name}", 0) + count
 
     classes = _nonzero(classes)
     predicates = _nonzero(predicates)
@@ -515,76 +899,13 @@ def sample_uri_ids(sample_ids: list[str]) -> list[str]:
     return out
 
 
-#: '##' key (lower-cased) -> vocabulary subclass. Mirrors HEADER_LINE_CLASSES
-#: in vcf_rdfizer.py; the unit tests assert the two stay identical.
-HEADER_LINE_CLASSES = {
-    "fileformat": "FileFormatHeaderLine",
-    "filedate": "FileDateHeaderLine",
-    "source": "SourceHeaderLine",
-    "reference": "ReferenceHeaderLine",
-    "info": "INFOHeaderLine",
-    "format": "FORMATHeaderLine",
-    "filter": "FILTERHeaderLine",
-    "alt": "ALTHeaderLine",
-    "contig": "ContigHeaderLine",
-}
-
-
-def parse_structured_header_fields(value: str) -> dict[str, str]:
-    """Parse '<ID=..,Description="..">' attributes, respecting quoting.
-
-    Mirrors ``_parse_structured_header_fields`` in ``vcf_rdfizer.py``; the unit
-    tests assert the two agree.
-    """
-    inner = value.strip()
-    if inner.startswith("<") and inner.endswith(">"):
-        inner = inner[1:-1]
-    tokens: list[str] = []
-    token: list[str] = []
-    in_quotes = escaped = False
-    for character in inner:
-        if escaped:
-            token.append(character)
-            escaped = False
-        elif character == "\\" and in_quotes:
-            token.append(character)
-            escaped = True
-        elif character == '"':
-            token.append(character)
-            in_quotes = not in_quotes
-        elif character == "," and not in_quotes:
-            tokens.append("".join(token))
-            token = []
-        else:
-            token.append(character)
-    tokens.append("".join(token))
-    fields: dict[str, str] = {}
-    for item in tokens:
-        if "=" not in item:
-            continue
-        key, raw_value = item.split("=", 1)
-        parsed = raw_value.strip()
-        if len(parsed) >= 2 and parsed[0] == parsed[-1] == '"':
-            parsed = parsed[1:-1].replace('\\"', '"').replace("\\\\", "\\")
-        fields[key.strip()] = parsed
-    return fields
-
-
-def parse_info_entries(info: str) -> list[tuple[str, str | None]]:
-    """Split an INFO column into ``(key, value)`` pairs; a bare key is a Flag.
-
-    Mirrors ``parse_info_entries`` in ``vcf_rdfizer.py``. The two are asserted
-    to agree in ``test_validation_logic_unit.py``.
-    """
-    if info in ("", "."):
-        return []
-    entries: list[tuple[str, str | None]] = []
-    for item in info.split(";"):
-        if not item:
-            continue
-        key, separator, value = item.partition("=")
-        entries.append((key, value if separator else None))
-    return entries
+# Shared with the wrapper through vcf_rdfizer_vocab, so the oracle and the
+# emitter cannot disagree about what a '##' line means or how it parses.
+HEADER_LINE_CLASSES = vocab.HEADER_LINE_CLASSES
+STRUCTURED_HEADER_KEYS = vocab.STRUCTURED_HEADER_KEYS
+parse_structured_header_fields = vocab.parse_structured_header_fields
+parse_structured_header_attributes = vocab.parse_structured_header_attributes
+parse_info_entries = vocab.parse_info_entries
 
 
 def info_declared_types(raw_header: str) -> dict[str, str]:
@@ -650,42 +971,44 @@ def parse_header_metadata(raw_header: str) -> dict[str, Any]:
         # A repeated declaration keeps the first, matching the awk parser.
         if field is not None and metadata[field] == METADATA_ABSENT:
             metadata[field] = value
-    # Header-representation counters. The class map mirrors HEADER_LINE_CLASSES
-    # in vcf_rdfizer.py; the two are asserted to agree in the unit tests.
-    header_classes: Counter[str] = Counter()
-    filter_definitions = alt_definitions = contigs = described = 0
-    contig_attributes: Counter[str] = Counter()
+    # Header-representation counters, derived by the one shared implementation
+    # the emitter's shape is described by.
+    header_lines: list[tuple[str, str]] = []
+    contig_ids: set[str] = set()
+    alt_ids: set[str] = set()
+    info_numbers: dict[str, str] = {}
+    format_numbers: dict[str, str] = {}
     for line in raw_header.splitlines():
         if not line.startswith("##"):
             continue
         key, _, value = line[2:].partition("=")
-        class_name = HEADER_LINE_CLASSES.get(key.lower())
-        if class_name is None:
-            continue
-        header_classes[class_name] += 1
-        if key.lower() not in {"filter", "alt", "contig"}:
+        header_lines.append((key, value))
+        lowered = key.lower()
+        if lowered not in {"contig", "alt", "info", "format"}:
             continue
         fields = parse_structured_header_fields(value)
-        if not (fields.get("ID") or "").strip():
+        identifier = (fields.get("ID") or "").strip()
+        if not identifier:
             continue
-        if key.lower() == "contig":
-            contigs += 1
-            for attribute in ("length", "md5", "assembly"):
-                if fields.get(attribute):
-                    contig_attributes[attribute] += 1
-            continue
-        if key.lower() == "filter":
-            filter_definitions += 1
+        if lowered == "contig":
+            contig_ids.add(identifier)
+        elif lowered == "alt":
+            alt_ids.add(identifier)
+        elif lowered == "info":
+            info_numbers.setdefault(identifier, fields.get("Number") or ".")
         else:
-            alt_definitions += 1
-        if fields.get("Description"):
-            described += 1
-    metadata["headerLineClassCounts"] = dict(header_classes)
-    metadata["filterDefinitionCount"] = filter_definitions
-    metadata["altDefinitionCount"] = alt_definitions
-    metadata["contigCount"] = contigs
-    metadata["contigAttributeCounts"] = dict(contig_attributes)
-    metadata["describedDefinitionCount"] = described
+            format_numbers.setdefault(identifier, fields.get("Number") or ".")
+
+    metadata.update(emitted_header_counters(header_lines))
+    metadata["headerLines"] = header_lines
+    metadata["contigIds"] = sorted(contig_ids)
+    metadata["hasAssemblyLine"] = any(
+        key.lower() == "assembly" and value for key, value in header_lines
+    )
+    metadata["altDeclarationIds"] = sorted(alt_ids)
+    metadata["infoKeyNumbers"] = info_numbers
+    metadata["formatKeyNumbers"] = format_numbers
+    metadata["contigCount"] = len(contig_ids)
     metadata["headerLineCount"] = sum(keys.values())
     metadata["headerValueCount"] = sum(
         1 for line in raw_header.splitlines()
@@ -751,6 +1074,7 @@ def parse_vcf(vcf_path: Path, *, filter_oracle: str) -> dict[str, Any]:
     info_definitions: set[str] = set()
     info_values = info_flags = info_typed_integers = info_typed_decimals = 0
     source_component = rml_uri_component(vcf_path.name)
+    record_rows: list[list[str]] = []
     records_with_format_column = records_with_format_keys = 0
     format_key_occurrences = format_value_slots = non_empty_format_values = 0
     distinct_format_keys: set[str] = set()
@@ -781,12 +1105,13 @@ def parse_vcf(vcf_path: Path, *, filter_oracle: str) -> dict[str, Any]:
             if has_gt:
                 gt_records += 1
 
-            # `vcfr:formatRaw` comes from the FORMAT column itself, so it is
+            # `vcfc:formatRaw` comes from the FORMAT column itself, so it is
             # present whenever that column is non-empty - samples or not.
             if format_keys:
                 records_with_format_column += 1
 
             columns = str(variant).rstrip("\r\n").split("\t")
+            record_rows.append(columns)
             # The record digest is computed from the raw line so it matches the
             # lexical values the mapping puts in the graph, character for
             # character, with no round-trip through cyvcf2's typed accessors.
@@ -909,12 +1234,24 @@ def parse_vcf(vcf_path: Path, *, filter_oracle: str) -> dict[str, Any]:
         "filterOracle": "bcftools" if use_bcftools else "cyvcf2-serialization",
         "headerLineCount": header_metadata["headerLineCount"],
         "fileDate": header_metadata["fileDate"],
-        "headerLineClassCounts": header_metadata["headerLineClassCounts"],
-        "filterDefinitionCount": header_metadata["filterDefinitionCount"],
-        "altDefinitionCount": header_metadata["altDefinitionCount"],
+        "emittedHeaderClasses": header_metadata["emittedHeaderClasses"],
+        "emittedHeaderPredicates": header_metadata["emittedHeaderPredicates"],
         "contigCount": header_metadata["contigCount"],
-        "contigAttributeCounts": header_metadata["contigAttributeCounts"],
-        "describedDefinitionCount": header_metadata["describedDefinitionCount"],
+        **emitted_record_counters(
+            record_rows,
+            samples,
+            version=vocab.resolve_vcf_version(header_metadata["fileFormat"])[0],
+            contig_ids=set(header_metadata["contigIds"]),
+            alt_declaration_ids=set(header_metadata["altDeclarationIds"]),
+            has_assembly_line=header_metadata["hasAssemblyLine"],
+            info_numbers=header_metadata["infoKeyNumbers"],
+            format_numbers=header_metadata["formatKeyNumbers"],
+        ),
+        **synthesized_definition_numbers(
+            record_rows,
+            declared_info=set(header_metadata["infoKeyNumbers"]),
+            declared_format=set(header_metadata["formatKeyNumbers"]),
+        ),
         "headerValueCount": header_metadata["headerValueCount"],
         "recordsWithFormatColumn": records_with_format_column,
         "recordsWithFormatKeys": records_with_format_keys,
@@ -1342,8 +1679,93 @@ class QueryEngine:
         return envelope
 
 
+#: Above this decoded-graph size, an engine with no persistent index spends
+#: more time parsing than querying. It is not a hard limit -- host memory and
+#: query shape decide the real ceiling -- but it is the point at which the
+#: per-query parse starts to dominate, and where a 27-query run stops being a
+#: reasonable thing to start without knowing that.
+UNINDEXED_ENGINE_ADVICE_BYTES = 4 * 1024 * 1024 * 1024
+
+
+def engine_advice(engine_name: str, source: Path, query_count: int, timeout: int) -> str | None:
+    """Warn before a run commits to an engine that cannot finish it.
+
+    Comunica has no persistent index: every query re-parses the whole source
+    into memory. On a cohort-scale graph each parse can exceed the per-query
+    timeout, and the cost is paid again for every remaining query.
+    """
+    if engine_name != "comunica":
+        return None
+    try:
+        size = source.stat().st_size
+    except OSError:
+        return None
+    if size < UNINDEXED_ENGINE_ADVICE_BYTES:
+        return None
+    return (
+        f"comunica re-parses the whole graph for each of the {query_count} "
+        f"queries and keeps it in memory; this source is "
+        f"{size / (1024 ** 3):.1f} GiB. Worst case at the current "
+        f"--query-timeout is {query_count * timeout / 3600:.0f}h. Prefer "
+        f"--engine qlever, or validate an indexed artifact "
+        f"(--validation-targets hdt)."
+    )
+
+
+def run_query_process(
+    command: list[str], *, stdout_path: Path, stderr_path: Path, timeout: int
+) -> tuple[int, str | None]:
+    """Run one query process, killing its whole process tree on timeout.
+
+    ``subprocess.run(timeout=...)`` signals only the process it started. Every
+    query here is wrapped in ``/usr/bin/time``, which forks the real engine, so
+    killing the wrapper leaves the engine running -- holding the entire graph in
+    memory, because that is what an in-memory SPARQL engine does. A handful of
+    those orphans is enough to push a host into swap and make the rest of the
+    run appear to hang rather than fail.
+
+    Starting a new session and signalling the group kills the wrapper and the
+    engine together. SIGTERM first so the engine can unmap its store, SIGKILL if
+    it does not go.
+    """
+    with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+        process = subprocess.Popen(
+            command, stdout=stdout, stderr=stderr, start_new_session=True
+        )
+        try:
+            return process.wait(timeout=timeout), None
+        except subprocess.TimeoutExpired:
+            _terminate_process_group(process)
+            return 124, f"query exceeded {timeout}s"
+
+
+def _terminate_process_group(process: subprocess.Popen) -> None:
+    """Signal a process group, escalating to SIGKILL, and reap the leader."""
+    for signal_number, grace in ((signal.SIGTERM, 10), (signal.SIGKILL, 5)):
+        try:
+            os.killpg(os.getpgid(process.pid), signal_number)
+        except (ProcessLookupError, PermissionError):
+            break
+        try:
+            process.wait(timeout=grace)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
 class ComunicaEngine(QueryEngine):
-    """Query the N-Triples file directly with comunica-sparql-file."""
+    """Query the N-Triples file directly with comunica-sparql-file.
+
+    Comunica has no persistent index: each invocation parses the whole source
+    into an in-memory store, answers one query, and exits. That is fine for a
+    fixture and unworkable for a cohort-scale graph, where the parse alone can
+    exceed the per-query timeout -- and then does so again for every remaining
+    query. ``engine_advice`` reports that before a run commits to it.
+    """
 
     name = "comunica"
 
@@ -1383,17 +1805,10 @@ class ComunicaEngine(QueryEngine):
             else command
         )
         started = time.monotonic()
-        try:
-            with raw_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
-                result = subprocess.run(
-                    timed, check=False, stdout=stdout, stderr=stderr,
-                    timeout=self.query_timeout,
-                )
-            returncode = result.returncode
-            error = None
-        except subprocess.TimeoutExpired:
-            returncode = 124
-            error = f"query exceeded {self.query_timeout}s"
+        returncode, error = run_query_process(
+            timed, stdout_path=raw_path, stderr_path=stderr_path,
+            timeout=self.query_timeout,
+        )
         return self._envelope(
             query_id, query_path, returncode=returncode, started=started,
             raw_path=raw_path, stderr_path=stderr_path, time_path=time_path, error=error,
@@ -1700,15 +2115,10 @@ class HdtEngine(NativeArtifactEngine):
             "-t", "application/sparql-results+json",
         ]
         started = time.monotonic()
-        try:
-            with raw_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
-                result = subprocess.run(
-                    command, check=False, stdout=stdout, stderr=stderr,
-                    timeout=self.query_timeout,
-                )
-            returncode, error = result.returncode, None
-        except subprocess.TimeoutExpired:
-            returncode, error = 124, f"query exceeded {self.query_timeout}s"
+        returncode, error = run_query_process(
+            command, stdout_path=raw_path, stderr_path=stderr_path,
+            timeout=self.query_timeout,
+        )
         return self._envelope(
             query_id, query_path, returncode=returncode, started=started,
             raw_path=raw_path, stderr_path=stderr_path, error=error,
@@ -2440,6 +2850,7 @@ def run_validation(args: argparse.Namespace) -> int:
             # multi-engine run usable as a benchmark.
             per_engine: dict[str, dict[str, Any]] = {}
             engine_descriptions: dict[str, Any] = {}
+            engine_warnings: dict[str, list[str]] = {}
             for engine_name in args.engines:
                 engine_raw_dir = raw_dir / engine_name
                 engine_raw_dir.mkdir(parents=True, exist_ok=True)
@@ -2450,6 +2861,12 @@ def run_validation(args: argparse.Namespace) -> int:
                 progress.emit("progress", completed=0, detail=f"preparing {engine_name} engine")
                 if not quiet:
                     print(f"[{args.dataset_id}] preparing {engine_name} engine", flush=True)
+                advice = engine_advice(
+                    engine_name, decoded, len(query_ids), args.query_timeout
+                )
+                if advice:
+                    engine_warnings.setdefault(engine_name, []).append(advice)
+                    eprint(f"[{args.dataset_id}] warning: {advice}")
                 try:
                     engine.prepare()
                 except (RuntimeError, OSError) as error:
@@ -2461,6 +2878,8 @@ def run_validation(args: argparse.Namespace) -> int:
                     continue
 
                 executions: dict[str, dict[str, Any]] = {}
+                abandoned: str | None = None
+                engine_started = time.monotonic()
                 try:
                     engine_descriptions[engine_name] = engine.describe()
                     for completed, query_id in enumerate(query_ids, start=1):
@@ -2481,16 +2900,61 @@ def run_validation(args: argparse.Namespace) -> int:
                             "progress", completed=completed, query_id=query_id,
                             detail=f"{engine_name}: completed {query_id}",
                         )
+
+                        # A query that exceeded the timeout says the engine
+                        # cannot answer this graph in the time allowed, and the
+                        # remaining queries are no easier. Running all of them
+                        # anyway costs one timeout each: with the defaults that
+                        # is 27 hours per engine per target, which is how a
+                        # validation step comes to look like a hang rather than
+                        # a failure. Stop and report instead.
+                        if (
+                            args.stop_after_query_timeout
+                            and executions[query_id].get("exitCode") == 124
+                        ):
+                            abandoned = (
+                                f"{query_id} exceeded the {engine.query_timeout}s "
+                                f"per-query timeout; skipped "
+                                f"{len(query_ids) - completed} further queries "
+                                f"rather than spending that timeout on each. "
+                                f"Raise --query-timeout, or use an indexed "
+                                f"engine or artifact for a graph this size."
+                            )
+                            break
+
+                        budget = args.validation_time_budget
+                        if budget and time.monotonic() - engine_started > budget:
+                            abandoned = (
+                                f"engine exceeded the {budget}s validation time "
+                                f"budget after {completed} of {len(query_ids)} "
+                                f"queries. Raise or clear "
+                                f"--validation-time-budget to allow more."
+                            )
+                            break
                 finally:
                     engine.stop()
+
+                if abandoned is not None:
+                    if not quiet:
+                        eprint(f"[{args.dataset_id}] {engine_name}: {abandoned}")
+                    progress.emit(
+                        "progress", completed=len(query_ids),
+                        detail=f"{engine_name}: abandoned",
+                    )
 
                 engine_dir = results_dir / "engines" / engine_name
                 engine_dir.mkdir(parents=True, exist_ok=True)
                 write_json(engine_dir / "query-executions.json", executions)
-                if any(item["status"] != "PASS" for item in executions.values()):
+                if abandoned is not None or any(
+                    item["status"] != "PASS" for item in executions.values()
+                ):
                     per_engine[engine_name] = {
                         "status": "EXECUTION_FAILED", "queryExecutions": executions,
                     }
+                    if abandoned is not None:
+                        per_engine[engine_name]["abandoned"] = abandoned
+                        per_engine[engine_name]["queriesRun"] = len(executions)
+                        per_engine[engine_name]["queriesPlanned"] = len(query_ids)
                     continue
 
                 verdict = evaluate_validation(
@@ -2505,6 +2969,10 @@ def run_validation(args: argparse.Namespace) -> int:
                     write_json(engine_dir / "comparison.json", verdict["comparison"])
                 verdict["executions"] = executions
                 per_engine[engine_name] = verdict
+
+            for engine_name, warnings in engine_warnings.items():
+                if engine_name in per_engine:
+                    per_engine[engine_name]["warnings"] = warnings
 
             benchmark = build_benchmark(
                 per_engine, engine_descriptions,
@@ -2636,6 +3104,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--validation-time-budget",
+        type=int,
+        default=0,
+        help=(
+            "Wall-clock ceiling in seconds for one engine's whole query set "
+            "(default: 0, no ceiling). A backstop for queries that are slow but "
+            "never individually time out; the per-query timeout and "
+            "--stop-after-query-timeout handle the common case."
+        ),
+    )
+    parser.add_argument(
+        "--continue-after-query-timeout",
+        dest="stop_after_query_timeout",
+        action="store_false",
+        default=True,
+        help=(
+            "Keep running an engine's remaining queries after one exceeds the "
+            "per-query timeout. Off by default: a timeout means the engine "
+            "cannot answer this graph in the time allowed, and the remaining "
+            "queries cost one timeout each"
+        ),
+    )
+    parser.add_argument(
         "--query-timeout",
         type=int,
         default=DEFAULT_QUERY_TIMEOUT,
@@ -2688,7 +3179,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Treat a missing-token conformance failure (a plain '.' literal not "
-            "typed as vcfr:Null) as a validation failure instead of a report-only "
+            "typed as vcfc:Null) as a validation failure instead of a report-only "
             "observation"
         ),
     )
@@ -2792,6 +3283,9 @@ def resolve_args(parser: argparse.ArgumentParser, argv: list[str] | None = None)
     ):
         if value <= 0:
             parser.error(f"{name} must be a positive integer")
+    # 0 is meaningful here: no ceiling.
+    if args.validation_time_budget < 0:
+        parser.error("--validation-time-budget must be zero or a positive integer")
     if not 1 <= args.qlever_port <= 65535:
         parser.error("--qlever-port must be between 1 and 65535")
     if args.shacl_shapes is not None:

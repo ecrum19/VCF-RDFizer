@@ -1,4 +1,4 @@
-PREFIX vcfr: <https://w3id.org/vcf-rdfizer/vocab#>
+PREFIX vcfc: <https://w3id.org/vcf-core/vocab#>
 
 SELECT
   (COUNT(DISTINCT ?sampleCall) AS ?sampleCallCount)
@@ -6,11 +6,11 @@ SELECT
   (COUNT(DISTINCT ?gtValueNode) AS ?gtValueNodeCount)
 WHERE {
   OPTIONAL {
-    ?sampleCall a vcfr:SampleCall ; vcfr:sampleId ?sampleId .
+    ?sampleCall a vcfc:SampleCall ; vcfc:sampleId ?sampleId .
     OPTIONAL {
-      ?sampleCall vcfr:hasFormatValue ?gtValueNode .
+      ?sampleCall vcfc:hasFormatValue ?gtValueNode .
       FILTER(STRENDS(STR(?gtValueNode), "/fmt/GT"))
-      ?gtValueNode vcfr:fieldValue ?gtLiteral .
+      ?gtValueNode vcfc:fieldValue ?gtLiteral .
     }
   }
 }

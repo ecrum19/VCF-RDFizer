@@ -1,0 +1,17 @@
+@prefix vcfl: <https://w3id.org/vcf-rdfizer/linking#> .
+
+# Tier 1: no code, reference download, or API request.
+# ID is a semicolon-separated VCF column. Matching is case-sensitive.
+<#rsIDdbSNP> a vcfl:Linker ;
+    vcfl:id "rsid-dbsnp" ;
+    vcfl:version "1.0.0" ;
+    vcfl:title "rsID to dbSNP" ;
+    vcfl:license "MIT (plug-in code and manifest)" ;
+    vcfl:termsOfUse <https://www.ncbi.nlm.nih.gov/home/about/policies/> ;
+    vcfl:join [ a vcfl:TokenJoin ;
+                vcfl:field "ID" ;
+                vcfl:splitOn ";" ;
+                vcfl:accept "^rs[0-9]+$" ] ;
+    vcfl:emit [ vcfl:subject vcfl:VariantCall ;
+                vcfl:predicate vcfl:sameVariantAs ;
+                vcfl:objectTemplate "https://identifiers.org/dbsnp:{TOKEN}" ] .

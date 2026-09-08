@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -214,17 +215,72 @@ class EngineTests(VerboseTestCase):
 
             def fake_run(command, **kwargs):
                 captured.append(command)
-                return subprocess.CompletedProcess(command, 0)
+                return 0, None
 
             with mock.patch.object(V.shutil, "which", return_value="/usr/bin/comunica-sparql-file"), \
                     mock.patch.object(V, "tool_version", return_value=None), \
-                    mock.patch.object(V.subprocess, "run", side_effect=fake_run):
+                    mock.patch.object(V, "run_query_process", side_effect=fake_run):
                 engine.start()
                 result = engine.execute("q02_variant_shape_counts", query)
             self.assertEqual(result["status"], "PASS")
             self.assertEqual(result["engine"], "comunica")
             self.assertIn(str(source), captured[0])
             self.assertIn("application/sparql-results+json", captured[0])
+
+    def test_query_timeout_kills_the_whole_process_tree(self):
+        """A timed-out query must not leave its engine running as an orphan.
+
+        Every query is wrapped in /usr/bin/time, which forks the real engine.
+        subprocess.run(timeout=) signals only the process it started, so the
+        engine survived - still holding the whole graph in memory. A few of
+        those is enough to push a host into swap, which is what made a slow
+        validation step look like a hang.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            marker = tmp / "still-alive"
+            # A shell that forks a child, exactly as /usr/bin/time does.
+            script = (
+                f"(sleep 30; touch {marker}) & "
+                "wait"
+            )
+            started = time.monotonic()
+            returncode, error = V.run_query_process(
+                ["/bin/sh", "-c", script],
+                stdout_path=tmp / "out", stderr_path=tmp / "err", timeout=1,
+            )
+            elapsed = time.monotonic() - started
+
+            self.assertEqual(returncode, 124)
+            self.assertIn("exceeded", error or "")
+            # The kill must be prompt, not the child's own 30s lifetime.
+            self.assertLess(elapsed, 20)
+            # And the grandchild must be gone: if it survived it would create
+            # the marker once its sleep finished.
+            time.sleep(2)
+            self.assertFalse(marker.exists(), "grandchild survived the timeout")
+
+    def test_unindexed_engine_advice_warns_before_a_long_run(self):
+        """Comunica on a large graph is reported before the run commits to it."""
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "graph.nt"
+            source.write_bytes(b"x")
+            # Small graph: nothing to say.
+            self.assertIsNone(V.engine_advice("comunica", source, 27, 3600))
+            # QLever indexes once, so the advice never applies to it.
+            self.assertIsNone(V.engine_advice("qlever", source, 27, 3600))
+
+            big = Path(td) / "big.nt"
+            big.write_bytes(b"")
+            with mock.patch.object(
+                Path, "stat",
+                return_value=os.stat_result((0, 0, 0, 0, 0, 0, 40 * 1024 ** 3, 0, 0, 0)),
+            ):
+                advice = V.engine_advice("comunica", big, 27, 3600)
+            self.assertIsNotNone(advice)
+            # It must say what it will cost and what to do instead.
+            self.assertIn("27h", advice)
+            self.assertIn("qlever", advice)
 
     def test_comunica_reports_a_missing_binary_clearly(self):
         """An image without Comunica must say so, not fail obscurely."""

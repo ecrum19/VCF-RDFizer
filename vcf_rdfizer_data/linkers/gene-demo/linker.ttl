@@ -1,0 +1,22 @@
+@prefix vcfl: <https://w3id.org/vcf-rdfizer/linking#> .
+
+# Tier 2: a deliberately tiny SYNTHETIC bundle, not a gene annotation release.
+# Relative IRIs resolve beside this manifest, including after `init`/pip install.
+# To adapt: declare your GFF3 HTTPS URL, its actual SHA-256 and assembly, then
+# change featureType/idAttribute/objectTemplate to match that bundle.
+<#demoGenes> a vcfl:Linker ;
+    vcfl:id "gene-demo" ;
+    vcfl:version "1.0.0" ;
+    vcfl:title "Synthetic GFF3 gene overlap example" ;
+    vcfl:license "MIT (manifest and synthetic reference data)" ;
+    vcfl:termsOfUse <https://opensource.org/license/mit> ;
+    vcfl:join [ a vcfl:IntervalJoin ;
+                vcfl:featureType "gene" ;
+                vcfl:idAttribute "ID" ] ;
+    vcfl:reference [ vcfl:url <genes.gff3> ;
+                     vcfl:sha256 "c343c83fbb27ca6a22079fccab7e385fc3e9c89967b521fd77bd9b0930b87aa3" ;
+                     vcfl:assembly "GRCh38" ;
+                     vcfl:format vcfl:GFF3 ] ;
+    vcfl:emit [ vcfl:subject vcfl:VariantCall ;
+                vcfl:predicate vcfl:overlapsGene ;
+                vcfl:objectTemplate "https://example.org/genes/{ID}" ] .

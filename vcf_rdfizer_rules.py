@@ -200,6 +200,11 @@ def referenced_columns(text: str) -> set[str]:
     return names
 
 
+#: Placeholder the wrapper rewrites to the per-input vcfc:VCF4xFile subclass.
+#: Kept in step with vcf_rdfizer.VCF_VERSION_CLASS_SENTINEL.
+VCF_VERSION_CLASS_SENTINEL = "vcfc:VCFVersionFile"
+
+
 def check_rules(rules_path: Path) -> dict:
     """Validate one mapping against the wrapper contract.
 
@@ -214,8 +219,29 @@ def check_rules(rules_path: Path) -> dict:
         "sources": [],
         "columns": [],
         "sample_representations": {},
+        "vcf_version_sentinel": False,
     }
     text = rules_path.read_text(encoding="utf-8")
+
+    # The wrapper rewrites this sentinel per input to the vcfc:VCF4xFile
+    # subclass for the version that input's ##fileformat line declares. A
+    # mapping without it still converts; it just never claims a version gate.
+    report["vcf_version_sentinel"] = VCF_VERSION_CLASS_SENTINEL in text
+    if report["vcf_version_sentinel"]:
+        report["info"].append(
+            "Version overlay: the file subject carries the "
+            f"{VCF_VERSION_CLASS_SENTINEL} sentinel, so each input is typed with "
+            "the vcfc:VCF4xFile subclass for its own declared VCF version."
+        )
+    else:
+        report["warnings"].append(
+            f"No {VCF_VERSION_CLASS_SENTINEL} sentinel in the file subject map. The "
+            "conversion still works and the version-dependent emitter behaviour "
+            "still follows each input's ##fileformat line, but the graph will not "
+            "carry a vcfc:VCF4xFile class, so the version-specific SHACL overlay "
+            "gate stays inactive. Copy the rr:class line from the shipped default "
+            "mapping to enable it."
+        )
 
     if not TRIPLES_MAP_RE.search(text):
         report["errors"].append(

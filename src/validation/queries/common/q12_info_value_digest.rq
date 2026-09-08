@@ -1,4 +1,4 @@
-PREFIX vcfr: <https://w3id.org/vcf-rdfizer/vocab#>
+PREFIX vcfc: <https://w3id.org/vcf-core/vocab#>
 
 # Structured INFO values, bound to the node that identifies record and key.
 #
@@ -9,7 +9,7 @@ PREFIX vcfr: <https://w3id.org/vcf-rdfizer/vocab#>
 # engine - GROUP_CONCAT would not be portable here.
 SELECT ?bucket (COUNT(*) AS ?valueCount)
 WHERE {
-  ?value a vcfr:InfoFieldValue ; vcfr:fieldValue ?lexLiteral .
+  ?value a vcfc:InfoFieldValue ; vcfc:fieldValue ?lexLiteral .
   BIND(STR(?lexLiteral) AS ?lex)
   BIND(SUBSTR(SHA256(CONCAT(STR(?value), "\u001F", STR(?lex))), 1, 2) AS ?bucket)
 }

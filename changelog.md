@@ -1,5 +1,421 @@
 # Changelog
 
+## 2026-09-08 — Verify against the published VCF Core 2.0.0
+
+VCF Core is published at **2.0.0**, covering VCF 4.1 through 4.5. This checks
+the converter against the released artifacts and closes the gap that made the
+version model a private assumption.
+
+### Fixed
+
+- **A bracketed CHROM now links to its assembly contig.** VCF 4.5 lets CHROM
+  name a breakpoint-assembly contig in angle brackets (`<asm1>`) instead of a
+  declared reference sequence. The converter emitted only the raw `vcfc:chrom`
+  literal, which the published consistency profile rejects: a bracketed CHROM
+  must resolve to a `vcfc:AssemblyContig` whose `vcfc:assemblyContigId` matches
+  the bracketed text, and must *not* also name a declared `##contig`. The
+  record now carries `vcfc:chromAssemblyContig`, and the contig resource cites
+  the `##assembly` header line with `vcfc:declaredInAssembly`.
+
+  Found by validating against the vocabulary's new `example-vcf45-boundaries`
+  fixture; the emitted IRIs and properties match its reference graph exactly.
+
+### Added
+
+- **The version model is cross-checked against the vocabulary's own registry.**
+  VCF Core publishes `ontology/versions/registry.json` as the single source of
+  truth for its version-scoped artifacts — the SHACL overlays, the reserved-key
+  snapshots and the `VCF4xFile` classes are generated from it. The converter
+  keeps a dependency-free copy of the same facts so it runs without the
+  vocabulary checked out;
+  `test_version_model_matches_the_published_registry` now pins the two together,
+  field by field: supported versions, `code`, `className`,
+  `leadingPhaseIndicator`, `svTupleScope`, the INFO/FORMAT `numberCodes`, and
+  the flattened-tuple keys and widths. It skips when no vocabulary checkout is
+  present; `VCF_CORE_VOCABULARY_DIR` points it at one.
+
+  The two agree exactly as published — no drift to fix — but a new VCF version
+  or a corrected arity can no longer land on one side alone.
+
+- **`vcf_version` and `vcf_version_source` in the conversion metrics**, in both
+  `metrics.csv` and `stages/conversion/*.json`. The source is `declared`,
+  `forced` or `fallback`. Benchmarks need these to group runs: the version
+  selects the SHACL overlay, the tuple semantics and which FORMAT families
+  exist, so cost and graph size are not comparable across versions without
+  them. `metrics_layout_version` is now `3`.
+
+### Verified
+
+- Every VCF version resolves end to end: detection from `##fileformat`, the
+  correct `vcfc:VCF4xFile` on the file subject, the sentinel never left
+  unresolved, TSV paths rewritten, and `--vcf-version` overriding cleanly.
+  VCF 4.0, a missing declaration and a malformed one all fall back to the
+  newest supported rules with no version class, and say so.
+- `--vcf-version` accepts exactly the versions the registry declares.
+- The vocabulary's own example VCFs now include `example-vcf45-boundaries`, and
+  `example-condensed-cohort` declares VCFv4.1; both convert correctly.
+
+### Documentation
+
+- **`vcf-coverage.md` records the term-coverage delta.** VCF Core 2.0.0 defines
+  338 terms; ten families are entirely unemitted — parsed FILTER, padding
+  semantics, parsed FORMAT keys, parsed record IDs, repeat units, breakend
+  mates, local-allele membership, mixed phasing, reference-block links, and
+  raw/decoded value pairs. None is required for conformance, and the table says
+  which kinds of benchmark the gap does and does not affect.
+- `limitations.md` no longer lists the condensed terms, the `ALT=.` shape
+  contradiction or the ordinal datatype disagreement: all three are resolved in
+  the published release. What remains is VCF 4.0 having no overlay, and the
+  version table being a checked copy rather than the original.
+
+## 2026-09-07 — Stop a slow validation engine from looking like a hang
+
+A full run with `--validate` on a real cohort VCF spent 62 hours on its first
+validation step. The cause was not a deadlock: it was three defects that
+compound into one.
+
+### Fixed
+
+- **A timed-out query no longer costs one timeout for every remaining query.**
+  The per-query timeout defaults to 3600s and there are 27 queries per engine
+  per target, so one engine that cannot answer the graph burned **27 hours per
+  target** — the loop ran every query and only checked for failures afterwards.
+  It now stops at the first timeout, records which query tripped it and how many
+  were skipped, and moves on to the next engine. `--validation-continue-after-`
+  `query-timeout` restores the old behaviour.
+- **A timed-out query no longer orphans its engine process.** Queries are
+  wrapped in `/usr/bin/time`, which forks the real engine.
+  `subprocess.run(timeout=)` signals only the process it started, so killing the
+  wrapper left the engine running — holding the entire graph in memory, because
+  that is what an in-memory SPARQL engine does. Twenty-seven of those is enough
+  to push a host into swap, which is what turned a slow step into an apparent
+  hang. Queries now run in their own session and the whole process group is
+  signalled, SIGTERM then SIGKILL.
+- **The validation results mount is resolved.** Docker reads a relative bind
+  source as a *named volume*, so an unresolved path would have sent the reports
+  into a volume instead of onto the host. Every other mount in that command was
+  already resolved.
+
+### Added
+
+- **`--validation-time-budget`** (seconds, 0 = no ceiling, the default): a
+  wall-clock ceiling for one engine's whole query set. A backstop for queries
+  that are slow but never individually time out.
+- **An up-front warning when an unindexed engine meets a large graph.** Comunica
+  has no persistent index: every query re-parses the whole source into memory,
+  so the cost is paid 27 times. Above 4 GiB the run now says so before
+  committing, states the worst-case hours at the current timeout, and points at
+  `--engine qlever` or `--validation-targets hdt`. This is the asymmetry behind
+  "QLever passed, Comunica did not": QLever builds an index once and answers
+  from it.
+- **`summary.json` now carries a `validation` index.** Each target's stage
+  report, results directory, summary, benchmark JSON/CSV and the engines that
+  ran are named explicitly, with status, engine and wall time, instead of being
+  left to find among the report globs.
+
+## 2026-09-07 — Migrate the validation suite to VCF Core
+
+The conversion moved to VCF Core and became version-aware; the validation suite
+still described the previous graph, so 31 of its tests failed. It now passes,
+with its design intact: one declarative fixture deriving three artifacts,
+coverage measured by mutation rather than asserted, and expectations derived
+from the VCF rather than from the mapping.
+
+**415 tests pass.** Mutation score: **96/113 (85%)** across 60 mutations, up
+from 42.
+
+### Fixed
+
+- **Every declared INFO and FORMAT definition was emitted twice.** The header
+  emitter produced a declaration's `fieldId`/`fieldNumber`/`fieldType`/
+  `fieldDescription` from the `##` line, and the value emitters produced the
+  same four triples at the same header-line IRI when the key was first used.
+  The header emitter now owns any declaration derived from a `##` line; the
+  value emitters cite it with `vcfc:declaredBy` and invent a definition only for
+  a key no header declared.
+
+  This is worth noting for what caught it: `preflight_duplicate_triples`, which
+  compares the parsed triple count against the distinct count. No SHACL shape
+  can express that — a duplicate triple is not a distinct RDF statement, so the
+  graph validated cleanly with the duplicates present.
+
+### Changed
+
+- **The runner and the wrapper share one vocabulary module.**
+  `validation_runner.py` carried its own copies of `HEADER_LINE_CLASSES`,
+  `rml_uri_component`, `parse_structured_header_fields` and
+  `parse_info_entries`, with unit tests asserting the copies stayed identical.
+  Both now import `vcf_rdfizer_vocab`, which the `Dockerfile` copies next to the
+  runner. The drift the tests policed is removed rather than policed.
+- **The census derives every new resource family from the VCF.** Two shared
+  functions, `emitted_header_counters` and `emitted_record_counters`, are called
+  by the container's `parse_vcf` and by the fixture's `parser_summary`, so the
+  two oracles cannot disagree. They cover the header attributes, the allele
+  layer, the `vcfc:FieldValueItem` decomposition, the breakend components and
+  the parsed genotype layer. `parse_vcf` stays representation-independent; the
+  genotype counters are reported separately and merged for the expanded profile
+  only.
+- **`base_triples()` tracks the new mapping**: the version class, the
+  `#CHROM` column-header line, `vcfc:lineIndex` and `vcfc:recordIndex` in, and
+  `ID`/`ALT`/`FILTER`/`infoRaw` out — those moved to the wrapper's emitter
+  because each may be the VCF missing token.
+- **The fixture derives its expected version class** from its own declared
+  `FILE_FORMAT`, so changing that changes the expected graph with it.
+
+### Added
+
+- **18 mutations** for the layers VCF Core introduced: the version class, header
+  attributes, the allele layer, indexed values, reusable sample identity, the
+  parsed genotype layer and field-declaration ownership. Ten are recorded as
+  undetected, each naming what would close it — the score fell from 97% to 85%
+  because the denominator grew, which is the methodology working rather than a
+  regression.
+- **`corrupt_sample_index` is split by profile**, because the same corruption is
+  detected in the condensed profile and not the expanded one. In the condensed
+  profile the ordinal associates a vector position with a sample, so corrupting
+  it moves genotypes between samples; in the expanded profile each `SampleCall`
+  carries its own `vcfc:sampleId` and nothing reads the ordinal. A real
+  difference in what the two profiles depend on, now recorded as such.
+- Census tests asserting that every new family is in the inventory, and that the
+  genotype layer appears in the expanded census and *not* in the condensed one.
+
+## 2026-09-07 — Version-aware conversion for VCF 4.1 through 4.5
+
+VCF Core gained a SHACL overlay per VCF version, each scoped by the file's
+`vcfc:fileFormat`, plus optional `vcfc:VCF41File`…`vcfc:VCF45File` classes that
+activate those gates. Three things the converter emits genuinely differ between
+versions, so the conversion now follows the version of each input instead of
+assuming 4.5.
+
+### Added
+
+- **Automatic version detection, per input.** `##fileformat` is required to be
+  the first line of a conforming VCF and `src/vcf_as_tsv.sh` already lifts it
+  into `file_metadata.tsv`, so detection costs one small read and needs nothing
+  from the user. It is per input rather than per run, so a directory of mixed
+  versions converts correctly. The run log states the version and how it was
+  chosen.
+- **`--vcf-version {auto,4.1,…,4.5}`**, defaulting to `auto`. An explicit
+  version is an override for a file whose declaration is missing or wrong, and
+  the log says when the file's own declaration was overridden.
+- **A version sentinel in the RML mapping.** `<#VCFFileMap>`'s subject map
+  carries `rr:class vcfc:VCFVersionFile`, which `render_rules_for_triplet`
+  rewrites per input — the same mechanism that already rewrites the five
+  `csvw:url` paths — to the `vcfc:VCF4xFile` subclass for that input's version.
+  One mapping stays the single source of truth for all five versions instead of
+  five near-identical copies that would drift apart. `vcf-rdfizer-rules check`
+  reports whether a custom mapping has the sentinel.
+- **A `VCFVersion` model** in `vcf_rdfizer_vocab.py` carrying, per version, the
+  permitted Number codes, the flattened-tuple keys and their widths, whether
+  tuples repeat per ALT allele, and whether the local-allele, base-modification,
+  EVENTTYPE and leading-phase-indicator features exist.
+
+### Changed
+
+- **`CIPOS`/`CIEND` tuple semantics follow the version.** Before VCF 4.4 the
+  list is one pair describing the record, so its `vcfc:FieldValueItem`s carry an
+  index and a `vcfc:tupleArity` but no `vcfc:forAllele`, and every ALT allele of
+  a multi-allelic record shares the interval. From 4.4 the list repeats per ALT
+  and each item joins its own allele. `CILEN` and `CICN` are only tuple keys
+  from 4.4.
+- **`EVENT` follows the version.** It is `Number=1` before 4.4 — one event for
+  the record — and `Number=A` from 4.4, one per ALT allele, so the `vcfc:inEvent`
+  link moved onto the allele there. `EVENTTYPE` does not exist before 4.4, and
+  `vcfc:VariantEventShape` requires an event type, so a pre-4.4 EVENT stays an
+  ordinary INFO value.
+- **Families a version does not define are no longer invented.** A `LAA` column
+  in a 4.4 file, or an `M27551C` column in a 4.3 file, keeps its raw
+  `vcfc:fieldValue` and gets no `vcfc:LocalAlleleSet` or `vcfc:BaseModification`
+  resource.
+- **VCF 4.0 is reported as unrecognized.** VCF Core claims no 4.0 overlay, so a
+  4.0 file converts with the newest supported rules — nothing representable is
+  dropped — but emits no version class, so the graph never claims a gate that
+  cannot be checked. A missing or malformed `##fileformat` line behaves the
+  same. All three are reported, never assumed silently.
+
+Parsing leniency is deliberately unchanged: a GT with a leading phase indicator
+in a 4.1 file is still parsed, and the version overlay reports it. The converter
+transcribes; the validator judges.
+
+### Fixed
+
+Two defects found by validating against the new complete profile set:
+
+- **Flattened tuple keys were never decomposed.** `CIPOS` and friends are
+  declared `Number=.` in 4.4/4.5, which on its own says "no positional
+  meaning", so no `vcfc:FieldValueItem`s were emitted — but the version overlays
+  count those items against the ALT count. Tuple keys are now positional by
+  virtue of being tuple keys, whatever their declared Number.
+- **Confidence-interval bounds were plain strings.** `vcfc:ciLower`/`ciUpper`
+  and the FALDO `begin`/`end` go through `vcfc:NumericLiteralShape`, which
+  requires an integer- or decimal-derived datatype.
+- **A sites-only VCF got no representation profile.** Both sample emitters
+  returned early when the file declared no sample columns, so a VCF with only
+  the eight fixed columns violated `vcfc:RepresentationProfileShape`, which
+  requires exactly one profile on every `vcfc:VCFFile`. The profile is now
+  emitted regardless; the `vcfc:SampleSet` is still omitted, because
+  `vcfc:SampleSetShape` requires at least one member.
+
+### Verified
+
+Zero violations across 19 graphs against the **complete** profile set — the
+portable, SPARQL and consistency profiles plus all five version overlays — run
+with pySHACL using the bundled ontology plus every `ontology/versions/*.ttl`
+and RDFS inference, which is the configuration the vocabulary's own
+`tests/validate_shacl.py` uses. Inputs were all ten of the vocabulary
+repository's example VCFs (4.1 through 4.5, including the breakend, gVCF, repeat
+and condensed-cohort fixtures) and a hand-written stress file rendered for every
+version plus a 4.0 variant, in both representation profiles.
+
+### Note on the vocabulary's own version number
+
+The vocabulary is now `owl:versionInfo "2.0.0"` with
+`owl:versionIRI <https://w3id.org/vcf-core/vocab/2.0.0>`, which matches the
+v2.0.0 originally requested — it read 4.0.0 when the migration started. This
+converter pins no version IRI, referencing only the namespace, so nothing here
+needed changing and nothing goes stale.
+
+## 2026-09-07 — Retarget the conversion to the VCF Core vocabulary
+
+The conversion produced RDF in `https://w3id.org/vcf-rdfizer/vocab#`. That
+namespace is retired: the vocabulary was renamed **VCF Core** and moved to
+`https://w3id.org/vcf-core/vocab#` (prefix `vcfc:`), because it is a semantic
+target any conversion system can adopt and its name should not carry the name of
+one converter. The old namespace is **not** redirected — it serves a deprecation
+document linking every former term to its successor — so this is a breaking
+change to the emitted graph.
+
+VCF Core also models considerably more of VCF 4.5 than its predecessor. The
+mapping rules and the wrapper's emitters were rewritten to cover it rather than
+only re-prefixed.
+
+### Changed
+
+- **Namespace.** Every emitted IRI moves from `vcfr:` to `vcfc:`. One term was
+  renamed rather than re-namespaced: `vcfr:DenseRepresentation` is now
+  `vcfc:ExpandedRepresentation`. No version IRI is pinned anywhere — the
+  converter targets the namespace, and the vocabulary's release line is
+  independent of this one's.
+- **The RML/wrapper split is now one rule**, stated in the mapping's header and
+  in [`architecture.md`](docs/architecture.md#4-where-the-split-leaks-and-why):
+  *RML carries every field whose RDF datatype is the same for every row; the
+  wrapper carries everything else.* Accordingly `ID`, `ALT`, `FILTER` and
+  `infoRaw` moved out of the mapping and into `emit_record_detail`, joining
+  `QUAL` and `fileDate`. Each may be the VCF missing token, which the vocabulary
+  requires as `"."^^vcfc:Null`, and RML cannot switch an object's datatype per
+  row. `CHROM`, `POS` and `REF` stay in the mapping precisely because VCF 4.5
+  forbids them from being missing.
+- **Ordinals are serialized `xsd:integer`, not `xsd:positiveInteger`.** The
+  SHACL profiles constrain every ordinal with `sh:datatype xsd:integer` and that
+  constraint compares the datatype IRI exactly, so an `xsd:positiveInteger`
+  literal fails the shape while an `xsd:integer` literal satisfies both the shape
+  and the ontology's declared range. This affects `vcfc:sampleIndex`, which the
+  condensed emitter previously typed `xsd:positiveInteger`.
+- **`--header-representation basic` no longer produces a conformant graph.**
+  `vcfc:StructuredHeaderLineShape` requires at least one `vcfc:hasAttribute` on
+  every structured header line, and `basic` emits no subclass and no attributes.
+  It remains available as the smallest, fastest header form.
+- **QUAL accepts the full VCF Float lexical space.** `INF`, `INFINITY` and `NAN`
+  in any case are emitted as `vcfc:VCFFloat` rather than coerced or flattened to
+  a plain literal; a finite value still takes `xsd:decimal` in its source lexical
+  form.
+
+### Added
+
+- **`vcf_rdfizer_vocab.py`** — the vocabulary terms and the VCF 4.5 parsers, as
+  pure functions so they are testable without producing RDF: allele
+  classification, breakend parsing, GT parsing, `Number` arity resolution, value-
+  item indexing, and base-modification key recognition.
+- **Header layer.** Ordered `vcfc:HeaderAttribute` resources on every structured
+  line; `##assembly`, `##pedigreeDB`, `##META`, `##SAMPLE` and `##PEDIGREE` typed
+  and decomposed; `vcfc:ColumnHeaderLine` for `#CHROM` with
+  `vcfc:hasGenotypeColumns`; `vcfc:lineIndex` and `vcfc:recordIndex` for the
+  ordering constraints the SPARQL SHACL profile checks; `vcfc:fieldArity` and
+  `vcfc:fieldNumberInteger`; `fieldSource`/`fieldVersion`; typed contig `length`
+  and `URL`. An unrecognised `##` key is now typed as structured or unstructured
+  by the form of its value rather than left bare.
+- **Allele layer.** `REF` and each `ALT` item become ordered
+  `vcfc:ReferenceAllele`/`vcfc:AltAllele` resources with `alleleIndex`,
+  `alleleValue` and `alleleKind`; symbolic alleles are linked to their `##ALT`
+  declaration and given a `vcfc:svType` where the ID is a reserved code;
+  breakends are parsed into orientation, replacement string and mate position;
+  records are linked to their contig declaration with `vcfc:chromosome`.
+- **Value items.** `Number=A/R/LA/LR/G/LG/P` values are decomposed into ordered
+  `vcfc:FieldValueItem` resources joined to their allele with `vcfc:forAllele`,
+  with `vcfc:tupleArity` for the keys that flatten fixed-width tuples. This
+  closes the multi-valued-INFO gap previously recorded in `limitations.md`.
+- **Structural variation.** `SVLEN`, `SVCLAIM`, `IMPRECISE`, `NOVEL`, `END`,
+  `EVENT`+`EVENTTYPE`, the `CI*` confidence intervals (FALDO `InRangePosition`
+  for `CIPOS`/`CIEND`), the `RN`/`RUS`/`RUL`/`RUC`/`RB` tandem-repeat structure,
+  and gVCF `<*>` reference blocks.
+- **Genotype layer, expanded profile only.** `GT` parsed into a `vcfc:Genotype`
+  with `genotypeString`, `ploidy`, an explicit `vcfc:phasingStatus` and one
+  `vcfc:GenotypeAlleleCall` per position; plus `FT`, `PS`/`PSL`/`PSO`/`PSQ`,
+  `LAA`, the copy-number and haplotype keys, and the `M`/`DPM`/`ADM`
+  base-modification families with their ChEBI residue. The condensed profile
+  deliberately keeps these inside its vectors — deriving them per sample is the
+  materialization that profile exists to avoid.
+- **Reusable sample identity in both profiles.** `vcfc:SampleSet` and its ordered
+  `vcfc:VCFSample` members are emitted in expanded mode too, and a `SampleCall`
+  links to its column with `vcfc:forSample`. It costs one resource per sample
+  column for the whole file.
+- `docs/validation-migration-notes.md` — what the migration leaves to do in the
+  validation suite, and how the converter's SHACL conformance was verified.
+
+### Fixed
+
+- The condensed emitter omitted `vcfc:fieldType` on its `FormatFieldDefinition`
+  resources, which `vcfc:FormatFieldDefinitionShape` requires. Condensed graphs
+  were therefore non-conformant.
+- Four modelling bugs found by running the vocabulary's SHACL profiles against
+  the output, all the same shape: a resource typed into a class whose shape
+  requires a property the record did not supply. `<*>` was typed
+  `vcfc:ReferenceBlock` without `referenceBlockLength`; `<CNV:TR>` was typed
+  `vcfc:TandemRepeatAllele` without `repeatSequenceCount`; `EVENT` minted a
+  `vcfc:VariantEvent` without `eventType`; and emitting `vcfc:endPosition` on a
+  symbolic SV allele made RDFS infer `vcfc:ReferenceBlock` for it. Each carrier
+  is now emitted only when the record supplies everything its shape needs.
+
+### Verified
+
+The output validates against both published SHACL profiles —
+`vcf-core-vocabulary.shacl.ttl` and `vcf-core-vocabulary-sparql.shacl.ttl` —
+with **zero violations**, in both representation profiles, run with pySHACL
+using the bundled ontology and RDFS inference. Inputs were the vocabulary's own
+`examples/example.vcf` and a VCF 4.5 stress file covering structured headers,
+symbolic and breakend ALTs, tandem repeats, a gVCF reference block,
+`Number=A/R/G` fields, phased GT with a phase set, `LAA`, `FT`, `CN` and a base
+modification.
+
+### Known broken
+
+The validation suite was migrated separately; see the entry above it. At the
+time of this change 31 of its tests failed because they asserted against the
+retired namespace and the previous emitted shape.
+
+## 2026-09-06 — Runnable examples of all three data-linking tiers
+
+### Added
+
+- `rsid-dbsnp` declarative token links, `gene-demo` with a digest-pinned
+  synthetic GFF3 bundle, and a batched `rsid-ensembl` live resolver.
+- A shared host-side runner with Turtle manifests, directory/entry-point
+  discovery, disk-backed key deduplication, interval joins, assembly refusal,
+  atomic side-graphs, provenance and per-linker run metrics.
+- `--link` in full mode; Docker-free `--mode link --rdf`; and
+  `vcf-rdfizer-link list|keys|init|check|dry-run|run` authoring commands.
+- Cached HTTPS sessions with per-host pacing, per-run request ceilings,
+  retries respecting `Retry-After`, offline replay and contact headers.
+- Known-answer and failure tests for the three examples and their shared
+  runtime. The live resolver is tested using fake HTTP, not a public API.
+
+### Changed
+
+- RDFLib is now a runtime dependency for Turtle/N-Triples parsing.
+- The [implementation guide](docs/datalinking.md) documents commands and
+  limitations; the original proposal is marked partially implemented. Allele
+  normalization, link merging and plug-in validation discovery remain planned.
+
 ## 2026-09-04 — Multi-engine validation, native HDT/COTTAS querying, and benchmarking
 
 Validation was one engine against one N-Triples file. It is now up to four
@@ -213,14 +629,14 @@ VCF contains. Mutation score **64/66 -> 76/78**, catalogue 36 -> 42 mutations.
 ### Added
 
 - `preflight_blank_nodes` — any blank node, in subject or object position. Every
-  class in the vocabulary declares an `vcfr:iriTemplate`, so a blank node means
+  class in the vocabulary declares an `vcfc:iriTemplate`, so a blank node means
   a term map produced no IRI; the record and value digests could not address
   such a node, and neither could anything that later merges the graph. A
   predicate cannot be blank in RDF, so it is not examined.
 - `preflight_empty_values` — empty or whitespace-only literals and IRIs, each
   labelled `EMPTY_LITERAL` or `EMPTY_IRI` in the sample. An empty literal means
   a value was lost rather than marked missing (the pipeline writes
-  `"."^^vcfr:Null` for a genuine missing token); an empty IRI means a template
+  `"."^^vcfc:Null` for a genuine missing token); an empty IRI means a template
   substitution collapsed. Whitespace-only counts as empty: it carries no more
   information and is just as certainly a defect.
 - `preflight_duplicate_triples` — the same statement emitted more than once.
@@ -279,10 +695,10 @@ Phases 2-6 of the validation-coverage plan. Mutation score **29/45 -> 64/66**
 ### Fixed — silent data loss
 
 - **QUAL was extracted from every VCF and never mapped into RDF.** It is now
-  emitted, typed `xsd:decimal` or `"."^^vcfr:Null` as the published SHACL shape
+  emitted, typed `xsd:decimal` or `"."^^vcfc:Null` as the published SHACL shape
   requires. RML cannot choose a datatype per row, so it comes from a new
   record-detail emitter rather than `default_rules.ttl`.
-- **`##fileDate` was never mapped.** Now emitted as `vcfr:fileDate`, typed
+- **`##fileDate` was never mapped.** Now emitted as `vcfc:fileDate`, typed
   `xsd:date` when the value's form allows and lexically otherwise.
 
 ### Added — completeness (Phase 2)
@@ -310,11 +726,11 @@ Phases 2-6 of the validation-coverage plan. Mutation score **29/45 -> 64/66**
 ### Added — structured INFO (Phase 4)
 
 - `--info-representation {structured,raw}`, default `structured`: one
-  `vcfr:InfoFieldValue` per record and key at the vocabulary's declared IRI
-  template, linked by `vcfr:declaredBy` to an `InfoFieldDefinition` carrying
+  `vcfc:InfoFieldValue` per record and key at the vocabulary's declared IRI
+  template, linked by `vcfc:declaredBy` to an `InfoFieldDefinition` carrying
   `fieldId`/`fieldNumber`/`fieldType`/`fieldDescription`. Single-valued
   Integer/Float fields also get `fieldValueInteger`/`fieldValueDecimal`; a Flag
-  gets `fieldValueBoolean true`. `vcfr:infoRaw` is retained.
+  gets `fieldValueBoolean true`. `vcfc:infoRaw` is retained.
 - The model was already fully defined in the vocabulary and simply unused.
 
 ### Added — header section (Phase 5)
@@ -334,8 +750,8 @@ Phases 2-6 of the validation-coverage plan. Mutation score **29/45 -> 64/66**
   as a conformance failure.
 - It found three violations the other layers could not see. Two are fixed above.
   The third is a **contradiction inside the published vocabulary**:
-  `vcfr:missingValuePolicy` says a missing token SHOULD be `"."^^vcfr:Null`,
-  while `VCFRecordShape` constrains `vcfr:alt` to `xsd:string`, so a record with
+  `vcfc:missingValuePolicy` says a missing token SHOULD be `"."^^vcfc:Null`,
+  while `VCFRecordShape` constrains `vcfc:alt` to `xsd:string`, so a record with
   `ALT=.` cannot satisfy both. Recorded in `docs/vcf-coverage.md` for a decision
   in the vocabulary repository.
 
@@ -682,7 +1098,7 @@ and for both `run_conversion.sh` storage modes.
   line-by-line.
 - `run()` discards subprocess output at the file-descriptor level instead of
   buffering a whole container's output in memory only to drop it.
-- `run_conversion.sh`: the `"."` -> `"."^^vcfr:Null` rewrite is now applied to
+- `run_conversion.sh`: the `"."` -> `"."^^vcfc:Null` rewrite is now applied to
   each RMLStreamer part while it is streamed into the aggregate, instead of as
   a separate pass over the finished aggregate. This removes one full read and
   one full write of the complete RDF output, and removes the transient
@@ -764,7 +1180,7 @@ and for both `run_conversion.sh` storage modes.
 - Updated the CLI default and accepted values, internal workflow/emitter names,
   tests, RML comments, and user documentation.
 - The emitted profile IRI is now
-  `vcfr:representationProfile vcfr:ExpandedRepresentation`.
+  `vcfc:representationProfile vcfc:ExpandedRepresentation`.
 
 ## 2026-09-04 — Input-labelled, container-complete metrics layout
 
