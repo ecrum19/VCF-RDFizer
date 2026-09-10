@@ -286,6 +286,12 @@ DEFAULT_ARTIFACT_COMPRESSION = "none"
 HDT_STRATEGY_CHOICES = {"auto", "single", "partitioned"}
 DEFAULT_HDT_STRATEGY = "auto"
 RDF_STORAGE_MODES = {"space-optimized", "plain"}
+#: Full mode defaults to the space-optimized aggregate. Benchmarking showed it
+#: reaches the same triples as `plain` at a much smaller peak workspace
+#: footprint and no practically important compute penalty, so the low-disk
+#: path is the one a caller gets without having to ask. `plain` remains
+#: available and is required for `--hdt-strategy single`.
+DEFAULT_RDF_STORAGE_MODE = "space-optimized"
 DEFAULT_CHUNK_TARGET_BYTES = 512 * 1024 * 1024
 DEFAULT_CHUNK_MIN_BYTES = 128 * 1024 * 1024
 DEFAULT_CHUNK_MAX_BYTES = 1024 * 1024 * 1024
@@ -4483,6 +4489,46 @@ def should_use_partitioned_hdt(
     return mode == "full" and rdf_storage_mode in RDF_STORAGE_MODES
 
 
+def hdt_strategy_rejection(
+    *,
+    hdt_strategy: str,
+    methods: list[str],
+    gzip_aggregate: bool,
+    gzip_remedy: str,
+) -> str | None:
+    """Return why `--hdt-strategy single` cannot be honoured here, or None.
+
+    `single` is a verification path rather than a performance alternative: it
+    exists so one `rdf2hdt` pass can be compared against the chunked `hdtc`
+    merge on the same graph. It applies only to an HDT-only run over an
+    uncompressed aggregate.
+
+    Two requests cannot be honoured, and both are refused rather than silently
+    downgraded to the partitioned path under a `single` label:
+
+    * a gzip aggregate, which one pass could only read by materializing a
+      second full uncompressed copy; and
+    * a run that also selects COTTAS, which always needs bounded chunks, so the
+      partitioned path would run for both representations regardless.
+    """
+    if hdt_strategy != "single" or not compression_uses_hdt(methods):
+        return None
+    if gzip_aggregate:
+        return (
+            "--hdt-strategy single cannot read a gzip aggregate: one rdf2hdt pass "
+            "would have to materialize a second full uncompressed copy. "
+            + gzip_remedy
+        )
+    if any(method in COTTAS_COMPRESSION_METHODS for method in methods):
+        return (
+            "--hdt-strategy single applies only to an HDT-only run. COTTAS always "
+            "requires chunked generation, so the partitioned path would run for "
+            "both representations and the strategy would have no effect. Drop "
+            "cottas from --representations, or use --hdt-strategy partitioned."
+        )
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Run metrics layout: naming, manifest, and summary
 # ---------------------------------------------------------------------------
@@ -7541,11 +7587,17 @@ def run_compress_mode(
         print("No compression methods selected (`none`). Nothing to do.")
         return 0
 
-    if rdf_path.name.endswith(".gz") and compression_uses_hdt(methods) and hdt_strategy == "single":
-        eprint(
-            "Error: --hdt-strategy single cannot read a gzip aggregate without materializing "
-            "an uncompressed RDF file; use --hdt-strategy partitioned."
-        )
+    hdt_strategy_error = hdt_strategy_rejection(
+        hdt_strategy=hdt_strategy,
+        methods=methods,
+        gzip_aggregate=rdf_path.name.endswith(".gz"),
+        gzip_remedy=(
+            "Use --hdt-strategy partitioned, or supply an uncompressed .nt if you "
+            "specifically need a single-pass HDT for verification."
+        ),
+    )
+    if hdt_strategy_error is not None:
+        eprint(f"Error: {hdt_strategy_error}")
         return 2
 
     if any(method in HDT_COMPRESSION_METHODS for method in methods):
@@ -8283,29 +8335,32 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  Full pipeline (plain aggregate):\n"
+            "  Full pipeline (space-optimized aggregate is the default):\n"
+            "    vcf_rdfizer.py -m full -i ./vcf_files --representations hdt,cottas "
+            "--rdf-compression none -o ./results\n"
+            "  Full pipeline keeping one uncompressed .nt aggregate:\n"
             "    vcf_rdfizer.py -m full -i ./vcf_files --rdf-storage-mode plain "
             "--representations hdt -o ./results\n"
-            "  Full pipeline (space-optimized aggregate):\n"
-            "    vcf_rdfizer.py -m full -i ./vcf_files --rdf-storage-mode space-optimized "
-            "--representations hdt,cottas --rdf-compression none -o ./results\n"
             "  Full pipeline with semantic validation:\n"
-            "    vcf_rdfizer.py -m full -i ./cohort.vcf.gz --rdf-storage-mode plain "
+            "    vcf_rdfizer.py -m full -i ./cohort.vcf.gz "
             "--representations none --rdf-compression none --validate -o ./results\n"
             "  Condensed multi-sample representation:\n"
             "    vcf_rdfizer.py -m full -i ./cohort.vcf.gz --sample-representation condensed "
-            "--rdf-storage-mode space-optimized --representations hdt -o ./results\n"
-            "  Space-optimized full pipeline with shared HDT/COTTAS chunks:\n"
-            "    vcf_rdfizer.py -m full -i ./vcf_files --rdf-storage-mode space-optimized "
+            "--representations hdt -o ./results\n"
+            "  Full pipeline with shared HDT/COTTAS chunks:\n"
+            "    vcf_rdfizer.py -m full -i ./vcf_files "
             "--representations hdt,cottas --rdf-compression none "
             "--chunk-target-bytes 536870912 -o ./results\n"
             "  Ultra-small full pipeline (remove aggregate RDF after compression):\n"
-            "    vcf_rdfizer.py -m full -i ./vcf_files --rdf-storage-mode space-optimized "
+            "    vcf_rdfizer.py -m full -i ./vcf_files "
             "--representations hdt --rdf-compression none --hdt-strategy partitioned "
             "--remove-rdf-storage-output -o ./results\n"
             "  Queryable HDT plus gzip-packaged HDT:\n"
-            "    vcf_rdfizer.py -m full -i ./vcf_files --rdf-storage-mode space-optimized "
+            "    vcf_rdfizer.py -m full -i ./vcf_files "
             "--rdf-compression none --representations hdt --artifact-compression gzip -o ./results\n"
+            "  Single-pass HDT for verification against the partitioned merge:\n"
+            "    vcf_rdfizer.py -m full -i ./vcf_files --rdf-storage-mode plain "
+            "--representations hdt --rdf-compression none --hdt-strategy single -o ./results\n"
             "  TSV-only benchmark:\n"
             "    vcf_rdfizer.py -m tsv -i ./vcf_files -o ./results\n"
             "  Compression-only:\n"
@@ -8434,10 +8489,12 @@ def main():
     parser.add_argument(
         "--rdf-storage-mode",
         choices=sorted(RDF_STORAGE_MODES),
-        default=None,
+        default=DEFAULT_RDF_STORAGE_MODE,
         help=(
             "Full-mode aggregate storage: plain keeps one .nt; space-optimized builds one .nt.gz "
-            "from RMLStreamer parts before record-safe HDT/COTTAS chunking"
+            "from RMLStreamer parts before record-safe HDT/COTTAS chunking "
+            f"(default: {DEFAULT_RDF_STORAGE_MODE}). plain is required by "
+            "--hdt-strategy single, which cannot read a gzip aggregate"
         ),
     )
     parser.add_argument(
@@ -8516,8 +8573,12 @@ def main():
         choices=sorted(HDT_STRATEGY_CHOICES),
         default=DEFAULT_HDT_STRATEGY,
         help=(
-            "HDT generation strategy: auto uses partitioned HDT+hdtc merge for full-mode aggregate storage, "
-            "single uses one rdf2hdt run, partitioned forces chunked HDT generation"
+            "HDT generation strategy. auto uses partitioned HDT+hdtc merge for full-mode "
+            "aggregate storage; partitioned forces chunked generation and is the setting to "
+            "pin for reproducible runs. single uses one rdf2hdt run and is a verification "
+            "path, not a faster alternative: it exists so a one-shot conversion can be "
+            "compared against the chunked merge, and it requires an HDT-only run over an "
+            "uncompressed aggregate (--rdf-storage-mode plain, no cottas)"
         ),
     )
     parser.add_argument(
@@ -8784,8 +8845,6 @@ def main():
         if mode == "full":
             if args.input is None:
                 raise ValueError("--input is required in --mode full")
-            if args.rdf_storage_mode is None:
-                raise ValueError("--rdf-storage-mode is required in --mode full")
             input_path = Path(args.input).expanduser().resolve()
             (
                 input_mount_dir,
@@ -8828,15 +8887,17 @@ def main():
                     representations=args.representations,
                     artifact_compression=args.artifact_compression,
                 )
-            if (
-                args.rdf_storage_mode == "space-optimized"
-                and args.hdt_strategy == "single"
-                and compression_uses_hdt(full_methods)
-            ):
-                raise ValueError(
-                    "--hdt-strategy single cannot be used with space-optimized HDT input; "
-                    "use --hdt-strategy partitioned"
-                )
+            hdt_strategy_error = hdt_strategy_rejection(
+                hdt_strategy=args.hdt_strategy,
+                methods=full_methods,
+                gzip_aggregate=args.rdf_storage_mode == "space-optimized",
+                gzip_remedy=(
+                    "Use --hdt-strategy partitioned, or --rdf-storage-mode plain if you "
+                    "specifically need a single-pass HDT for verification."
+                ),
+            )
+            if hdt_strategy_error is not None:
+                raise ValueError(hdt_strategy_error)
             if args.spark_partitions is not None:
                 spark_partitions = parse_positive_int(
                     args.spark_partitions, name="--spark-partitions"
@@ -8938,15 +8999,17 @@ def main():
                     representations=args.representations,
                     artifact_compression=args.artifact_compression,
                 )
-            if (
-                rdf_path.name.endswith(".gz")
-                and args.hdt_strategy == "single"
-                and compression_uses_hdt(methods)
-            ):
-                raise ValueError(
-                    "--hdt-strategy single cannot be used with a .nt.gz HDT input; "
-                    "use --hdt-strategy partitioned"
-                )
+            hdt_strategy_error = hdt_strategy_rejection(
+                hdt_strategy=args.hdt_strategy,
+                methods=methods,
+                gzip_aggregate=rdf_path.name.endswith(".gz"),
+                gzip_remedy=(
+                    "Use --hdt-strategy partitioned, or supply an uncompressed .nt if you "
+                    "specifically need a single-pass HDT for verification."
+                ),
+            )
+            if hdt_strategy_error is not None:
+                raise ValueError(hdt_strategy_error)
             validate_mode_dirs([out_root, out_dir, metrics_root])
             compression_uses_partitioning_for_input = compression_uses_partitioning(methods) and (
                 any(method in COTTAS_COMPRESSION_METHODS for method in methods)

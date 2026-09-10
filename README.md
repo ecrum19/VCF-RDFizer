@@ -262,7 +262,7 @@ host filesystem.
 - `--filter-oracle {auto,bcftools,cyvcf2}` FILTER oracle for `--validate`
 - `--quiet` suppress terminal progress and validation query chatter while retaining logs/metrics
 - `--no-progress` disable progress sidecars and terminal progress displays
-- `--rdf-storage-mode {plain,space-optimized}` required full-mode aggregate storage policy
+- `--rdf-storage-mode {plain,space-optimized}` full-mode aggregate storage policy (default: `space-optimized`)
   - `plain`: merge RMLStreamer parts into one uncompressed `.nt`
   - `space-optimized`: gzip each part into one `.nt.gz` aggregate and delete the source part immediately
 - `--rdf-compression {gzip,brotli,none}` raw RDF artifacts to retain

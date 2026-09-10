@@ -77,7 +77,7 @@ See [Data linking](datalinking.md) for commands and current limits. There is no
 
 | Flag | Values | Default |
 | --- | --- | --- |
-| `--rdf-storage-mode` | `plain`, `space-optimized` | **required in full mode** |
+| `--rdf-storage-mode` | `plain`, `space-optimized` | `space-optimized` |
 | `--rdf-compression` | `gzip`, `brotli`, `none` | `gzip,brotli` |
 | `--representations` | `hdt`, `cottas`, `none` | `hdt` |
 | `--artifact-compression` | `gzip`, `brotli`, `none` | `none` |
@@ -86,11 +86,23 @@ See [Data linking](datalinking.md) for commands and current limits. There is no
 | `--chunk-min-bytes` | bytes | 128 MiB |
 | `--chunk-max-bytes` | bytes | 1 GiB |
 
+`--rdf-storage-mode` defaults to `space-optimized`: it reaches the same triples
+as `plain` at a much smaller peak workspace footprint and no practically
+important compute penalty, so the low-disk path is what a caller gets without
+having to ask for it. Pass `plain` when you want one uncompressed `.nt`
+aggregate on disk, which is also what `--hdt-strategy single` requires.
+
 Constraints that are enforced rather than documented-and-hoped:
 
 - Each selector takes a comma-separated list; `none` must appear alone.
 - `--artifact-compression` requires at least one selected representation.
-- `--hdt-strategy single` cannot consume a `space-optimized` gzip stream.
+- `--hdt-strategy single` cannot consume a `space-optimized` gzip stream, and
+  is rejected rather than silently downgraded. Since `space-optimized` is now
+  the default, `single` needs an explicit `--rdf-storage-mode plain`.
+- `--hdt-strategy single` is also rejected when `cottas` is among the
+  `--representations`. COTTAS always needs bounded chunks, so the partitioned
+  path would run for both representations and the strategy would have no
+  effect; earlier releases ignored the flag silently in this case.
 
 `-c, --compression` is a hidden legacy alias retained for backward
 compatibility. Use the three explicit selectors.

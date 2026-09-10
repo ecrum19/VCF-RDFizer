@@ -1,5 +1,60 @@
 # Changelog
 
+## 2026-09-10 — Space-optimized by default, and `--hdt-strategy single` stops lying
+
+Benchmarking the two aggregate storage modes as a paired comparison showed
+`space-optimized` reaches the same triples as `plain` at a much smaller peak
+workspace footprint, with no practically important change in wall time, CPU
+time, or peak memory. A flag with an answer that good should not be mandatory.
+
+The same experiment exposed that `--hdt-strategy single` was being silently
+ignored in the most common configuration anyone would pass it in.
+
+### Changed
+
+- **`--rdf-storage-mode` now defaults to `space-optimized`** instead of being
+  required in full mode. `plain` remains available and is unchanged; it is what
+  `--hdt-strategy single` needs, and what to pass when one uncompressed `.nt`
+  aggregate on disk is the point. The new `DEFAULT_RDF_STORAGE_MODE` constant
+  carries the value.
+- **`--hdt-strategy single` is documented as a verification path, not a faster
+  alternative.** There is no size regime where it wins: below
+  `--chunk-min-bytes` the partitioned path emits one chunk and its merge is
+  trivial, so the two converge, and above it partitioned is the only one that
+  survives cohort scale. What `single` is for is producing a one-shot HDT of the
+  same graph so the chunk-and-merge result can be checked against it — which is
+  what justifies partitioned generation being the default rather than merely
+  convenient.
+
+### Fixed
+
+- **`--hdt-strategy single` is no longer silently ignored when COTTAS is
+  selected.** COTTAS always needs bounded chunks, and both dispatch sites gate
+  partitioning on one boolean, so `--representations hdt,cottas --hdt-strategy
+  single` ran the partitioned path for both representations with the strategy
+  having no effect. Benchmark runs using that combination were measuring
+  partitioned HDT under a `single` label. It is now refused with a message
+  naming the remedy.
+- **The two `single` refusals share one implementation.** `hdt_strategy_rejection`
+  replaces three separately worded inline checks across full-mode validation,
+  compress-mode validation, and the compress-mode runtime guard. The gzip-aggregate
+  message now also names `--rdf-storage-mode plain`, which matters more than it
+  did: with `space-optimized` the default, `single` needs that flag explicitly.
+
+### Tests
+
+- `test_main_full_mode_requires_storage_mode_argument` is replaced by
+  `test_main_full_mode_defaults_to_space_optimized_storage`, which asserts the
+  resolved value reaching `run_full_mode`.
+- Added `test_main_full_mode_rejects_single_hdt_strategy_with_cottas` and
+  `test_main_full_mode_rejects_single_hdt_strategy_with_space_optimized`.
+- The mocked RMLStreamer runner now reads `RDF_STORAGE_MODE` from the container
+  command and writes a real gzip aggregate for `space-optimized`, so the
+  default path is exercisable end to end rather than only under `plain`.
+
+Suite: **436 passing, 147 skipped** (all skips are the pre-existing `rdflib`
+gates on the mutation and linking harnesses).
+
 ## 2026-09-08 — Run without the data-linking dependency
 
 Running the tool from a checkout raised `ModuleNotFoundError: No module named

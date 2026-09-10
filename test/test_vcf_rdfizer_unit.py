@@ -167,11 +167,25 @@ def invoke_main(argv, *, auto_storage=True):
                 ),
                 "rdf",
             )
+            storage_mode = next(
+                (
+                    part.split("=", 1)[1]
+                    for part in cmd
+                    if isinstance(part, str) and part.startswith("RDF_STORAGE_MODE=")
+                ),
+                "plain",
+            )
             if out_mount is not None:
                 output_dir = out_mount / output_name
                 output_dir.mkdir(parents=True, exist_ok=True)
                 if not any(output_dir.glob("*.nt")) and not any(output_dir.glob("*.nt.gz")):
-                    (output_dir / f"{output_name}.nt").write_text("<s> <p> <o> .\n")
+                    # Match the aggregate the wrapper plans for this storage mode:
+                    # space-optimized expects one .nt.gz assembled from the parts.
+                    if storage_mode == "space-optimized":
+                        with gzip.open(output_dir / f"{output_name}.nt.gz", "wt") as handle:
+                            handle.write("<s> <p> <o> .\n")
+                    else:
+                        (output_dir / f"{output_name}.nt").write_text("<s> <p> <o> .\n")
         if result == 0:
             rendered = str(cmd[-1]) if cmd else ""
             work_mount = next(
@@ -3093,16 +3107,87 @@ class WrapperUnitTests(VerboseTestCase):
         rc = invoke_main(["--mode", "full"])
         self.assertEqual(rc, 2)
 
-    def test_main_full_mode_requires_storage_mode_argument(self):
-        """Full mode fails validation when --rdf-storage-mode is omitted."""
+    def test_main_full_mode_defaults_to_space_optimized_storage(self):
+        """Full mode without --rdf-storage-mode resolves to the space-optimized aggregate."""
+        self.assertEqual(vcf_rdfizer.DEFAULT_RDF_STORAGE_MODE, "space-optimized")
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             input_dir, rules_path = prepare_inputs(tmp_path)
-            rc = invoke_main(
-                ["--mode", "full", "--input", str(input_dir), "--rules", str(rules_path)],
-                auto_storage=False,
-            )
+            observed = {}
+
+            def capture_full_mode(**kwargs):
+                observed.update(kwargs)
+                return 0
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "check_docker", return_value=True), \
+                        mock.patch.object(vcf_rdfizer, "docker_image_exists", return_value=True), \
+                        mock.patch.object(
+                            vcf_rdfizer, "run_full_mode", side_effect=capture_full_mode
+                        ):
+                    rc = invoke_main(
+                        [
+                            "--mode", "full",
+                            "--input", str(input_dir),
+                            "--rules", str(rules_path),
+                            "--out", str(tmp_path / "out"),
+                        ],
+                        auto_storage=False,
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(observed.get("rdf_storage_mode"), "space-optimized")
+
+    def test_main_full_mode_rejects_single_hdt_strategy_with_cottas(self):
+        """`single` is refused, not silently ignored, when COTTAS forces chunking."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+            stderr = StringIO()
+            with redirect_stderr(stderr):
+                rc = invoke_main(
+                    [
+                        "--mode", "full",
+                        "--input", str(input_dir),
+                        "--rules", str(rules_path),
+                        "--rdf-storage-mode", "plain",
+                        "--representations", "hdt,cottas",
+                        "--rdf-compression", "none",
+                        "--hdt-strategy", "single",
+                        "--out", str(tmp_path / "out"),
+                    ],
+                    auto_storage=False,
+                )
             self.assertEqual(rc, 2)
+            self.assertIn("HDT-only run", stderr.getvalue())
+
+    def test_main_full_mode_rejects_single_hdt_strategy_with_space_optimized(self):
+        """`single` cannot read the now-default gzip aggregate."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+            stderr = StringIO()
+            with redirect_stderr(stderr):
+                rc = invoke_main(
+                    [
+                        "--mode", "full",
+                        "--input", str(input_dir),
+                        "--rules", str(rules_path),
+                        "--representations", "hdt",
+                        "--rdf-compression", "none",
+                        "--hdt-strategy", "single",
+                        "--out", str(tmp_path / "out"),
+                    ],
+                    auto_storage=False,
+                )
+            self.assertEqual(rc, 2)
+            message = stderr.getvalue()
+            self.assertIn("gzip aggregate", message)
+            self.assertIn("--rdf-storage-mode plain", message)
 
     def test_removed_legacy_cli_options_are_rejected(self):
         """Removed layout and compatibility aliases are not accepted by the CLI."""
