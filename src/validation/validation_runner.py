@@ -85,6 +85,31 @@ CORE_QUERIES = (
     "q12_info_value_digest",
     "q13_format_value_digest",
 )
+#: Which oracle phases a query would actually have paid for, had it been the
+#: only question asked. The oracle is one pass that fills every query's
+#: counters together, so there is no measured per-query slice of it; this is the
+#: explicit statement of what a one-question cyvcf2 script would have cost.
+#:
+#: Every query pays to open the file, scan the records, and assemble its answer.
+#: Only the sample-level queries pay for the per-sample genotype/AC-AN block,
+#: which is the part whose cost scales with cohort size. Measured on the
+#: shipped fixtures, the block is 15.5% of the scan at one sample and 73.5% at
+#: 2,504 -- which is the whole reason per-query oracle numbers are worth having.
+#:
+#: Known coarseness: `assemblySeconds` is charged to every query equally, and on
+#: a cohort file it is not small (149 s against a 181 s scan on the 2,504-sample
+#: fixture) because it sorts the per-sample counters. Most of that work belongs
+#: to the sample-level queries, so this attribution OVER-charges record-level
+#: queries on multi-sample inputs -- i.e. it understates the gap it is measuring.
+#: Splitting it would mean restructuring the post-loop assembly into per-query
+#: builders; until then the bias is in the conservative direction and is stated
+#: rather than hidden.
+ORACLE_SAMPLE_LEVEL_QUERIES = frozenset({
+    "q05_sample_genotype_counts",
+    "q06_ac_an_distribution",
+    "q13_format_value_digest",
+})
+
 #: Queries that must return exactly one row, normalized to a dict rather than
 #: a list so the comparison reads as a field-by-field check.
 SINGLE_ROW_QUERIES = frozenset({"q03_titv", "q07_file_metadata"})
@@ -1054,7 +1079,35 @@ def attach_census_expectations(
     return parser
 
 
-def parse_vcf(vcf_path: Path, *, filter_oracle: str) -> dict[str, Any]:
+def parse_vcf(
+    vcf_path: Path, *, filter_oracle: str, timing: dict[str, float] | None = None
+) -> dict[str, Any]:
+    """Compute every query's expected value in ONE pass over the VCF.
+
+    ``timing``, when supplied, is filled with the phase breakdown below. It is
+    opt-in because the sample-block measurement costs two clock reads per
+    record, which is negligible next to a real parse but pointless when nobody
+    is going to read it.
+
+        readerOpenSeconds     open the file and parse the header
+        scanSeconds           the record loop, in total
+        sampleBlockSeconds    the per-sample genotype/AC-AN portion INSIDE the
+                              scan -- the only part of the pass whose cost
+                              depends on which queries you want
+        assemblySeconds       building the per-query expected structures after
+                              the loop
+
+    Why phases and not per-query totals: this is a single pass that accumulates
+    every query's counters together, so there is no per-query slice of it to
+    measure. Attributing the shared scan to individual queries is a decision
+    about what a one-question script would have paid, not a measurement, so it
+    is made explicitly in the analysis (see ORACLE_QUERY_PHASES) rather than
+    silently here.
+
+    Gating the pass per query was considered and rejected: the accumulators in
+    the sample block feed the expected values, so a gate left on in a
+    correctness run would corrupt the oracle every equality claim rests on.
+    """
     if VCF is None:
         raise RuntimeError(
             "cyvcf2 is unavailable; the validator must run inside the "
@@ -1066,9 +1119,16 @@ def parse_vcf(vcf_path: Path, *, filter_oracle: str) -> dict[str, Any]:
     if filter_oracle == "bcftools" and not shutil.which("bcftools"):
         raise RuntimeError("--filter-oracle=bcftools requested but bcftools is unavailable")
     filters = filters_with_bcftools(vcf_path) if use_bcftools else Counter()
+    _open_started = time.monotonic()
     reader = VCF(str(vcf_path), strict_gt=True)
     samples = list(reader.samples)
     header_metadata = parse_header_metadata(read_vcf_header_text(vcf_path))
+    if timing is not None:
+        timing["readerOpenSeconds"] = time.monotonic() - _open_started
+    # Hoisted out of the loop: a per-record attribute lookup on `timing` would
+    # be measuring the measurement.
+    _time_samples = timing is not None
+    _sample_block_seconds = 0.0
     density: Counter[tuple[str, int]] = Counter()
     shapes: Counter[str] = Counter()
     genotypes: Counter[tuple[str, str]] = Counter()
@@ -1090,6 +1150,7 @@ def parse_vcf(vcf_path: Path, *, filter_oracle: str) -> dict[str, Any]:
     records_with_format_column = records_with_format_keys = 0
     format_key_occurrences = format_value_slots = non_empty_format_values = 0
     distinct_format_keys: set[str] = set()
+    _scan_started = time.monotonic()
     try:
         for variant in reader:
             total_records += 1
@@ -1209,6 +1270,7 @@ def parse_vcf(vcf_path: Path, *, filter_oracle: str) -> dict[str, Any]:
                     condensed_format_digest[
                         record_digest_bucket([vector_iri, encoded])
                     ] += 1
+            _sample_started = time.monotonic() if _time_samples else 0.0
             alleles = [None] * len(samples)
             if samples and has_gt:
                 raw_genotypes = list(variant.genotypes)
@@ -1232,15 +1294,21 @@ def parse_vcf(vcf_path: Path, *, filter_oracle: str) -> dict[str, Any]:
                     if an:
                         ac_an[(an, ac)] += 1
                         q06_eligible += 1
+            if _time_samples:
+                _sample_block_seconds += time.monotonic() - _sample_started
     finally:
         reader.close()
+    if timing is not None:
+        timing["scanSeconds"] = time.monotonic() - _scan_started
+        timing["sampleBlockSeconds"] = _sample_block_seconds
+    _assembly_started = time.monotonic()
     if sum(filters.values()) != total_records:
         raise ValueError("FILTER oracle record count differs from the VCF record count")
     q05 = [
         {"sampleId": sample, "genotypeClass": genotype_class, "callCount": int(count)}
         for (sample, genotype_class), count in sorted(genotypes.items())
     ]
-    return {
+    result = {
         "source": str(vcf_path),
         "sourceSha256": sha256_file(vcf_path),
         "filterOracle": "bcftools" if use_bcftools else "cyvcf2-serialization",
@@ -1330,6 +1398,9 @@ def parse_vcf(vcf_path: Path, *, filter_oracle: str) -> dict[str, Any]:
             for (an, ac), count in sorted(ac_an.items())
         ],
     }
+    if timing is not None:
+        timing["assemblySeconds"] = time.monotonic() - _assembly_started
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -2906,10 +2977,44 @@ BENCHMARK_CSV_HEADER = [
     "query_id",
     "status",
     "wall_seconds",
+    # The parser's cost for THIS query, comparable row-wise against
+    # `wall_seconds`. Empty unless the oracle recorded its phase breakdown.
+    "oracle_query_seconds",
+    # The parser's total for ALL queries, repeated on every row so the file
+    # needs no join. NOT comparable row-wise against `wall_seconds`.
     "oracle_wall_seconds",
     "engine_setup_seconds",
     "artifact_origin",
 ]
+
+
+def oracle_query_seconds(
+    phases: dict[str, float] | None, query_ids: tuple[str, ...]
+) -> dict[str, float]:
+    """Attribute the oracle's measured phases to individual queries.
+
+    Not a measurement of each query in isolation -- see
+    :data:`ORACLE_SAMPLE_LEVEL_QUERIES` for why that does not exist -- but the
+    cost a one-question script would have paid, composed from phases that were
+    each measured directly.
+    """
+    if not phases:
+        return {}
+    reader_open = phases.get("readerOpenSeconds") or 0.0
+    scan = phases.get("scanSeconds") or 0.0
+    sample_block = phases.get("sampleBlockSeconds") or 0.0
+    assembly = phases.get("assemblySeconds") or 0.0
+    record_level_scan = max(scan - sample_block, 0.0)
+
+    out: dict[str, float] = {}
+    for query_id in query_ids:
+        pays_sample_block = query_id in ORACLE_SAMPLE_LEVEL_QUERIES
+        out[query_id] = (
+            reader_open
+            + (scan if pays_sample_block else record_level_scan)
+            + assembly
+        )
+    return out
 
 
 def build_benchmark(
@@ -2951,6 +3056,8 @@ def build_benchmark(
             "queries": queries,
         }
 
+    oracle_phases = oracle_seconds.get("phases") or {}
+    per_query_oracle = oracle_query_seconds(oracle_phases, query_ids)
     return {
         "oracle": {
             # The parser side of the comparison: what it costs to compute the
@@ -2958,6 +3065,16 @@ def build_benchmark(
             "totalSeconds": oracle_seconds.get("total"),
             "vcfParseSeconds": oracle_seconds.get("parse"),
             "censusSeconds": oracle_seconds.get("census"),
+            # Directly measured phases of the single pass.
+            "phases": oracle_phases or None,
+            # Per-query cost a one-question script would have paid, composed
+            # from those phases. `sampleLevelQueries` names the ones that pay
+            # for the per-sample block, so the attribution is auditable rather
+            # than implicit.
+            "perQuerySeconds": per_query_oracle or None,
+            "sampleLevelQueries": sorted(
+                q for q in query_ids if q in ORACLE_SAMPLE_LEVEL_QUERIES
+            ) or None,
         },
         "preparation": {
             "materializationSeconds": materialization_seconds,
@@ -2981,6 +3098,7 @@ def write_benchmark_csv(path: Path, benchmark: dict[str, Any]) -> Path:
     """Write one row per engine and query, for direct analysis."""
     path.parent.mkdir(parents=True, exist_ok=True)
     oracle_total = benchmark["oracle"]["totalSeconds"]
+    per_query = benchmark["oracle"].get("perQuerySeconds") or {}
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=BENCHMARK_CSV_HEADER)
         writer.writeheader()
@@ -2991,6 +3109,7 @@ def write_benchmark_csv(path: Path, benchmark: dict[str, Any]) -> Path:
                     "query_id": query_id,
                     "status": entry["status"],
                     "wall_seconds": entry["wallSeconds"],
+                    "oracle_query_seconds": per_query.get(query_id),
                     # Repeated on each row so the CSV is usable without a join.
                     "oracle_wall_seconds": oracle_total,
                     "engine_setup_seconds": engine["setupSeconds"],
@@ -3129,14 +3248,21 @@ def run_validation(args: argparse.Namespace) -> int:
                 detail="parsing source VCF",
             )
             oracle_started = time.monotonic()
-            parser = parse_vcf(args.vcf, filter_oracle=args.filter_oracle)
+            oracle_phases: dict[str, float] = {}
+            parser = parse_vcf(
+                args.vcf, filter_oracle=args.filter_oracle, timing=oracle_phases
+            )
             parse_seconds = time.monotonic() - oracle_started
             census_started = time.monotonic()
             parser = attach_census_expectations(parser, args.representation)
+            oracle_phases["censusSeconds"] = time.monotonic() - census_started
             oracle_seconds = {
                 "parse": parse_seconds,
-                "census": time.monotonic() - census_started,
+                "census": oracle_phases["censusSeconds"],
                 "total": time.monotonic() - oracle_started,
+                # Phase breakdown, so per-query oracle cost can be attributed
+                # from measured parts rather than guessed.
+                "phases": dict(oracle_phases),
             }
             parser["oracleSeconds"] = oracle_seconds
             write_json(results_dir / "parser.json", parser)
