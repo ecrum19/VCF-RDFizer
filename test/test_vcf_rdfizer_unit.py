@@ -3321,6 +3321,104 @@ class WrapperUnitTests(VerboseTestCase):
                 )
             tracker.close()
 
+    def test_temp_volume_removal_retries_while_a_container_holds_it(self):
+        """A container killed a moment ago has not released its volume yet."""
+        vcf_rdfizer._TEMP_DOCKER_VOLUMES.clear()
+        vcf_rdfizer.register_temp_volume("vol-a")
+        attempts = []
+
+        # Fail twice (volume still in use), then succeed.
+        def fake_run(cmd, cwd=None, env=None):
+            attempts.append(cmd)
+            return 0 if len(attempts) >= 3 else 1
+
+        with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), \
+                mock.patch.object(vcf_rdfizer.time, "sleep"):
+            self.assertTrue(vcf_rdfizer.remove_temp_volume("vol-a", delay=0))
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(attempts[0][-4:], ["volume", "rm", "-f", "vol-a"])
+        # Success deregisters it, so the later sweep does not retry it.
+        self.assertNotIn("vol-a", vcf_rdfizer._TEMP_DOCKER_VOLUMES)
+
+    def test_a_volume_that_cannot_be_removed_stays_registered(self):
+        """It must remain for the interrupt sweep, not be silently forgotten."""
+        vcf_rdfizer._TEMP_DOCKER_VOLUMES.clear()
+        vcf_rdfizer.register_temp_volume("vol-stuck")
+        with mock.patch.object(vcf_rdfizer, "run", return_value=1), \
+                mock.patch.object(vcf_rdfizer.time, "sleep"):
+            self.assertFalse(vcf_rdfizer.remove_temp_volume("vol-stuck", attempts=2, delay=0))
+        self.assertIn("vol-stuck", vcf_rdfizer._TEMP_DOCKER_VOLUMES)
+
+    def test_remove_tracked_volumes_counts_and_never_raises(self):
+        """Cleanup that raises leaves exactly the leak it exists to prevent."""
+        with tempfile.TemporaryDirectory() as td:
+            tracker = vcf_rdfizer.RunTracker(Path(td) / "progress.log")
+            vcf_rdfizer._TEMP_DOCKER_VOLUMES.clear()
+            for name in ("vol-ok", "vol-bad"):
+                vcf_rdfizer.register_temp_volume(name)
+
+            def fake_remove(name, **kwargs):
+                if name == "vol-bad":
+                    raise RuntimeError("docker daemon gone")
+                vcf_rdfizer._TEMP_DOCKER_VOLUMES.discard(name)
+                return True
+
+            with mock.patch.object(vcf_rdfizer, "remove_temp_volume", side_effect=fake_remove):
+                removed, failed = vcf_rdfizer.remove_tracked_volumes(run_tracker=tracker)
+            self.assertEqual((removed, failed), (1, 1))
+            self.assertIn("temporary volumes removed=1, failed=1", tracker.log_path.read_text())
+            tracker.close()
+            vcf_rdfizer._TEMP_DOCKER_VOLUMES.clear()
+
+    def test_interrupt_removes_volumes_only_after_stopping_containers(self):
+        """Docker refuses to remove a volume a live container still holds.
+
+        That is the whole bug: each volume's own `finally` ran as the exception
+        unwound, before the containers were killed, so removal failed there and
+        nothing retried -- leaking ~700 MB per interrupted run.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+            out_dir = tmp_path / "out"
+            order = []
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "check_docker", return_value=True), \
+                        mock.patch.object(vcf_rdfizer, "docker_image_exists", return_value=True), \
+                        mock.patch.object(vcf_rdfizer, "run_full_mode", side_effect=KeyboardInterrupt()), \
+                        mock.patch.object(
+                            vcf_rdfizer, "kill_run_containers",
+                            side_effect=lambda **k: (order.append("kill-containers"), (1, 0))[1],
+                        ), \
+                        mock.patch.object(
+                            vcf_rdfizer, "remove_tracked_volumes",
+                            side_effect=lambda **k: (order.append("remove-volumes"), (2, 0))[1],
+                        ), \
+                        mock.patch.object(
+                            vcf_rdfizer, "cleanup_interrupted_full_run",
+                            side_effect=lambda **k: (order.append("remove-temporaries"), (4, 0))[1],
+                        ):
+                    rc = invoke_main([
+                        "--mode", "full",
+                        "--input", str(input_dir),
+                        "--rules", str(rules_path),
+                        "--rdf-storage-mode", "plain",
+                        "--out", str(out_dir),
+                    ])
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 130)
+            # Containers first, then the volumes they were holding.
+            self.assertLess(order.index("kill-containers"), order.index("remove-volumes"))
+
+            run_metrics_dir = latest_metrics_run_dir(out_dir / "run_metrics")
+            data = json.loads((run_metrics_dir / "interrupt-checkpoint.json").read_text())
+            self.assertEqual(data["volumes"], {"removed": 2, "failed": 0})
+
     def test_interrupt_stops_containers_before_deleting_their_inputs(self):
         """Order is the bug: temps were deleted from under a live container.
 

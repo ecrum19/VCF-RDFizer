@@ -215,17 +215,26 @@ number, and no progress history is retained in memory.
 1. **Stop this run's containers.** Every container the wrapper starts carries a
    `vcf-rdfizer.run=<run-id>-<pid>` label, and cleanup kills exactly the ones
    matching its own label — a concurrent run's containers are never touched.
-2. **Remove tracked intermediates.** Raw RDF follows
+2. **Remove this run's temporary Docker volumes.** Partitioned compression
+   works in a named volume, and Docker refuses to remove one while a container
+   still holds it — so this can only happen after step 1, and retries a few
+   times while the killed container releases it.
+3. **Remove tracked intermediates.** Raw RDF follows
    `--keep-rmlstreamer-rdf-output`: with it, raw RDF is preserved; without it,
    tracked raw RDF files are removed.
-3. **Write `interrupt-checkpoint.json`** into the run's metrics directory,
+4. **Write `interrupt-checkpoint.json`** into the run's metrics directory,
    recording the stages that completed, the last progress event, how many
-   containers were stopped, and what was removed.
+   containers were stopped, how many volumes were removed, and what else was
+   deleted.
 
-The order matters. Killing the wrapper does not kill its containers, and until
-this existed an interrupted run deleted files that its own container was still
-reading — one such orphan ran for three days after the run had "finished",
-holding 17 GB and a core, working against inputs that no longer existed.
+The order matters, twice over. Killing the wrapper does not kill its
+containers, and until this existed an interrupted run deleted files that its
+own container was still reading — one such orphan ran for three days after the
+run had "finished", holding 17 GB and a core, working against inputs that no
+longer existed. And a volume cannot be removed before the container using it
+stops: each volume's own `finally` ran as the exception unwound, *before* the
+containers were killed, so it warned and gave up — leaking roughly 700 MB per
+interrupted run, which nothing retried.
 
 A second `Ctrl+C` during cleanup is ignored, so an impatient operator cannot
 abort the step that stops the containers. If cleanup itself fails the wrapper

@@ -1664,6 +1664,60 @@ def remove_path_with_docker_fallback(
     return True
 
 
+#: Temporary Docker volumes this process created and has not yet removed.
+#:
+#: Each volume is already removed in its own `finally`, which is enough on the
+#: normal path. On an interrupt it is not: that `finally` runs as the exception
+#: unwinds, which is *before* the handler kills the containers, and Docker
+#: refuses to remove a volume a container still holds. The removal failed
+#: there, warned, and nothing ever retried -- leaking ~700 MB per interrupted
+#: run. Registering them here lets the interrupt path sweep once the
+#: containers are actually gone.
+_TEMP_DOCKER_VOLUMES: set[str] = set()
+
+
+def register_temp_volume(name: str) -> None:
+    _TEMP_DOCKER_VOLUMES.add(name)
+
+
+def remove_temp_volume(name: str, *, attempts: int = 3, delay: float = 1.0) -> bool:
+    """Remove one temporary volume, retrying while a container still holds it.
+
+    A container killed a moment ago may not have released the volume yet, so a
+    single attempt is not enough on the interrupt path.
+    """
+    for attempt in range(max(1, attempts)):
+        if run([*docker_cmd_prefix(), "volume", "rm", "-f", name]) == 0:
+            _TEMP_DOCKER_VOLUMES.discard(name)
+            return True
+        if attempt + 1 < attempts:
+            time.sleep(delay)
+    return False
+
+
+def remove_tracked_volumes(*, run_tracker: RunTracker | None = None) -> tuple[int, int]:
+    """Remove every temporary volume still outstanding. Returns ``(removed, failed)``.
+
+    Must run *after* the containers are stopped. Best effort by construction:
+    an interrupt path must never raise.
+    """
+    removed = 0
+    failed = 0
+    for name in sorted(_TEMP_DOCKER_VOLUMES):
+        try:
+            if remove_temp_volume(name):
+                removed += 1
+            else:
+                failed += 1
+        except Exception:  # noqa: BLE001 - cleanup must not raise
+            failed += 1
+    if (removed or failed) and run_tracker is not None:
+        run_tracker.mark(
+            f"Interrupt cleanup: temporary volumes removed={removed}, failed={failed}"
+        )
+    return removed, failed
+
+
 def kill_run_containers(*, run_tracker: RunTracker | None = None) -> tuple[int, int]:
     """Stop every container this wrapper started. Returns ``(killed, failed)``.
 
@@ -1726,6 +1780,8 @@ def write_interrupt_checkpoint(
     containers_failed: int,
     removed: int | None,
     failed: int | None,
+    volumes_removed: int = 0,
+    volumes_failed: int = 0,
 ) -> Path | None:
     """Record where an interrupted run stopped, so it can be resumed or read.
 
@@ -1740,6 +1796,7 @@ def write_interrupt_checkpoint(
         "exit_code": 130,
         "interrupted_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
         "containers": {"killed": containers_killed, "failed": containers_failed},
+        "volumes": {"removed": volumes_removed, "failed": volumes_failed},
         "temporaries": {"removed": removed, "failed": failed},
         "stages_completed": list(run_tracker.completed_stages),
         "last_event": run_tracker.events[-1] if run_tracker.events else None,
@@ -6331,6 +6388,9 @@ def run_containerized_partitioned_representation_methods(
             eprint(f"Error: unable to create temporary Docker volume '{volume_name}'. See log: {wrapper_log_path}")
             return False, {}
         volume_created = True
+        # Track it from the moment it exists, so an interrupt can still find it
+        # if this function's own cleanup cannot remove it.
+        register_temp_volume(volume_name)
 
         # A named volume is normally initialized by Docker as root. Make its
         # workspace writable for the mapped host user before running COTTAS.
@@ -6487,13 +6547,13 @@ def run_containerized_partitioned_representation_methods(
             result_path.unlink()
         except OSError:
             pass
-        if volume_created:
-            cleanup_exit_code = run([*docker_cmd_prefix(), "volume", "rm", "-f", volume_name])
-            if cleanup_exit_code != 0:
-                eprint(
-                    f"Warning: failed to remove temporary Docker volume '{volume_name}'. "
-                    f"See log: {wrapper_log_path}"
-                )
+        if volume_created and not remove_temp_volume(volume_name):
+            # Still registered, so the interrupt sweep retries after the
+            # containers holding it are stopped.
+            eprint(
+                f"Warning: failed to remove temporary Docker volume '{volume_name}' "
+                f"for now; it will be retried during cleanup. See log: {wrapper_log_path}"
+            )
 
 
 def run_partitioned_representation_methods_for_rdf_files(
@@ -9469,6 +9529,7 @@ def main():
 
         removed = failed = None
         containers_killed = containers_failed = 0
+        volumes_removed = volumes_failed = 0
         try:
             # Containers first, and for every mode -- validation, compress and
             # index all start containers too, and every one of them outlives
@@ -9483,6 +9544,18 @@ def main():
                 eprint(
                     "Interrupt cleanup: stopped containers "
                     f"killed={containers_killed}, failed={containers_failed}"
+                )
+
+            # Only now can a temporary volume be removed: Docker refuses while
+            # a container still holds it, which is why each volume's own
+            # `finally` could not do this during an interrupt.
+            volumes_removed, volumes_failed = remove_tracked_volumes(
+                run_tracker=run_tracker
+            )
+            if volumes_removed or volumes_failed:
+                eprint(
+                    "Interrupt cleanup: temporary volumes "
+                    f"removed={volumes_removed}, failed={volumes_failed}"
                 )
 
             if mode == "full":
@@ -9510,6 +9583,8 @@ def main():
                 containers_failed=containers_failed,
                 removed=removed,
                 failed=failed,
+                volumes_removed=volumes_removed,
+                volumes_failed=volumes_failed,
             )
             if checkpoint_path is not None:
                 eprint(f"Interrupt checkpoint: {checkpoint_path}")
@@ -9525,6 +9600,13 @@ def main():
 
         eprint(f"Progress log: {progress_log_path}")
     finally:
+        # Last chance for any temporary volume still outstanding. On the normal
+        # path each is already gone; this catches the one whose own removal
+        # failed and which would otherwise be left behind on a clean exit too.
+        try:
+            remove_tracked_volumes(run_tracker=run_tracker)
+        except Exception:  # noqa: BLE001 - teardown must not mask a result
+            pass
         if hasattr(signal, "SIGTERM") and original_sigterm is not None:
             signal.signal(signal.SIGTERM, original_sigterm)
         # Always report/record wrapper runtime, even on failure paths.
