@@ -56,6 +56,18 @@ except ImportError:  # pragma: no cover
     VCF = None
 
 
+def eprint(*args: Any) -> None:
+    """Print to stderr.
+
+    This runner executes standalone inside the container, so it cannot borrow
+    the identically named helper from ``vcf_rdfizer.py`` on the host. Both the
+    oversized-graph advisory and the query-timeout abandon message call this;
+    before it existed here, either one raised ``NameError`` and killed the run
+    at the exact moment it was trying to warn the operator.
+    """
+    print(*args, file=sys.stderr, flush=True)
+
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 QUERY_ROOT = SCRIPT_DIR / "queries"
 CORE_QUERIES = (
@@ -1368,25 +1380,115 @@ def _resolve_binary(env_var: str, *candidates: str) -> str:
     raise RuntimeError(f"Required binary not found in container: {candidates[0]}")
 
 
+#: Substrings that mean a decode step failed even though it exited 0. hdt-cpp's
+#: ``hdt2rdf`` is the reason this list exists: its raptor file serializer emits
+#: ``error: :0:0: write error`` once per triple and still returns success.
+STEP_ERROR_MARKERS = ("write error", "error:", "ERROR:")
+
+
 def _run_step(
-    command: list[str], *, label: str, log_dir: Path, env: dict[str, str] | None = None
+    command: list[str],
+    *,
+    label: str,
+    log_dir: Path,
+    env: dict[str, str] | None = None,
+    stdout_path: Path | None = None,
+    error_markers: tuple[str, ...] = (),
 ) -> None:
-    """Run one decode step, preserving its output for diagnosis on failure."""
+    """Run one decode step, preserving its output for diagnosis on failure.
+
+    ``stdout_path`` redirects the command's stdout to that file and keeps only
+    stderr in the log, which is how a tool that can only serialize correctly to
+    stdout is driven.
+
+    ``error_markers`` are matched against the log after a *successful* exit. An
+    exit code is only as trustworthy as the tool that returns it, and a decode
+    step that reports success while writing garbage is worse than one that
+    fails: the garbage flows downstream and the run dies somewhere unrelated,
+    hours later.
+    """
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{label}.log"
-    with log_path.open("wb") as log:
-        result = subprocess.run(
-            command, check=False, stdout=log, stderr=subprocess.STDOUT, env=env
-        )
+    if stdout_path is not None:
+        stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        with stdout_path.open("wb") as out, log_path.open("wb") as log:
+            result = subprocess.run(command, check=False, stdout=out, stderr=log, env=env)
+    else:
+        with log_path.open("wb") as log:
+            result = subprocess.run(
+                command, check=False, stdout=log, stderr=subprocess.STDOUT, env=env
+            )
+
+    tail = ""
+    try:
+        tail = log_path.read_text(encoding="utf-8", errors="replace")[-2000:]
+    except OSError:
+        pass
+
     if result.returncode != 0:
-        tail = ""
-        try:
-            tail = log_path.read_text(encoding="utf-8", errors="replace")[-2000:]
-        except OSError:
-            pass
         raise RuntimeError(
             f"{label} failed with exit code {result.returncode}. Output tail: {tail}"
         )
+
+    if error_markers:
+        try:
+            log_text = log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            log_text = tail
+        hit = next((m for m in error_markers if m in log_text), None)
+        if hit is not None:
+            raise RuntimeError(
+                f"{label} exited 0 but reported errors on stderr "
+                f"(matched {hit!r}); treating the step as failed because its "
+                f"output cannot be trusted. Output tail: {tail}"
+            )
+
+
+def _verify_ntriples(path: Path, *, label: str) -> int:
+    """Reject a materialized N-Triples file that is structurally impossible.
+
+    Cheap enough to run on any size (it reads a prefix and a suffix, never the
+    whole file) and it catches the failure mode that cost this project days: a
+    4.4 GiB "N-Triples" file containing no newline at all, whose every line was
+    a truncated subject IRI. Raptor accepts that as one enormous line and
+    degrades to quadratic behaviour, so the run does not fail -- it crawls, at
+    roughly 7 KiB/s, and looks like a hang rather than a bug.
+
+    Returns the size in bytes. Raises RuntimeError with a diagnosis otherwise.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError as error:
+        raise RuntimeError(f"{label} produced no readable output at {path}: {error}") from error
+    if size == 0:
+        raise RuntimeError(f"{label} produced an empty N-Triples file at {path}")
+
+    probe = 1024 * 1024
+    with path.open("rb") as handle:
+        head = handle.read(probe)
+        if b"\n" not in head:
+            raise RuntimeError(
+                f"{label} produced {size} bytes with no newline in the first "
+                f"{min(probe, size)}; this is not N-Triples. First 200 bytes: "
+                f"{head[:200]!r}"
+            )
+        first_line = head.split(b"\n", 1)[0].strip()
+        if not (first_line.startswith(b"<") or first_line.startswith(b"_:")):
+            raise RuntimeError(
+                f"{label} produced a first line that does not begin a triple: {first_line[:200]!r}"
+            )
+        if not first_line.endswith(b"."):
+            raise RuntimeError(
+                f"{label} produced a first line with no statement terminator: "
+                f"{first_line[:200]!r}"
+            )
+        handle.seek(max(0, size - 4096))
+        if not handle.read().endswith(b"\n"):
+            raise RuntimeError(
+                f"{label} produced a file not terminated by a newline; it is "
+                f"most likely truncated ({size} bytes)"
+            )
+    return size
 
 
 def materialize_ntriples(
@@ -1412,6 +1514,7 @@ def materialize_ntriples(
     if rdf_format == "nt.gz":
         with gzip.open(source, "rb") as handle, target.open("wb") as out:
             shutil.copyfileobj(handle, out, length=1024 * 1024)
+        _verify_ntriples(target, label="gzip-decompress")
         provenance["steps"].append({"tool": "python-gzip", "output": str(target)})
         return target, provenance
 
@@ -1419,13 +1522,31 @@ def materialize_ntriples(
         brotli = _resolve_binary("BROTLI_BIN", "brotli")
         _run_step([brotli, "-d", "-c", "-o", str(target), str(source)],
                   label="brotli-decompress", log_dir=log_dir)
+        _verify_ntriples(target, label="brotli-decompress")
         provenance["steps"].append({"tool": brotli, "output": str(target)})
         return target, provenance
 
     if rdf_format == "hdt":
         hdt2rdf = _resolve_binary("HDT2RDF_BIN", "hdt2rdf", "/usr/local/bin/hdt2rdf")
-        _run_step([hdt2rdf, str(source), str(target)], label="hdt2rdf", log_dir=log_dir)
-        provenance["steps"].append({"tool": hdt2rdf, "output": str(target)})
+        # hdt-cpp's file-output path is broken: for every output format its
+        # raptor iostream serializer emits "error: :0:0: write error" per
+        # triple, writes a truncated subject IRI with no terminator and no
+        # newline, and still exits 0. Its stdout serializer takes a different
+        # code path and is correct, verified at 200k triples with empty
+        # stderr, so the dump is taken from stdout and redirected here.
+        _run_step(
+            [hdt2rdf, "-f", "ntriples", str(source), "-"],
+            label="hdt2rdf",
+            log_dir=log_dir,
+            stdout_path=target,
+            error_markers=STEP_ERROR_MARKERS,
+        )
+        _verify_ntriples(target, label="hdt2rdf")
+        provenance["steps"].append({
+            "tool": hdt2rdf,
+            "output": str(target),
+            "mode": "stdout-redirect",
+        })
         return target, provenance
 
     if rdf_format in {"cottas", "cottas.gz", "cottas.br"}:
@@ -1449,6 +1570,7 @@ def materialize_ntriples(
             label="cottas-decompress",
             log_dir=log_dir,
         )
+        _verify_ntriples(target, label="cottas-decompress")
         provenance["steps"].append({"tool": f"{python_bin} cottas_tool.py decompress",
                                     "output": str(target)})
         if cottas_input != source:
@@ -1591,6 +1713,17 @@ DEFAULT_QLEVER_PORT = 7019
 DEFAULT_QLEVER_MEMORY_GB = 4
 DEFAULT_QLEVER_STARTUP_TIMEOUT = 900
 DEFAULT_QUERY_TIMEOUT = 3600
+DEFAULT_COMUNICA_PORT = 7020
+#: Seconds to wait for comunica-sparql-file-http to bind its port. The graph is
+#: not read yet at that point, so this is process startup only and stays short.
+DEFAULT_COMUNICA_BIND_TIMEOUT = 120
+#: Seconds allowed for the warm-up query that proves the endpoint can read the
+#: source before the suite commits to it. Budgeted separately from a normal
+#: query because on a large graph even a LIMIT 1 has to start streaming it.
+DEFAULT_COMUNICA_WARMUP_TIMEOUT = 3600
+#: The HDT endpoint runs alongside the N-Triples one within a single run, so
+#: they must not contend for a port.
+DEFAULT_HDT_ENDPOINT_PORT = 7021
 
 
 QLEVER_STATUS_FILE = Path("/opt/vcf-rdfizer/qlever-status.txt")
@@ -1690,9 +1823,10 @@ UNINDEXED_ENGINE_ADVICE_BYTES = 4 * 1024 * 1024 * 1024
 def engine_advice(engine_name: str, source: Path, query_count: int, timeout: int) -> str | None:
     """Warn before a run commits to an engine that cannot finish it.
 
-    Comunica has no persistent index: every query re-parses the whole source
-    into memory. On a cohort-scale graph each parse can exceed the per-query
-    timeout, and the cost is paid again for every remaining query.
+    Comunica still has no index. The endpoint removes per-query engine startup
+    but streams the source for every query, so a full-scan query re-reads the
+    whole graph each time. On a large graph that is the dominant cost and no
+    amount of tuning fixes it -- only an engine that indexes will.
     """
     if engine_name != "comunica":
         return None
@@ -1703,12 +1837,10 @@ def engine_advice(engine_name: str, source: Path, query_count: int, timeout: int
     if size < UNINDEXED_ENGINE_ADVICE_BYTES:
         return None
     return (
-        f"comunica re-parses the whole graph for each of the {query_count} "
-        f"queries and keeps it in memory; this source is "
-        f"{size / (1024 ** 3):.1f} GiB. Worst case at the current "
-        f"--query-timeout is {query_count * timeout / 3600:.0f}h. Prefer "
-        f"--engine qlever, or validate an indexed artifact "
-        f"(--validation-targets hdt)."
+        f"comunica has no index and streams the source for every query, so "
+        f"each of the {query_count} full-scan queries re-reads all "
+        f"{size / (1024 ** 3):.1f} GiB. Prefer --engine qlever, or validate an "
+        f"indexed artifact (--validation-targets hdt)."
     )
 
 
@@ -1757,62 +1889,259 @@ def _terminate_process_group(process: subprocess.Popen) -> None:
         pass
 
 
-class ComunicaEngine(QueryEngine):
-    """Query the N-Triples file directly with comunica-sparql-file.
+class ComunicaHttpEndpointMixin:
+    """One long-lived Comunica endpoint, shared by every query in the suite.
 
-    Comunica has no persistent index: each invocation parses the whole source
-    into an in-memory store, answers one query, and exits. That is fine for a
-    fixture and unworkable for a cohort-scale graph, where the parse alone can
-    exceed the per-query timeout -- and then does so again for every remaining
-    query. ``engine_advice`` reports that before a run commits to it.
+    Comunica's one-shot CLIs (``comunica-sparql-file``, ``comunica-sparql-hdt``)
+    were spawned once per query, so each of the 27 queries paid Node startup
+    and engine initialisation again. The matching ``*-http`` binaries pay that
+    once and answer every query from the running process.
+
+    Measured in this image on 1.5M N-Triples, per ``SELECT (COUNT(*))``:
+
+    ==========================  ========
+    one-shot ``comunica-sparql-file``  26.0s
+    this endpoint                      10.3s
+    ==========================  ========
+
+    What it does **not** do is materialize the graph. ``LIMIT 1`` answers in
+    0.59s while ``COUNT(*)`` takes 10s on every repeat, which is the signature
+    of a source streamed per query rather than an in-memory store. Loading it
+    into one instead was measured and rejected: an ``N3.Store`` of the same
+    1.5M triples cost 2.45 GiB and made ``COUNT`` *slower* (15.0s), which
+    extrapolates to roughly 145 GiB for an 88M-triple cohort graph. For a graph
+    that large the answer is an engine that indexes -- QLever, or the HDT
+    artifact -- not a bigger heap.
+
+    So the saving here is per-query engine startup, which is real and repeated
+    27 times, and the scan cost is unchanged. Per-query worker recycling
+    (``--freshWorker``) would give the startup cost straight back and is never
+    passed. The worker count is pinned to 1: workers do not share state, so
+    each extra one only adds another process reading the same file.
     """
 
-    name = "comunica"
+    #: Endpoint binary, e.g. "comunica-sparql-file-http".
+    endpoint_binary = ""
+    #: Key in ``options`` holding this endpoint's port.
+    endpoint_port_option = "comunica_port"
+    default_endpoint_port = DEFAULT_COMUNICA_PORT
+    #: Guidance appended when the binary is missing from the image.
+    endpoint_missing_hint = "rebuild the image or select --engine qlever"
 
-    def start(self) -> None:
-        self.executable = shutil.which("comunica-sparql-file")
+    def _init_endpoint(self, options: dict[str, Any]) -> None:
+        self.port = int(
+            options.get(self.endpoint_port_option) or self.default_endpoint_port
+        )
+        self.bind_timeout = int(
+            options.get("comunica_bind_timeout") or DEFAULT_COMUNICA_BIND_TIMEOUT
+        )
+        self.warmup_timeout = int(
+            options.get("comunica_warmup_timeout")
+            or max(DEFAULT_COMUNICA_WARMUP_TIMEOUT, self.query_timeout)
+        )
+        self.server: subprocess.Popen | None = None
+        self.executable: str | None = None
+        self.endpoint: str | None = None
+        self.warmup_seconds: float | None = None
+        self.command: list[str] = []
+
+    def _endpoint_source_argument(self) -> str:
+        """The source argv entry, in whatever form this engine's binary needs."""
+        raise NotImplementedError
+
+    def _candidate_endpoints(self) -> list[str]:
+        return [
+            f"http://127.0.0.1:{self.port}/sparql",
+            f"http://127.0.0.1:{self.port}/",
+        ]
+
+    def _require_endpoint_binary(self) -> str:
+        """Fail before any expensive setup when the binary is missing.
+
+        An engine that cannot possibly run should say so before an artifact is
+        built for it, not after.
+        """
+        self.executable = shutil.which(self.endpoint_binary)
         if not self.executable:
             raise RuntimeError(
-                "comunica-sparql-file is not installed in this image; rebuild it or "
-                "select --engine qlever"
+                f"{self.endpoint_binary} is not installed in this image; "
+                f"{self.endpoint_missing_hint}"
+            )
+        return self.executable
+
+    def _start_endpoint(self) -> None:
+        if not self.executable:
+            self._require_endpoint_binary()
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.command = [
+            self.executable,
+            self._endpoint_source_argument(),
+            "-p", str(self.port),
+            # One worker: workers share no state, so extra ones would only add
+            # more processes reading the same source.
+            "-w", "1",
+            # Comunica's own per-query ceiling, aligned with the client side so
+            # neither silently pre-empts the other.
+            "-t", str(self.query_timeout),
+        ]
+        server_log = self.log_dir / f"{self.name}-server.log"
+        self.server = subprocess.Popen(
+            self.command,
+            stdout=server_log.open("wb"),
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        self._await_bind(server_log)
+        self._await_warm(server_log)
+
+    def _await_bind(self, server_log: Path) -> None:
+        """Wait for the port to answer at all. The graph is not read yet."""
+        deadline = time.monotonic() + self.bind_timeout
+        last_error = "endpoint never bound"
+        while time.monotonic() < deadline:
+            self._assert_alive(server_log)
+            for endpoint in self._candidate_endpoints():
+                try:
+                    self._post(endpoint, "ASK { }", timeout=10)
+                    self.endpoint = endpoint
+                    return
+                except Exception as error:  # noqa: BLE001 - readiness probe
+                    last_error = str(error)
+            time.sleep(0.5)
+        raise RuntimeError(
+            f"comunica endpoint did not bind port {self.port} within "
+            f"{self.bind_timeout}s: {last_error}"
+        )
+
+    def _await_warm(self, server_log: Path) -> None:
+        """Prove the endpoint can actually read the source, before the suite runs.
+
+        Charged to setup rather than to the first query, so one query is not
+        billed for readiness that every later query got for free.
+        """
+        assert self.endpoint is not None
+        started = time.monotonic()
+        try:
+            self._post(
+                self.endpoint, "SELECT * WHERE { ?s ?p ?o } LIMIT 1",
+                timeout=self.warmup_timeout,
+            )
+        except Exception as error:  # noqa: BLE001 - surfaced as engine failure
+            self._assert_alive(server_log)
+            raise RuntimeError(
+                f"{self.name} could not read {self._endpoint_source_argument()} "
+                f"within {self.warmup_timeout}s (raise --comunica-warmup-timeout, "
+                f"or use --engine qlever): {error}"
+            ) from error
+        self.warmup_seconds = time.monotonic() - started
+
+    def _assert_alive(self, server_log: Path) -> None:
+        if self.server is not None and self.server.poll() is not None:
+            tail = ""
+            try:
+                tail = server_log.read_text(encoding="utf-8", errors="replace")[-2000:]
+            except OSError:
+                pass
+            raise RuntimeError(
+                f"{self.name} endpoint exited with code {self.server.returncode}. "
+                f"Log tail: {tail}"
             )
 
-    def describe(self) -> dict[str, Any]:
+    def _post(self, endpoint: str, query: str, *, timeout: int) -> bytes:
+        import urllib.request
+
+        request = urllib.request.Request(
+            endpoint,
+            data=urllib.parse.urlencode({"query": query}).encode("utf-8"),
+            headers={
+                "Accept": "application/sparql-results+json",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.read()
+
+    def endpoint_describe(self) -> dict[str, Any]:
+        """Endpoint-specific report fields, merged by each engine's describe."""
         return {
-            "engine": self.name,
-            "setupSeconds": self.setup_seconds,
             "version": tool_version(
-                ["comunica-sparql-file", "--version"], table_label="Comunica Engine"
+                [self.endpoint_binary, "--version"], table_label="Comunica Engine"
             ),
-            "mode": "in-memory file query",
+            "mode": "one long-lived endpoint, source streamed per query",
+            "endpoint": self.endpoint,
+            "port": self.port,
+            # Readiness, not a graph load: the source is not materialized.
+            "warmupSeconds": self.warmup_seconds,
+            "command": list(self.command),
         }
 
     def execute(self, query_id: str, query_path: Path) -> dict[str, Any]:
         raw_path = self.raw_dir / f"{query_id}.sparql.json"
         stderr_path = self.raw_dir / f"{query_id}.stderr.txt"
-        time_path = self.raw_dir / f"{query_id}.time.txt"
-        command = [
-            self.executable,
-            str(self.source),
-            "-f",
-            str(query_path),
-            "-t",
-            "application/sparql-results+json",
-        ]
-        timed = (
-            ["/usr/bin/time", "-v", "-o", str(time_path), *command]
-            if tool_version(["/usr/bin/time", "--version"])
-            else command
-        )
         started = time.monotonic()
-        returncode, error = run_query_process(
-            timed, stdout_path=raw_path, stderr_path=stderr_path,
-            timeout=self.query_timeout,
-        )
+        if self.endpoint is None:
+            message = f"{self.name} endpoint is not running"
+            stderr_path.write_text(message, encoding="utf-8")
+            raw_path.write_bytes(b"")
+            return self._envelope(
+                query_id, query_path, returncode=1, started=started,
+                raw_path=raw_path, stderr_path=stderr_path, error=message,
+            )
+        try:
+            payload = self._post(
+                self.endpoint, query_path.read_text(encoding="utf-8"),
+                timeout=self.query_timeout,
+            )
+        except Exception as error:  # noqa: BLE001 - reported as EXECUTION_FAILED
+            stderr_path.write_text(str(error), encoding="utf-8")
+            raw_path.write_bytes(b"")
+            return self._envelope(
+                query_id, query_path, returncode=1, started=started,
+                raw_path=raw_path, stderr_path=stderr_path, error=str(error),
+            )
+        raw_path.write_bytes(payload)
+        stderr_path.write_bytes(b"")
         return self._envelope(
-            query_id, query_path, returncode=returncode, started=started,
-            raw_path=raw_path, stderr_path=stderr_path, time_path=time_path, error=error,
+            query_id, query_path, returncode=0, started=started,
+            raw_path=raw_path, stderr_path=stderr_path,
         )
+
+    def stop(self) -> None:
+        if self.server is not None and self.server.poll() is None:
+            # The endpoint holds the whole graph in memory; a survivor would
+            # starve everything that runs after it, so the group is signalled
+            # rather than just the leader.
+            _terminate_process_group(self.server)
+        self.server = None
+        self.endpoint = None
+
+
+class ComunicaEngine(ComunicaHttpEndpointMixin, QueryEngine):
+    """Serve the N-Triples file from one load via comunica-sparql-file-http."""
+
+    name = "comunica"
+    endpoint_binary = "comunica-sparql-file-http"
+    endpoint_port_option = "comunica_port"
+    default_endpoint_port = DEFAULT_COMUNICA_PORT
+
+    def __init__(self, source: Path, *, raw_dir: Path, scratch: Path, options: dict[str, Any]):
+        super().__init__(source, raw_dir=raw_dir, scratch=scratch, options=options)
+        self.log_dir = raw_dir / "engine"
+        self._init_endpoint(options)
+
+    def _endpoint_source_argument(self) -> str:
+        return str(self.source)
+
+    def start(self) -> None:
+        self._start_endpoint()
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            "engine": self.name,
+            "setupSeconds": self.setup_seconds,
+            **self.endpoint_describe(),
+        }
 
 
 class QleverEngine(QueryEngine):
@@ -2080,11 +2409,30 @@ class NativeArtifactEngine(QueryEngine):
         }
 
 
-class HdtEngine(NativeArtifactEngine):
-    """Query a .hdt artifact in place with Comunica's HDT engine."""
+class HdtEngine(ComunicaHttpEndpointMixin, NativeArtifactEngine):
+    """Query a .hdt artifact in place, from one load, over Comunica's endpoint.
+
+    The one-shot ``comunica-sparql-hdt`` CLI was previously spawned per query,
+    so every query re-opened the artifact and re-initialised the engine. HDT is
+    memory-mapped rather than parsed, so the per-query cost is far smaller than
+    Comunica's N-Triples reload -- but it is still paid 27 times for nothing,
+    and it makes the measured query time include engine startup, which is
+    exactly what a benchmark must not do.
+    """
 
     name = "hdt"
     artifact_format = "hdt"
+    endpoint_binary = "comunica-sparql-hdt-http"
+    endpoint_port_option = "hdt_port"
+    default_endpoint_port = DEFAULT_HDT_ENDPOINT_PORT
+    endpoint_missing_hint = (
+        "so HDT cannot be queried natively. Rebuild the image, or validate the "
+        "HDT artifact by decoding it (--rdf file.hdt --engine comunica)"
+    )
+
+    def __init__(self, source: Path, *, raw_dir: Path, scratch: Path, options: dict[str, Any]):
+        super().__init__(source, raw_dir=raw_dir, scratch=scratch, options=options)
+        self._init_endpoint(options)
 
     def build_artifact(self, target: Path) -> None:
         rdf2hdt = _resolve_binary("RDF2HDT_BIN", "rdf2hdt", "/usr/local/bin/rdf2hdt")
@@ -2093,36 +2441,25 @@ class HdtEngine(NativeArtifactEngine):
             label="hdt-engine-build", log_dir=self.log_dir,
         )
 
-    def start(self) -> None:
-        self.executable = shutil.which("comunica-sparql-hdt")
-        if not self.executable:
-            raise RuntimeError(
-                "comunica-sparql-hdt is not installed in this image, so HDT cannot "
-                "be queried natively. Rebuild the image, or validate the HDT "
-                "artifact by decoding it (--rdf file.hdt --engine comunica)"
-            )
-        super().start()
+    def _endpoint_source_argument(self) -> str:
+        # Comunica needs the source type declared: a bare path is treated as a
+        # link to dereference and fails with "could not dereference".
+        return f"hdt@{self.artifact}"
 
-    def execute(self, query_id: str, query_path: Path) -> dict[str, Any]:
-        raw_path = self.raw_dir / f"{query_id}.sparql.json"
-        stderr_path = self.raw_dir / f"{query_id}.stderr.txt"
-        command = [
-            self.executable,
-            # Comunica needs the source type declared: a bare path is treated
-            # as a link to dereference and fails with "could not dereference".
-            f"hdt@{self.artifact}",
-            "-f", str(query_path),
-            "-t", "application/sparql-results+json",
-        ]
-        started = time.monotonic()
-        returncode, error = run_query_process(
-            command, stdout_path=raw_path, stderr_path=stderr_path,
-            timeout=self.query_timeout,
-        )
-        return self._envelope(
-            query_id, query_path, returncode=returncode, started=started,
-            raw_path=raw_path, stderr_path=stderr_path, error=error,
-        )
+    def start(self) -> None:
+        # Check the binary before resolving the artifact: building an HDT for
+        # an engine that cannot run wastes the most expensive step in the run.
+        self._require_endpoint_binary()
+        # Then resolve (or build) the artifact; the endpoint needs its path.
+        NativeArtifactEngine.start(self)
+        self._start_endpoint()
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            **NativeArtifactEngine.describe(self),
+            **self.endpoint_describe(),
+            "mode": "native hdt query, no decode, single load served over HTTP",
+        }
 
 
 class CottasEngine(NativeArtifactEngine):
@@ -2733,7 +3070,7 @@ def build_manifest(
             "python": platform.python_version(),
             "cyvcf2": getattr(cyvcf2, "__version__", None),
             "bcftools": tool_version(["bcftools", "--version"]), "node": tool_version(["node", "--version"]),
-            "comunicaQuerySparqlFile": tool_version(["comunica-sparql-file", "--version"], table_label="Comunica Engine"),
+            "comunicaQuerySparqlFile": tool_version(["comunica-sparql-file-http", "--version"], table_label="Comunica Engine"),
             "rapper": tool_version(["rapper", "--version"]),
         },
         "queries": {path.stem: {"path": str(path), "sha256": sha256_file(path)} for path in query_paths},
@@ -2823,6 +3160,10 @@ def run_validation(args: argparse.Namespace) -> int:
                 "query_timeout": args.query_timeout,
                 "extra_index_args": list(args.qlever_index_arg),
                 "extra_server_args": list(args.qlever_server_arg),
+                "comunica_port": args.comunica_port,
+                "hdt_port": args.hdt_port,
+                "comunica_bind_timeout": args.comunica_bind_timeout,
+                "comunica_warmup_timeout": args.comunica_warmup_timeout,
             }
             engine_options["artifact_path"] = str(args.rdf)
             engine_options["artifact_format"] = args.rdf_format
@@ -2901,13 +3242,18 @@ def run_validation(args: argparse.Namespace) -> int:
                             detail=f"{engine_name}: completed {query_id}",
                         )
 
-                        # A query that exceeded the timeout says the engine
-                        # cannot answer this graph in the time allowed, and the
-                        # remaining queries are no easier. Running all of them
-                        # anyway costs one timeout each: with the defaults that
-                        # is 27 hours per engine per target, which is how a
-                        # validation step comes to look like a hang rather than
-                        # a failure. Stop and report instead.
+                        # A query that fails, times out, or returns the wrong
+                        # answer never stops the suite: its verdict is recorded
+                        # and the next query runs. Coverage is the point --
+                        # "26 of 27 passed, q11 disagreed" is a result, while
+                        # "stopped at q01" is not.
+                        #
+                        # --stop-after-query-timeout opts back into abandoning
+                        # the rest, which caps the worst case at one timeout
+                        # per engine rather than one per query. It is off by
+                        # default now that each engine loads the graph once
+                        # instead of once per query, so the remaining queries
+                        # no longer each re-pay that load.
                         if (
                             args.stop_after_query_timeout
                             and executions[query_id].get("exitCode") == 124
@@ -3115,15 +3461,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--stop-after-query-timeout",
+        dest="stop_after_query_timeout",
+        action="store_true",
+        default=False,
+        help=(
+            "Abandon an engine's remaining queries once one exceeds the "
+            "per-query timeout. Off by default: a validation suite reports "
+            "coverage, so a run is worth far more when every query has a "
+            "recorded verdict than when it stops at the first slow one. Turn "
+            "this on to cap the worst case at one timeout per engine instead "
+            "of one per query"
+        ),
+    )
+    parser.add_argument(
         "--continue-after-query-timeout",
         dest="stop_after_query_timeout",
         action="store_false",
-        default=True,
         help=(
-            "Keep running an engine's remaining queries after one exceeds the "
-            "per-query timeout. Off by default: a timeout means the engine "
-            "cannot answer this graph in the time allowed, and the remaining "
-            "queries cost one timeout each"
+            "Run every query even after one times out. This is now the "
+            "default; the flag is kept so existing callers keep working"
         ),
     )
     parser.add_argument(
@@ -3143,6 +3500,40 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_QLEVER_PORT,
         help=f"Container-local QLever port (default: {DEFAULT_QLEVER_PORT})",
+    )
+    parser.add_argument(
+        "--comunica-port",
+        type=int,
+        default=DEFAULT_COMUNICA_PORT,
+        help=f"Container-local Comunica endpoint port (default: {DEFAULT_COMUNICA_PORT})",
+    )
+    parser.add_argument(
+        "--hdt-port",
+        type=int,
+        default=DEFAULT_HDT_ENDPOINT_PORT,
+        help=(
+            "Container-local port for the native HDT endpoint "
+            f"(default: {DEFAULT_HDT_ENDPOINT_PORT})"
+        ),
+    )
+    parser.add_argument(
+        "--comunica-bind-timeout",
+        type=int,
+        default=DEFAULT_COMUNICA_BIND_TIMEOUT,
+        help=(
+            "Seconds to wait for the Comunica endpoint to bind its port, before "
+            f"the graph is read (default: {DEFAULT_COMUNICA_BIND_TIMEOUT})"
+        ),
+    )
+    parser.add_argument(
+        "--comunica-warmup-timeout",
+        type=int,
+        default=DEFAULT_COMUNICA_WARMUP_TIMEOUT,
+        help=(
+            "Seconds allowed for the Comunica endpoint's warm-up query, which "
+            "proves it can read the source before the suite starts "
+            f"(default: {DEFAULT_COMUNICA_WARMUP_TIMEOUT})"
+        ),
     )
     parser.add_argument(
         "--qlever-startup-timeout",
@@ -3280,6 +3671,8 @@ def resolve_args(parser: argparse.ArgumentParser, argv: list[str] | None = None)
         ("--query-timeout", args.query_timeout),
         ("--qlever-memory-gb", args.qlever_memory_gb),
         ("--qlever-startup-timeout", args.qlever_startup_timeout),
+        ("--comunica-bind-timeout", args.comunica_bind_timeout),
+        ("--comunica-warmup-timeout", args.comunica_warmup_timeout),
     ):
         if value <= 0:
             parser.error(f"{name} must be a positive integer")
@@ -3288,6 +3681,12 @@ def resolve_args(parser: argparse.ArgumentParser, argv: list[str] | None = None)
         parser.error("--validation-time-budget must be zero or a positive integer")
     if not 1 <= args.qlever_port <= 65535:
         parser.error("--qlever-port must be between 1 and 65535")
+    if not 1 <= args.comunica_port <= 65535:
+        parser.error("--comunica-port must be between 1 and 65535")
+    if not 1 <= args.hdt_port <= 65535:
+        parser.error("--hdt-port must be between 1 and 65535")
+    if len({args.comunica_port, args.qlever_port, args.hdt_port}) != 3:
+        parser.error("--comunica-port, --qlever-port and --hdt-port must all differ")
     if args.shacl_shapes is not None:
         args.shacl_shapes = args.shacl_shapes.resolve()
         if not args.shacl_shapes.is_file():

@@ -210,10 +210,26 @@ number, and no progress history is retained in memory.
 
 ## 7. Interrupts and exit codes
 
-`Ctrl+C` exits with **130**, writes progress to `logs/progress.log`, and
-performs best-effort cleanup of tracked intermediates. Raw RDF cleanup on
-interrupt follows `--keep-rmlstreamer-rdf-output`: with it, raw RDF is
-preserved; without it, tracked raw RDF files are removed.
+`Ctrl+C` exits with **130** and runs cleanup in a fixed order:
+
+1. **Stop this run's containers.** Every container the wrapper starts carries a
+   `vcf-rdfizer.run=<run-id>-<pid>` label, and cleanup kills exactly the ones
+   matching its own label — a concurrent run's containers are never touched.
+2. **Remove tracked intermediates.** Raw RDF follows
+   `--keep-rmlstreamer-rdf-output`: with it, raw RDF is preserved; without it,
+   tracked raw RDF files are removed.
+3. **Write `interrupt-checkpoint.json`** into the run's metrics directory,
+   recording the stages that completed, the last progress event, how many
+   containers were stopped, and what was removed.
+
+The order matters. Killing the wrapper does not kill its containers, and until
+this existed an interrupted run deleted files that its own container was still
+reading — one such orphan ran for three days after the run had "finished",
+holding 17 GB and a core, working against inputs that no longer existed.
+
+A second `Ctrl+C` during cleanup is ignored, so an impatient operator cannot
+abort the step that stops the containers. If cleanup itself fails the wrapper
+still exits 130 and records `Interrupt cleanup error` in the progress log.
 
 Otherwise the wrapper exits `0` on success and non-zero on failure. In full mode
 with `--validate`, a validation failure sets a non-zero exit even when the

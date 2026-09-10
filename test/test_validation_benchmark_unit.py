@@ -157,27 +157,64 @@ class NativeArtifactEngineTests(VerboseTestCase):
 
         Verified against comunica-sparql-hdt 5.0.1: '/tmp/g.hdt' reports
         "Could not dereference", while 'hdt@/tmp/g.hdt' answers the query.
+        The typed prefix now goes to the endpoint at startup rather than into
+        each query's argv, but it is no less required.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            raw_dir = tmp_path / "raw"
+            raw_dir.mkdir()
+            engine = self._engine("hdt", tmp_path)
+            engine.artifact = tmp_path / "cohort.hdt"
+            self.assertEqual(
+                engine._endpoint_source_argument(),
+                f"hdt@{tmp_path / 'cohort.hdt'}",
+            )
+
+    def test_hdt_loads_the_artifact_once_for_the_whole_query_set(self):
+        """Every query must be answered from one load, not one process each.
+
+        The one-shot CLI was spawned per query, so each of the 27 queries
+        re-opened the artifact and re-initialised the engine - and every
+        measured query time silently included that startup.
         """
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             raw_dir = tmp_path / "raw"
             raw_dir.mkdir()
             query = tmp_path / "q.rq"
-            query.write_text("SELECT * WHERE { ?s ?p ?o }", encoding="utf-8")
+            query_text = "SELECT * WHERE { ?s ?p ?o }"
+            query.write_text(query_text, encoding="utf-8")
             engine = self._engine("hdt", tmp_path)
-            engine.executable = "/usr/bin/comunica-sparql-hdt"
             engine.artifact = tmp_path / "cohort.hdt"
-            recorded = {}
+            posted = []
 
-            def fake_run(command, **kwargs):
-                recorded["command"] = command
-                return 0, None
+            def fake_post(self, endpoint, q, *, timeout):
+                posted.append(q)
+                return b'{"results": {"bindings": []}}'
 
-            with mock.patch.object(V, "run_query_process", side_effect=fake_run):
-                envelope = engine.execute("q01", query)
+            with mock.patch.object(
+                        V.shutil, "which",
+                        return_value="/usr/bin/comunica-sparql-hdt-http",
+                    ), \
+                    mock.patch.object(V, "tool_version", return_value=None), \
+                    mock.patch.object(
+                        V.NativeArtifactEngine, "start", lambda self: None
+                    ), \
+                    mock.patch.object(V.subprocess, "Popen") as popen, \
+                    mock.patch.object(V.ComunicaHttpEndpointMixin, "_post", fake_post):
+                popen.return_value.poll.return_value = None
+                engine.start()
+                for query_id in ("q01", "q02", "q03"):
+                    envelope = engine.execute(query_id, query)
 
-        self.assertEqual(recorded["command"][1], f"hdt@{tmp_path / 'cohort.hdt'}")
-        self.assertIn("application/sparql-results+json", recorded["command"])
+        # One server process for the whole set.
+        self.assertEqual(popen.call_count, 1)
+        command = popen.call_args[0][0]
+        self.assertIn(f"hdt@{tmp_path / 'cohort.hdt'}", command)
+        self.assertEqual(command[command.index("-w") + 1], "1")
+        # Three queries answered from that single load.
+        self.assertEqual(len([q for q in posted if q == query_text]), 3)
         self.assertEqual(envelope["status"], "PASS")
         self.assertEqual(envelope["engine"], "hdt")
 

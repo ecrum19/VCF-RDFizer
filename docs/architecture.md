@@ -54,7 +54,7 @@ run entirely on the host.
 | Docker orchestration | Mounts, user mapping, environment forwarding, permission auto-fix |
 | Progress rendering | Containers write a JSONL sidecar; the host polls and renders it |
 | Metrics assembly | Every stage's JSON is collected into one `run_metrics/` tree |
-| Interrupt handling | `Ctrl+C` triggers best-effort cleanup of tracked intermediates |
+| Interrupt handling | `Ctrl+C` stops this run's labelled containers, then cleans tracked intermediates, then writes a checkpoint |
 | Optional data linking | Python plug-ins, reference/response caches and an atomic side-graph share one host runner for full and post-hoc mode |
 
 ## 3. Container responsibilities

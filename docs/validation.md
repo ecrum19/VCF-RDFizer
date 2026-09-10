@@ -26,35 +26,56 @@ only reports are retained.
 
 ## Choosing an engine, and what happens when it cannot keep up
 
-**Comunica has no persistent index.** `comunica-sparql-file` parses the whole
-source into an in-memory store, answers one query, and exits — so a run pays
-that parse **once per query**, 27 times. That is fine for a fixture and
-unworkable for a cohort-scale graph, where the parse alone can exceed the
-per-query timeout.
+**Every engine is now set up once per target**, and all 27 queries reuse that
+setup. Setup is timed separately as `setupSeconds` so a benchmark can attribute
+it correctly instead of smearing it across 27 query timings.
 
-**QLever builds an index once** and answers every query from it. On a large
-graph the index build dominates and the queries are cheap. This is why a graph
-can pass with QLever and time out with Comunica: it is a scale property of the
-engine, not a disagreement about the data.
+| Engine | What is paid once |
+| --- | --- |
+| `comunica` | one `comunica-sparql-file-http` process: Node startup and engine init |
+| `hdt` | one `comunica-sparql-hdt-http` process, holding the memory-mapped `.hdt` |
+| `qlever` | an on-disk index build, then its own HTTP server |
+| `cottas` | one `COTTASStore`-backed rdflib graph |
+
+Earlier releases spawned the one-shot `comunica-sparql-file` and
+`comunica-sparql-hdt` CLIs **once per query**, paying startup 27 times.
+Measured in this image on 1.5M N-Triples, per `SELECT (COUNT(*))`:
+
+| | per query |
+| --- | --- |
+| one-shot `comunica-sparql-file` | 26.0s |
+| `comunica-sparql-file-http` endpoint | 10.3s |
+
+**Comunica still has no index, and the endpoint does not change that.** It
+streams the source for every query: `LIMIT 1` answers in 0.59s while `COUNT(*)`
+takes 10s on every repeat. So a full-scan query still re-reads the whole graph
+each time — the endpoint removes per-query *startup*, not per-query *scanning*.
+
+Materializing the graph into an in-memory store instead was measured and
+rejected: an `N3.Store` of the same 1.5M triples cost 2.45 GiB and made `COUNT`
+*slower* (15.0s), which extrapolates to roughly 145 GiB for an 88M-triple
+cohort graph. Above fixture scale the answer is an engine that indexes, not a
+bigger heap.
 
 | Graph size | Recommended |
 | --- | --- |
 | Fixtures, small VCFs | `--validation-engine comunica` (default; no index build) |
 | Anything above a few GiB of N-Triples | `--validation-engine qlever`, or validate the indexed artifact with `--validate-artifacts hdt` |
 
-Above 4 GiB the runner warns before it starts, states the worst case at the
-current timeout, and names the alternatives.
+Above 4 GiB the runner warns before it starts and names the alternatives.
 
 ### If validation seems to hang
 
-It is almost certainly an engine that cannot answer the graph inside
-`--validation-query-timeout` (default 3600s). Since this is per query and there
-are 27 of them, a run that answers none of them used to take 27 hours per engine
-per target before reporting anything.
+First check `setupSeconds` in the engine report. Slow *setup* is a scale
+problem (an index build, or a source the endpoint struggles to read); a slow
+*query* is a `--validation-query-timeout` problem (default 3600s).
 
-That no longer happens: the first query to exceed the timeout abandons that
-engine's remaining queries, and the report records which query tripped it and
-how many were skipped:
+**Every query runs, always.** A query that fails, times out, or returns the
+wrong answer is recorded and the suite moves on — a validation run is a
+coverage report, and "26 of 27 passed, q11 disagreed" is a result while
+"stopped at q01" is not. `--validation-stop-after-query-timeout` opts into
+abandoning an engine's remaining queries after the first timeout, which caps
+the worst case at one timeout per engine rather than one per query:
 
 ```json
 {"status": "EXECUTION_FAILED",
@@ -62,10 +83,10 @@ how many were skipped:
  "queriesRun": 1, "queriesPlanned": 27}
 ```
 
-Options from there:
+Options for a graph that is genuinely too large:
 
 ```bash
-# Index once and query from it, instead of re-parsing per query.
+# Build an index once and query from it.
 vcf-rdfizer --mode full -i cohort.vcf.gz --validate --validation-engine qlever -o ./out
 
 # Or validate the HDT artifact, which is already indexed.
@@ -76,9 +97,20 @@ vcf-rdfizer --mode full -i cohort.vcf.gz --validate \
   --validation-query-timeout 14400 --validation-time-budget 86400 -o ./out
 ```
 
-`--validation-continue-after-query-timeout` restores the old behaviour of
-running every query regardless; it is off by default because the remaining
-queries are no easier than the one that just failed.
+### A decode that reports success and writes garbage
+
+Every decode into N-Triples is now checked structurally before anything reads
+it: non-empty, newline-terminated, with a parseable first statement. A step
+that exits 0 but writes errors to stderr is treated as failed.
+
+This exists because hdt-cpp's `hdt2rdf` **file** serializer is broken: it emits
+`error: :0:0: write error` once per triple, writes truncated subject IRIs with
+no terminators and no newlines at all, and still exits 0. Its stdout serializer
+is correct, so the decode is taken from stdout and redirected. Left unchecked,
+the malformed dump reached `rapper`, which saw one multi-gigabyte "line",
+degraded to quadratic parsing, and spent 38 hours reaching 23% of a 4.4 GiB
+file — a hang, in every way that matters, produced by a tool that reported
+success.
 
 Queries run in their own process session, so a timeout kills the engine along
 with its `/usr/bin/time` wrapper. Before that fix the engine survived the
@@ -534,23 +566,62 @@ Results are written to the run's canonical metrics tree:
 <out>/run_metrics/<input-label>__<run-id>/reports/validation/<validation-id>/
 ```
 
-Detailed results live beneath `reports/validation/`, so they are indexed by
-the same `summary.json` used for conversion and compression metrics.
+### The tree
 
-Important files include `summary.json`, `manifest.json`, `parser.json`,
-`rdf-validation.json`, `materialization.json`, `preflight.json`, `sparql.json`,
-`comparison.json`, `benchmark.json` and `benchmark.csv`. Raw SPARQL Results
-JSON, stderr, and query resource logs are in `raw/<engine>/`; normalized results
-are in `normalized/`. `manifest.json` records the engine that ran (including
-QLever's exact argv), the source artifact format and checksum, and every decode
-step; `materialization.json` records how a compressed or indexed artifact was
-turned into N-Triples and how many triples that yielded.
+```text
+<out>/run_metrics/<input-label>__<run-id>/
+├── summary.json                      ← start here: a `validation` array indexes every target
+├── stages/validation/<id>.json       ← one compact stage report per target
+└── reports/validation/<id>/          ← the detail for that target
+    ├── summary.json                    verdict, engines, pointers
+    ├── manifest.json                   provenance
+    ├── parser.json                     what the oracle read from the VCF
+    ├── sparql.json                     what the queries got from the graph
+    ├── comparison.json                 the two, compared per query
+    ├── preflight.json                  graph-integrity gates
+    ├── rdf-validation.json             syntax check and parsed triple count
+    ├── materialization.json            how a compressed artifact was decoded
+    ├── benchmark.json / benchmark.csv  timings
+    ├── shacl.json / shacl-report.txt   only with --shacl-shapes
+    ├── engine-agreement.json           only with several engines
+    ├── engines/<name>/                 only with several engines
+    ├── raw/<engine>/                   raw engine output
+    └── normalized/                     per-query rows the comparison used
+```
 
-A multi-engine run adds `engines/<name>/` - one `preflight.json`,
-`sparql.json`, `comparison.json` and `query-executions.json` per engine - and
-`engine-agreement.json`, which records whether every engine returned the same
-normalized results and, if not, which queries differed. The top-level reports
-remain those of the primary (first-named) engine.
+### What each file answers
+
+| File | Open it when you want to know |
+| --- | --- |
+| `summary.json` | The verdict, which engines ran and what each returned, and where the rest is. **Start here.** |
+| `comparison.json` | *Why* a run is `MISMATCH`: per query, the rows that were missing, extra, or differing |
+| `parser.json` | What the oracle independently computed **from the VCF** — the side of the comparison that does not involve RDF |
+| `sparql.json` | What the queries returned **from the graph**, normalized — the other side |
+| `preflight.json` | Which integrity gate failed on a `BLOCKED_BY_PREFLIGHT`: blank nodes, empty terms, duplicate statements, record cardinality, missing-token conformance, representation profile |
+| `rdf-validation.json` | Whether the N-Triples parsed at all (`rapper -c`), and how many statements it holds |
+| `materialization.json` | How an `.hdt`/`.cottas`/`.gz` artifact was turned into N-Triples, and how many triples that yielded — the first place to look when a compressed artifact validates differently from the aggregate |
+| `manifest.json` | Provenance for a result you want to reproduce or cite: the engine and its exact argv (including QLever's), the source artifact's format and checksum, every decode step |
+| `benchmark.json`, `benchmark.csv` | Timings. The CSV is long-format — one row per engine per query — and is the file to load for analysis |
+| `shacl.json`, `shacl-report.txt` | Shape conformance, when `--shacl-shapes` was given. Independent of the VCF: it checks the graph against the vocabulary, not against the source |
+| `engine-agreement.json` | Whether every engine returned identical normalized results, and which queries differed if not |
+| `engines/<name>/` | The same `preflight`/`sparql`/`comparison` for one engine, plus `query-executions.json` with each query's exit code, wall time and error. The top-level reports are the **primary** (first-named) engine's |
+| `raw/<engine>/` | Raw SPARQL Results JSON, stderr, and `/usr/bin/time` resource logs, per query — for debugging an engine rather than the data |
+| `normalized/` | The per-query rows the comparison actually used, after normalization |
+
+### Reading order when something fails
+
+Take the `status` from `summary.json` and go straight to the file that explains it:
+
+| Status | Meaning | Go to |
+| --- | --- | --- |
+| `PASS` | Every required query and invariant matched | — |
+| `MISMATCH` | Both sides ran and disagree | `comparison.json` |
+| `BLOCKED_BY_PREFLIGHT` | RDF syntax or core graph structure failed, so the comparison never ran | `preflight.json`, then `rdf-validation.json` |
+| `EXECUTION_FAILED` | A parser or an engine could not complete | `engines/<name>/query-executions.json` |
+
+An engine that exceeded `--validation-query-timeout` reports `EXECUTION_FAILED`
+with an `abandoned` field naming the query that tripped it and how many were
+skipped. See [If validation seems to hang](#if-validation-seems-to-hang).
 
 When several artifacts are validated in one full run, each gets its own
 directory: the aggregate keeps `<validation-id>/`, and the representations use

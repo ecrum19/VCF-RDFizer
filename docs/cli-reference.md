@@ -170,7 +170,7 @@ volume**, not the output filesystem.
 | --- | --- |
 | `0` | Success (possibly with recorded index warnings) |
 | `1` | One or more inputs failed, including a semantic validation failure |
-| `130` | Interrupted with `Ctrl+C`; progress written and tracked intermediates cleaned up |
+| `130` | Interrupted with `Ctrl+C`; containers stopped, tracked intermediates cleaned up, `interrupt-checkpoint.json` written |
 
 ---
 

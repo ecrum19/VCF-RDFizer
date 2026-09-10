@@ -700,11 +700,19 @@ class RunTracker:
         self._handle = self.log_path.open("a", encoding="utf-8")
         self.intermediate_paths: set[Path] = set()
         self.raw_rdf_paths: set[Path] = set()
+        #: Every mark, kept in memory so an interrupt can write a checkpoint
+        #: without re-reading and re-parsing its own log.
+        self.events: list[dict] = []
+        #: Marks that announced a finished stage, in order.
+        self.completed_stages: list[str] = []
 
     def mark(self, message: str):
         timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
         self._handle.write(f"[{timestamp}] {message}\n")
         self._handle.flush()
+        self.events.append({"timestamp": timestamp, "message": message})
+        if "completed" in message:
+            self.completed_stages.append(message)
 
     def track_intermediate(self, path: Path):
         self.intermediate_paths.add(path)
@@ -829,9 +837,35 @@ def docker_cmd_prefix(*, use_sudo: bool | None = None):
     return ["sudo", "docker"] if use_sudo else ["docker"]
 
 
+#: Label key stamped on every container this wrapper starts, so an interrupted
+#: run can find and stop its own containers -- and only its own.
+DOCKER_RUN_LABEL_KEY = "vcf-rdfizer.run"
+#: Unique per wrapper process. Two runs on one host must never kill each
+#: other's containers, so the pid is part of the value rather than the run id
+#: alone (two runs started in the same second share a run id).
+_DOCKER_RUN_LABEL_VALUE = f"{os.getpid()}-{int(time.time())}"
+
+
+def set_docker_run_label(run_id: str) -> None:
+    """Fold the run id into the container label once it is known.
+
+    Purely for legibility: `docker ps --filter label=vcf-rdfizer.run` should
+    show which run a stray container belongs to.
+    """
+    global _DOCKER_RUN_LABEL_VALUE
+    _DOCKER_RUN_LABEL_VALUE = f"{run_id}-{os.getpid()}"
+
+
+def docker_run_label_filter() -> str:
+    return f"label={DOCKER_RUN_LABEL_KEY}={_DOCKER_RUN_LABEL_VALUE}"
+
+
 def docker_run_base(*, as_user: bool = True):
     """Return base args for `docker run`, optionally mapped to host UID/GID."""
-    base = [*docker_cmd_prefix(), "run", "--rm"]
+    base = [
+        *docker_cmd_prefix(), "run", "--rm",
+        "--label", f"{DOCKER_RUN_LABEL_KEY}={_DOCKER_RUN_LABEL_VALUE}",
+    ]
     if not as_user:
         return base
     as_user = os.environ.get("VCF_RDFIZER_DOCKER_AS_USER", "1").strip().lower()
@@ -1622,6 +1656,98 @@ def remove_path_with_docker_fallback(
         eprint(f"See log for details: {wrapper_log_path}")
         return False
     return True
+
+
+def kill_run_containers(*, run_tracker: RunTracker | None = None) -> tuple[int, int]:
+    """Stop every container this wrapper started. Returns ``(killed, failed)``.
+
+    Killing the wrapper does not kill its containers. ``docker run`` forwards a
+    SIGINT it receives itself, but a wrapper that dies without forwarding --
+    SIGTERM, a closed terminal, an exception unwinding past the wait -- leaves
+    the container running and reparented to init. One such orphan ran for three
+    days after its run had "finished", holding 17 GB and a core the whole time.
+
+    Worse, cleanup then deleted files the orphan was still reading, so the
+    container spent those days working against inputs that no longer existed.
+    That is why this runs *before* any temporary file is removed.
+
+    Best effort by construction: an interrupt path must never raise. Every
+    failure is counted and reported, never propagated.
+    """
+    killed = 0
+    failed = 0
+    try:
+        listing = subprocess.run(
+            [*docker_cmd_prefix(), "ps", "-q", "--filter", docker_run_label_filter()],
+            check=False, capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        if run_tracker is not None:
+            run_tracker.mark(f"Interrupt cleanup: could not list containers ({error})")
+        return 0, 0
+
+    container_ids = [line.strip() for line in listing.stdout.splitlines() if line.strip()]
+    if not container_ids:
+        return 0, 0
+
+    for container_id in container_ids:
+        try:
+            result = subprocess.run(
+                [*docker_cmd_prefix(), "kill", container_id],
+                check=False, capture_output=True, text=True, timeout=60,
+            )
+            if result.returncode == 0:
+                killed += 1
+            else:
+                failed += 1
+        except (OSError, subprocess.SubprocessError):
+            failed += 1
+
+    if run_tracker is not None:
+        run_tracker.mark(
+            f"Interrupt cleanup: stopped containers killed={killed}, failed={failed}"
+        )
+    return killed, failed
+
+
+def write_interrupt_checkpoint(
+    *,
+    run_tracker: RunTracker,
+    metrics_dir: Path,
+    run_id: str,
+    mode: str,
+    containers_killed: int,
+    containers_failed: int,
+    removed: int | None,
+    failed: int | None,
+) -> Path | None:
+    """Record where an interrupted run stopped, so it can be resumed or read.
+
+    A run that is killed mid-flight still produced real measurements for every
+    stage it finished. Without a checkpoint those are only recoverable by
+    reading the progress log by eye, and nothing records *why* the run ended.
+    """
+    checkpoint = {
+        "run_id": run_id,
+        "mode": mode,
+        "status": "interrupted",
+        "exit_code": 130,
+        "interrupted_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        "containers": {"killed": containers_killed, "failed": containers_failed},
+        "temporaries": {"removed": removed, "failed": failed},
+        "stages_completed": list(run_tracker.completed_stages),
+        "last_event": run_tracker.events[-1] if run_tracker.events else None,
+        "tracked_intermediates": sorted(str(p) for p in run_tracker.intermediate_paths),
+    }
+    try:
+        path = metrics_dir / "interrupt-checkpoint.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(checkpoint, indent=2) + "\n", encoding="utf-8")
+        run_tracker.mark(f"Interrupt checkpoint written: {path}")
+        return path
+    except OSError as error:
+        run_tracker.mark(f"Interrupt checkpoint could not be written: {error}")
+        return None
 
 
 def cleanup_interrupted_full_run(
@@ -7969,12 +8095,17 @@ def run_validation_mode(
         ("--qlever-memory-gb", "qlever_memory_gb"),
         ("--qlever-port", "qlever_port"),
         ("--qlever-startup-timeout", "qlever_startup_timeout"),
+        ("--comunica-port", "comunica_port"),
+        ("--hdt-port", "hdt_port"),
+        ("--comunica-warmup-timeout", "comunica_warmup_timeout"),
     ):
         value = options.get(key)
         if value is not None:
             engine_args.extend([flag, str(value)])
-    if options.get("continue_after_query_timeout"):
-        engine_args.append("--continue-after-query-timeout")
+    # Running every query is the default; the runner still accepts the old
+    # continue flag, and stopping early is now the thing you opt into.
+    if options.get("stop_after_query_timeout"):
+        engine_args.append("--stop-after-query-timeout")
     for flag, key in (
         ("--qlever-index-arg", "qlever_index_args"),
         ("--qlever-server-arg", "qlever_server_args"),
@@ -8495,10 +8626,17 @@ def main():
         "--validation-continue-after-query-timeout",
         action="store_true",
         help=(
-            "Keep running an engine's remaining validation queries after one "
-            "exceeds the per-query timeout. Off by default: a timeout means "
-            "the engine cannot answer this graph in the time allowed, and each "
-            "remaining query costs another full timeout"
+            "Run every validation query even after one times out. This is now "
+            "the default; the flag is kept so existing callers keep working"
+        ),
+    )
+    parser.add_argument(
+        "--validation-stop-after-query-timeout",
+        action="store_true",
+        help=(
+            "Abandon an engine's remaining validation queries once one exceeds "
+            "the per-query timeout. Off by default: every query gets a "
+            "recorded verdict, which is what makes a validation run reportable"
         ),
     )
     parser.add_argument(
@@ -8608,8 +8746,13 @@ def main():
                     "--validation-time-budget must be zero or a positive integer"
                 )
             validation_engine_options["validation_time_budget"] = budget
-        if args.validation_continue_after_query_timeout:
-            validation_engine_options["continue_after_query_timeout"] = True
+        if args.validation_stop_after_query_timeout:
+            if args.validation_continue_after_query_timeout:
+                raise ValueError(
+                    "--validation-continue-after-query-timeout and "
+                    "--validation-stop-after-query-timeout are mutually exclusive"
+                )
+            validation_engine_options["stop_after_query_timeout"] = True
         if args.qlever_index_arg:
             validation_engine_options["qlever_index_args"] = list(args.qlever_index_arg)
         if args.qlever_server_arg:
@@ -9002,6 +9145,9 @@ def main():
     wrapper_log_path = metrics_dir / "logs" / "wrapper.log"
     progress_log_path = metrics_dir / "logs" / "progress.log"
     execution_started = time.perf_counter()
+    # Stamp containers with this run before any of them start, so an interrupt
+    # can identify exactly the ones it owns.
+    set_docker_run_label(run_id)
     global _COMMAND_LOGGER
     _COMMAND_LOGGER = CommandLogger(wrapper_log_path)
     run_tracker = RunTracker(progress_log_path)
@@ -9247,21 +9393,73 @@ def main():
         result_code = 130
         eprint("Run interrupted by user signal; starting best-effort cleanup.")
         run_tracker.mark("Run interrupted by user signal")
-        if mode == "full":
-            removed, failed = cleanup_interrupted_full_run(
+
+        # Ignore a second interrupt for the duration of cleanup. Ctrl-C twice
+        # is exactly what an impatient operator does, and it used to abort the
+        # cleanup halfway -- leaving behind the containers this is here to
+        # stop. Cleanup is bounded and short; let it finish.
+        previous_sigint = signal.getsignal(signal.SIGINT)
+        try:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+        except (OSError, ValueError):  # not the main thread, or unsupported
+            previous_sigint = None
+
+        removed = failed = None
+        containers_killed = containers_failed = 0
+        try:
+            # Containers first, and for every mode -- validation, compress and
+            # index all start containers too, and every one of them outlives
+            # the wrapper unless it is killed here. This must precede the file
+            # removal below: deleting inputs from under a live container is
+            # how an orphaned run spent three days reading files that no
+            # longer existed.
+            containers_killed, containers_failed = kill_run_containers(
+                run_tracker=run_tracker
+            )
+            if containers_killed or containers_failed:
+                eprint(
+                    "Interrupt cleanup: stopped containers "
+                    f"killed={containers_killed}, failed={containers_failed}"
+                )
+
+            if mode == "full":
+                removed, failed = cleanup_interrupted_full_run(
+                    run_tracker=run_tracker,
+                    out_root=out_root,
+                    image_ref=resolved_image_ref,
+                    keep_rmlstreamer_rdf_output=args.keep_rmlstreamer_rdf_output,
+                    wrapper_log_path=wrapper_log_path,
+                )
+                eprint(
+                    "Interrupt cleanup summary: "
+                    "removed="
+                    f"{removed}, failed={failed}, "
+                    "keep_rmlstreamer_rdf_output="
+                    f"{str(args.keep_rmlstreamer_rdf_output).lower()}"
+                )
+
+            checkpoint_path = write_interrupt_checkpoint(
                 run_tracker=run_tracker,
-                out_root=out_root,
-                image_ref=resolved_image_ref,
-                keep_rmlstreamer_rdf_output=args.keep_rmlstreamer_rdf_output,
-                wrapper_log_path=wrapper_log_path,
+                metrics_dir=metrics_dir,
+                run_id=run_id,
+                mode=mode,
+                containers_killed=containers_killed,
+                containers_failed=containers_failed,
+                removed=removed,
+                failed=failed,
             )
-            eprint(
-                "Interrupt cleanup summary: "
-                "removed="
-                f"{removed}, failed={failed}, "
-                "keep_rmlstreamer_rdf_output="
-                f"{str(args.keep_rmlstreamer_rdf_output).lower()}"
-            )
+            if checkpoint_path is not None:
+                eprint(f"Interrupt checkpoint: {checkpoint_path}")
+        except Exception as cleanup_error:  # noqa: BLE001 - never mask the interrupt
+            eprint(f"Interrupt cleanup did not complete: {cleanup_error}")
+            run_tracker.mark(f"Interrupt cleanup error: {cleanup_error}")
+        finally:
+            if previous_sigint is not None:
+                try:
+                    signal.signal(signal.SIGINT, previous_sigint)
+                except (OSError, ValueError):
+                    pass
+
         eprint(f"Progress log: {progress_log_path}")
     finally:
         if hasattr(signal, "SIGTERM") and original_sigterm is not None:

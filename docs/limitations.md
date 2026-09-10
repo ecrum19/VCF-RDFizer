@@ -34,9 +34,12 @@ no distributed execution and no work queue.
 **No incremental update.** Adding variants to a converted dataset means
 reconverting the VCF and rebuilding every representation from scratch.
 
-**Interrupt cleanup is best-effort.** `Ctrl+C` exits 130 and removes tracked
-intermediates, but a `SIGKILL` or a host crash can leave a partial output
-directory that the collision check will then refuse to write into.
+**Interrupt cleanup is best-effort.** `Ctrl+C` exits 130, stops this run's
+containers, removes tracked intermediates and writes
+`interrupt-checkpoint.json`. But `SIGKILL` and a host crash both bypass it
+entirely: no handler runs, so containers survive and a partial output directory
+is left behind, which the collision check will then refuse to write into. After
+an ungraceful kill, check `docker ps --filter label=vcf-rdfizer.run` yourself.
 
 ## 2. Input handling
 

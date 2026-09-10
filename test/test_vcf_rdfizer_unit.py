@@ -3182,6 +3182,174 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertTrue(progress_log.exists())
             self.assertIn("Run interrupted by user signal", progress_log.read_text())
 
+    def test_every_container_is_labelled_so_an_interrupt_can_find_it(self):
+        """Cleanup can only stop containers it can identify."""
+        labels = set()
+        for as_user in (True, False):
+            base = vcf_rdfizer.docker_run_base(as_user=as_user)
+            self.assertIn("--label", base)
+            labels.add(base[base.index("--label") + 1])
+        # Both argv shapes carry the same label - the as_user=False early
+        # return used to skip everything added after it.
+        self.assertEqual(len(labels), 1)
+        label = labels.pop()
+        self.assertTrue(label.startswith(f"{vcf_rdfizer.DOCKER_RUN_LABEL_KEY}="))
+        # The filter must select exactly the label that was stamped.
+        self.assertEqual(vcf_rdfizer.docker_run_label_filter(), f"label={label}")
+
+    def test_run_label_is_unique_per_process(self):
+        """Two concurrent runs must never kill each other's containers."""
+        before = vcf_rdfizer.docker_run_label_filter()
+        vcf_rdfizer.set_docker_run_label("20260910T120000")
+        after = vcf_rdfizer.docker_run_label_filter()
+        self.assertNotEqual(before, after)
+        self.assertIn("20260910T120000", after)
+        self.assertIn(str(os.getpid()), after)
+
+    def test_kill_run_containers_counts_results_and_never_raises(self):
+        """An interrupt path that raises leaves the orphans it exists to stop."""
+        with tempfile.TemporaryDirectory() as td:
+            tracker = vcf_rdfizer.RunTracker(Path(td) / "progress.log")
+
+            calls = []
+
+            def fake_subprocess_run(cmd, **kwargs):
+                calls.append(cmd)
+                if "ps" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout="abc123\ndef456\n", stderr="")
+                # First kill succeeds, second fails.
+                code = 0 if cmd[-1] == "abc123" else 1
+                return subprocess.CompletedProcess(cmd, code, stdout="", stderr="no such container")
+
+            with mock.patch.object(vcf_rdfizer.subprocess, "run", side_effect=fake_subprocess_run):
+                killed, failed = vcf_rdfizer.kill_run_containers(run_tracker=tracker)
+            self.assertEqual((killed, failed), (1, 1))
+            # Selection is by this run's label, never "all containers".
+            self.assertIn(vcf_rdfizer.docker_run_label_filter(), calls[0])
+
+            # Docker absent entirely: reported, not raised.
+            with mock.patch.object(
+                vcf_rdfizer.subprocess, "run", side_effect=OSError("docker not found")
+            ):
+                self.assertEqual(
+                    vcf_rdfizer.kill_run_containers(run_tracker=tracker), (0, 0)
+                )
+            tracker.close()
+
+    def test_interrupt_stops_containers_before_deleting_their_inputs(self):
+        """Order is the bug: temps were deleted from under a live container.
+
+        An interrupted HG004 run removed its .nt.gz while its validation
+        container kept running for three more days against a file that no
+        longer existed. Containers must be stopped first.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+            out_dir = tmp_path / "out"
+            order = []
+
+            def fake_kill(**kwargs):
+                order.append("kill-containers")
+                return 2, 0
+
+            def fake_cleanup(**kwargs):
+                order.append("remove-temporaries")
+                return 4, 0
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "check_docker", return_value=True), \
+                        mock.patch.object(vcf_rdfizer, "docker_image_exists", return_value=True), \
+                        mock.patch.object(vcf_rdfizer, "run_full_mode", side_effect=KeyboardInterrupt()), \
+                        mock.patch.object(vcf_rdfizer, "kill_run_containers", side_effect=fake_kill), \
+                        mock.patch.object(
+                            vcf_rdfizer, "cleanup_interrupted_full_run", side_effect=fake_cleanup
+                        ):
+                    rc = invoke_main([
+                        "--mode", "full",
+                        "--input", str(input_dir),
+                        "--rules", str(rules_path),
+                        "--rdf-storage-mode", "plain",
+                        "--out", str(out_dir),
+                    ])
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 130)
+            self.assertEqual(order, ["kill-containers", "remove-temporaries"])
+
+    def test_interrupt_writes_a_resumable_checkpoint(self):
+        """A killed run still produced real results; record where it stopped."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+            out_dir = tmp_path / "out"
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "check_docker", return_value=True), \
+                        mock.patch.object(vcf_rdfizer, "docker_image_exists", return_value=True), \
+                        mock.patch.object(vcf_rdfizer, "run_full_mode", side_effect=KeyboardInterrupt()), \
+                        mock.patch.object(
+                            vcf_rdfizer, "kill_run_containers", return_value=(3, 1)
+                        ):
+                    rc = invoke_main([
+                        "--mode", "full",
+                        "--input", str(input_dir),
+                        "--rules", str(rules_path),
+                        "--rdf-storage-mode", "plain",
+                        "--out", str(out_dir),
+                    ])
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 130)
+            run_metrics_dir = latest_metrics_run_dir(out_dir / "run_metrics")
+            checkpoint = run_metrics_dir / "interrupt-checkpoint.json"
+            self.assertTrue(checkpoint.exists(), "no checkpoint written")
+            data = json.loads(checkpoint.read_text())
+            self.assertEqual(data["status"], "interrupted")
+            self.assertEqual(data["exit_code"], 130)
+            self.assertEqual(data["mode"], "full")
+            self.assertEqual(data["containers"], {"killed": 3, "failed": 1})
+            self.assertIn("stages_completed", data)
+            self.assertIn("interrupted_at", data)
+
+    def test_interrupt_still_exits_130_when_cleanup_itself_fails(self):
+        """A cleanup failure must not mask the interrupt or crash the wrapper."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+            out_dir = tmp_path / "out"
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "check_docker", return_value=True), \
+                        mock.patch.object(vcf_rdfizer, "docker_image_exists", return_value=True), \
+                        mock.patch.object(vcf_rdfizer, "run_full_mode", side_effect=KeyboardInterrupt()), \
+                        mock.patch.object(
+                            vcf_rdfizer, "kill_run_containers",
+                            side_effect=RuntimeError("docker daemon gone"),
+                        ):
+                    rc = invoke_main([
+                        "--mode", "full",
+                        "--input", str(input_dir),
+                        "--rules", str(rules_path),
+                        "--rdf-storage-mode", "plain",
+                        "--out", str(out_dir),
+                    ])
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 130)
+            run_metrics_dir = latest_metrics_run_dir(out_dir / "run_metrics")
+            log = (run_metrics_dir / "logs" / "progress.log").read_text()
+            self.assertIn("Interrupt cleanup error", log)
+
     def test_main_compress_mode_none_skips_compression_commands(self):
         """Compression mode with method none performs no compression runs."""
         with tempfile.TemporaryDirectory() as td:

@@ -102,9 +102,9 @@ class ArtifactFormatTests(VerboseTestCase):
             scratch.mkdir()
             calls = []
 
-            def fake_run(command, **kwargs):
+            def fake_run(command, stdout=None, stderr=None, **kwargs):
                 calls.append(command)
-                Path(command[2]).write_bytes(TRIPLES)
+                stdout.write(TRIPLES)
                 return subprocess.CompletedProcess(command, 0)
 
             with mock.patch.object(V, "_resolve_binary", return_value="/usr/local/bin/hdt2rdf"), \
@@ -113,9 +113,65 @@ class ArtifactFormatTests(VerboseTestCase):
                     source, "hdt", scratch, log_dir=tmp_path / "log"
                 )
             self.assertEqual(calls[0][0], "/usr/local/bin/hdt2rdf")
-            self.assertEqual(calls[0][1], str(source))
+            self.assertIn(str(source), calls[0])
+            # hdt-cpp's file-output serializer is broken, so the dump is taken
+            # from stdout: the target must never appear as an argv entry.
+            self.assertEqual(calls[0][-1], "-")
+            self.assertNotIn(str(decoded), calls[0])
             self.assertEqual(decoded.read_bytes(), TRIPLES)
             self.assertTrue(provenance["materialized"])
+            self.assertEqual(provenance["steps"][0]["mode"], "stdout-redirect")
+
+    def test_hdt2rdf_write_errors_fail_even_when_it_exits_zero(self):
+        """hdt-cpp reports write errors on stderr and still returns success.
+
+        That is how a 4.4 GiB file of truncated subject IRIs with no newline in
+        it reached rapper, which spent 38 hours on 23% of it before anyone
+        noticed. An exit code is only as trustworthy as the tool returning it.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            source = tmp_path / "cohort.hdt"
+            source.write_bytes(b"fake-hdt")
+            scratch = tmp_path / "scratch"
+            scratch.mkdir()
+
+            def fake_run(command, stdout=None, stderr=None, **kwargs):
+                stdout.write(b"<http://ex/a<http://ex/a")
+                stderr.write(b"error: :0:0: write error\n" * 3)
+                return subprocess.CompletedProcess(command, 0)
+
+            with mock.patch.object(V, "_resolve_binary", return_value="hdt2rdf"), \
+                    mock.patch.object(V.subprocess, "run", side_effect=fake_run):
+                with self.assertRaises(RuntimeError) as caught:
+                    V.materialize_ntriples(source, "hdt", scratch, log_dir=tmp_path / "log")
+            self.assertIn("exited 0", str(caught.exception))
+            self.assertIn("write error", str(caught.exception))
+
+    def test_a_newline_free_decode_is_rejected_immediately(self):
+        """The structural guard must catch the pathology rapper cannot.
+
+        A single multi-gigabyte 'line' is not a syntax error to raptor, it is
+        one enormous token: the parse degrades to quadratic and the run looks
+        like a hang instead of a failure. This check reads a prefix, so it
+        costs nothing at any size.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            broken = Path(td) / "input.nt"
+            broken.write_bytes(b"<http://ex/a" * 5000)
+            with self.assertRaises(RuntimeError) as caught:
+                V._verify_ntriples(broken, label="hdt2rdf")
+            self.assertIn("no newline", str(caught.exception))
+
+            truncated = Path(td) / "cut.nt"
+            truncated.write_bytes(b"<s> <p> <o> .\n<s2> <p> <o2")
+            with self.assertRaises(RuntimeError) as caught:
+                V._verify_ntriples(truncated, label="hdt2rdf")
+            self.assertIn("newline", str(caught.exception))
+
+            good = Path(td) / "ok.nt"
+            good.write_bytes(TRIPLES)
+            self.assertEqual(V._verify_ntriples(good, label="hdt2rdf"), len(TRIPLES))
 
     def test_cottas_is_decoded_with_the_cottas_tool(self):
         """A .cottas source is decoded through cottas_tool.py decompress."""
@@ -173,8 +229,8 @@ class ArtifactFormatTests(VerboseTestCase):
             scratch = tmp_path / "scratch"
             scratch.mkdir()
 
-            def fake_run(command, stdout=None, **kwargs):
-                stdout.write(b"hdt2rdf: corrupt header\n")
+            def fake_run(command, stdout=None, stderr=None, **kwargs):
+                (stderr or stdout).write(b"hdt2rdf: corrupt header\n")
                 return subprocess.CompletedProcess(command, 3)
 
             with mock.patch.object(V, "_resolve_binary", return_value="hdt2rdf"), \
@@ -211,21 +267,37 @@ class EngineTests(VerboseTestCase):
             engine = V.build_engine(
                 "comunica", source, raw_dir=tmp_path, scratch=tmp_path, options={}
             )
-            captured = []
+            posted = []
 
-            def fake_run(command, **kwargs):
-                captured.append(command)
-                return 0, None
+            def fake_post(self, endpoint, q, *, timeout):
+                posted.append((endpoint, q, timeout))
+                return b'{"results": {"bindings": []}}'
 
-            with mock.patch.object(V.shutil, "which", return_value="/usr/bin/comunica-sparql-file"), \
+            with mock.patch.object(
+                        V.shutil, "which",
+                        return_value="/usr/bin/comunica-sparql-file-http",
+                    ), \
                     mock.patch.object(V, "tool_version", return_value=None), \
-                    mock.patch.object(V, "run_query_process", side_effect=fake_run):
+                    mock.patch.object(V.subprocess, "Popen") as popen, \
+                    mock.patch.object(V.ComunicaHttpEndpointMixin, "_post", fake_post):
+                popen.return_value.poll.return_value = None
                 engine.start()
                 result = engine.execute("q02_variant_shape_counts", query)
+
+            command = popen.call_args[0][0]
+            # The graph is handed to the endpoint once, at startup.
+            self.assertIn("/usr/bin/comunica-sparql-file-http", command)
+            self.assertIn(str(source), command)
+            # One worker only: each would hold its own copy of the graph.
+            self.assertEqual(command[command.index("-w") + 1], "1")
+
             self.assertEqual(result["status"], "PASS")
             self.assertEqual(result["engine"], "comunica")
-            self.assertIn(str(source), captured[0])
-            self.assertIn("application/sparql-results+json", captured[0])
+            # Startup probes (bind + warm-up) then exactly one query POST, all
+            # to the same long-lived endpoint - never a new process per query.
+            self.assertEqual(len({endpoint for endpoint, _, _ in posted}), 1)
+            self.assertEqual(posted[-1][1], query.read_text())
+            self.assertIsNotNone(engine.warmup_seconds)
 
     def test_query_timeout_kills_the_whole_process_tree(self):
         """A timed-out query must not leave its engine running as an orphan.
@@ -278,8 +350,10 @@ class EngineTests(VerboseTestCase):
             ):
                 advice = V.engine_advice("comunica", big, 27, 3600)
             self.assertIsNotNone(advice)
-            # It must say what it will cost and what to do instead.
-            self.assertIn("27h", advice)
+            # Comunica streams the source per query, so the warning is about
+            # re-reading the graph 27 times, not about one big parse.
+            self.assertIn("no index", advice)
+            self.assertIn("40.0 GiB", advice)
             self.assertIn("qlever", advice)
 
     def test_comunica_reports_a_missing_binary_clearly(self):
