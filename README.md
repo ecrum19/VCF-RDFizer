@@ -1028,8 +1028,8 @@ how each part of the tool works, why, and where it stops working.
 | [Data linking design](docs/datalinking-design.md) | Broader proposal and remaining work |
 | [Privacy policy design](docs/privacy-policy-design.md) | Proposal: ODRL-based granular disclosure control over the graph |
 
-- [`changelog.md`](changelog.md) - dated change history
 - [`ACKNOWLEDGEMENTS.md`](ACKNOWLEDGEMENTS.md) - funding and attribution
+- [Releases](https://github.com/ecrum19/VCF-RDFizer/releases) - release notes per version
 
 ## Troubleshooting
 

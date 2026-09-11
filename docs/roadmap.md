@@ -181,4 +181,4 @@ Stated so the absence reads as a decision rather than an oversight.
 - [Data linking design](datalinking-design.md) — the largest planned addition
 - [Privacy policy design](privacy-policy-design.md) — governed release over parts of the graph
 - [Validation methodology](validation-methodology.md) — how coverage is measured, so gaps stay falsifiable
-- [`changelog.md`](../changelog.md) — what has actually shipped
+- [Releases](https://github.com/ecrum19/VCF-RDFizer/releases) — what has actually shipped

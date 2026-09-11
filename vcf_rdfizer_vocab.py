@@ -977,6 +977,50 @@ def parse_structured_header_fields(value: str) -> dict[str, str]:
     return dict(parse_structured_header_attributes(value))
 
 
+def _split_header_attributes(inner: str, *, bracket_aware: bool) -> tuple[list[str], int]:
+    """Split a structured header body on its attribute-separating commas.
+
+    A comma separates attributes only outside quotes and, when *bracket_aware*,
+    outside a bracketed list. VCF 4.5 writes a ``##META`` allowed-value set as
+    ``Values=[a, b, c]``, whose internal commas are part of one attribute;
+    splitting on them drops every member after the first, because the fragments
+    carry no ``=`` and are discarded as non-attributes.
+
+    Returns the tokens and the final bracket depth, which is non-zero only when
+    the input's brackets are unbalanced.
+    """
+    tokens: list[str] = []
+    token: list[str] = []
+    in_quotes = False
+    escaped = False
+    depth = 0
+    for character in inner:
+        if escaped:
+            token.append(character)
+            escaped = False
+        elif character == "\\" and in_quotes:
+            token.append(character)
+            escaped = True
+        elif character == '"':
+            token.append(character)
+            in_quotes = not in_quotes
+        elif bracket_aware and character == "[" and not in_quotes:
+            depth += 1
+            token.append(character)
+        elif bracket_aware and character == "]" and not in_quotes:
+            # Clamped, so a stray ']' cannot make the depth negative and turn a
+            # later, genuine '[' into a no-op.
+            depth = max(0, depth - 1)
+            token.append(character)
+        elif character == "," and not in_quotes and depth == 0:
+            tokens.append("".join(token))
+            token = []
+        else:
+            token.append(character)
+    tokens.append("".join(token))
+    return tokens, depth
+
+
 def parse_structured_header_attributes(value: str) -> list[tuple[str, str]]:
     """Parse a structured header value into ordered (key, value) attributes.
 
@@ -988,26 +1032,12 @@ def parse_structured_header_attributes(value: str) -> list[tuple[str, str]]:
     if inner.startswith("<") and inner.endswith(">"):
         inner = inner[1:-1]
 
-    tokens: list[str] = []
-    token: list[str] = []
-    in_quotes = False
-    escaped = False
-    for character in inner:
-        if escaped:
-            token.append(character)
-            escaped = False
-        elif character == "\\" and in_quotes:
-            token.append(character)
-            escaped = True
-        elif character == '"':
-            token.append(character)
-            in_quotes = not in_quotes
-        elif character == "," and not in_quotes:
-            tokens.append("".join(token))
-            token = []
-        else:
-            token.append(character)
-    tokens.append("".join(token))
+    tokens, depth = _split_header_attributes(inner, bracket_aware=True)
+    if depth:
+        # Unbalanced brackets are malformed. Bracket-aware splitting would treat
+        # the rest of the line as one token and silently drop every attribute
+        # after the stray '[', so fall back to splitting on commas alone.
+        tokens, _ = _split_header_attributes(inner, bracket_aware=False)
 
     attributes: list[tuple[str, str]] = []
     for item in tokens:

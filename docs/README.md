@@ -134,5 +134,6 @@ Three conventions, kept deliberately:
 
 Related files outside `docs/`: [`rules/README.md`](../rules/README.md) (the
 mapping directory), [`test/README.md`](../test/README.md) (the test suite),
-[`changelog.md`](../changelog.md), [`scripts/RELEASING.md`](../scripts/RELEASING.md),
-and [`ACKNOWLEDGEMENTS.md`](../ACKNOWLEDGEMENTS.md).
+[`scripts/RELEASING.md`](../scripts/RELEASING.md), and
+[`ACKNOWLEDGEMENTS.md`](../ACKNOWLEDGEMENTS.md). Per-version release notes are
+published on the [releases page](https://github.com/ecrum19/VCF-RDFizer/releases).

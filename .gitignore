@@ -27,6 +27,10 @@ build/
 *.cover
 test/*.cover
 vcf_rdfizer.cover
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
 
 # OS
 .DS_Store

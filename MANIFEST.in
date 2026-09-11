@@ -1,0 +1,13 @@
+# The sdist ships the installable package, not the development tree.
+#
+# setuptools' default sdist walk picks up `test/*.py`, but not the support files
+# those modules import (`test/__init__.py`, `helpers.py`, `validation_fixtures.py`,
+# `validation_mutations.py`), nor the fixtures and container scripts they read
+# from `src/`, `rules/`, `examples/` and `test/test_vcf_files/`. The result was a
+# published archive whose test suite could not run at all. Shipping no tests is
+# honest; shipping a suite that fails on arrival is not.
+#
+# The full suite runs from a git checkout, which is what CONTRIBUTING and
+# `.github/workflows/tests.yml` both assume:
+#     python3 -m unittest discover -s test -p "test_*_unit.py"
+prune test

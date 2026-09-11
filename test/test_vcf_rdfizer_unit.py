@@ -2214,6 +2214,51 @@ class WrapperUnitTests(VerboseTestCase):
         self.assertEqual(fields["Number"], "1")
         self.assertEqual(fields["Description"], 'Genotype, with "quoted" text')
 
+    def test_structured_header_parser_keeps_a_bracketed_values_list_whole(self):
+        """A ##META ``Values=[a, b, c]`` list is one attribute, not three fragments.
+
+        The commas inside the brackets separate allowed values, not attributes.
+        Splitting on them dropped every member after the first, because the
+        fragments carry no '=' and were discarded, leaving a value that still
+        held its opening bracket.
+        """
+        fields = vcf_rdfizer._parse_structured_header_fields(
+            "<ID=Assay,Type=String,Number=.,Values=[WholeGenome, Exome, Panel]>"
+        )
+
+        self.assertEqual(fields["Values"], "[WholeGenome, Exome, Panel]")
+        self.assertEqual(
+            vcf_rdfizer._parse_meta_values(fields["Values"]),
+            ["WholeGenome", "Exome", "Panel"],
+        )
+
+    def test_structured_header_parser_resumes_after_a_bracketed_list(self):
+        """An attribute following the Values list is still parsed."""
+        fields = vcf_rdfizer._parse_structured_header_fields(
+            '<ID=Assay,Values=[a, b],Type=String,Description="an assay, described">'
+        )
+
+        self.assertEqual(fields["Type"], "String")
+        self.assertEqual(fields["Description"], "an assay, described")
+
+    def test_structured_header_parser_survives_an_unbalanced_bracket(self):
+        """Malformed brackets must not swallow every remaining attribute."""
+        fields = vcf_rdfizer._parse_structured_header_fields(
+            "<ID=Broken,Values=[a, b,Type=String>"
+        )
+
+        self.assertEqual(fields["ID"], "Broken")
+        self.assertEqual(fields["Type"], "String")
+
+    def test_structured_header_parser_ignores_a_bracket_inside_quotes(self):
+        """A '[' in a description is text, not the start of a values list."""
+        fields = vcf_rdfizer._parse_structured_header_fields(
+            '<ID=DP,Type=Integer,Description="depth [reads], per sample",Number=1>'
+        )
+
+        self.assertEqual(fields["Description"], "depth [reads], per sample")
+        self.assertEqual(fields["Number"], "1")
+
     def test_condensed_sample_emitter_rolls_back_on_sample_count_mismatch(self):
         """Malformed sample alignment fails atomically without a partial condensed graph."""
         with tempfile.TemporaryDirectory() as td:
