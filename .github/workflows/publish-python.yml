@@ -130,5 +130,12 @@ jobs:
           name: python-dist
           path: dist
 
+      # PyPI reserves a version permanently once it is uploaded, so re-pushing a
+      # release tag -- to correct a Dockerfile, a workflow, or anything else
+      # outside the Python artifact -- used to fail this job on the duplicate.
+      # Skipping what is already published makes a tag re-push idempotent: the
+      # Docker and release jobs re-run, and PyPI is left exactly as it was.
       - name: Publish package
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
