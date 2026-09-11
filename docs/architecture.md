@@ -206,7 +206,7 @@ Set as build arguments in the [`Dockerfile`](../Dockerfile):
 | RMLStreamer | 2.5.0 | RML mapping execution on Flink |
 | `hdtc` | 1.1.0 (Rust) | HDT create/merge/index, Java-free |
 | Comunica | 5.3.0 | Default validation SPARQL engine |
-| QLever | from `adfreiburg/qlever` (verified against build `bfd5741`) | Scale validation SPARQL engine |
+| QLever | `adfreiburg/qlever` pinned by digest `sha256:f8aa7704` (upstream build `bfd5741`) | Scale validation SPARQL engine |
 | `pycottas` | image-pinned | COTTAS conversion and decode |
 
 QLever is copied from a differently based upstream image, so its
