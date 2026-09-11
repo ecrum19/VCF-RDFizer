@@ -345,9 +345,13 @@ The exact argv that ran is recorded in each report's `manifest.json` under
 removed as soon as the queries finish.
 
 QLever is copied into the image from the upstream `adfreiburg/qlever` image at
-build time (`qlever-index` and `qlever-server`, verified against build
-`bfd5741`); pin a version with
-`--build-arg QLEVER_IMAGE=adfreiburg/qlever:<tag>`. That image is built on a
+build time (`qlever-index` and `qlever-server`). The image is pinned by its
+multi-architecture index digest `sha256:f8aa7704` rather than by tag, because
+`:latest` is a rolling build of upstream's main branch and would change which
+engine a released image contains. The pinned digest is build `bfd5741` - the
+one QLever's documented behaviour here was verified against.
+Override with `--build-arg QLEVER_IMAGE=adfreiburg/qlever@sha256:<index digest>`.
+That image is built on a
 different Ubuntu release, so its release-specific Boost, ICU, jemalloc and
 io_uring libraries are copied alongside the binaries into `/opt/qlever/lib`,
 and only QLever's own processes are pointed there - they cannot shadow

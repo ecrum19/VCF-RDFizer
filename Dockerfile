@@ -8,8 +8,28 @@ ARG COMUNICA_HDT_VERSION=5.0.1
 # QLever is an optional second SPARQL engine for validation. Its binaries are
 # copied from the upstream published image rather than built here: compiling
 # QLever needs a large C++ toolchain and would dominate this image's build.
-# Pin a digest or release tag here to make validation runs reproducible.
-ARG QLEVER_IMAGE=adfreiburg/qlever:latest
+#
+# Pinned by digest, not by tag. `adfreiburg/qlever:latest` is a rolling build of
+# upstream's main branch -- it is rebuilt within a day of most commits -- so a
+# tag reference would silently change which engine a released image contains,
+# and a validation result recorded against one build would not be reproducible
+# against another. This digest is the multi-architecture index, so it resolves
+# correctly on both linux/amd64 and linux/arm64; pinning a per-architecture
+# manifest digest instead would break the other platform's build.
+#
+# The pinned build is upstream commit `bfd5741a5d` (tag `commit-bfd5741a5d`),
+# which is the build this repository's QLever behaviour was actually verified
+# against: the `qlever-index` flags asserted in
+# `test/test_validation_engines_unit.py`, and QLever's canonicalisation of
+# xsd:integer to xsd:int that `preflight_position_datatype` accommodates. Pinning
+# the build the assertions were measured on keeps the image and the tests
+# describing the same engine.
+#
+# Override with --build-arg QLEVER_IMAGE=adfreiburg/qlever@sha256:<index digest>
+# (or a tag, accepting that it moves). Upstream also publishes a `0.6.0` release
+# tag, which is multi-architecture; moving to it is a QLever version change
+# rather than a pin, so it belongs with a validation run, not with this edit.
+ARG QLEVER_IMAGE=adfreiburg/qlever@sha256:f8aa770424f9f863289da87649f1532c350339411255d02d3059eca94d5444e2
 
 FROM eclipse-temurin:11-jre AS build-hdt-cpp
 
@@ -70,6 +90,42 @@ RUN cargo build --locked --release \
 
 # Named stage so the runtime image can COPY QLever's binaries out of it.
 FROM ${QLEVER_IMAGE} AS qlever
+
+# Stage QLever's binaries and the release-specific libraries they need into one
+# fixed layout, so the runtime image copies from architecture-independent paths.
+#
+# The libraries used to be copied straight out of /lib/x86_64-linux-gnu by
+# soname. That broke the linux/arm64 build outright: upstream publishes an arm64
+# image whose multiarch directory is /lib/aarch64-linux-gnu, so the COPY could
+# not resolve its sources and the whole build failed -- before the link check in
+# the runtime stage could record QLever as unusable. Resolving the libraries
+# with ldd is both architecture- and soname-independent, so an upstream rebuild
+# that bumps Boost or ICU no longer needs an edit here.
+#
+# Every step is best-effort and the directories are always created. QLever is an
+# optional second SPARQL engine: an image without it is still fully functional,
+# and the marker written in the runtime stage says why it is unavailable. A
+# missing COPY source would instead fail the build, which is the failure this
+# whole arrangement exists to avoid.
+#
+# glibc is deliberately not gathered -- it is backward compatible and the
+# runtime base is newer than QLever's. Only the families the binaries cannot
+# find in that base are taken, which is the same set the previous soname list
+# named.
+RUN set -eu; \
+  mkdir -p /opt/qlever-stage/bin /opt/qlever-stage/lib; \
+  for binary in qlever-index qlever-server; do \
+    [ -f "/qlever/$binary" ] || continue; \
+    cp "/qlever/$binary" /opt/qlever-stage/bin/; \
+    ldd "/qlever/$binary" 2>/dev/null \
+      | sed -n 's/.*=> \(\/[^ ]*\).*/\1/p' \
+      | grep -E '/(libboost_|libicu|libjemalloc|liburing|libgomp)[^/]*$' \
+      | while read -r library; do \
+          cp -Ln "$library" /opt/qlever-stage/lib/ 2>/dev/null || true; \
+        done; \
+  done; \
+  echo "staged QLever binaries:"; ls -1 /opt/qlever-stage/bin || true; \
+  echo "staged QLever libraries:"; ls -1 /opt/qlever-stage/lib || true
 
 
 FROM eclipse-temurin:11-jre
@@ -149,19 +205,8 @@ COPY --from=build-hdtc /opt/third_party_licenses/ /usr/share/licenses/vcf-rdfize
 # pointed at, so they cannot shadow anything the rest of the image links
 # against. (glibc itself is not copied - it is backward compatible, and this
 # base is newer than QLever's.)
-COPY --from=qlever /qlever/qlever-index /opt/qlever/bin/qlever-index
-COPY --from=qlever /qlever/qlever-server /opt/qlever/bin/qlever-server
-COPY --from=qlever \
-  /lib/x86_64-linux-gnu/libboost_iostreams.so.1.83.0 \
-  /lib/x86_64-linux-gnu/libboost_program_options.so.1.83.0 \
-  /lib/x86_64-linux-gnu/libboost_url.so.1.83.0 \
-  /lib/x86_64-linux-gnu/libgomp.so.1 \
-  /lib/x86_64-linux-gnu/libicudata.so.74 \
-  /lib/x86_64-linux-gnu/libicui18n.so.74 \
-  /lib/x86_64-linux-gnu/libicuuc.so.74 \
-  /lib/x86_64-linux-gnu/libjemalloc.so.2 \
-  /lib/x86_64-linux-gnu/liburing.so.2 \
-  /opt/qlever/lib/
+COPY --from=qlever /opt/qlever-stage/bin/ /opt/qlever/bin/
+COPY --from=qlever /opt/qlever-stage/lib/ /opt/qlever/lib/
 COPY THIRD_PARTY_NOTICES.md /usr/share/licenses/vcf-rdfizer/THIRD_PARTY_NOTICES.md
 COPY src/*.sh /opt/vcf-rdfizer/
 COPY src/*.py /opt/vcf-rdfizer/
@@ -179,7 +224,7 @@ RUN chmod +x /opt/vcf-rdfizer/*.sh \
   && chmod +x /usr/local/bin/rdf2hdt \
   && chmod +x /usr/local/bin/hdt2rdf \
   && chmod +x /usr/local/bin/hdtc \
-  && chmod +x /opt/qlever/bin/qlever-index /opt/qlever/bin/qlever-server
+  && find /opt/qlever/bin -type f -exec chmod +x {} +
 
 # QLever's binaries come from a different base image, so record at build time
 # whether they actually link here. The validator reads this marker to explain
@@ -187,6 +232,11 @@ RUN chmod +x /opt/vcf-rdfizer/*.sh \
 RUN set -eu; \
   status="ok"; \
   for binary in qlever-index qlever-server; do \
+    if [ ! -f "/opt/qlever/bin/$binary" ]; then \
+      status="QLever binary $binary was not published for this image's architecture, so --validation-engine qlever is unavailable here; use comunica, hdt or cottas."; \
+      echo "WARNING: $status" >&2; \
+      continue; \
+    fi; \
     missing="$(LD_LIBRARY_PATH=/opt/qlever/lib ldd "/opt/qlever/bin/$binary" 2>&1 | grep 'not found' || true)"; \
     if [ -n "$missing" ]; then \
       status="QLever binary $binary has unresolved shared libraries in this base image: $missing"; \
