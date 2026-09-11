@@ -14,8 +14,9 @@
 
 VCF-RDFizer is a Docker-first CLI wrapper for:
 1. VCF -> RDF (N-Triples) with RMLStreamer
-2. Optional RDF compression/decompression
+2. Optional RDF compression/decompression, into queryable HDT and COTTAS artifacts
 3. Semantic validation of a compressed RDF graph against its source VCF
+4. Data linking, which writes a provenance-tracked side-graph of external links
 
 The conversion targets the **VCF Core vocabulary**, published at
 [https://w3id.org/vcf-core/vocab#](https://w3id.org/vcf-core/vocab#) (prefix
@@ -26,11 +27,12 @@ Core is a semantic target any conversion system can adopt, and its version line
 is independent of this converter's — the emitted IRIs reference the namespace,
 not a pinned version.
 
-This README is the task-oriented reference. For how the tool works, why it is
-built that way, and where it stops working, see the documentation set in
-**[`docs/`](docs/README.md)** - starting with
-[Architecture](docs/architecture.md) and, before you rely on the output,
-[Limitations](docs/limitations.md).
+This README covers day-to-day use: installation, the CLI flags, and worked
+commands. The documentation set in **[`docs/`](docs/README.md)** covers
+everything else — how the tool works internally, why it is designed that way,
+and where it stops working. Start with
+[Architecture](docs/architecture.md), and read
+[Limitations](docs/limitations.md) before you rely on the output.
 
 ## Requirements
 
@@ -103,7 +105,7 @@ In `full` mode with multiple VCF inputs, failures are isolated per input:
 
 ## Main Flags (Most Used)
 
-- `-m, --mode {full,compress,decompress,tsv,validation,index}`
+- `-m, --mode {full,compress,decompress,tsv,index,validation,link}`
 - `-o, --out` required output root directory
 - `--rdf-compression` final raw RDF codecs: `gzip`, `brotli`, or `none`
 - `--representations` queryable RDF outputs: `hdt`, `cottas`, or `none`
@@ -1078,7 +1080,7 @@ Safe termination:
 
 If you use VCF-RDFizer in a publication, please cite:
 
-VCF-RDFizer maintainers. (2026). *VCF-RDFizer* (Version 2.1.0) [Computer software]. GitHub. https://github.com/ecrum19/VCF-RDFizer
+VCF-RDFizer maintainers. (2026). *VCF-RDFizer* (Version 3.0.0) [Computer software]. GitHub. https://github.com/ecrum19/VCF-RDFizer
 
 BibTeX:
 
@@ -1087,7 +1089,7 @@ BibTeX:
   author  = {{VCF-RDFizer maintainers}},
   title   = {VCF-RDFizer},
   year    = {2026},
-  version = {2.1.0},
+  version = {3.0.0},
   url     = {https://github.com/ecrum19/VCF-RDFizer},
   note    = {Computer software}
 }
