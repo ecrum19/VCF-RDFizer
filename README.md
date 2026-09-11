@@ -14,16 +14,25 @@
 
 VCF-RDFizer is a Docker-first CLI wrapper for:
 1. VCF -> RDF (N-Triples) with RMLStreamer
-2. Optional RDF compression/decompression
+2. Optional RDF compression/decompression, into queryable HDT and COTTAS artifacts
 3. Semantic validation of a compressed RDF graph against its source VCF
+4. Data linking, which writes a provenance-tracked side-graph of external links
 
-The VCF-RDFizer vocabulary is available at [https://w3id.org/vcf-rdfizer/vocab#](https://w3id.org/vcf-rdfizer/vocab#).
+The conversion targets the **VCF Core vocabulary**, published at
+[https://w3id.org/vcf-core/vocab#](https://w3id.org/vcf-core/vocab#) (prefix
+`vcfc:`). It replaces the retired VCF-RDFizer vocabulary
+(`https://w3id.org/vcf-rdfizer/vocab#`), which is not redirected: that namespace
+serves a deprecation document linking every former term to its successor. VCF
+Core is a semantic target any conversion system can adopt, and its version line
+is independent of this converter's — the emitted IRIs reference the namespace,
+not a pinned version.
 
-This README is the task-oriented reference. For how the tool works, why it is
-built that way, and where it stops working, see the documentation set in
-**[`docs/`](docs/README.md)** - starting with
-[Architecture](docs/architecture.md) and, before you rely on the output,
-[Limitations](docs/limitations.md).
+This README covers day-to-day use: installation, the CLI flags, and worked
+commands. The documentation set in **[`docs/`](docs/README.md)** covers
+everything else — how the tool works internally, why it is designed that way,
+and where it stops working. Start with
+[Architecture](docs/architecture.md), and read
+[Limitations](docs/limitations.md) before you rely on the output.
 
 ## Requirements
 
@@ -96,7 +105,7 @@ In `full` mode with multiple VCF inputs, failures are isolated per input:
 
 ## Main Flags (Most Used)
 
-- `-m, --mode {full,compress,decompress,tsv,validation,index}`
+- `-m, --mode {full,compress,decompress,tsv,index,validation,link}`
 - `-o, --out` required output root directory
 - `--rdf-compression` final raw RDF codecs: `gzip`, `brotli`, or `none`
 - `--representations` queryable RDF outputs: `hdt`, `cottas`, or `none`
@@ -195,7 +204,7 @@ vocabulary's published shapes.
 
 ```bash
 vcf-rdfizer --mode validation -i ./cohort.vcf.gz --rdf ./results/cohort/cohort.nt.gz \
-  --shacl-shapes ./vocabulary/shacl/vcf-rdfizer-vocabulary.shacl.ttl \
+  --shacl-shapes ./vocabulary/shacl/vcf-core-vocabulary.shacl.ttl \
   --strict-conformance -o ./validation-results
 ```
 
@@ -255,7 +264,7 @@ host filesystem.
 - `--filter-oracle {auto,bcftools,cyvcf2}` FILTER oracle for `--validate`
 - `--quiet` suppress terminal progress and validation query chatter while retaining logs/metrics
 - `--no-progress` disable progress sidecars and terminal progress displays
-- `--rdf-storage-mode {plain,space-optimized}` required full-mode aggregate storage policy
+- `--rdf-storage-mode {plain,space-optimized}` full-mode aggregate storage policy (default: `space-optimized`)
   - `plain`: merge RMLStreamer parts into one uncompressed `.nt`
   - `space-optimized`: gzip each part into one `.nt.gz` aggregate and delete the source part immediately
 - `--rdf-compression {gzip,brotli,none}` raw RDF artifacts to retain
@@ -284,11 +293,36 @@ structure is emitted; all default to the richer form.
 | Option | Effect |
 | --- | --- |
 | `--sample-representation {expanded,condensed}` | Genotype shape (see below) |
-| `--info-representation {structured,raw}` | `structured` adds one `vcfr:InfoFieldValue` per record and key, with typed values, alongside `vcfr:infoRaw` |
-| `--header-representation {structured,basic}` | `structured` types each `##` line with its vocabulary subclass and lifts FILTER/ALT/contig attributes into their own properties |
+| `--info-representation {structured,raw}` | `structured` adds one `vcfc:InfoFieldValue` per record and key, with typed values, alongside `vcfc:infoRaw` |
+| `--vcf-version {auto,4.1,4.2,4.3,4.4,4.5}` | `auto` (the default) reads each input's `##fileformat` line, so nothing has to be supplied; an explicit version overrides it for a file whose declaration is missing or wrong |
+| `--header-representation {structured,basic}` | `structured` types each `##` line with its vocabulary subclass, emits the ordered `vcfc:HeaderAttribute` resources the SHACL profile requires, and lifts the INFO/FORMAT/FILTER/ALT/contig/META/SAMPLE/PEDIGREE attributes into their own properties |
 
-QUAL is always emitted, typed `xsd:decimal` or `vcfr:Null`, because the
-published SHACL shape requires a datatype that depends on the value.
+`ID`, `ALT`, `QUAL`, `FILTER` and `infoRaw` are always emitted by the wrapper
+rather than by the RML mapping, because each may be the VCF missing token and
+the vocabulary requires that as `"."^^vcfc:Null` — a datatype that depends on
+the row, which RML cannot express. QUAL additionally takes `xsd:decimal` for a
+finite value and `vcfc:VCFFloat` for the `INF`/`INFINITY`/`NAN` spellings.
+
+### VCF versions
+
+VCF Core ships a SHACL overlay per VCF version (4.1–4.5). The converter detects
+each input's version from its `##fileformat` line — required to be the first
+line of a conforming VCF — and follows it **per input**, so a directory of mixed
+versions converts correctly without any flag. The version selects the
+`vcfc:VCF4xFile` class in the mapping and the behaviour that genuinely differs
+between versions: whether `CIPOS`/`CIEND` carry one pair per record (4.1–4.3) or
+one per ALT allele (4.4+), whether `CILEN`/`CICN` and `EVENTTYPE` exist at all,
+and whether the local-allele and base-modification FORMAT families are defined.
+
+VCF 4.0 has no conformance overlay, so it converts with the newest supported
+rules and no version class, and the run says so rather than assuming silently.
+
+`--info-representation structured` also carries the **allele layer** (ordered
+`vcfc:ReferenceAllele`/`vcfc:AltAllele` with their kind, symbolic type and
+breakend components), the `vcfc:FieldValueItem` decomposition of
+`Number=A/R/G/P` values, and the structural-variant carriers.
+`--header-representation basic` is the smallest header form but does **not**
+produce a SHACL-conformant graph.
 
 [`docs/vcf-coverage.md`](docs/vcf-coverage.md) maps every VCF element to its RDF
 terms and to the validation check that covers it.
@@ -306,11 +340,17 @@ selection trade-offs.
 ### Expanded (default)
 
 Use `--sample-representation expanded` for single-sample and low-sample VCFs. It
-preserves the original vocabulary model:
+preserves the per-sample vocabulary model:
 
-- every record/sample pair is a `vcfr:SampleCall`;
-- every represented FORMAT slot is a `vcfr:FormatFieldValue`;
-- the VCF file declares `vcfr:representationProfile vcfr:ExpandedRepresentation`.
+- every record/sample pair is a `vcfc:SampleCall`, linked to a reusable
+  `vcfc:VCFSample` with `vcfc:forSample`;
+- every represented FORMAT slot is a `vcfc:FormatFieldValue`, linked to its
+  declaration with `vcfc:declaredBy`;
+- `GT` is parsed into a `vcfc:Genotype` with an explicit `vcfc:phasingStatus`
+  and one `vcfc:GenotypeAlleleCall` per position, and `FT`, `PS`/`PSL`, `LAA`,
+  the copy-number and haplotype keys, and the `M`/`DPM`/`ADM` base-modification
+  families get their own resources;
+- the VCF file declares `vcfc:representationProfile vcfc:ExpandedRepresentation`.
 
 With the default rules, these triples are appended directly from `records.tsv`;
 the large materialized helper TSVs are not created. The final graph is still
@@ -326,19 +366,25 @@ vcf-rdfizer --mode full \
 
 ### Condensed
 
-Use `--sample-representation condensed` for large multi-sample cohorts. It
-uses the vocabulary introduced in VCF-RDFizer Vocabulary 1.1.0:
+Use `--sample-representation condensed` for large multi-sample cohorts:
 
-- sample columns are declared once as an ordered `vcfr:SampleSet` of reusable
-  `vcfr:VCFSample` resources;
-- each genotype-bearing call has one `vcfr:CohortCallMatrix`;
-- each FORMAT key has one `vcfr:FormatValueVector`, rather than one RDF value
+- sample columns are declared once as an ordered `vcfc:SampleSet` of reusable
+  `vcfc:VCFSample` resources;
+- each genotype-bearing call has one `vcfc:CohortCallMatrix`;
+- each FORMAT key has one `vcfc:FormatValueVector`, rather than one RDF value
   resource per sample;
 - the VCF file declares
-  `vcfr:representationProfile vcfr:CondensedRepresentation`.
+  `vcfc:representationProfile vcfc:CondensedRepresentation`.
 
-`vcfr:encodedValues` uses `vcfr:VCFTextVector`: one tab-separated lexical item
-per sample in `vcfr:sampleIndex` order. Commas inside a FORMAT value remain part
+Condensed mode deliberately stops at the vector: it does **not** derive the
+per-sample genotype, phase-set or base-modification resources that expanded mode
+does, because that is exactly the per-sample materialization the profile exists
+to avoid. Every value stays recoverable by decoding a vector against its FORMAT
+definition and the matrix `SampleSet`. Both profiles do emit the file-level
+`vcfc:SampleSet`, which costs one resource per sample column for the whole file.
+
+`vcfc:encodedValues` uses `vcfc:VCFTextVector`: one tab-separated lexical item
+per sample in `vcfc:sampleIndex` order. Commas inside a FORMAT value remain part
 of that item, and absent values are emitted as `.` so all vectors stay aligned.
 Consumers reconstruct sample `i`'s value for a FORMAT key by selecting position
 `i` from its vector. This changes genotype graph growth to approximately
@@ -843,6 +889,23 @@ finishes.
 - default rules file: `rules/default_rules.ttl`
 - rules guide: `rules/README.md`
 
+### Data linking plug-ins
+
+Three installed examples cover declarative dbSNP links (`rsid-dbsnp`), interval
+joins against a synthetic GFF3 bundle (`gene-demo`), and an Ensembl API resolver
+(`rsid-ensembl`). Add `--link <ids>` in full mode, or link an existing aggregate
+without Docker:
+
+```bash
+vcf-rdfizer --mode link --rdf ./results/sample/sample.nt.gz \
+  --link rsid-dbsnp --offline -o ./linked-results
+```
+
+Links go into `sample.links.nt`; the base graph is unchanged. The
+`vcf-rdfizer-link` companion CLI lists, scaffolds, checks and previews plug-ins.
+See [Data linking](docs/datalinking.md) for all three worked examples, reference
+and network safeguards, provenance, and the remaining design limitations.
+
 ### Custom RML Mappings
 
 `--rules` accepts any RML mapping, so you can change what RDF the pipeline
@@ -924,6 +987,8 @@ launches Docker, and reads back the JSON/CSV reports each stage writes.
 | --- | --- |
 | `vcf_rdfizer.py` | Host CLI: argument validation, output-collision planning, Docker orchestration, metrics assembly, mode dispatch. Also emits the multi-sample genotype RDF (see below). |
 | `vcf_rdfizer_rules.py` | `vcf-rdfizer-rules` CLI: scaffold, document, and validate custom RML mappings. |
+| `vcf_rdfizer_link.py`, `vcf_rdfizer_linking/` | Linker authoring CLI and shared token/interval/API runner. |
+| `vcf_rdfizer_data/linkers/` | Packaged examples of all three plug-in tiers. |
 | `vcf_rdfizer_gzip.py` | Uncompressed size of a gzip/BGZF VCF without decompressing it. Used by the host preflight estimate and, inside the image, by `run_conversion.sh`. |
 | `src/vcf_as_tsv.sh` | VCF -> per-input `records`/`header_lines`/`file_metadata` TSV, in one `awk` pass. |
 | `src/run_conversion.sh` | Runs RMLStreamer, normalizes Spark part files, merges them into one `.nt`/`.nt.gz` aggregate, records conversion metrics. |
@@ -959,11 +1024,12 @@ how each part of the tool works, why, and where it stops working.
 | [CLI reference](docs/cli-reference.md) | Every flag, with constraints and interactions |
 | [Limitations](docs/limitations.md) | Everything the tool cannot do, in one place |
 | [Roadmap](docs/roadmap.md) | Planned work, known defects, and rejected options |
-| [Data linking design](docs/datalinking-design.md) | Proposal: a plug-in system for external links |
+| [Data linking](docs/datalinking.md) | Runnable examples of all three plug-in tiers, authoring, safeguards, and provenance |
+| [Data linking design](docs/datalinking-design.md) | Broader proposal and remaining work |
 | [Privacy policy design](docs/privacy-policy-design.md) | Proposal: ODRL-based granular disclosure control over the graph |
 
-- [`changelog.md`](changelog.md) - dated change history
 - [`ACKNOWLEDGEMENTS.md`](ACKNOWLEDGEMENTS.md) - funding and attribution
+- [Releases](https://github.com/ecrum19/VCF-RDFizer/releases) - release notes per version
 
 ## Troubleshooting
 
@@ -1014,7 +1080,7 @@ Safe termination:
 
 If you use VCF-RDFizer in a publication, please cite:
 
-VCF-RDFizer maintainers. (2026). *VCF-RDFizer* (Version 2.1.0) [Computer software]. GitHub. https://github.com/ecrum19/VCF-RDFizer
+VCF-RDFizer maintainers. (2026). *VCF-RDFizer* (Version 3.0.0) [Computer software]. GitHub. https://github.com/ecrum19/VCF-RDFizer
 
 BibTeX:
 
@@ -1023,7 +1089,7 @@ BibTeX:
   author  = {{VCF-RDFizer maintainers}},
   title   = {VCF-RDFizer},
   year    = {2026},
-  version = {2.1.0},
+  version = {3.0.0},
   url     = {https://github.com/ecrum19/VCF-RDFizer},
   note    = {Computer software}
 }

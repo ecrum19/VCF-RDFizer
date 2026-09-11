@@ -11,7 +11,7 @@ Compression is deliberately not one option. It is three:
 
 | Decision | Flag | Values | Default |
 | --- | --- | --- | --- |
-| How the aggregate is staged | `--rdf-storage-mode` | `plain`, `space-optimized` | *(required in full mode)* |
+| How the aggregate is staged | `--rdf-storage-mode` | `plain`, `space-optimized` | `space-optimized` |
 | Which raw RDF artifacts to keep | `--rdf-compression` | `gzip`, `brotli`, `none` | `gzip,brotli` |
 | Which queryable representations to build | `--representations` | `hdt`, `cottas`, `none` | `hdt` |
 | How to package those representations | `--artifact-compression` | `gzip`, `brotli`, `none` | `none` |
@@ -54,9 +54,36 @@ usable without ever expanding a second full raw copy.
 | `--chunk-max-bytes` | hard ceiling; boundaries stay on complete lines | 1 GiB |
 
 `--hdt-strategy` chooses the policy: `auto` (build chunks and merge with native
-`hdtc`), `partitioned` (always chunk), `single` (one `rdf2hdt` run). `single`
-cannot consume a gzip stream without expanding it, so it is incompatible with
-`space-optimized`.
+`hdtc`), `partitioned` (always chunk), `single` (one `rdf2hdt` run).
+
+**`single` is a verification path, not a faster alternative.** There is no size
+regime in which it wins: below `--chunk-min-bytes` the partitioned path emits
+one chunk and its merge is trivial, so the two converge, and above it
+partitioned is the only one that survives cohort scale. What `single` is for is
+producing a one-shot HDT of the same graph so the chunk-and-merge result can be
+checked against it — identical triple counts and identical query answers are
+what justify partitioned generation being the default, rather than it merely
+being convenient.
+
+It applies only to an HDT-only run over an uncompressed aggregate, and both
+other cases are refused rather than silently downgraded:
+
+- a gzip aggregate cannot be read in one pass without expanding a second full
+  uncompressed copy, so `single` is incompatible with `space-optimized` and
+  needs an explicit `--rdf-storage-mode plain`;
+- `cottas` among the `--representations` always needs bounded chunks, so the
+  partitioned path would run for both representations and the strategy would
+  have no effect. Earlier releases ignored the flag silently here, which meant a
+  `--representations hdt,cottas --hdt-strategy single` run measured partitioned
+  HDT under a `single` label.
+
+So the one configuration where `single` does what it says is:
+
+```bash
+vcf-rdfizer --mode full --input cohort.vcf.gz \
+  --rdf-storage-mode plain --representations hdt \
+  --rdf-compression none --hdt-strategy single --out results
+```
 
 The whole partitioned stage runs in an **ephemeral Docker-managed volume**.
 Chunks, scratch, and merge files never reach the output directory, and the
@@ -154,7 +181,8 @@ unwrapped file never appears on the host.
 | Queryable, single artifact, smallest footprint | `--representations hdt --rdf-compression none --remove-rdf-storage-output` |
 | Comparing HDT against COTTAS | `--representations hdt,cottas` |
 | Archival transfer | `--artifact-compression brotli` on top of the chosen representation |
-| Memory-constrained host | `space-optimized` + `partitioned` + lower `--chunk-*-bytes` |
+| Memory-constrained host | `space-optimized` + `partitioned` (both default) + lower `--chunk-*-bytes` |
+| Verifying the partitioned merge | `plain` + `--representations hdt` + `single`, compared against `partitioned` |
 
 ## 10. Limitations
 

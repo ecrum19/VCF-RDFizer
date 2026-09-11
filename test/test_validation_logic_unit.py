@@ -35,13 +35,13 @@ def load_runner():
 V = load_runner()
 
 
-def parser_fixture() -> dict:
+def parser_fixture(representation: str = "expanded") -> dict:
     """The canonical fixture's oracle.
 
     Shared with the graph-level mutation harness rather than hand-written here,
     so there is exactly one description of what the fixture VCF contains.
     """
-    return copy.deepcopy(fixtures.parser_summary("expanded"))
+    return copy.deepcopy(fixtures.parser_summary(representation))
 
 
 def sparql_fixture() -> dict:
@@ -182,8 +182,8 @@ class ValidationDetectionTests(VerboseTestCase):
     def test_digest_covers_every_fixed_field(self):
         """ID, QUAL and INFO are only covered through the record digest."""
         query = (V.QUERY_ROOT / "common" / "q11_record_digest.rq").read_text(encoding="utf-8")
-        for term in ("vcfr:chrom", "vcfr:pos", "vcfr:recordId", "vcfr:ref",
-                     "vcfr:alt", "vcfr:qual", "vcfr:filter", "vcfr:infoRaw"):
+        for term in ("vcfc:chrom", "vcfc:pos", "vcfc:recordId", "vcfc:ref",
+                     "vcfc:alt", "vcfc:qual", "vcfc:filter", "vcfc:infoRaw"):
             self.assertIn(term, query, f"{term} missing from the record digest")
 
     def test_runner_and_wrapper_agree_on_template_encoding(self):
@@ -319,7 +319,61 @@ class CensusAndDigestTests(VerboseTestCase):
         """The elements added in Phases 2, 4 and 5 are in the expected inventory."""
         predicates = {row["predicate"] for row in parser_fixture()["q09_predicate_census"]}
         for term in ("qual", "hasInfoValue", "fileDate", "contigId", "filterId", "altId"):
-            self.assertIn(f"{V.VCFR}{term}", predicates, term)
+            self.assertIn(f"{V.VCFC}{term}", predicates, term)
+
+    def test_census_covers_the_vcf_core_layers(self):
+        """Every family the VCF Core emitters added is in the inventory too.
+
+        The census asserts an exact set, so a family missing from it would make
+        a correct graph report extra predicates rather than passing.
+        """
+        summary = parser_fixture()
+        predicates = {row["predicate"] for row in summary["q09_predicate_census"]}
+        classes = {row["class"] for row in summary["q10_class_census"]}
+
+        for term in (
+            # Ordering, required by the SPARQL SHACL profile.
+            "lineIndex", "recordIndex",
+            # Header attributes and the #CHROM line.
+            "hasAttribute", "attributeKey", "attributeValue", "attributeIndex",
+            "hasColumnHeader", "hasGenotypeColumns",
+            # The allele layer.
+            "hasReferenceAllele", "hasAltAllele", "alleleIndex", "alleleValue",
+            "alleleKind", "chromosome",
+            # Indexed values.
+            "hasValueItem", "valueIndex", "itemValue", "forAllele",
+            # Reusable sample identity, emitted in both profiles.
+            "hasSampleSet", "hasSample", "sampleName", "sampleIndex",
+            # Field declarations.
+            "fieldArity", "fieldNumberInteger", "fieldType",
+        ):
+            self.assertIn(f"{V.VCFC}{term}", predicates, term)
+
+        for name in (
+            "ColumnHeaderLine", "HeaderAttribute", "ReferenceAllele", "AltAllele",
+            "FieldValueItem", "SampleSet", "VCFSample", "FormatFieldDefinition",
+        ):
+            self.assertIn(f"{V.VCFC}{name}", classes, name)
+
+        # The mapping's version sentinel resolves to the subclass for the
+        # version the fixture declares.
+        self.assertIn(f"{V.VCFC}{fixtures.VERSION_FILE_CLASS}", classes)
+
+    def test_expanded_census_covers_the_parsed_genotype_layer(self):
+        """The genotype layer is expanded-only, and the census must say so."""
+        expanded = {
+            row["predicate"] for row in parser_fixture("expanded")["q09_predicate_census"]
+        }
+        condensed = {
+            row["predicate"] for row in parser_fixture("condensed")["q09_predicate_census"]
+        }
+        for term in ("hasGenotype", "genotypeString", "ploidy", "phasingStatus",
+                     "hasAlleleCall", "callIndex", "isNoCall", "calledAllele",
+                     "forSample"):
+            self.assertIn(f"{V.VCFC}{term}", expanded, term)
+            # The condensed profile keeps these values inside its vectors, so
+            # deriving them there would be exactly the growth it prevents.
+            self.assertNotIn(f"{V.VCFC}{term}", condensed, term)
 
     def test_digest_separator_prevents_field_boundary_collisions(self):
         """Shifting a field boundary must not be able to forge a matching digest."""
@@ -344,7 +398,7 @@ class CensusAndDigestTests(VerboseTestCase):
             )
 
     def test_qual_is_typed_as_the_published_shape_requires(self):
-        """The shape demands xsd:decimal or vcfr:Null, never a plain literal."""
+        """The shape demands xsd:decimal or vcfc:Null, never a plain literal."""
         import vcf_rdfizer
 
         self.assertIn("XMLSchema#decimal", vcf_rdfizer._qual_object("12.5"))

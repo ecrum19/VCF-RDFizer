@@ -78,20 +78,87 @@ helper-table consumers works in both modes.
 
 ## 3. What a custom mapping does *not* control
 
-This is the part most easily missed. Three families of triple are emitted by the
-wrapper, not by RML, and they appear in your graph regardless of your mapping:
+This is the part most easily missed, and it grew with the move to the VCF Core
+vocabulary. Several families of triple are emitted by the wrapper, not by RML,
+and they appear in your graph regardless of your mapping.
+
+The split follows one rule:
+
+> **The RML mapping carries every field whose RDF datatype is the same for every
+> row. The wrapper carries everything else.**
+
+"Everything else" is two things. A value that may be the VCF missing token `.`
+needs `"."^^vcfc:Null` on some rows and a typed literal on others, and RML
+cannot switch an object's datatype per row. A value that has to be *decomposed*
+— an angle-bracketed header line, an ALT list, a GT string, a comma-separated
+`Number=A`/`R`/`G` payload — would need a materialized helper table whose size
+is the product of its dimensions.
 
 | Triples | Turned off with |
 | --- | --- |
-| Genotypes (`SampleCall`/`FormatFieldValue`, or the condensed equivalents) | nothing — one emitter always runs; choose which with `--sample-representation` |
-| `QUAL`, and structured `InfoFieldValue` nodes | `--info-representation raw` still emits QUAL |
-| Header-line subclasses and lifted FILTER/ALT/contig/INFO/FORMAT attributes | `--header-representation basic` |
+| `ID`, `ALT`, `QUAL`, `FILTER`, `infoRaw` — the fixed fields that may be missing | nothing; they are the record's mandatory content |
+| `fileDate` — no mandated format in VCF, so the value must be inspected to type it | nothing |
+| Genotypes (`SampleCall`/`FormatFieldValue`/`Genotype`, or the condensed `CohortCallMatrix`/`FormatValueVector`) | nothing — one emitter always runs; choose which with `--sample-representation` |
+| Structured `InfoFieldValue` nodes, the allele layer, `FieldValueItem` decomposition, and the SV carriers | `--info-representation raw` (`QUAL`, `ID`, `ALT`, `FILTER` and `infoRaw` are still emitted) |
+| Header-line subclasses, `HeaderAttribute` resources, and the lifted INFO/FORMAT/FILTER/ALT/contig/META/SAMPLE/PEDIGREE attributes | `--header-representation basic` |
+| The `vcfc:VCF4xFile` version class | nothing directly; `--vcf-version` selects which one, and a mapping without the sentinel emits none |
 
-The reasons are in [`architecture.md`](architecture.md#4-where-the-split-leaks-and-why):
-RML cannot choose a datatype or a class per row, and the alternatives would
-require materializing helper tables. It is a real constraint on the extension
-point, not an oversight, but a mapping author who assumes `--rules` is the sole
-source of truth for the graph will be surprised.
+Two of those are worth calling out because they are new:
+
+- **The allele layer travels with `--info-representation structured`** (the
+  default). `vcfc:hasReferenceAllele` and `vcfc:hasAltAllele` are minted there
+  because the `Number=A`/`R`/`G` value items join to them; turning INFO down to
+  `raw` turns the alleles off too.
+- **`--header-representation basic` no longer produces a SHACL-conformant
+  graph.** `vcfc:StructuredHeaderLineShape` requires at least one
+  `vcfc:hasAttribute` on every structured header line, and `basic` emits no
+  subclass and no attributes at all. It remains available as the minimal,
+  fastest header form; it is simply not a conforming one.
+
+The reasons are in [`architecture.md`](architecture.md#4-where-the-split-leaks-and-why).
+It is a real constraint on the extension point, not an oversight, but a mapping
+author who assumes `--rules` is the sole source of truth for the graph will be
+surprised.
+
+## 3a. The version sentinel
+
+The mapping carries one placeholder the wrapper resolves per input:
+
+```turtle
+rr:subjectMap [
+  rr:template "file://{SOURCE_FILE}" ;
+  rr:class vcfc:VCFFile ;
+  rr:class vcfc:VCFVersionFile      # rewritten per input
+] ;
+```
+
+`vcfc:VCFVersionFile` is not a vocabulary term. The wrapper rewrites it, exactly
+the way it rewrites the five `csvw:url` paths, to the `vcfc:VCF4xFile` subclass
+for the version that input's `##fileformat` line declares — which activates that
+version's SHACL overlay gate. When the version has no conformance overlay
+(VCFv4.0, or a missing or malformed line) it is rewritten to `vcfc:VCFFile`,
+which the subject map already asserts, so the graph never claims a gate that
+cannot be checked and never gains an undefined term.
+
+One mapping is therefore the single source of truth for all five versions,
+rather than five near-identical copies that would drift apart.
+
+`vcf-rdfizer-rules check` reports whether your mapping has the sentinel. A
+mapping without it still converts, and the version-dependent *emitter* behaviour
+still follows each input's own `##fileformat` line — only the class is missing,
+so the version overlay's gate stays inactive:
+
+```
+Warnings:
+  - No vcfc:VCFVersionFile sentinel in the file subject map. …
+```
+
+To render a materialized per-version mapping — to read it, or to hand-edit one
+version's rules — render it for a specific version and inspect the result:
+
+```bash
+vcf-rdfizer-rules init -o my_rules.ttl   # keeps the sentinel
+```
 
 ## 4. What a custom mapping costs in validation
 
@@ -144,8 +211,11 @@ Recommendations that come from experience rather than from the checker:
 1. **Preserve the stable subject templates** (`file://{SOURCE_FILE}`,
    `file://{SOURCE_FILE}#record/{ROW_ID}`, `file://{SOURCE_FILE}#call/{ROW_ID}`)
    if you want joins with the wrapper-emitted triples to keep working. The
-   genotype, QUAL, INFO and header emitters all mint IRIs against those
-   templates and will not follow a mapping that changes them.
+   genotype, record-detail, allele and header emitters all mint IRIs against
+   those templates and will not follow a mapping that changes them. The allele
+   and genotype layers additionally depend on
+   `file://{SOURCE_FILE}#record/{ROW_ID}/allele/{n}` and
+   `file://{SOURCE_FILE}#samples/{SAMPLE_URI_ID}`.
 2. **Add, don't replace.** A mapping that extends the default with additional
    `rr:TriplesMap` blocks keeps the full validation suite meaningful for the
    parts it did not change; one that rebuilds the graph from scratch does not.
@@ -154,11 +224,30 @@ Recommendations that come from experience rather than from the checker:
 
 ## 6. SHACL
 
-The SHACL constraints are maintained in the vocabulary repository, not here:
-[`vcf-rdfizer-vocabulary.shacl.ttl`](https://github.com/ecrum19/VCF-RDFizer-vocabulary/blob/main/shacl/vcf-rdfizer-vocabulary.shacl.ttl).
+The SHACL constraints are maintained in the vocabulary repository, not here.
+VCF Core ships two profiles:
+
+- `shacl/vcf-core-vocabulary.shacl.ttl` — the portable profile: required
+  structural links, VCF 4.5 lexical patterns, and field type/arity constraints.
+- `shacl/vcf-core-vocabulary-sparql.shacl.ttl` — cross-resource checks that need
+  SPARQL: header and record ordering, sample uniqueness, GT-first FORMAT order,
+  and the rule that a graph must not mix expanded sample calls with condensed
+  call matrices.
+
 Point `--shacl-shapes` at them to check a graph structurally, independently of
-the VCF. Note the known contradiction inside the published shapes, recorded in
-[`vcf-coverage.md`](vcf-coverage.md#an-open-conflict-inside-the-vocabulary).
+the VCF. Both profiles need the bundled ontology as an ontology graph and RDFS
+inference enabled — subclass-based targets and `sh:class` constraints do not
+resolve without it (a concrete `INFOHeaderLine` is also an
+`InfoFieldDefinition`, and only inference makes that true).
+
+The default mapping's output validates against both profiles with zero
+violations in both representation profiles. One inconsistency inside the
+published vocabulary is worth knowing about: the ontology declares
+`rdfs:range xsd:positiveInteger` on the ordinal properties while every SHACL
+shape constrains them with `sh:datatype xsd:integer`, and a SHACL datatype
+constraint compares the datatype IRI exactly. This converter emits
+`xsd:integer`, which satisfies both. See
+[`validation-migration-notes.md`](validation-migration-notes.md#3-ordinals-are-now-xsdinteger-not-xsdpositiveinteger).
 
 ---
 
@@ -168,3 +257,5 @@ the VCF. Note the known contradiction inside the published shapes, recorded in
 - [Architecture](architecture.md) — why some triples bypass RML
 - [Validation](validation.md) — what changes under a custom mapping
 - [`rules/README.md`](../rules/README.md) — the mapping directory itself
+- [Validation migration notes](validation-migration-notes.md) — what the move to
+  VCF Core leaves to do in the validation suite

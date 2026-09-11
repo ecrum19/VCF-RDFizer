@@ -32,14 +32,16 @@ def count_nt(path: Path) -> int:
 
 def count_decoded(command: list[str]) -> int:
     """Run an RDF exporter and count its streamed N-Triples output."""
-    process = subprocess.Popen(
+    # The context manager closes the stdout pipe even when counting raises, so a
+    # failed decode cannot leak a file descriptor into the rest of the run.
+    with subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
-    )
-    assert process.stdout is not None
-    count = sum(1 for line in process.stdout if is_triple_line(line))
-    return_code = process.wait()
+    ) as process:
+        assert process.stdout is not None
+        count = sum(1 for line in process.stdout if is_triple_line(line))
+        return_code = process.wait()
     if return_code != 0:
         raise RuntimeError(f"decoder exited with status {return_code}: {' '.join(command)}")
     return count

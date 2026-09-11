@@ -157,27 +157,64 @@ class NativeArtifactEngineTests(VerboseTestCase):
 
         Verified against comunica-sparql-hdt 5.0.1: '/tmp/g.hdt' reports
         "Could not dereference", while 'hdt@/tmp/g.hdt' answers the query.
+        The typed prefix now goes to the endpoint at startup rather than into
+        each query's argv, but it is no less required.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            raw_dir = tmp_path / "raw"
+            raw_dir.mkdir()
+            engine = self._engine("hdt", tmp_path)
+            engine.artifact = tmp_path / "cohort.hdt"
+            self.assertEqual(
+                engine._endpoint_source_argument(),
+                f"hdt@{tmp_path / 'cohort.hdt'}",
+            )
+
+    def test_hdt_loads_the_artifact_once_for_the_whole_query_set(self):
+        """Every query must be answered from one load, not one process each.
+
+        The one-shot CLI was spawned per query, so each of the 27 queries
+        re-opened the artifact and re-initialised the engine - and every
+        measured query time silently included that startup.
         """
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             raw_dir = tmp_path / "raw"
             raw_dir.mkdir()
             query = tmp_path / "q.rq"
-            query.write_text("SELECT * WHERE { ?s ?p ?o }", encoding="utf-8")
+            query_text = "SELECT * WHERE { ?s ?p ?o }"
+            query.write_text(query_text, encoding="utf-8")
             engine = self._engine("hdt", tmp_path)
-            engine.executable = "/usr/bin/comunica-sparql-hdt"
             engine.artifact = tmp_path / "cohort.hdt"
-            recorded = {}
+            posted = []
 
-            def fake_run(command, **kwargs):
-                recorded["command"] = command
-                return mock.Mock(returncode=0)
+            def fake_post(self, endpoint, q, *, timeout):
+                posted.append(q)
+                return b'{"results": {"bindings": []}}'
 
-            with mock.patch.object(V.subprocess, "run", side_effect=fake_run):
-                envelope = engine.execute("q01", query)
+            with mock.patch.object(
+                        V.shutil, "which",
+                        return_value="/usr/bin/comunica-sparql-hdt-http",
+                    ), \
+                    mock.patch.object(V, "tool_version", return_value=None), \
+                    mock.patch.object(
+                        V.NativeArtifactEngine, "start", lambda self: None
+                    ), \
+                    mock.patch.object(V.subprocess, "Popen") as popen, \
+                    mock.patch.object(V.ComunicaHttpEndpointMixin, "_post", fake_post):
+                popen.return_value.poll.return_value = None
+                engine.start()
+                for query_id in ("q01", "q02", "q03"):
+                    envelope = engine.execute(query_id, query)
 
-        self.assertEqual(recorded["command"][1], f"hdt@{tmp_path / 'cohort.hdt'}")
-        self.assertIn("application/sparql-results+json", recorded["command"])
+        # One server process for the whole set.
+        self.assertEqual(popen.call_count, 1)
+        command = popen.call_args[0][0]
+        self.assertIn(f"hdt@{tmp_path / 'cohort.hdt'}", command)
+        self.assertEqual(command[command.index("-w") + 1], "1")
+        # Three queries answered from that single load.
+        self.assertEqual(len([q for q in posted if q == query_text]), 3)
         self.assertEqual(envelope["status"], "PASS")
         self.assertEqual(envelope["engine"], "hdt")
 
@@ -294,6 +331,100 @@ class BenchmarkReportTests(VerboseTestCase):
         )
         # Repeated on every row so the file needs no join to be usable.
         self.assertEqual({row["oracle_wall_seconds"] for row in rows}, {"0.4"})
+
+
+class OracleQuerySecondsTests(VerboseTestCase):
+    """Per-query oracle cost, attributed from directly measured phases."""
+
+    PHASES = {
+        "readerOpenSeconds": 1.0,
+        "scanSeconds": 100.0,
+        "sampleBlockSeconds": 90.0,
+        "assemblySeconds": 2.0,
+    }
+
+    def test_a_record_level_query_does_not_pay_for_the_sample_block(self):
+        """The per-sample block is the only phase a query can avoid."""
+        per_query = V.oracle_query_seconds(self.PHASES, ("q01_record_density_1mb",))
+        # 1.0 open + (100 scan - 90 sample block) + 2.0 assembly
+        self.assertAlmostEqual(per_query["q01_record_density_1mb"], 13.0)
+
+    def test_a_sample_level_query_pays_for_the_whole_scan(self):
+        per_query = V.oracle_query_seconds(self.PHASES, ("q05_sample_genotype_counts",))
+        # 1.0 open + 100 scan + 2.0 assembly
+        self.assertAlmostEqual(per_query["q05_sample_genotype_counts"], 103.0)
+
+    def test_the_sample_level_set_is_the_three_genotype_queries(self):
+        """Q5/Q6/Q13 traverse the sample layer; nothing else does."""
+        self.assertEqual(
+            V.ORACLE_SAMPLE_LEVEL_QUERIES,
+            frozenset({"q05_sample_genotype_counts", "q06_ac_an_distribution",
+                       "q13_format_value_digest"}),
+        )
+
+    def test_no_phases_means_no_per_query_attribution(self):
+        """Without a measured breakdown there is nothing to attribute."""
+        self.assertEqual(V.oracle_query_seconds(None, ("q01",)), {})
+        self.assertEqual(V.oracle_query_seconds({}, ("q01",)), {})
+
+    def test_a_sample_block_longer_than_the_scan_cannot_go_negative(self):
+        """Clock jitter on a fast scan must not produce a negative cost."""
+        per_query = V.oracle_query_seconds(
+            {"readerOpenSeconds": 0.0, "scanSeconds": 1.0,
+             "sampleBlockSeconds": 1.5, "assemblySeconds": 0.0},
+            ("q01_record_density_1mb",),
+        )
+        self.assertEqual(per_query["q01_record_density_1mb"], 0.0)
+
+    def test_the_benchmark_carries_phases_and_per_query_seconds(self):
+        benchmark = V.build_benchmark(
+            {"qlever": _verdict("PASS", {"q01_record_density_1mb": 0.2,
+                                         "q05_sample_genotype_counts": 0.3})},
+            {"qlever": {"setupSeconds": 0.1}},
+            oracle_seconds={"total": 103.0, "parse": 101.0, "census": 2.0,
+                            "phases": dict(self.PHASES)},
+            materialization_seconds=None,
+            shacl_seconds=None,
+            query_ids=("q01_record_density_1mb", "q05_sample_genotype_counts"),
+        )
+        self.assertEqual(benchmark["oracle"]["phases"], self.PHASES)
+        self.assertAlmostEqual(
+            benchmark["oracle"]["perQuerySeconds"]["q01_record_density_1mb"], 13.0)
+        self.assertAlmostEqual(
+            benchmark["oracle"]["perQuerySeconds"]["q05_sample_genotype_counts"], 103.0)
+        # The attribution is auditable: the payload names which queries pay.
+        self.assertEqual(benchmark["oracle"]["sampleLevelQueries"],
+                         ["q05_sample_genotype_counts"])
+
+    def test_an_oracle_without_phases_reports_none_not_an_empty_dict(self):
+        """A run made before phase timing existed must not look like zero cost."""
+        benchmark = V.build_benchmark(
+            {"qlever": _verdict("PASS", {"q01": 0.2})},
+            {"qlever": {"setupSeconds": 0.1}},
+            oracle_seconds={"total": 0.4, "parse": 0.3, "census": 0.1},
+            materialization_seconds=None, shacl_seconds=None, query_ids=("q01",),
+        )
+        self.assertIsNone(benchmark["oracle"]["phases"])
+        self.assertIsNone(benchmark["oracle"]["perQuerySeconds"])
+
+    def test_the_csv_carries_a_per_query_oracle_column(self):
+        """`oracle_query_seconds` IS row-wise comparable; the total is not."""
+        benchmark = V.build_benchmark(
+            {"qlever": _verdict("PASS", {"q01_record_density_1mb": 0.2,
+                                         "q05_sample_genotype_counts": 0.3})},
+            {"qlever": {"setupSeconds": 0.1}},
+            oracle_seconds={"total": 103.0, "parse": 101.0, "census": 2.0,
+                            "phases": dict(self.PHASES)},
+            materialization_seconds=None, shacl_seconds=None,
+            query_ids=("q01_record_density_1mb", "q05_sample_genotype_counts"),
+        )
+        with tempfile.TemporaryDirectory() as td:
+            path = V.write_benchmark_csv(Path(td) / "benchmark.csv", benchmark)
+            rows = {r["query_id"]: r for r in csv.DictReader(path.open(encoding="utf-8"))}
+        self.assertEqual(rows["q01_record_density_1mb"]["oracle_query_seconds"], "13.0")
+        self.assertEqual(rows["q05_sample_genotype_counts"]["oracle_query_seconds"], "103.0")
+        # The whole-run total is still there, and still the same on every row.
+        self.assertEqual({r["oracle_wall_seconds"] for r in rows.values()}, {"103.0"})
 
 
 class EngineAgreementTests(VerboseTestCase):

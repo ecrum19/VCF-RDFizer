@@ -1,4 +1,4 @@
-PREFIX vcfr: <https://w3id.org/vcf-rdfizer/vocab#>
+PREFIX vcfc: <https://w3id.org/vcf-core/vocab#>
 
 # Exact number of triples carrying an empty or whitespace-only term.
 SELECT (COUNT(*) AS ?anomalyCount)

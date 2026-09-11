@@ -1,17 +1,17 @@
-PREFIX vcfr: <https://w3id.org/vcf-rdfizer/vocab#>
+PREFIX vcfc: <https://w3id.org/vcf-core/vocab#>
 
 SELECT ?sampleId ?genotypeClass (COUNT(DISTINCT ?record) AS ?callCount)
 WHERE {
-  ?file a vcfr:VCFFile ; vcfr:hasRecord ?record ; vcfr:hasSampleSet ?sampleSet .
-  ?record a vcfr:VCFRecord ; vcfr:hasCall ?call .
-  ?sampleSet vcfr:hasSample ?sample .
-  ?sample vcfr:sampleName ?sampleId ; vcfr:sampleIndex ?sampleIndex .
+  ?file a vcfc:VCFFile ; vcfc:hasRecord ?record ; vcfc:hasSampleSet ?sampleSet .
+  ?record a vcfc:VCFRecord ; vcfc:hasCall ?call .
+  ?sampleSet vcfc:hasSample ?sample .
+  ?sample vcfc:sampleName ?sampleId ; vcfc:sampleIndex ?sampleIndex .
   OPTIONAL {
-    ?sample vcfr:sampleIndex ?sampleIndexForVector .
-    ?call vcfr:hasCallMatrix ?matrix .
-    ?matrix vcfr:appliesToSampleSet ?sampleSet ; vcfr:hasFormatValueVector ?gtVector .
-    ?gtVector vcfr:declaredBy ?definition ; vcfr:encodedValues ?encoded .
-    ?definition vcfr:fieldId "GT" .
+    ?sample vcfc:sampleIndex ?sampleIndexForVector .
+    ?call vcfc:hasCallMatrix ?matrix .
+    ?matrix vcfc:appliesToSampleSet ?sampleSet ; vcfc:hasFormatValueVector ?gtVector .
+    ?gtVector vcfc:declaredBy ?definition ; vcfc:encodedValues ?encoded .
+    ?definition vcfc:fieldId "GT" .
     BIND(?sampleIndexForVector - 1 AS ?zeroIndex)
     BIND(REPLACE(STR(?encoded), CONCAT("^(?:[^\\t]*\\t){", STR(?zeroIndex), "}([^\\t]*).*$"), "$1") AS ?gtLiteral)
   }

@@ -5,8 +5,8 @@ the constraints that are enforced. `vcf-rdfizer --help` is the authority; this
 page adds the *why* and the interactions.
 
 Two companion CLIs are installed alongside: `vcf-rdfizer-rules` (see
-[`rml-mappings.md`](rml-mappings.md)) and, once implemented,
-`vcf-rdfizer-link` (see [`datalinking-design.md`](datalinking-design.md)).
+[`rml-mappings.md`](rml-mappings.md)) and `vcf-rdfizer-link` (see
+[`datalinking.md`](datalinking.md)).
 
 ---
 
@@ -24,6 +24,7 @@ artifacts, run metrics and logs, and hidden intermediates all live beneath it.
 | `compress` | Compress an existing `.nt` / `.nt.gz` | `--rdf` |
 | `decompress` | Decode a compressed or indexed artifact back to N-Triples | `-C/--compressed-input` |
 | `validation` | Compare a source VCF against its RDF | `-i/--input` **and** `--rdf` |
+| `link` | Write a side-graph from an existing `.nt` / `.nt.gz`, without Docker | `--rdf` **and** `--link` |
 | `index` | Regenerate an artifact's query index in place | exactly one of `-H/--hdt` or `--cottas` |
 
 ## Inputs and outputs
@@ -31,7 +32,7 @@ artifacts, run metrics and logs, and hidden intermediates all live beneath it.
 | Flag | Meaning |
 | --- | --- |
 | `-i, --input` | VCF file or directory. Only `*.vcf` and `*.vcf.gz` are recognised; a directory is enumerated one level deep and snapshotted at run start |
-| `--rdf` | RDF input for `compress`, or the artifact to check in `validation` |
+| `--rdf` | RDF input for `compress`/`link`, or the artifact to check in `validation` |
 | `-C, --compressed-input` | `.nt.gz`, `.nt.br`, `.hdt`, `.cottas`, `.cottas.gz`, `.cottas.br` |
 | `-H, --hdt` / `--cottas` | Existing artifact for `--mode index` |
 | `-d, --decompress-out` | Explicit output `.nt` path; must be inside `--out` |
@@ -46,6 +47,7 @@ artifacts, run metrics and logs, and hidden intermediates all live beneath it.
 | `--sample-representation` | `expanded`, `condensed` | `expanded` | Genotype graph shape |
 | `--info-representation` | `structured`, `raw` | `structured` | `structured` adds typed `InfoFieldValue` nodes alongside `infoRaw` |
 | `--header-representation` | `structured`, `basic` | `structured` | `structured` types each `##` line and lifts its attributes |
+| `--vcf-version` | `auto`, `4.1`–`4.5` | `auto` | `auto` reads each input's `##fileformat` line; an explicit version overrides a missing or wrong declaration |
 
 There is **no automatic sample-count threshold**: the same command always
 produces the same graph shape, so a downstream consumer can rely on the contract
@@ -54,11 +56,28 @@ it selected. QUAL is always emitted regardless of these options.
 `condensed` rejects a custom mapping that consumes the materialized sample
 helper tables, because that would emit both genotype representations at once.
 
+## Data linking (`full` / `link`)
+
+| Flag | Meaning |
+| --- | --- |
+| `--link` | Comma-separated installed IDs; examples: `rsid-dbsnp`, `gene-demo`, `rsid-ensembl` |
+| `--linker-path` | Additional linker directory or parent search directory; repeatable; also `VCF_RDFIZER_LINKER_PATH` |
+| `--links-cache` | Reference/response cache; default `~/.cache/vcf-rdfizer/linkers` |
+| `--offline` / `--links-cache-only` | Disable linker network access; require local reference bytes or cached responses |
+| `--assembly` | Supply missing/unrecognised input assembly metadata; cannot override a recognised mismatch |
+| `--links-contact-email` | Contact address for live resolver User-Agent headers |
+
+The side-graph is `<name>.links.nt`. `gene-demo` contains synthetic intervals;
+`rsid-ensembl` requires a real contact address before a live cache miss. The
+companion CLI provides `list`, `keys`, `init`, `check`, `dry-run`, and `run`.
+See [Data linking](datalinking.md) for commands and current limits. There is no
+`--merge-links` in this initial implementation.
+
 ## Compression plan
 
 | Flag | Values | Default |
 | --- | --- | --- |
-| `--rdf-storage-mode` | `plain`, `space-optimized` | **required in full mode** |
+| `--rdf-storage-mode` | `plain`, `space-optimized` | `space-optimized` |
 | `--rdf-compression` | `gzip`, `brotli`, `none` | `gzip,brotli` |
 | `--representations` | `hdt`, `cottas`, `none` | `hdt` |
 | `--artifact-compression` | `gzip`, `brotli`, `none` | `none` |
@@ -67,11 +86,23 @@ helper tables, because that would emit both genotype representations at once.
 | `--chunk-min-bytes` | bytes | 128 MiB |
 | `--chunk-max-bytes` | bytes | 1 GiB |
 
+`--rdf-storage-mode` defaults to `space-optimized`: it reaches the same triples
+as `plain` at a much smaller peak workspace footprint and no practically
+important compute penalty, so the low-disk path is what a caller gets without
+having to ask for it. Pass `plain` when you want one uncompressed `.nt`
+aggregate on disk, which is also what `--hdt-strategy single` requires.
+
 Constraints that are enforced rather than documented-and-hoped:
 
 - Each selector takes a comma-separated list; `none` must appear alone.
 - `--artifact-compression` requires at least one selected representation.
-- `--hdt-strategy single` cannot consume a `space-optimized` gzip stream.
+- `--hdt-strategy single` cannot consume a `space-optimized` gzip stream, and
+  is rejected rather than silently downgraded. Since `space-optimized` is now
+  the default, `single` needs an explicit `--rdf-storage-mode plain`.
+- `--hdt-strategy single` is also rejected when `cottas` is among the
+  `--representations`. COTTAS always needs bounded chunks, so the partitioned
+  path would run for both representations and the strategy would have no
+  effect; earlier releases ignored the flag silently in this case.
 
 `-c, --compression` is a hidden legacy alias retained for backward
 compatibility. Use the three explicit selectors.
@@ -151,7 +182,7 @@ volume**, not the output filesystem.
 | --- | --- |
 | `0` | Success (possibly with recorded index warnings) |
 | `1` | One or more inputs failed, including a semantic validation failure |
-| `130` | Interrupted with `Ctrl+C`; progress written and tracked intermediates cleaned up |
+| `130` | Interrupted with `Ctrl+C`; containers stopped, tracked intermediates cleaned up, `interrupt-checkpoint.json` written |
 
 ---
 

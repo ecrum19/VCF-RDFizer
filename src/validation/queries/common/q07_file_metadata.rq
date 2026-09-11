@@ -1,4 +1,4 @@
-PREFIX vcfr: <https://w3id.org/vcf-rdfizer/vocab#>
+PREFIX vcfc: <https://w3id.org/vcf-core/vocab#>
 
 # The file-level declarations carried over from the VCF meta-information lines.
 #
@@ -10,8 +10,8 @@ SELECT
   (COALESCE(?rg, "(absent)") AS ?referenceGenome)
   (COALESCE(?ss, "(absent)") AS ?sourceSoftware)
 WHERE {
-  ?file a vcfr:VCFFile .
-  OPTIONAL { ?file vcfr:fileFormat ?ffLiteral      BIND(STR(?ffLiteral) AS ?ff) }
-  OPTIONAL { ?file vcfr:referenceGenome ?rgLiteral BIND(STR(?rgLiteral) AS ?rg) }
-  OPTIONAL { ?file vcfr:sourceSoftware ?ssLiteral  BIND(STR(?ssLiteral) AS ?ss) }
+  ?file a vcfc:VCFFile .
+  OPTIONAL { ?file vcfc:fileFormat ?ffLiteral      BIND(STR(?ffLiteral) AS ?ff) }
+  OPTIONAL { ?file vcfc:referenceGenome ?rgLiteral BIND(STR(?rgLiteral) AS ?rg) }
+  OPTIONAL { ?file vcfc:sourceSoftware ?ssLiteral  BIND(STR(?ssLiteral) AS ?ss) }
 }

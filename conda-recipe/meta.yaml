@@ -1,5 +1,5 @@
 {% set name = "vcf-rdfizer" %}
-{% set version = "2.1.0" %}
+{% set version = "3.0.0" %}
 
 package:
   name: {{ name|lower }}
@@ -15,6 +15,7 @@ build:
   script: {{ PYTHON }} -m pip install . -vv
   entry_points:
     - vcf-rdfizer=vcf_rdfizer:main
+    - vcf-rdfizer-link=vcf_rdfizer_link:main
 
 requirements:
   host:
@@ -25,24 +26,33 @@ requirements:
   run:
     - python >={{ python_min }}
     - rich >=13.7.0
+    - rdflib >=7.0.0
 
 test:
   requires:
     - python {{ python_min }}
   commands:
     - vcf-rdfizer --help
+    - vcf-rdfizer-link list
   imports:
     - vcf_rdfizer
+    # The vocabulary terms, VCF-version model and lexical parsers. Importing it
+    # here catches a packaging miss that would otherwise only surface at
+    # conversion time, since vcf_rdfizer imports it at module load.
+    - vcf_rdfizer_vocab
 
 about:
   home: https://github.com/ecrum19/VCF-RDFizer
-  summary: Docker-first VCF to RDF conversion wrapper with compression and decompression modes
+  summary: Docker-first VCF to RDF conversion targeting the VCF Core vocabulary, with compressed queryable representations (HDT, COTTAS), semantic validation, and data linking
   license: MIT
   license_family: MIT
   license_file: LICENSE
   description: |
     VCF-RDFizer provides a Python CLI wrapper around a Dockerized VCF to RDF conversion pipeline.
-    It requires a working Docker installation at runtime for conversion/compression commands.
+    It converts VCF files into RDF in the VCF Core vocabulary, optionally into compressed and
+    queryable representations (HDT, COTTAS), and can validate that the result still reproduces
+    the source VCF's semantics. It requires a working Docker installation at runtime for
+    conversion, compression, indexing and validation commands.
   doc_url: https://github.com/ecrum19/VCF-RDFizer/blob/main/README.md
 
 extra:

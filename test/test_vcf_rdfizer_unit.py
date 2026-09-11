@@ -167,11 +167,25 @@ def invoke_main(argv, *, auto_storage=True):
                 ),
                 "rdf",
             )
+            storage_mode = next(
+                (
+                    part.split("=", 1)[1]
+                    for part in cmd
+                    if isinstance(part, str) and part.startswith("RDF_STORAGE_MODE=")
+                ),
+                "plain",
+            )
             if out_mount is not None:
                 output_dir = out_mount / output_name
                 output_dir.mkdir(parents=True, exist_ok=True)
                 if not any(output_dir.glob("*.nt")) and not any(output_dir.glob("*.nt.gz")):
-                    (output_dir / f"{output_name}.nt").write_text("<s> <p> <o> .\n")
+                    # Match the aggregate the wrapper plans for this storage mode:
+                    # space-optimized expects one .nt.gz assembled from the parts.
+                    if storage_mode == "space-optimized":
+                        with gzip.open(output_dir / f"{output_name}.nt.gz", "wt") as handle:
+                            handle.write("<s> <p> <o> .\n")
+                    else:
+                        (output_dir / f"{output_name}.nt").write_text("<s> <p> <o> .\n")
         if result == 0:
             rendered = str(cmd[-1]) if cmd else ""
             work_mount = next(
@@ -272,6 +286,20 @@ def latest_metrics_run_dir(metrics_root: Path) -> Path:
 
 
 
+def _vocabulary_registry_path() -> Path | None:
+    """Locate the published VCF Core version registry, if it is available."""
+    override = os.environ.get("VCF_CORE_VOCABULARY_DIR")
+    candidates = [Path(override)] if override else []
+    repo_root = Path(__file__).resolve().parents[1]
+    candidates += [
+        repo_root.parent / "vcf-core-vocabulary",
+        repo_root.parent / "vcf-rdfizer-vocabulary",
+    ]
+    for candidate in candidates:
+        registry = candidate / "ontology" / "versions" / "registry.json"
+        if registry.is_file():
+            return registry
+    return None
 def stable_progress_env():
     """Pin the ambient progress opt-outs for one test.
 
@@ -1737,21 +1765,44 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertEqual(stats["records"], 1)
             self.assertEqual(stats["sample_calls"], 2)
             self.assertEqual(stats["format_values"], 4)
-            self.assertEqual(stats["triples"], 19)
+            # One GT per sample, each diploid.
+            self.assertEqual(stats["genotypes"], 2)
+            self.assertEqual(stats["genotype_calls"], 4)
             rdf_lines = rdf_path.read_text(encoding="utf-8").splitlines()
-            self.assertEqual(len(rdf_lines), 20)
+            self.assertEqual(len(rdf_lines), stats["triples"] + 1)
             self.assertIn(
-                "<file://sample.vcf> <https://w3id.org/vcf-rdfizer/vocab#representationProfile> "
-                "<https://w3id.org/vcf-rdfizer/vocab#ExpandedRepresentation> .",
+                "<file://sample.vcf> <https://w3id.org/vcf-core/vocab#representationProfile> "
+                "<https://w3id.org/vcf-core/vocab#ExpandedRepresentation> .",
                 rdf_lines,
             )
             self.assertIn(
-                "<file://sample.vcf#call/2> <https://w3id.org/vcf-rdfizer/vocab#hasSampleCall> "
+                "<file://sample.vcf#call/2> <https://w3id.org/vcf-core/vocab#hasSampleCall> "
                 "<file://sample.vcf#sample/2/SAMPLE-A> .",
                 rdf_lines,
             )
+            # The expanded profile gives each call a reusable sample identity in
+            # addition to its sampleId literal.
             self.assertIn(
-                '"."^^<https://w3id.org/vcf-rdfizer/vocab#Null> .',
+                "<file://sample.vcf#sample/2/SAMPLE-A> <https://w3id.org/vcf-core/vocab#forSample> "
+                "<file://sample.vcf#samples/SAMPLE-A> .",
+                rdf_lines,
+            )
+            # GT is parsed into an ordered genotype, and its no-call positions
+            # are marked rather than given a fabricated allele.
+            self.assertIn(
+                "<file://sample.vcf#sample/2/SAMPLE-A/genotype> "
+                "<https://w3id.org/vcf-core/vocab#genotypeString> "
+                '"0/1"^^<https://w3id.org/vcf-core/vocab#GenotypeString> .',
+                rdf_lines,
+            )
+            self.assertIn(
+                "<file://sample.vcf#sample/2/SAMPLE_B/genotype/call/0> "
+                "<https://w3id.org/vcf-core/vocab#isNoCall> "
+                '"true"^^<http://www.w3.org/2001/XMLSchema#boolean> .',
+                rdf_lines,
+            )
+            self.assertIn(
+                '"."^^<https://w3id.org/vcf-core/vocab#Null> .',
                 rdf_lines[-1],
             )
 
@@ -1782,9 +1833,18 @@ class WrapperUnitTests(VerboseTestCase):
 
             self.assertEqual(stats["sample_calls"], 2504)
             self.assertEqual(stats["format_values"], 2504)
-            self.assertEqual(stats["triples"], 1 + (2504 * 6))
+            self.assertEqual(stats["samples"], 2504)
+            # The payload is not in the GT lexical space, so no Genotype is
+            # invented for it; the value stays as the FORMAT field's literal.
+            self.assertEqual(stats["genotypes"], 0)
+            # 3 file-level triples (profile, hasSampleSet, SampleSet type) and 6
+            # for the single synthesized FORMAT definition, then per sample: 5
+            # for the VCFSample and its column-header link, 4 for the SampleCall
+            # and 4 for its one FORMAT value.
+            expected = 3 + 6 + (2504 * 13)
+            self.assertEqual(stats["triples"], expected)
             with gzip.open(rdf_path, "rt", encoding="utf-8") as handle:
-                self.assertEqual(sum(1 for _line in handle), 2 + (2504 * 6))
+                self.assertEqual(sum(1 for _line in handle), expected + 1)
 
     def test_sample_support_strategy_preserves_custom_helper_consumers(self):
         """Only the exact canonical helper maps use direct RDF streaming."""
@@ -1859,19 +1919,290 @@ class WrapperUnitTests(VerboseTestCase):
             self.assertEqual(stats["matrices"], 1)
             self.assertEqual(stats["format_vectors"], 3)
             self.assertEqual(stats["format_definitions"], 3)
-            self.assertEqual(stats["triples"], 45)
             rdf_text = rdf_path.read_text(encoding="utf-8")
+            self.assertEqual(len(rdf_text.splitlines()), stats["triples"] + 1)
             self.assertIn("vocab#CondensedRepresentation", rdf_text)
             self.assertIn("vocab#SampleSet", rdf_text)
-            self.assertIn("#samples/S3> <https://w3id.org/vcf-rdfizer/vocab#sampleIndex>", rdf_text)
+            # Ordinals are xsd:integer so they satisfy the SHACL profiles, which
+            # constrain every one of them with sh:datatype xsd:integer.
+            self.assertIn(
+                "#samples/S3> <https://w3id.org/vcf-core/vocab#sampleIndex> "
+                '"3"^^<http://www.w3.org/2001/XMLSchema#integer>',
+                rdf_text,
+            )
             self.assertIn("#call/7/matrix/fmt/GT", rdf_text)
             self.assertIn('"0/1\\t./.\\t1/1"', rdf_text)
             self.assertIn('"30,12\\t.\\t."', rdf_text)
+            # A vector cites its declaration at the header line's own IRI.
             self.assertIn("#header/line/1> .", rdf_text)
-            self.assertIn("vocab#fieldNumber> \"1\"", rdf_text)
-            self.assertIn("vocab#fieldDescription> \"Genotype\"", rdf_text)
+            self.assertIn(
+                "vocab#FormatFieldDefinition>", rdf_text,
+                "the vector's declaration must be typed",
+            )
+            # The declaration's ID/Number/Type/Description belong to the header
+            # emitter, which owns that IRI. Emitting them here too produced two
+            # copies of every one of those triples, which the validation
+            # suite's duplicate-triple preflight rejects.
+            for owned in ("vocab#fieldId>", "vocab#fieldNumber>",
+                          "vocab#fieldType>", "vocab#fieldDescription>"):
+                self.assertNotIn(owned, rdf_text, owned)
             self.assertNotIn("vocab#hasSampleCall", rdf_text)
             self.assertNotIn("vocab#FormatFieldValue", rdf_text)
+            # The condensed profile keeps genotype values inside their vectors,
+            # so no per-sample Genotype is derived. (hasGenotypeColumns, on the
+            # #CHROM line, is a different property and is expected.)
+            self.assertNotIn("vocab#hasGenotype>", rdf_text)
+            self.assertIn("vocab#hasGenotypeColumns>", rdf_text)
+
+    def test_version_model_matches_the_published_registry(self):
+        """The converter's version table must agree with the vocabulary's own.
+
+        VCF Core publishes ``ontology/versions/registry.json`` as the single
+        source of truth for its version-scoped artifacts: the SHACL overlays,
+        the reserved-key snapshots and the VCF4xFile classes are all generated
+        from it. The converter keeps its own dependency-free copy of the same
+        facts so it works without the vocabulary checked out; this pins the two
+        together so a new VCF version, or a corrected arity, cannot land on one
+        side alone.
+
+        Skipped when the vocabulary is not available. Point
+        VCF_CORE_VOCABULARY_DIR at a checkout to run it.
+        """
+        registry_path = _vocabulary_registry_path()
+        if registry_path is None:
+            self.skipTest(
+                "VCF Core vocabulary not found; set VCF_CORE_VOCABULARY_DIR to "
+                "a checkout to cross-check the version model"
+            )
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        vocab = vcf_rdfizer.vocab
+
+        published = {entry["id"] for entry in registry["versions"]}
+        self.assertEqual(
+            published, set(vocab.VCF_VERSIONS),
+            "the converter and the vocabulary disagree about which VCF "
+            "versions are supported",
+        )
+        # The newest published version is what an unrecognized file falls back
+        # to, so that has to track the registry too.
+        self.assertEqual(vocab.FALLBACK_VERSION.short, registry["current"])
+
+        for entry in registry["versions"]:
+            version = vocab.VCF_VERSIONS[entry["id"]]
+            with self.subTest(version=entry["id"]):
+                self.assertEqual(version.token, entry["code"])
+                self.assertEqual(version.file_class, entry["className"])
+                self.assertEqual(
+                    version.leading_phase_indicator, entry["leadingPhaseIndicator"]
+                )
+                # "perAlt" means a tuple repeats once per ALT allele; "fixed"
+                # means one tuple describes the whole record.
+                self.assertEqual(
+                    version.tuples_per_alt, entry["svTupleScope"] == "perAlt"
+                )
+
+                # numberCodes lists regex alternatives; "[0-9]+" and "[.]" are
+                # the integer and missing forms the model handles separately.
+                for scope, is_format in (("info", False), ("format", True)):
+                    codes = {
+                        code for code in entry["numberCodes"][scope]
+                        if code != "[0-9]+"
+                    }
+                    codes = {"." if code == "[.]" else code for code in codes}
+                    allowed = {
+                        code for code in vocab.ARITY_INDIVIDUALS
+                        if version.allows_number(code, is_format=is_format)
+                    }
+                    self.assertEqual(
+                        allowed, codes,
+                        f"{scope} Number codes disagree for {entry['id']}",
+                    )
+
+                expected_tuples = {
+                    key: group["width"]
+                    for group in entry["svTuples"] for key in group["keys"]
+                }
+                self.assertEqual(
+                    version.tuple_keys, expected_tuples,
+                    f"flattened-tuple keys disagree for {entry['id']}",
+                )
+
+    def test_vcf_version_is_detected_from_the_fileformat_line(self):
+        """Auto-detection reads ##fileformat; nothing has to be supplied."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            for declared, expected_short, expected_recognized in (
+                ("VCFv4.1", "4.1", True),
+                ("VCFv4.3", "4.3", True),
+                ("VCFv4.5", "4.5", True),
+                # VCF Core claims no 4.0 conformance overlay, so 4.0 is not
+                # recognized and no version class may be claimed for it.
+                ("VCFv4.0", "4.5", False),
+                ("", "4.5", False),
+                ("nonsense", "4.5", False),
+            ):
+                metadata = tmp_path / f"{expected_short}-{declared or 'none'}.tsv"
+                metadata.write_text(
+                    "SOURCE_FILE\tFILE_FORMAT\tFILE_DATE\tSOURCE_SOFTWARE\t"
+                    "REFERENCE_GENOME\tHEADER_COUNT\tRECORD_COUNT\n"
+                    f"x.vcf\t{declared}\t\t\t\t1\t1\n",
+                    encoding="utf-8",
+                )
+                version, recognized, raw = vcf_rdfizer.read_declared_vcf_version(metadata)
+                self.assertEqual(version.short, expected_short, declared)
+                self.assertEqual(recognized, expected_recognized, declared)
+                self.assertEqual(raw, declared)
+
+    def test_rules_rendering_resolves_the_version_class_sentinel(self):
+        """The mapping's version sentinel becomes the input's own file class."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            template = tmp_path / "template.ttl"
+            template.write_text(
+                "rr:class vcfc:VCFFile ;\n    rr:class vcfc:VCFVersionFile\n",
+                encoding="utf-8",
+            )
+
+            rendered = tmp_path / "v43.ttl"
+            vcf_rdfizer.render_rules_for_triplet(
+                template, rendered, "r.tsv", "h.tsv", "m.tsv", "sc.tsv", "sf.tsv",
+                vcf_version=vcf_rdfizer.vocab.VCF_VERSIONS["4.3"],
+            )
+            self.assertIn("rr:class vcfc:VCF43File", rendered.read_text())
+            self.assertNotIn("VCFVersionFile", rendered.read_text())
+
+            # An unrecognized version resolves to the base class the subject map
+            # already asserts, so the graph never claims a gate that cannot be
+            # checked and never gains a term the vocabulary does not define.
+            neutral = tmp_path / "neutral.ttl"
+            vcf_rdfizer.render_rules_for_triplet(
+                template, neutral, "r.tsv", "h.tsv", "m.tsv", "sc.tsv", "sf.tsv",
+                vcf_version=None,
+            )
+            text = neutral.read_text()
+            self.assertNotIn("VCFVersionFile", text)
+            self.assertEqual(text.count("rr:class vcfc:VCFFile"), 2)
+
+    def test_confidence_intervals_follow_the_version_tuple_rule(self):
+        """CIPOS is one pair per record before VCF 4.4 and one per ALT after."""
+        vocab = vcf_rdfizer.vocab
+        early, late = vocab.VCF_VERSIONS["4.3"], vocab.VCF_VERSIONS["4.4"]
+
+        # Both treat CIPOS as a materialized tuple, so its items are emitted
+        # even though 4.4 declares it Number=. -- the overlay counts them.
+        self.assertTrue(early.is_positional("CIPOS", "2"))
+        self.assertTrue(late.is_positional("CIPOS", "."))
+
+        # Before 4.4 an item has a position but no allele to point at.
+        self.assertTrue(early.value_item_link("CIPOS", "2", 0).is_empty)
+        # From 4.4 items 0-1 belong to ALT 1 and items 2-3 to ALT 2.
+        self.assertEqual(
+            [late.value_item_link("CIPOS", ".", i).allele_index for i in range(4)],
+            [1, 1, 2, 2],
+        )
+
+        # CILEN and CICN are not tuple keys before 4.4 at all.
+        self.assertIsNone(early.tuple_arity("CILEN"))
+        self.assertEqual(late.tuple_arity("CILEN"), 2)
+
+    def test_version_gates_number_codes_and_format_families(self):
+        """Number codes and the LA/M families arrived in specific versions."""
+        vocab = vcf_rdfizer.vocab
+        v41, v42, v44, v45 = (
+            vocab.VCF_VERSIONS[s] for s in ("4.1", "4.2", "4.4", "4.5")
+        )
+        # Number=R arrived in 4.2, P in 4.4, and LA/LR/LG/M in 4.5.
+        self.assertFalse(v41.allows_number("R", is_format=True))
+        self.assertTrue(v42.allows_number("R", is_format=True))
+        self.assertFalse(v42.allows_number("P", is_format=True))
+        self.assertTrue(v44.allows_number("P", is_format=True))
+        self.assertFalse(v44.allows_number("M", is_format=True))
+        self.assertTrue(v45.allows_number("M", is_format=True))
+        # A plain integer count is legal in every version.
+        self.assertTrue(v41.allows_number("2", is_format=False))
+
+        self.assertFalse(v44.local_alleles)
+        self.assertTrue(v45.local_alleles)
+        self.assertFalse(v44.base_modifications)
+        self.assertTrue(v45.base_modifications)
+        # EVENT is one per record before 4.4 and one per ALT after; EVENTTYPE
+        # does not exist before 4.4 at all.
+        self.assertFalse(v42.events_per_alt)
+        self.assertFalse(v42.event_types)
+        self.assertTrue(v44.events_per_alt)
+        self.assertTrue(v44.event_types)
+
+    def test_expanded_emitter_omits_families_the_version_lacks(self):
+        """A 4.4 file gets no base modifications and no local-allele set."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            records_tsv = tmp_path / "s.records.tsv"
+            records_tsv.write_text(
+                "SOURCE_FILE\tROW_ID\tCHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\t"
+                "INFO\tFORMAT\tS1\n"
+                "s.vcf\t1\t1\t100\t.\tA\tG\t50\tPASS\t.\tGT:LAA:M27551C\t"
+                "0/1:1:0.8\n",
+                encoding="utf-8",
+            )
+            vocab = vcf_rdfizer.vocab
+
+            for short, expect_families in (("4.4", False), ("4.5", True)):
+                rdf_path = tmp_path / f"{short}.nt"
+                rdf_path.write_text("<b> <p> <o> .\n", encoding="utf-8")
+                stats = vcf_rdfizer.append_expanded_sample_rdf(
+                    records_tsv, rdf_path, None,
+                    version=vocab.VCF_VERSIONS[short],
+                    progress_interval_records=0,
+                )
+                expected = 1 if expect_families else 0
+                self.assertEqual(stats["local_allele_sets"], expected, short)
+                self.assertEqual(stats["base_modifications"], expected, short)
+                # The raw FORMAT values are present either way; only the
+                # derived resources the version does not define are withheld.
+                text = rdf_path.read_text(encoding="utf-8")
+                self.assertIn('vocab#fieldValue> "1"', text)
+                self.assertIn('vocab#fieldValue> "0.8"', text)
+
+
+    def test_declared_field_definitions_are_emitted_exactly_once(self):
+        """The header emitter owns a declared definition; value emitters cite it.
+
+        Both used to emit ID/Number/Type/Description at the same header-line
+        IRI, so every declared INFO and FORMAT key produced a duplicate of each
+        of those triples.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            records_tsv = tmp_path / "s.records.tsv"
+            records_tsv.write_text(
+                "SOURCE_FILE\tROW_ID\tCHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\t"
+                "INFO\tFORMAT\tS1\n"
+                "s.vcf\t1\t1\t100\t.\tA\tG\t50\tPASS\tDP=7\tGT:DP\t0/1:7\n",
+                encoding="utf-8",
+            )
+            headers_tsv = tmp_path / "s.header_lines.tsv"
+            headers_tsv.write_text(
+                "SOURCE_FILE\tHEADER_INDEX\tHEADER_KEY\tHEADER_VALUE\tRAW_LINE\n"
+                "s.vcf\t1\tfileformat\tVCFv4.5\tx\n"
+                "s.vcf\t2\tINFO\t<ID=DP,Number=1,Type=Integer,Description=Depth>\tx\n"
+                "s.vcf\t3\tFORMAT\t<ID=GT,Number=1,Type=String,Description=Genotype>\tx\n"
+                "s.vcf\t4\tFORMAT\t<ID=DP,Number=1,Type=Integer,Description=Depth>\tx\n",
+                encoding="utf-8",
+            )
+            rdf_path = tmp_path / "s.nt"
+            rdf_path.write_text("", encoding="utf-8")
+
+            vcf_rdfizer.append_expanded_sample_rdf(
+                records_tsv, rdf_path, headers_tsv, progress_interval_records=0
+            )
+            vcf_rdfizer.append_header_representation_rdf(headers_tsv, rdf_path)
+            vcf_rdfizer.append_record_detail_rdf(
+                records_tsv, headers_tsv, rdf_path, progress_interval_records=0
+            )
+
+            lines = [l for l in rdf_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+            duplicates = {line for line in lines if lines.count(line) > 1}
+            self.assertEqual(duplicates, set(), "duplicate triples emitted")
 
     def test_structured_format_header_parser_preserves_quoted_commas(self):
         """FORMAT descriptions with commas and escaped quotes remain one attribute."""
@@ -1882,6 +2213,51 @@ class WrapperUnitTests(VerboseTestCase):
         self.assertEqual(fields["ID"], "GT")
         self.assertEqual(fields["Number"], "1")
         self.assertEqual(fields["Description"], 'Genotype, with "quoted" text')
+
+    def test_structured_header_parser_keeps_a_bracketed_values_list_whole(self):
+        """A ##META ``Values=[a, b, c]`` list is one attribute, not three fragments.
+
+        The commas inside the brackets separate allowed values, not attributes.
+        Splitting on them dropped every member after the first, because the
+        fragments carry no '=' and were discarded, leaving a value that still
+        held its opening bracket.
+        """
+        fields = vcf_rdfizer._parse_structured_header_fields(
+            "<ID=Assay,Type=String,Number=.,Values=[WholeGenome, Exome, Panel]>"
+        )
+
+        self.assertEqual(fields["Values"], "[WholeGenome, Exome, Panel]")
+        self.assertEqual(
+            vcf_rdfizer._parse_meta_values(fields["Values"]),
+            ["WholeGenome", "Exome", "Panel"],
+        )
+
+    def test_structured_header_parser_resumes_after_a_bracketed_list(self):
+        """An attribute following the Values list is still parsed."""
+        fields = vcf_rdfizer._parse_structured_header_fields(
+            '<ID=Assay,Values=[a, b],Type=String,Description="an assay, described">'
+        )
+
+        self.assertEqual(fields["Type"], "String")
+        self.assertEqual(fields["Description"], "an assay, described")
+
+    def test_structured_header_parser_survives_an_unbalanced_bracket(self):
+        """Malformed brackets must not swallow every remaining attribute."""
+        fields = vcf_rdfizer._parse_structured_header_fields(
+            "<ID=Broken,Values=[a, b,Type=String>"
+        )
+
+        self.assertEqual(fields["ID"], "Broken")
+        self.assertEqual(fields["Type"], "String")
+
+    def test_structured_header_parser_ignores_a_bracket_inside_quotes(self):
+        """A '[' in a description is text, not the start of a values list."""
+        fields = vcf_rdfizer._parse_structured_header_fields(
+            '<ID=DP,Type=Integer,Description="depth [reads], per sample",Number=1>'
+        )
+
+        self.assertEqual(fields["Description"], "depth [reads], per sample")
+        self.assertEqual(fields["Number"], "1")
 
     def test_condensed_sample_emitter_rolls_back_on_sample_count_mismatch(self):
         """Malformed sample alignment fails atomically without a partial condensed graph."""
@@ -2051,7 +2427,7 @@ class WrapperUnitTests(VerboseTestCase):
         self.assertEqual(exc.exception.code, 0)
         text = out_buf.getvalue()
         self.assertIn("Examples:", text)
-        self.assertIn("-m {full,compress,decompress,tsv,index,validation}", text)
+        self.assertIn("-m {full,compress,decompress,tsv,index,validation,link}", text)
         self.assertIn("-i INPUT", text)
         self.assertIn("--keep-rmlstreamer-rdf-output", text)
         self.assertIn("--remove-rdf-storage-output", text)
@@ -2776,16 +3152,87 @@ class WrapperUnitTests(VerboseTestCase):
         rc = invoke_main(["--mode", "full"])
         self.assertEqual(rc, 2)
 
-    def test_main_full_mode_requires_storage_mode_argument(self):
-        """Full mode fails validation when --rdf-storage-mode is omitted."""
+    def test_main_full_mode_defaults_to_space_optimized_storage(self):
+        """Full mode without --rdf-storage-mode resolves to the space-optimized aggregate."""
+        self.assertEqual(vcf_rdfizer.DEFAULT_RDF_STORAGE_MODE, "space-optimized")
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             input_dir, rules_path = prepare_inputs(tmp_path)
-            rc = invoke_main(
-                ["--mode", "full", "--input", str(input_dir), "--rules", str(rules_path)],
-                auto_storage=False,
-            )
+            observed = {}
+
+            def capture_full_mode(**kwargs):
+                observed.update(kwargs)
+                return 0
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "check_docker", return_value=True), \
+                        mock.patch.object(vcf_rdfizer, "docker_image_exists", return_value=True), \
+                        mock.patch.object(
+                            vcf_rdfizer, "run_full_mode", side_effect=capture_full_mode
+                        ):
+                    rc = invoke_main(
+                        [
+                            "--mode", "full",
+                            "--input", str(input_dir),
+                            "--rules", str(rules_path),
+                            "--out", str(tmp_path / "out"),
+                        ],
+                        auto_storage=False,
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(observed.get("rdf_storage_mode"), "space-optimized")
+
+    def test_main_full_mode_rejects_single_hdt_strategy_with_cottas(self):
+        """`single` is refused, not silently ignored, when COTTAS forces chunking."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+            stderr = StringIO()
+            with redirect_stderr(stderr):
+                rc = invoke_main(
+                    [
+                        "--mode", "full",
+                        "--input", str(input_dir),
+                        "--rules", str(rules_path),
+                        "--rdf-storage-mode", "plain",
+                        "--representations", "hdt,cottas",
+                        "--rdf-compression", "none",
+                        "--hdt-strategy", "single",
+                        "--out", str(tmp_path / "out"),
+                    ],
+                    auto_storage=False,
+                )
             self.assertEqual(rc, 2)
+            self.assertIn("HDT-only run", stderr.getvalue())
+
+    def test_main_full_mode_rejects_single_hdt_strategy_with_space_optimized(self):
+        """`single` cannot read the now-default gzip aggregate."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+            stderr = StringIO()
+            with redirect_stderr(stderr):
+                rc = invoke_main(
+                    [
+                        "--mode", "full",
+                        "--input", str(input_dir),
+                        "--rules", str(rules_path),
+                        "--representations", "hdt",
+                        "--rdf-compression", "none",
+                        "--hdt-strategy", "single",
+                        "--out", str(tmp_path / "out"),
+                    ],
+                    auto_storage=False,
+                )
+            self.assertEqual(rc, 2)
+            message = stderr.getvalue()
+            self.assertIn("gzip aggregate", message)
+            self.assertIn("--rdf-storage-mode plain", message)
 
     def test_removed_legacy_cli_options_are_rejected(self):
         """Removed layout and compatibility aliases are not accepted by the CLI."""
@@ -2864,6 +3311,272 @@ class WrapperUnitTests(VerboseTestCase):
             progress_log = run_metrics_dir / "logs" / "progress.log"
             self.assertTrue(progress_log.exists())
             self.assertIn("Run interrupted by user signal", progress_log.read_text())
+
+    def test_every_container_is_labelled_so_an_interrupt_can_find_it(self):
+        """Cleanup can only stop containers it can identify."""
+        labels = set()
+        for as_user in (True, False):
+            base = vcf_rdfizer.docker_run_base(as_user=as_user)
+            self.assertIn("--label", base)
+            labels.add(base[base.index("--label") + 1])
+        # Both argv shapes carry the same label - the as_user=False early
+        # return used to skip everything added after it.
+        self.assertEqual(len(labels), 1)
+        label = labels.pop()
+        self.assertTrue(label.startswith(f"{vcf_rdfizer.DOCKER_RUN_LABEL_KEY}="))
+        # The filter must select exactly the label that was stamped.
+        self.assertEqual(vcf_rdfizer.docker_run_label_filter(), f"label={label}")
+
+    def test_run_label_is_unique_per_process(self):
+        """Two concurrent runs must never kill each other's containers."""
+        before = vcf_rdfizer.docker_run_label_filter()
+        vcf_rdfizer.set_docker_run_label("20260910T120000")
+        after = vcf_rdfizer.docker_run_label_filter()
+        self.assertNotEqual(before, after)
+        self.assertIn("20260910T120000", after)
+        self.assertIn(str(os.getpid()), after)
+
+    def test_kill_run_containers_counts_results_and_never_raises(self):
+        """An interrupt path that raises leaves the orphans it exists to stop."""
+        with tempfile.TemporaryDirectory() as td:
+            tracker = vcf_rdfizer.RunTracker(Path(td) / "progress.log")
+
+            calls = []
+
+            def fake_subprocess_run(cmd, **kwargs):
+                calls.append(cmd)
+                if "ps" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout="abc123\ndef456\n", stderr="")
+                # First kill succeeds, second fails.
+                code = 0 if cmd[-1] == "abc123" else 1
+                return subprocess.CompletedProcess(cmd, code, stdout="", stderr="no such container")
+
+            with mock.patch.object(vcf_rdfizer.subprocess, "run", side_effect=fake_subprocess_run):
+                killed, failed = vcf_rdfizer.kill_run_containers(run_tracker=tracker)
+            self.assertEqual((killed, failed), (1, 1))
+            # Selection is by this run's label, never "all containers".
+            self.assertIn(vcf_rdfizer.docker_run_label_filter(), calls[0])
+
+            # Docker absent entirely: reported, not raised.
+            with mock.patch.object(
+                vcf_rdfizer.subprocess, "run", side_effect=OSError("docker not found")
+            ):
+                self.assertEqual(
+                    vcf_rdfizer.kill_run_containers(run_tracker=tracker), (0, 0)
+                )
+            tracker.close()
+
+    def test_temp_volume_removal_retries_while_a_container_holds_it(self):
+        """A container killed a moment ago has not released its volume yet."""
+        vcf_rdfizer._TEMP_DOCKER_VOLUMES.clear()
+        vcf_rdfizer.register_temp_volume("vol-a")
+        attempts = []
+
+        # Fail twice (volume still in use), then succeed.
+        def fake_run(cmd, cwd=None, env=None):
+            attempts.append(cmd)
+            return 0 if len(attempts) >= 3 else 1
+
+        with mock.patch.object(vcf_rdfizer, "run", side_effect=fake_run), \
+                mock.patch.object(vcf_rdfizer.time, "sleep"):
+            self.assertTrue(vcf_rdfizer.remove_temp_volume("vol-a", delay=0))
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(attempts[0][-4:], ["volume", "rm", "-f", "vol-a"])
+        # Success deregisters it, so the later sweep does not retry it.
+        self.assertNotIn("vol-a", vcf_rdfizer._TEMP_DOCKER_VOLUMES)
+
+    def test_a_volume_that_cannot_be_removed_stays_registered(self):
+        """It must remain for the interrupt sweep, not be silently forgotten."""
+        vcf_rdfizer._TEMP_DOCKER_VOLUMES.clear()
+        vcf_rdfizer.register_temp_volume("vol-stuck")
+        with mock.patch.object(vcf_rdfizer, "run", return_value=1), \
+                mock.patch.object(vcf_rdfizer.time, "sleep"):
+            self.assertFalse(vcf_rdfizer.remove_temp_volume("vol-stuck", attempts=2, delay=0))
+        self.assertIn("vol-stuck", vcf_rdfizer._TEMP_DOCKER_VOLUMES)
+
+    def test_remove_tracked_volumes_counts_and_never_raises(self):
+        """Cleanup that raises leaves exactly the leak it exists to prevent."""
+        with tempfile.TemporaryDirectory() as td:
+            tracker = vcf_rdfizer.RunTracker(Path(td) / "progress.log")
+            vcf_rdfizer._TEMP_DOCKER_VOLUMES.clear()
+            for name in ("vol-ok", "vol-bad"):
+                vcf_rdfizer.register_temp_volume(name)
+
+            def fake_remove(name, **kwargs):
+                if name == "vol-bad":
+                    raise RuntimeError("docker daemon gone")
+                vcf_rdfizer._TEMP_DOCKER_VOLUMES.discard(name)
+                return True
+
+            with mock.patch.object(vcf_rdfizer, "remove_temp_volume", side_effect=fake_remove):
+                removed, failed = vcf_rdfizer.remove_tracked_volumes(run_tracker=tracker)
+            self.assertEqual((removed, failed), (1, 1))
+            self.assertIn("temporary volumes removed=1, failed=1", tracker.log_path.read_text())
+            tracker.close()
+            vcf_rdfizer._TEMP_DOCKER_VOLUMES.clear()
+
+    def test_interrupt_removes_volumes_only_after_stopping_containers(self):
+        """Docker refuses to remove a volume a live container still holds.
+
+        That is the whole bug: each volume's own `finally` ran as the exception
+        unwound, before the containers were killed, so removal failed there and
+        nothing retried -- leaking ~700 MB per interrupted run.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+            out_dir = tmp_path / "out"
+            order = []
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "check_docker", return_value=True), \
+                        mock.patch.object(vcf_rdfizer, "docker_image_exists", return_value=True), \
+                        mock.patch.object(vcf_rdfizer, "run_full_mode", side_effect=KeyboardInterrupt()), \
+                        mock.patch.object(
+                            vcf_rdfizer, "kill_run_containers",
+                            side_effect=lambda **k: (order.append("kill-containers"), (1, 0))[1],
+                        ), \
+                        mock.patch.object(
+                            vcf_rdfizer, "remove_tracked_volumes",
+                            side_effect=lambda **k: (order.append("remove-volumes"), (2, 0))[1],
+                        ), \
+                        mock.patch.object(
+                            vcf_rdfizer, "cleanup_interrupted_full_run",
+                            side_effect=lambda **k: (order.append("remove-temporaries"), (4, 0))[1],
+                        ):
+                    rc = invoke_main([
+                        "--mode", "full",
+                        "--input", str(input_dir),
+                        "--rules", str(rules_path),
+                        "--rdf-storage-mode", "plain",
+                        "--out", str(out_dir),
+                    ])
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 130)
+            # Containers first, then the volumes they were holding.
+            self.assertLess(order.index("kill-containers"), order.index("remove-volumes"))
+
+            run_metrics_dir = latest_metrics_run_dir(out_dir / "run_metrics")
+            data = json.loads((run_metrics_dir / "interrupt-checkpoint.json").read_text())
+            self.assertEqual(data["volumes"], {"removed": 2, "failed": 0})
+
+    def test_interrupt_stops_containers_before_deleting_their_inputs(self):
+        """Order is the bug: temps were deleted from under a live container.
+
+        An interrupted HG004 run removed its .nt.gz while its validation
+        container kept running for three more days against a file that no
+        longer existed. Containers must be stopped first.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+            out_dir = tmp_path / "out"
+            order = []
+
+            def fake_kill(**kwargs):
+                order.append("kill-containers")
+                return 2, 0
+
+            def fake_cleanup(**kwargs):
+                order.append("remove-temporaries")
+                return 4, 0
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "check_docker", return_value=True), \
+                        mock.patch.object(vcf_rdfizer, "docker_image_exists", return_value=True), \
+                        mock.patch.object(vcf_rdfizer, "run_full_mode", side_effect=KeyboardInterrupt()), \
+                        mock.patch.object(vcf_rdfizer, "kill_run_containers", side_effect=fake_kill), \
+                        mock.patch.object(
+                            vcf_rdfizer, "cleanup_interrupted_full_run", side_effect=fake_cleanup
+                        ):
+                    rc = invoke_main([
+                        "--mode", "full",
+                        "--input", str(input_dir),
+                        "--rules", str(rules_path),
+                        "--rdf-storage-mode", "plain",
+                        "--out", str(out_dir),
+                    ])
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 130)
+            self.assertEqual(order, ["kill-containers", "remove-temporaries"])
+
+    def test_interrupt_writes_a_resumable_checkpoint(self):
+        """A killed run still produced real results; record where it stopped."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+            out_dir = tmp_path / "out"
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "check_docker", return_value=True), \
+                        mock.patch.object(vcf_rdfizer, "docker_image_exists", return_value=True), \
+                        mock.patch.object(vcf_rdfizer, "run_full_mode", side_effect=KeyboardInterrupt()), \
+                        mock.patch.object(
+                            vcf_rdfizer, "kill_run_containers", return_value=(3, 1)
+                        ):
+                    rc = invoke_main([
+                        "--mode", "full",
+                        "--input", str(input_dir),
+                        "--rules", str(rules_path),
+                        "--rdf-storage-mode", "plain",
+                        "--out", str(out_dir),
+                    ])
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 130)
+            run_metrics_dir = latest_metrics_run_dir(out_dir / "run_metrics")
+            checkpoint = run_metrics_dir / "interrupt-checkpoint.json"
+            self.assertTrue(checkpoint.exists(), "no checkpoint written")
+            data = json.loads(checkpoint.read_text())
+            self.assertEqual(data["status"], "interrupted")
+            self.assertEqual(data["exit_code"], 130)
+            self.assertEqual(data["mode"], "full")
+            self.assertEqual(data["containers"], {"killed": 3, "failed": 1})
+            self.assertIn("stages_completed", data)
+            self.assertIn("interrupted_at", data)
+
+    def test_interrupt_still_exits_130_when_cleanup_itself_fails(self):
+        """A cleanup failure must not mask the interrupt or crash the wrapper."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            input_dir, rules_path = prepare_inputs(tmp_path)
+            out_dir = tmp_path / "out"
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                with mock.patch.object(vcf_rdfizer, "check_docker", return_value=True), \
+                        mock.patch.object(vcf_rdfizer, "docker_image_exists", return_value=True), \
+                        mock.patch.object(vcf_rdfizer, "run_full_mode", side_effect=KeyboardInterrupt()), \
+                        mock.patch.object(
+                            vcf_rdfizer, "kill_run_containers",
+                            side_effect=RuntimeError("docker daemon gone"),
+                        ):
+                    rc = invoke_main([
+                        "--mode", "full",
+                        "--input", str(input_dir),
+                        "--rules", str(rules_path),
+                        "--rdf-storage-mode", "plain",
+                        "--out", str(out_dir),
+                    ])
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(rc, 130)
+            run_metrics_dir = latest_metrics_run_dir(out_dir / "run_metrics")
+            log = (run_metrics_dir / "logs" / "progress.log").read_text()
+            self.assertIn("Interrupt cleanup error", log)
 
     def test_main_compress_mode_none_skips_compression_commands(self):
         """Compression mode with method none performs no compression runs."""

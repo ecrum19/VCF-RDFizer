@@ -1,4 +1,4 @@
-PREFIX vcfr: <https://w3id.org/vcf-rdfizer/vocab#>
+PREFIX vcfc: <https://w3id.org/vcf-core/vocab#>
 
 # Exact number of records with anomalous property cardinality.
 # The companion query returns at most 100 example rows for diagnosis; this one
@@ -7,12 +7,12 @@ SELECT (COUNT(*) AS ?anomalyCount)
 WHERE {
   SELECT ?record
   WHERE {
-    ?record a vcfr:VCFRecord .
-    OPTIONAL { ?record vcfr:chrom ?chrom }
-    OPTIONAL { ?record vcfr:pos ?pos }
-    OPTIONAL { ?record vcfr:ref ?ref }
-    OPTIONAL { ?record vcfr:alt ?alt }
-    OPTIONAL { ?record vcfr:hasCall ?call }
+    ?record a vcfc:VCFRecord .
+    OPTIONAL { ?record vcfc:chrom ?chrom }
+    OPTIONAL { ?record vcfc:pos ?pos }
+    OPTIONAL { ?record vcfc:ref ?ref }
+    OPTIONAL { ?record vcfc:alt ?alt }
+    OPTIONAL { ?record vcfc:hasCall ?call }
   }
   GROUP BY ?record
   HAVING(COUNT(DISTINCT ?chrom) != 1 || COUNT(DISTINCT ?pos) != 1 || COUNT(DISTINCT ?ref) != 1 || COUNT(DISTINCT ?alt) != 1 || COUNT(DISTINCT ?call) != 1)

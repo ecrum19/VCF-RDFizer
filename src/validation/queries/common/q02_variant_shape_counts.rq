@@ -1,8 +1,8 @@
-PREFIX vcfr: <https://w3id.org/vcf-rdfizer/vocab#>
+PREFIX vcfc: <https://w3id.org/vcf-core/vocab#>
 
 SELECT ?variantClass (COUNT(DISTINCT ?record) AS ?recordCount)
 WHERE {
-  ?record a vcfr:VCFRecord ; vcfr:ref ?refLiteral ; vcfr:alt ?altLiteral .
+  ?record a vcfc:VCFRecord ; vcfc:ref ?refLiteral ; vcfc:alt ?altLiteral .
   BIND(UCASE(STR(?refLiteral)) AS ?ref)
   BIND(UCASE(STR(?altLiteral)) AS ?alt)
   BIND(

@@ -4,6 +4,15 @@ This repository uses `unittest` (Python standard library) to isolate orchestrati
 
 ## What is covered
 
+- `test/test_linking_unit.py`
+  - Exercises all three shipped linkers with known-answer token and interval
+    cases, the actual Ensembl resolver over fake HTTP, offline cache replay,
+    budgets/retries/host pacing, digest and assembly refusal, and atomic output.
+  - Covers unordered/plain/gzip RDF, existing subject identity, full/post-hoc
+    wiring, discovery, scaffolding and previews. No Docker or public API calls.
+  - These checks do not change the core semantic mutation score; plug-in
+    SPARQL/mutation auto-discovery remains planned. See `docs/datalinking.md`.
+
 - `test/test_vcf_rdfizer_unit.py`
   - Verifies wrapper control flow for the 5-step pipeline.
   - Verifies image/version resolution behavior and error handling.
@@ -38,8 +47,9 @@ This repository uses `unittest` (Python standard library) to isolate orchestrati
   - Mutation testing for the semantic validation suite: corrupts a correct
     graph in 42 named ways and asserts which corruptions the validator
     detects, producing a reproducible mutation score (currently 76/78).
-  - Requires `rdflib` (test-only, in the `dev` extra); the tests skip cleanly
-    without it. See `docs/validation-methodology.md`.
+  - Requires `rdflib` (now a runtime dependency for linking); the tests still
+    skip cleanly without it in source-only environments. See
+    `docs/validation-methodology.md`.
   - The fixture derives the VCF, the RDF graph and the parser oracle from one
     declarative spec, and builds its graph with the project's own emitters, so
     the two halves cannot drift apart.
@@ -80,6 +90,50 @@ This repository uses `unittest` (Python standard library) to isolate orchestrati
     concatenated members, each against a full-inflate ground truth.
   - Verifies that an unresolvable file falls back rather than reporting a wrong
     size, including the 32-bit `ISIZE` wrap and multi-member trailers.
+
+## VCF fixtures (`test/test_vcf_files/`)
+
+`test/test_vcf_files/*` is gitignored with an explicit `!` exception per file,
+so a new fixture is invisible to git until `.gitignore` names it.
+
+| File | Records | Samples | Uncompressed | Purpose |
+| --- | --- | --- | --- | --- |
+| `test-100.vcf` | 100 | 1 | 6 KB | Fast unit-test input; mapping smoke tests |
+| `test-1k.vcf` | 1,000 | 1 | 60 KB | Small end-to-end runs |
+| `test-10k.vcf` | 10,000 | 1 | 612 KB | Larger end-to-end runs still fast enough for CI |
+| `test-larger.vcf.gz` | 1,155,741 | 1 | 296 MB | **Many records**, one sample: the record-scaling axis |
+| `test-larger-multisample.vcf.gz` | 10,000 | 2,504 | 97 MB | **Many samples**, few records: the sample-scaling axis |
+
+The two `test-larger*` fixtures are deliberately complementary. Conversion cost
+is driven by *record count x sample count*, and each isolates one factor:
+
+- `test-larger.vcf.gz` — 1.16M records x 1 sample = **1.16M sample calls**
+- `test-larger-multisample.vcf.gz` — 10k records x 2,504 samples = **25.0M sample calls**
+
+A single-sample fixture cannot exercise the per-sample fan-out at all, which in
+the expanded representation is where the triple count actually comes from. Use
+both, and never generalise a scaling result from one to the other.
+
+### Provenance of `test-larger-multisample.vcf.gz`
+
+Derived from the 1000 Genomes Project phase 3 chromosome 20 call set (b37,
+2,504 samples, 1,812,841 records) by taking **20 contiguous blocks of 500
+records at even intervals** across the source, keeping all 2,504 sample columns
+and the original header unmodified. Blocks rather than a random sample, so
+neighbouring-variant structure survives; spread across the whole chromosome, so
+the allele-frequency spectrum and variant mix are representative rather than
+whatever happens to sit at the start of the file.
+
+The result spans chr20 positions 60,343-60,416,754 and contains 9,575 SNPs, 428
+indels, 5 structural variants and 58 multi-allelic sites. It is
+`##fileformat=VCFv4.1` (the source's own version — `test-larger.vcf.gz` is
+VCFv4.2, so the pair also covers both header versions), POS-ascending,
+single-contig, and verified to parse cleanly with both `bcftools stats` and
+`cyvcf2` — the two readers the validation oracle itself uses. Three `##` lines
+record its derivation inside the file.
+
+1000 Genomes is open-consent, freely redistributable data, so the fixture
+carries no access restrictions.
 
 ## CI matrix behavior
 

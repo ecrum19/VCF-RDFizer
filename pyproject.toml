@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vcf-rdfizer"
-version = "2.1.0"
-description = "Docker-first VCF to RDF conversion wrapper with compression/decompression modes"
+version = "3.0.0"
+description = "Docker-first VCF to RDF conversion targeting the VCF Core vocabulary, with compressed queryable representations (HDT, COTTAS), semantic validation, and data linking"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -26,6 +26,7 @@ classifiers = [
 ]
 dependencies = [
   "rich>=13.7.0",
+  "rdflib>=7.0.0",
 ]
 
 [project.urls]
@@ -35,20 +36,19 @@ Issues = "https://github.com/ecrum19/VCF-RDFizer/issues"
 [project.scripts]
 vcf-rdfizer = "vcf_rdfizer:main"
 vcf-rdfizer-rules = "vcf_rdfizer_rules:main"
+vcf-rdfizer-link = "vcf_rdfizer_link:main"
 
 [project.optional-dependencies]
 dev = [
   "build>=1.2.2",
   "twine>=5.1.1",
-  # Test-only: an in-process SPARQL engine for the validation mutation harness,
-  # so it needs no Docker. The suite skips those tests when it is absent.
-  "rdflib>=7.0.0",
 ]
 
 [tool.setuptools]
-py-modules = ["vcf_rdfizer", "vcf_rdfizer_gzip", "vcf_rdfizer_rules"]
-packages = ["vcf_rdfizer_data", "vcf_rdfizer_data.rules"]
+py-modules = ["vcf_rdfizer", "vcf_rdfizer_gzip", "vcf_rdfizer_rules", "vcf_rdfizer_link", "vcf_rdfizer_vocab"]
+packages = ["vcf_rdfizer_data", "vcf_rdfizer_data.rules", "vcf_rdfizer_data.linkers", "vcf_rdfizer_linking"]
 include-package-data = true
 
 [tool.setuptools.package-data]
 "vcf_rdfizer_data.rules" = ["default_rules.ttl"]
+"vcf_rdfizer_data.linkers" = ["*/linker.ttl", "*/resolver.py", "*/genes.gff3", "*/README.md"]

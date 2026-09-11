@@ -18,7 +18,9 @@ See "Custom RML Mappings" in the top-level `README.md` for the full contract.
 
 - `default_rules.ttl`
   - Active default mapping for this repository.
-  - Targets the VCF-RDFizer vocabulary (`https://w3id.org/vcf-rdfizer/vocab#`).
+  - Targets the VCF Core vocabulary (`https://w3id.org/vcf-core/vocab#`,
+    prefix `vcfc:`), which replaces the retired
+    `https://w3id.org/vcf-rdfizer/vocab#`. No version IRI is pinned.
   - Uses template TSV paths:
     - `/data/tsv/file_metadata.tsv`
     - `/data/tsv/header_lines.tsv`
@@ -60,15 +62,32 @@ after RMLStreamer emits the custom record-level graph.
 
 ## SHACL Notes
 
-The related SHACL constraints are maintained in the vocabulary repository:
+The related SHACL constraints are maintained in the vocabulary repository, in
+two profiles:
 
-- [vcf-rdfizer-vocabulary.shacl.ttl](https://github.com/ecrum19/VCF-RDFizer-vocabulary/blob/main/shacl/vcf-rdfizer-vocabulary.shacl.ttl)
+- `shacl/vcf-core-vocabulary.shacl.ttl` — portable: structural links, VCF 4.5
+  lexical patterns, field type and arity constraints.
+- `shacl/vcf-core-vocabulary-sparql.shacl.ttl` — cross-resource: header and
+  record ordering, sample uniqueness, and the rule that a graph must not mix
+  expanded sample calls with condensed call matrices.
 
-The default mapping is structured to align with those classes/properties, especially:
+Both need the bundled ontology as an ontology graph and RDFS inference enabled.
 
-- `vcfr:VCFFile` + `vcfr:hasHeader`
-- `vcfr:VCFHeader` + `vcfr:hasHeaderLine`
-- `vcfr:VCFRecord` core fields (`chrom`, `pos`, `ref`, `alt`)
-- `vcfr:VariantCall` with raw call attributes
-- expanded `vcfr:SampleCall` / `vcfr:FormatFieldValue` resources, or condensed
-  `vcfr:CohortCallMatrix` / `vcfr:FormatValueVector` resources
+This mapping emits:
+
+- `vcfc:VCFFile` + `vcfc:hasHeader`, `vcfc:fileFormat`, `vcfc:sourceSoftware`,
+  `vcfc:referenceGenome`
+- `vcfc:VCFHeader` + `vcfc:hasHeaderLine`, and `vcfc:hasColumnHeader` to the
+  `#CHROM` `vcfc:ColumnHeaderLine`
+- `vcfc:HeaderLine` with `headerKey`, `headerValue` and `lineIndex`
+- `vcfc:VCFRecord` with `chrom`, `pos`, `ref`, `recordIndex` and `hasCall`
+- `vcfc:VariantCall` with `formatRaw`
+- the expanded `vcfc:SampleCall` / `vcfc:FormatFieldValue` compatibility maps
+
+`ID`, `ALT`, `QUAL`, `FILTER` and `infoRaw` are **not** here. Each may be the
+VCF missing token, which the vocabulary requires as `"."^^vcfc:Null`, and RML
+cannot switch an object's datatype per row — so the wrapper emits them, along
+with the header attributes, the allele layer, structured INFO, the SV carriers
+and the genotype layer. The rule is stated at the top of `default_rules.ttl`:
+**RML carries every field whose datatype is the same for every row; the wrapper
+carries everything else.**

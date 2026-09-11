@@ -28,7 +28,7 @@ haplotypes have been used to recover surnames from public genealogy databases
 
 Three consequences follow, and they shape everything below:
 
-1. **Removing `vcfr:sampleId` does not anonymize anything.** The genotype vector
+1. **Removing `vcfc:sampleId` does not anonymize anything.** The genotype vector
    that remains is a stronger identifier than the label you deleted.
 2. **Access control is not anonymization.** A policy layer governs *who is
    permitted to receive what*, and creates an audit trail. It does not make the
@@ -52,8 +52,8 @@ the shapes the conversion already emits (see
 
 | Cut | Addresses | Example |
 | --- | --- | --- |
-| **By class** | all resources of a type | every `vcfr:SampleCall` |
-| **By predicate** | all triples with a predicate | every `vcfr:sampleName` |
+| **By class** | all resources of a type | every `vcfc:SampleCall` |
+| **By predicate** | all triples with a predicate | every `vcfc:sampleName` |
 | **By sample** | one participant's contribution | everything hanging off `#samples/NA12878` |
 | **By region** | a genomic interval | `chr19:44,905,791-44,909,393` (*APOE*) |
 | **By declared field** | one INFO or FORMAT key | `DP` yes, `GT` no |
@@ -69,10 +69,10 @@ easy to forget when thinking in terms of genotypes:
 - **IRIs themselves.** `file://cohort.vcf#sample/1/NA12878` contains the sample
   name. `#record/{ROW_ID}` is a monotonic counter, so row identifiers disclose
   the source ordering — and therefore approximate genomic position — even if
-  `vcfr:pos` is dropped. And `{SOURCE_FILE}` is the VCF's basename, which in
+  `vcfc:pos` is dropped. And `{SOURCE_FILE}` is the VCF's basename, which in
   practice is often `patient_12345.vcf`. Filtering triples while leaving IRIs
   intact leaks membership. See §7.
-- **Header lines.** `vcfr:headerValue` and the raw line text carry `##source`
+- **Header lines.** `vcfc:headerValue` and the raw line text carry `##source`
   (pipeline and centre identifiers), `##SAMPLE` and `##PEDIGREE` (family
   structure, by design), free-text `Description` fields, and `##fileDate`.
   A policy that covers genotypes and ignores the header section has not covered
@@ -132,7 +132,7 @@ Namespace `vcfp:` = `https://w3id.org/vcf-rdfizer/policy#`, declared through
 ```turtle
 @prefix odrl: <http://www.w3.org/ns/odrl/2/> .
 @prefix vcfp: <https://w3id.org/vcf-rdfizer/policy#> .
-@prefix vcfr: <https://w3id.org/vcf-rdfizer/vocab#> .
+@prefix vcfc: <https://w3id.org/vcf-core/vocab#> .
 @prefix duo:  <http://purl.obolibrary.org/obo/> .
 
 <#apoe-locus> a odrl:Asset , vcfp:GraphSelection ;
@@ -144,7 +144,7 @@ Namespace `vcfp:` = `https://w3id.org/vcf-rdfizer/policy#`, declared through
 
 <#direct-identifiers> a odrl:Asset , vcfp:GraphSelection ;
   vcfp:selector [ a vcfp:PredicateSelector ;
-                  vcfp:predicate vcfr:sampleName , vcfr:sampleId ] .
+                  vcfp:predicate vcfc:sampleName , vcfc:sampleId ] .
 
 <#withdrawn-participants> a odrl:Asset , vcfp:GraphSelection ;
   vcfp:selector [ a vcfp:SampleSelector ;
@@ -293,7 +293,7 @@ For applying a policy to a graph that has already been converted
 
 Triple- and predicate-level rules are a single streaming pass. **Region rules
 are not**, because an N-Triples stream has no ordering guarantee: by the time
-you see `<…#sample/4711/NA12878> vcfr:fieldValue "0/1"`, the triple that told
+you see `<…#sample/4711/NA12878> vcfc:fieldValue "0/1"`, the triple that told
 you record 4711 is at `chr19:44906000` may be long gone. This needs two passes:
 pass one builds a `row_id → (chrom, pos)` map restricted to records that fall in
 a policy region, pass two filters. Memory scales with the number of **in-scope**
@@ -380,7 +380,7 @@ This one is specific to VCF-RDFizer and easy to miss until it produces a leak.
 In **expanded** mode, one participant's value is its own resource:
 
 ```text
-<…#sample/4711/NA12878/fmt/GT>  vcfr:fieldValue  "0/1" .
+<…#sample/4711/NA12878/fmt/GT>  vcfc:fieldValue  "0/1" .
 ```
 
 Excluding a sample is triple filtering. Straightforward.
@@ -389,7 +389,7 @@ In **condensed** mode, all participants' values for one FORMAT key live in
 **one literal**:
 
 ```text
-<…#call/4711/matrix/fmt/GT>  vcfr:encodedValues  "0/1\t0/0\t1/1\t./."^^vcfr:VCFTextVector .
+<…#call/4711/matrix/fmt/GT>  vcfc:encodedValues  "0/1\t0/0\t1/1\t./."^^vcfc:VCFTextVector .
 ```
 
 There is no triple to remove for one sample. Graph-pattern access control cannot
@@ -400,7 +400,7 @@ Two consequences:
 
 1. **Redaction must rewrite the literal.** `vcfp:maskVectorPositions` replaces
    the masked participant's token with `.`, which is the VCF missing marker and
-   keeps the vector aligned with `vcfr:sampleIndex` — alignment the format
+   keeps the vector aligned with `vcfc:sampleIndex` — alignment the format
    depends on. Dropping a position instead would silently shift every downstream
    sample's value, which is a data-corruption bug wearing a privacy feature's
    clothing.
@@ -458,7 +458,7 @@ linkset node in [`datalinking-design.md`](datalinking-design.md#5-output-and-pro
     vcfp:policyDigest     "sha256:9f2c…" ;
     vcfp:duoVersion       "2024-11-03" ;
     vcfp:pseudonymKeyId   "release-2026-09-key-3" ;
-    vcfp:representation   vcfr:ExpandedRepresentation ;
+    vcfp:representation   vcfc:ExpandedRepresentation ;
     vcfp:triplesWithheld  1840221 ;
     vcfp:samplesWithheld  2 ;
     vcfp:thresholdApplied 5 ;
@@ -489,7 +489,7 @@ release that fails one is not published. This turns "the APOE region was
 excluded" from a claim into a measurement — the distinction
 [`validation-methodology.md`](validation-methodology.md) is built around.
 
-**SHACL for shape-level guarantees.** "No `vcfr:sampleName` appears anywhere" is
+**SHACL for shape-level guarantees.** "No `vcfc:sampleName` appears anywhere" is
 naturally a shape constraint, and the `--shacl-shapes` layer already exists.
 
 **Mutation testing the redactor.** Add a mutation class to

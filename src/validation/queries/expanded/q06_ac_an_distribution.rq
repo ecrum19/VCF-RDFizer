@@ -1,4 +1,4 @@
-PREFIX vcfr: <https://w3id.org/vcf-rdfizer/vocab#>
+PREFIX vcfc: <https://w3id.org/vcf-core/vocab#>
 
 SELECT ?an ?ac (COUNT(DISTINCT ?record) AS ?siteCount)
 WHERE {
@@ -8,12 +8,12 @@ WHERE {
       {
         SELECT DISTINCT ?record ?sampleCall ?gt
         WHERE {
-          ?record a vcfr:VCFRecord ; vcfr:alt ?altLiteral ; vcfr:hasCall ?call .
+          ?record a vcfc:VCFRecord ; vcfc:alt ?altLiteral ; vcfc:hasCall ?call .
           FILTER(STR(?altLiteral) != "." && !CONTAINS(STR(?altLiteral), ","))
-          ?call vcfr:hasSampleCall ?sampleCall .
-          ?sampleCall vcfr:hasFormatValue ?gtValueNode .
+          ?call vcfc:hasSampleCall ?sampleCall .
+          ?sampleCall vcfc:hasFormatValue ?gtValueNode .
           FILTER(STRENDS(STR(?gtValueNode), "/fmt/GT"))
-          ?gtValueNode vcfr:fieldValue ?gtLiteral .
+          ?gtValueNode vcfc:fieldValue ?gtLiteral .
           BIND(REPLACE(STR(?gtLiteral), "[|]", "/") AS ?gt)
         }
       }

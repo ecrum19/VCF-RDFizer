@@ -1,26 +1,36 @@
-!docker/configuration.properties
-scripts/node_modules
-
-!time-*
-
+# Run outputs and intermediates
 run_output/
+run_metrics/
+out/
+tsv/
+
+# Downloaded toolchain
+RMLStreamer-*-standalone.jar
+
+# Test inputs: large VCFs are generated locally; only the small fixtures are tracked
 test/test_vcf_files/*
 !test/test_vcf_files/test-100.vcf
 !test/test_vcf_files/test-1k.vcf
 !test/test_vcf_files/test-10k.vcf
 !test/test_vcf_files/test-larger.vcf.gz
+!test/test_vcf_files/test-larger-multisample.vcf.gz
 
-RMLStreamer-v2.5.0-standalone.jar
-out/
-tsv/
-run_metrics/
+# Python build and cache artifacts
 __pycache__/
 *.py[cod]
 .venv/
-.DS_Store
-*.cover
-test/*.cover
-vcf_rdfizer.cover
 dist/
 build/
 *.egg-info/
+
+# Coverage
+*.cover
+test/*.cover
+vcf_rdfizer.cover
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# OS
+.DS_Store

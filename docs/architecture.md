@@ -24,6 +24,7 @@ writes.
     ├─ docker run ────────────────────▶   src/vcf_as_tsv.sh      (awk)
     │                                      src/run_conversion.sh  (RMLStreamer/Flink)
     ├─ append direct RDF (see §4)
+    ├─ optional host-side linking ─────▶  <sample>.links.nt (separate side-graph)
     ├─ docker run ────────────────────▶   src/partitioned_compression.py
     │                                      src/cottas_tool.py
     │                                      src/ensure_hdt_index.sh
@@ -37,8 +38,10 @@ awkward dependencies — RMLStreamer 2.5.0 on Flink, a Rust `hdtc` 1.1.0 build,
 `pycottas`, Comunica 5.3.0, QLever, `pyshacl`, `cyvcf2`, `bcftools`. Asking a
 user to assemble that on their own machine is asking for irreproducible results.
 Pinning it in one image means a run on a laptop and a run on a cluster execute
-the same binaries. The price is that **Docker is a hard requirement** and the
-image is large; see [`limitations.md`](limitations.md).
+the same binaries. The price is that **Docker is a hard requirement for
+conversion and representation operations** and the image is large; see
+[`limitations.md`](limitations.md). Post-hoc linking and the authoring CLIs
+run entirely on the host.
 
 ## 2. Host responsibilities
 
@@ -51,7 +54,8 @@ image is large; see [`limitations.md`](limitations.md).
 | Docker orchestration | Mounts, user mapping, environment forwarding, permission auto-fix |
 | Progress rendering | Containers write a JSONL sidecar; the host polls and renders it |
 | Metrics assembly | Every stage's JSON is collected into one `run_metrics/` tree |
-| Interrupt handling | `Ctrl+C` triggers best-effort cleanup of tracked intermediates |
+| Interrupt handling | `Ctrl+C` stops this run's labelled containers, then cleans tracked intermediates, then writes a checkpoint |
+| Optional data linking | Python plug-ins, reference/response caches and an atomic side-graph share one host runner for full and post-hoc mode |
 
 ## 3. Container responsibilities
 
@@ -67,16 +71,32 @@ image is large; see [`limitations.md`](limitations.md).
 
 ## 4. Where the split leaks, and why
 
-The design intent is "all data processing happens in the container". There are
-**three deliberate exceptions**, all in `vcf_rdfizer.py`, all appending directly
+The conversion design intent is "all data processing happens in the container".
+There are **three direct-emission exceptions**, all in `vcf_rdfizer.py`, appending directly
 to the RDF aggregate between the conversion container and the compression
-container:
+container.
+
+One rule decides what goes where:
+
+> **The RML mapping carries every field whose RDF datatype is the same for every
+> row. The wrapper carries everything else.**
+
+Two kinds of field fall on the wrapper's side. A value that may be the VCF
+missing token `.` needs `"."^^vcfc:Null` on some rows and a typed literal on
+others, and RML cannot switch an object's datatype per row. A value that has to
+be decomposed into several resources would need a materialized helper table
+whose size is the product of its dimensions.
 
 | Emitter | Emits | Why not RML |
 | --- | --- | --- |
-| `emit_sample_representation` | `SampleCall`/`FormatFieldValue`, or `SampleSet`/`CohortCallMatrix`/`FormatValueVector` | RML would first have to materialize a helper table of variants × samples (× FORMAT keys) — the largest intermediate the pipeline can produce |
-| `append_header_representation_rdf` | Header-line subclasses, FILTER/ALT/contig attributes, INFO/FORMAT declarations | RML cannot choose a class per row from a parsed attribute string |
-| `emit_record_detail` | `QUAL` (typed per value) and structured `InfoFieldValue` nodes | RML cannot switch a literal's datatype based on a declared `Type`, and structured INFO would need a variants × INFO-keys helper table |
+| `emit_sample_representation` | Expanded: `SampleCall`/`FormatFieldValue`/`Genotype`/`PhaseSet`/`LocalAlleleSet`/`BaseModification`. Condensed: `SampleSet`/`CohortCallMatrix`/`FormatValueVector`. `SampleSet` and `VCFSample` in both. | RML would first have to materialize a helper table of variants × samples (× FORMAT keys) — the largest intermediate the pipeline can produce |
+| `append_header_representation_rdf` | Header-line subclasses, the ordered `HeaderAttribute` resources every structured line needs, and the INFO/FORMAT/FILTER/ALT/contig/META/SAMPLE/PEDIGREE declaration properties | RML cannot choose a class per row, nor decompose one angle-bracketed cell into an ordered set of resources |
+| `emit_record_detail` | `ID`, `ALT`, `QUAL`, `FILTER`, `infoRaw` (each may be the missing token); the allele layer (`ReferenceAllele`/`AltAllele`, breakends, symbolic types); structured `InfoFieldValue` with its `FieldValueItem` decomposition; and the SV carriers | RML cannot type the missing token per row, cannot switch a literal's datatype on a declared `Type`, and the allele and value-item layers would need variants × alleles and variants × INFO-keys helper tables |
+
+The exception count did not change with the move to the VCF Core vocabulary, but
+what each emitter covers grew considerably: the vocabulary models the VCF 4.5
+logical model in full, and almost all of the additions are decompositions of a
+single source cell, which is exactly the category RML cannot express.
 
 This is worth stating plainly because it has consequences:
 
@@ -92,6 +112,14 @@ This is worth stating plainly because it has consequences:
   `_append_rdf_atomically`, so an interrupted append does not leave a
   half-written aggregate.
 
+Optional data linking is a separate host-side stage in `vcf_rdfizer_linking/`.
+It reads the completed aggregate, stages only join fields/keys in SQLite,
+resolves the selected plug-ins, and atomically publishes a side-graph. That
+extra graph scan preserves actual subject identities and makes full and
+post-hoc linking share exactly one implementation. The reference interval
+index lives in memory; HTTP and reference bytes are cached on disk. See
+[`datalinking.md`](datalinking.md) for this extension's limits.
+
 ## 5. Data flow in full mode
 
 ```text
@@ -105,6 +133,8 @@ This is worth stating plainly because it has consequences:
         │  host-side direct emitters (§4) append in place
         ▼
   complete aggregate
+        │  optional: --link <ids> (host-side; aggregate unchanged)
+        ├──────────────▶ <sample>.links.nt
         │  optional: --rdf-compression gzip,brotli
         ├──────────────▶ <sample>.nt.gz / <sample>.nt.br
         │  optional: --representations hdt,cottas  (chunked)

@@ -45,10 +45,10 @@ deciding whether the tool fits your problem, read
 - **[Custom RML mappings](rml-mappings.md)** — the `--rules` contract, the
   `vcf-rdfizer-rules` CLI, and an honest account of what a custom mapping does
   *not* control and what it costs in validation.
-- **[Data linking design](datalinking-design.md)** — *proposal, not
-  implemented.* A plug-in architecture for connecting the graph to external
-  resources (rsIDs, genes, clinical assertions) with declarative linkers,
-  reference bundles, live-API safeguards, and provenance.
+- **[Data linking](datalinking.md)** — three runnable plug-in tiers, full and
+  post-hoc usage, the authoring CLI, reference/assembly checks, network policy,
+  provenance, and measured implementation limits. The broader
+  **[design](datalinking-design.md)** records what remains planned.
 - **[Privacy policy design](privacy-policy-design.md)** — *proposal, not
   implemented.* Granular, machine-readable disclosure control over parts of the
   graph: an ODRL profile with graph selectors, three enforcement tiers, and
@@ -62,7 +62,7 @@ deciding whether the tool fits your problem, read
   and an assessment of query-time decoding options.
 - **[VCF coverage matrix](vcf-coverage.md)** — element by element: is it
   represented, and would a corruption of it be detected. Includes the current
-  mutation score and the vocabulary alignment gaps.
+  mutation score and the vocabulary alignment status.
 
 ### Whether to trust it
 
@@ -72,6 +72,9 @@ deciding whether the tool fits your problem, read
 - **[Validation methodology](validation-methodology.md)** — how coverage is
   *measured* rather than asserted: the mutation-testing harness, why known gaps
   are assertions rather than comments, and how to reproduce the score.
+- **[Validation migration notes](validation-migration-notes.md)** — what the
+  move to the VCF Core vocabulary leaves to do in the validation suite, and how
+  the converter's SHACL conformance was verified in the meantime.
 
 ### Where it is going
 
@@ -98,7 +101,7 @@ deciding whether the tool fits your problem, read
 [Custom RML mappings](rml-mappings.md)
 
 **"I want to add my own domain's links."**
-[Data linking design](datalinking-design.md) →
+[Data linking](datalinking.md) → [Data linking design](datalinking-design.md) →
 [Custom RML mappings](rml-mappings.md) →
 [Validation methodology](validation-methodology.md)
 
@@ -131,5 +134,6 @@ Three conventions, kept deliberately:
 
 Related files outside `docs/`: [`rules/README.md`](../rules/README.md) (the
 mapping directory), [`test/README.md`](../test/README.md) (the test suite),
-[`changelog.md`](../changelog.md), [`scripts/RELEASING.md`](../scripts/RELEASING.md),
-and [`ACKNOWLEDGEMENTS.md`](../ACKNOWLEDGEMENTS.md).
+[`scripts/RELEASING.md`](../scripts/RELEASING.md), and
+[`ACKNOWLEDGEMENTS.md`](../ACKNOWLEDGEMENTS.md). Per-version release notes are
+published on the [releases page](https://github.com/ecrum19/VCF-RDFizer/releases).

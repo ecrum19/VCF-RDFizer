@@ -18,6 +18,7 @@ everything lives beneath it:
     <sample>.hdt  +  <sample>.hdt.index.v1-1
     <sample>.cottas
     <sample>.hdt.gz | .cottas.br | ...
+    <sample>.links.nt                         optional --link side-graph
   run_metrics/<INPUT_LABEL>__<RUN_ID>/       per-run reports and logs
   .intermediate/tsv/                         hidden intermediates
   decompressed/                              --mode decompress default target
@@ -27,6 +28,11 @@ The directory name and every artifact basename come from the source filename
 with its recognized VCF/RDF/representation suffix removed. `--mode compress` on
 `test-larger.nt` and on `test-larger.nt.gz` therefore both write into
 `<out>/test-larger/`.
+
+`--mode link` is host-only and writes `<out>/<name>.links.nt`, with the usual
+`run_metrics/` directory. Full mode writes its linkset beside the aggregate
+inside `<out>/<sample>/`. Side-graph triples are excluded from the base
+conversion's triple counts. See [Data linking](datalinking.md).
 
 **Collision policy.** Before Docker starts, the wrapper computes every artifact
 the run intends to write and fails if any already exists. It never overwrites a
@@ -60,16 +66,39 @@ recognisable without opening a timestamp-named folder.
 | --- | --- |
 | `run.json` | Source identity, resolved input paths, requested configuration, image selection |
 | `summary.json` | Final status, wrapper wall time, summary rows, and an index of every stage report and log |
-| `metrics.csv` | Analysis-ready per-output table |
+| `metrics.csv` | Analysis-ready per-output table, including `vcf_version` and `vcf_version_source` |
 | `tsv_metrics.csv` | TSV-mode benchmark table |
 | `wrapper_execution_times.csv` | Host-side stage timings |
 | `logs/wrapper.log`, `logs/progress.log` | Command log and progress history |
 | `timings/<stage>/…` | Raw GNU `time -v` output from inside the relevant container |
 | `stages/tsv/`, `stages/conversion/`, `stages/compression/`, `stages/compression_operations/`, `stages/decompression/`, `stages/index/`, `stages/validation/` | Structured per-stage results |
 | `stages/partitioned/<sample>.json` | Full handoff from the partitioned-compression container |
+| `stages/linking/<sample>.links.json` | Linker counts, reference/response digests, network accounting and success/failure; also collected in `run.json` |
 | `reports/index_warnings.json` | Degraded-index events |
 | `reports/failed_inputs.csv` | Inputs abandoned during a multi-file run |
 | `reports/validation/<validation-id>/` | Detailed semantic-validation reports |
+
+**Finding a validation run.** Its artifacts are spread across three trees by
+design — the stage JSON with the other stages, the detail beside the other
+reports, the raw engine output under that — which is convenient for analysis and
+awkward when diagnosing. `summary.json` therefore carries a `validation` array
+naming all of them per target:
+
+```json
+{"validation": [{
+  "validation_id": "chr20",
+  "status": "PASS", "engine": "qlever", "validation_target": "aggregate",
+  "wall_seconds": 812.4,
+  "stage_report": "stages/validation/chr20.json",
+  "results_dir":  "reports/validation/chr20",
+  "summary":      "reports/validation/chr20/summary.json",
+  "benchmark_csv":"reports/validation/chr20/benchmark.csv",
+  "engines": ["comunica", "qlever"]
+}]}
+```
+
+Start there rather than globbing. A target validated against a non-aggregate
+artifact is suffixed: `chr20__hdt`.
 
 `compression_operations/` preserves the per-RDF operation and round-trip
 validation reports; `compression/` is the final output-level summary over them.
@@ -80,6 +109,20 @@ results, the generated chunk plan, workspace free-space samples, CPU time, peak
 RSS, exit codes, and bounded `stderr` diagnostics — **and it survives the
 deletion of the temporary Docker volume**, which is what makes a failed
 cohort-scale run diagnosable at all.
+
+**Recording the VCF version.** `metrics.csv` and
+`stages/conversion/*.json` carry `vcf_version` (the specification version the
+input was converted under, e.g. `VCFv4.4`) and `vcf_version_source`:
+
+| `vcf_version_source` | Meaning |
+| --- | --- |
+| `declared` | Read from the input's own `##fileformat` line |
+| `forced` | `--vcf-version` overrode the declaration |
+| `fallback` | The declaration was missing, malformed, or a version with no conformance overlay (VCF 4.0); the newest supported rules were used and no `vcfc:VCF4xFile` class was emitted |
+
+Benchmarks should group by these. The version selects the SHACL overlay, the
+flattened-tuple semantics and which FORMAT families exist, so conversion cost
+and graph size are not comparable across versions without them.
 
 ## 3. Input size accounting
 
@@ -167,10 +210,35 @@ number, and no progress history is retained in memory.
 
 ## 7. Interrupts and exit codes
 
-`Ctrl+C` exits with **130**, writes progress to `logs/progress.log`, and
-performs best-effort cleanup of tracked intermediates. Raw RDF cleanup on
-interrupt follows `--keep-rmlstreamer-rdf-output`: with it, raw RDF is
-preserved; without it, tracked raw RDF files are removed.
+`Ctrl+C` exits with **130** and runs cleanup in a fixed order:
+
+1. **Stop this run's containers.** Every container the wrapper starts carries a
+   `vcf-rdfizer.run=<run-id>-<pid>` label, and cleanup kills exactly the ones
+   matching its own label — a concurrent run's containers are never touched.
+2. **Remove this run's temporary Docker volumes.** Partitioned compression
+   works in a named volume, and Docker refuses to remove one while a container
+   still holds it — so this can only happen after step 1, and retries a few
+   times while the killed container releases it.
+3. **Remove tracked intermediates.** Raw RDF follows
+   `--keep-rmlstreamer-rdf-output`: with it, raw RDF is preserved; without it,
+   tracked raw RDF files are removed.
+4. **Write `interrupt-checkpoint.json`** into the run's metrics directory,
+   recording the stages that completed, the last progress event, how many
+   containers were stopped, how many volumes were removed, and what else was
+   deleted.
+
+The order matters, twice over. Killing the wrapper does not kill its
+containers, and until this existed an interrupted run deleted files that its
+own container was still reading — one such orphan ran for three days after the
+run had "finished", holding 17 GB and a core, working against inputs that no
+longer existed. And a volume cannot be removed before the container using it
+stops: each volume's own `finally` ran as the exception unwound, *before* the
+containers were killed, so it warned and gave up — leaking roughly 700 MB per
+interrupted run, which nothing retried.
+
+A second `Ctrl+C` during cleanup is ignored, so an impatient operator cannot
+abort the step that stops the containers. If cleanup itself fails the wrapper
+still exits 130 and records `Interrupt cleanup error` in the progress log.
 
 Otherwise the wrapper exits `0` on success and non-zero on failure. In full mode
 with `--validate`, a validation failure sets a non-zero exit even when the

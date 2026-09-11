@@ -33,6 +33,7 @@ import platform
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -55,6 +56,18 @@ except ImportError:  # pragma: no cover
     VCF = None
 
 
+def eprint(*args: Any) -> None:
+    """Print to stderr.
+
+    This runner executes standalone inside the container, so it cannot borrow
+    the identically named helper from ``vcf_rdfizer.py`` on the host. Both the
+    oversized-graph advisory and the query-timeout abandon message call this;
+    before it existed here, either one raised ``NameError`` and killed the run
+    at the exact moment it was trying to warn the operator.
+    """
+    print(*args, file=sys.stderr, flush=True)
+
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 QUERY_ROOT = SCRIPT_DIR / "queries"
 CORE_QUERIES = (
@@ -72,6 +85,31 @@ CORE_QUERIES = (
     "q12_info_value_digest",
     "q13_format_value_digest",
 )
+#: Which oracle phases a query would actually have paid for, had it been the
+#: only question asked. The oracle is one pass that fills every query's
+#: counters together, so there is no measured per-query slice of it; this is the
+#: explicit statement of what a one-question cyvcf2 script would have cost.
+#:
+#: Every query pays to open the file, scan the records, and assemble its answer.
+#: Only the sample-level queries pay for the per-sample genotype/AC-AN block,
+#: which is the part whose cost scales with cohort size. Measured on the
+#: shipped fixtures, the block is 15.5% of the scan at one sample and 73.5% at
+#: 2,504 -- which is the whole reason per-query oracle numbers are worth having.
+#:
+#: Known coarseness: `assemblySeconds` is charged to every query equally, and on
+#: a cohort file it is not small (149 s against a 181 s scan on the 2,504-sample
+#: fixture) because it sorts the per-sample counters. Most of that work belongs
+#: to the sample-level queries, so this attribution OVER-charges record-level
+#: queries on multi-sample inputs -- i.e. it understates the gap it is measuring.
+#: Splitting it would mean restructuring the post-loop assembly into per-query
+#: builders; until then the bias is in the conservative direction and is stated
+#: rather than hidden.
+ORACLE_SAMPLE_LEVEL_QUERIES = frozenset({
+    "q05_sample_genotype_counts",
+    "q06_ac_an_distribution",
+    "q13_format_value_digest",
+})
+
 #: Queries that must return exactly one row, normalized to a dict rather than
 #: a list so the comparison reads as a field-by-field check.
 SINGLE_ROW_QUERIES = frozenset({"q03_titv", "q07_file_metadata"})
@@ -330,27 +368,37 @@ METADATA_ABSENT = "(absent)"
 # A custom mapping therefore invalidates them, and the wrapper switches the
 # policy to report-only in that case.
 
-VCFR = "https://w3id.org/vcf-rdfizer/vocab#"
-RDF_TYPE = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+# The vocabulary terms, the VCF-version model and the lexical parsers are
+# shared with the wrapper rather than mirrored here. They used to be duplicated,
+# with unit tests asserting the copies stayed identical; one module removes the
+# drift the tests were policing. `Dockerfile` copies it next to this runner, so
+# it imports the same way inside the container and on the host.
+try:
+    import vcf_rdfizer_vocab as vocab
+except ImportError:
+    # In the container the module sits next to this file; in a source checkout
+    # it is at the repository root. Try both before giving up, so the runner
+    # works as a script in either layout.
+    for candidate in (SCRIPT_DIR, SCRIPT_DIR.parent.parent):
+        if (candidate / "vcf_rdfizer_vocab.py").is_file():
+            sys.path.insert(0, str(candidate))
+            break
+    import vcf_rdfizer_vocab as vocab
+
+VCFC = vocab.VCFC_NAMESPACE
+RDF_TYPE = vocab.RDF_TYPE_URI
 
 
 def _nonzero(counts: dict[str, int]) -> dict[str, int]:
     return {key: value for key, value in counts.items() if value}
 
 
+rml_uri_component = vocab.rml_uri_component
+
+
 #: Field separator for the record digest. U+001F cannot appear in a VCF field,
 #: so no shift of a field boundary can make two different records collide. The
 #: query in q11_record_digest.rq writes it as a SPARQL \\u001F escape.
-def rml_uri_component(value: str) -> str:
-    """Encode a template value the way RMLStreamer 2.5.0 does.
-
-    Mirrors ``_rml_uri_component`` in ``vcf_rdfizer.py``; that module is not on
-    the container's import path, and ``test_validation_logic_unit.py`` asserts
-    the two agree so they cannot drift.
-    """
-    encoded = quote_plus(value, safe="*-._", encoding="utf-8", errors="strict")
-    # urllib leaves '~' unescaped; java.net.URLEncoder does not.
-    return encoded.replace("+", "%20").replace("~", "%7E")
 
 
 DIGEST_SEPARATOR = "\u001f"
@@ -366,6 +414,351 @@ def record_digest_bucket(fields: list[str]) -> str:
     return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:DIGEST_BUCKET_CHARS]
 
 
+# ---------------------------------------------------------------------------
+# Emitted-shape counters
+# ---------------------------------------------------------------------------
+#
+# The census asserts an exact inventory: these predicates and classes, with
+# these counts, and nothing else. So every resource family the emitters produce
+# has to be counted here, from the VCF, without reading the graph or the
+# mapping. These two functions are the single derivation: parse_vcf calls them
+# with the columns it read, and the test fixture calls them with the columns it
+# declares, so the container oracle and the fixture oracle cannot disagree.
+#
+# They mirror append_header_representation_rdf and append_record_detail_rdf.
+# Where a decision depends on a shared table (which '##' keys are structured,
+# which INFO keys carry an SV carrier, which Number tokens are positional), the
+# table comes from vcf_rdfizer_vocab rather than being restated.
+
+
+def _count_field_definition(counts: Counter, *, number: str, has_type: bool,
+                            has_description: bool) -> None:
+    """Count the ID/Number/Type/Description quartet of one field definition."""
+    counts["fieldId"] += 1
+    counts["fieldNumber"] += 1
+    if vocab.arity_individual(number) is not None:
+        counts["fieldArity"] += 1
+    if vocab.number_as_integer(number) is not None:
+        counts["fieldNumberInteger"] += 1
+    if has_type:
+        counts["fieldType"] += 1
+    if has_description:
+        counts["fieldDescription"] += 1
+
+
+def emitted_header_counters(header_lines: list[tuple[str, str]]) -> dict[str, Any]:
+    """Counters for everything append_header_representation_rdf emits.
+
+    ``header_lines`` is the ordered ``(key, value)`` list of '##' lines, without
+    the leading '##' and split on the first '='.
+    """
+    classes: Counter[str] = Counter()
+    predicates: Counter[str] = Counter()
+    contigs = 0
+    declarations: set[str] = set()
+
+    for key, value in header_lines:
+        key_lower = key.lower()
+        structured = vocab.is_structured_header_value(value)
+        line_class = HEADER_LINE_CLASSES.get(key_lower)
+        if line_class is None:
+            # An unrecognized key is still one of the two VCF forms. An
+            # unstructured line is only typed when it has a value, because
+            # vcfc:UnstructuredHeaderLineShape requires one.
+            if structured:
+                line_class = "StructuredHeaderLine"
+            elif value:
+                line_class = "UnstructuredHeaderLine"
+            else:
+                continue
+        classes[line_class] += 1
+
+        if not structured:
+            if key_lower == "assembly" and value:
+                predicates["assemblyUrl"] += 1
+            elif key_lower == "pedigreedb" and value:
+                predicates["pedigreeDbUrl"] += 1
+            continue
+
+        attributes = parse_structured_header_attributes(value)
+        classes["HeaderAttribute"] += len(attributes)
+        for name in ("hasAttribute", "attributeKey", "attributeValue", "attributeIndex"):
+            predicates[name] += len(attributes)
+
+        fields = dict(attributes)
+        identifier = (fields.get("ID") or "").strip()
+
+        if key_lower in {"info", "format"}:
+            if not identifier:
+                continue
+            # An absent Description is synthesized, so the property is always
+            # present on an INFO or FORMAT declaration.
+            _count_field_definition(
+                predicates, number=fields.get("Number") or ".",
+                has_type=True, has_description=True,
+            )
+            if key_lower == "info":
+                for attribute, predicate in vocab.INFO_EXTRA_ATTRIBUTES.items():
+                    if fields.get(attribute):
+                        predicates[predicate] += 1
+        elif key_lower == "filter":
+            if identifier:
+                predicates["filterId"] += 1
+                predicates["fieldDescription"] += 1
+        elif key_lower == "alt":
+            if identifier:
+                predicates["altId"] += 1
+                predicates["fieldDescription"] += 1
+        elif key_lower == "contig":
+            if not identifier:
+                continue
+            contigs += 1
+            predicates["contigId"] += 1
+            for attribute, (predicate, _datatype) in vocab.CONTIG_ATTRIBUTES.items():
+                if fields.get(attribute):
+                    predicates[predicate] += 1
+        elif key_lower == "meta":
+            if not identifier:
+                continue
+            _count_field_definition(
+                predicates, number=fields.get("Number") or ".",
+                has_type=True, has_description=fields.get("Description") is not None,
+            )
+            predicates["metaAllowedValue"] += len(_meta_values(fields.get("Values")))
+        elif key_lower == "sample":
+            if identifier:
+                predicates["declaresSample"] += 1
+                if identifier not in declarations:
+                    declarations.add(identifier)
+                    classes["SampleDeclaration"] += 1
+        elif key_lower == "pedigree":
+            for attribute_key, attribute_value in attributes:
+                if attribute_key == "ID" or not attribute_value:
+                    continue
+                predicates[
+                    vocab.PEDIGREE_ROLE_PROPERTIES.get(attribute_key, "pedigreeAncestor")
+                ] += 1
+                predicates["ancestorRole"] += 1
+                if attribute_value not in declarations:
+                    declarations.add(attribute_value)
+                    classes["SampleDeclaration"] += 1
+
+    if contigs:
+        predicates["contigCount"] += 1
+    return {
+        "emittedHeaderClasses": dict(classes),
+        "emittedHeaderPredicates": dict(predicates),
+    }
+
+
+def _meta_values(raw: str | None) -> list[str]:
+    """Split a ##META ``Values=[a, b, c]`` list, as the emitter does."""
+    if not raw:
+        return []
+    inner = raw.strip()
+    if inner.startswith("[") and inner.endswith("]"):
+        inner = inner[1:-1]
+    return [item.strip() for item in inner.split(",") if item.strip()]
+
+
+def emitted_record_counters(
+    rows: list[list[str]],
+    samples: list[str],
+    *,
+    version: Any,
+    contig_ids: set[str],
+    alt_declaration_ids: set[str],
+    has_assembly_line: bool = False,
+    info_numbers: dict[str, str],
+    format_numbers: dict[str, str],
+) -> dict[str, Any]:
+    """Counters for the allele, INFO, value-item, SV and genotype families.
+
+    ``rows`` are the raw tab-split VCF data columns. Everything is derived from
+    those and from the version, exactly as the emitters derive it.
+    """
+    classes: Counter[str] = Counter()
+    predicates: Counter[str] = Counter()
+
+    assembly_contig_ids: set[str] = set()
+    reference_alleles = alt_alleles = 0
+    value_items = value_item_alleles = tuple_items = 0
+    genotypes = genotype_calls = called_alleles = 0
+
+    for row in rows:
+        chrom = row[0] if len(row) > 0 else ""
+        ref = row[3] if len(row) > 3 else ""
+        alt = row[4] if len(row) > 4 else ""
+        info = row[7] if len(row) > 7 else ""
+
+        # A bracketed CHROM names a breakpoint-assembly contig instead of a
+        # declared reference sequence; the two are mutually exclusive.
+        assembly_id = vocab.parse_bracketed_chrom(chrom)
+        if assembly_id is not None:
+            predicates["chromAssemblyContig"] += 1
+            if assembly_id not in assembly_contig_ids:
+                assembly_contig_ids.add(assembly_id)
+                classes["AssemblyContig"] += 1
+                predicates["assemblyContigId"] += 1
+                if has_assembly_line:
+                    predicates["declaredInAssembly"] += 1
+        elif chrom in contig_ids:
+            predicates["chromosome"] += 1
+
+        alleles = vocab.parse_alt_alleles(ref, alt)
+        allele_uris = {allele.index for allele in alleles}
+        alt_count = sum(1 for allele in alleles if allele.index >= 1)
+        for allele in alleles:
+            if allele.index == 0:
+                reference_alleles += 1
+            else:
+                alt_alleles += 1
+            if allele.symbolic_id and allele.symbolic_id in alt_declaration_ids:
+                predicates["declaredByAlt"] += 1
+            if allele.symbolic_type:
+                predicates["svType"] += 1
+            if allele.breakend is not None:
+                classes["Breakend"] += 1
+                if allele.breakend.orientation is not None:
+                    predicates["breakendOrientation"] += 1
+                if allele.breakend.replacement:
+                    predicates["breakendReplacementString"] += 1
+                if allele.breakend.is_single:
+                    predicates["isSingleBreakend"] += 1
+
+        entries = parse_info_entries(info)
+        for key, value in entries:
+            if value is None:
+                continue
+            number = info_numbers.get(key, ".")
+            if not (allele_uris and version.is_positional(key, number)):
+                continue
+            items = vocab.split_value_items(value)
+            value_items += len(items)
+            arity = version.tuple_arity(key)
+            if arity is not None:
+                tuple_items += len(items)
+            for index in range(len(items)):
+                link = version.value_item_link(key, number, index)
+                if link.allele_index is not None and link.allele_index in allele_uris:
+                    value_item_alleles += 1
+                elif link.genotype_index is not None:
+                    predicates["forGenotypeIndex"] += 1
+                elif link.gt_allele_index is not None:
+                    predicates["forGTAlleleIndex"] += 1
+
+        if samples:
+            format_keys = (row[8].split(":") if len(row) > 8 and row[8] else [])
+            payloads = row[9 : 9 + len(samples)]
+            if "GT" in format_keys:
+                gt_index = format_keys.index("GT")
+                for payload in payloads:
+                    fields = payload.split(":") if payload else []
+                    raw_gt = fields[gt_index] if gt_index < len(fields) else ""
+                    parsed = vocab.parse_genotype(raw_gt)
+                    if parsed is None:
+                        continue
+                    genotypes += 1
+                    genotype_calls += len(parsed.calls)
+                    called_alleles += sum(
+                        1 for call in parsed.calls
+                        if call.allele_index is not None and call.allele_index <= alt_count
+                    )
+
+    if reference_alleles:
+        classes["ReferenceAllele"] = reference_alleles
+        predicates["hasReferenceAllele"] = reference_alleles
+    if alt_alleles:
+        classes["AltAllele"] = alt_alleles
+        predicates["hasAltAllele"] = alt_alleles
+    total_alleles = reference_alleles + alt_alleles
+    for name in ("alleleIndex", "alleleValue", "alleleKind"):
+        predicates[name] += total_alleles
+
+    if value_items:
+        classes["FieldValueItem"] += value_items
+        for name in ("hasValueItem", "valueIndex", "itemValue"):
+            predicates[name] += value_items
+        predicates["forAllele"] += value_item_alleles
+        predicates["tupleArity"] += tuple_items
+
+    # The parsed genotype layer is expanded-only, so it is reported separately
+    # and merged by expected_census for that profile alone. Keeping parse_vcf
+    # representation-independent is what lets one parse serve both censuses.
+    genotype_classes: Counter[str] = Counter()
+    genotype_predicates: Counter[str] = Counter()
+    if genotypes:
+        genotype_classes["Genotype"] += genotypes
+        genotype_classes["GenotypeAlleleCall"] += genotype_calls
+        for name in ("hasGenotype", "genotypeString", "ploidy", "phasingStatus"):
+            genotype_predicates[name] += genotypes
+        for name in ("hasAlleleCall", "callIndex", "isNoCall"):
+            genotype_predicates[name] += genotype_calls
+        genotype_predicates["calledAllele"] += called_alleles
+
+    return {
+        "emittedRecordClasses": dict(classes),
+        "emittedRecordPredicates": dict(predicates),
+        "emittedGenotypeClasses": dict(genotype_classes),
+        "emittedGenotypePredicates": dict(genotype_predicates),
+        "alleleCount": total_alleles,
+        "valueItemCount": value_items,
+        "genotypeCount": genotypes,
+        "genotypeAlleleCallCount": genotype_calls,
+    }
+
+
+def synthesized_definition_numbers(
+    rows: list[list[str]], *, declared_info: set[str], declared_format: set[str]
+) -> dict[str, list[str]]:
+    """The Number token of every definition the value emitters have to invent.
+
+    A key declared by a '##INFO' or '##FORMAT' line is owned by the header
+    emitter, which emits its ID/Number/Type/Description at the header line's
+    own IRI. Only an undeclared key gets a definition invented at value time,
+    with Number "0" for a Flag and "." otherwise.
+    """
+    info: list[str] = []
+    format_keys: list[str] = []
+    seen_info: set[str] = set()
+    seen_format: set[str] = set()
+    for row in rows:
+        for key, value in parse_info_entries(row[7] if len(row) > 7 else ""):
+            if key in declared_info or key in seen_info:
+                continue
+            seen_info.add(key)
+            info.append("0" if value is None else ".")
+        declared_keys = row[8].split(":") if len(row) > 8 and row[8] else []
+        payloads = [p.split(":") if p else [] for p in row[9:]]
+        width = max([len(declared_keys), *(len(p) for p in payloads)], default=0)
+        for index in range(width):
+            key = (declared_keys[index]
+                   if index < len(declared_keys) and declared_keys[index]
+                   else f"FIELD_{index + 1}")
+            if key in declared_format or key in seen_format:
+                continue
+            seen_format.add(key)
+            format_keys.append(".")
+    return {"synthesizedInfoNumbers": info, "synthesizedFormatNumbers": format_keys}
+
+
+def _count_definitions(predicates: dict[str, int], numbers: list[str]) -> None:
+    """Count the field* triples of each synthesized field definition.
+
+    A synthesized definition always carries ID, Number, Type and Description,
+    plus the arity individual or the fixed count its Number token implies.
+    """
+    for number in numbers:
+        for name in ("fieldId", "fieldNumber", "fieldType", "fieldDescription"):
+            predicates[f"{VCFC}{name}"] = predicates.get(f"{VCFC}{name}", 0) + 1
+        if vocab.arity_individual(number) is not None:
+            predicates[f"{VCFC}fieldArity"] = predicates.get(f"{VCFC}fieldArity", 0) + 1
+        if vocab.number_as_integer(number) is not None:
+            predicates[f"{VCFC}fieldNumberInteger"] = (
+                predicates.get(f"{VCFC}fieldNumberInteger", 0) + 1
+            )
+
+
 def expected_census(
     parser: dict[str, Any], representation: str, *, info_representation: str = "structured",
     header_representation: str = "structured",
@@ -376,112 +769,140 @@ def expected_census(
     header_lines = parser["headerLineCount"]
 
     classes: dict[str, int] = {
-        f"{VCFR}VCFFile": 1,
-        f"{VCFR}VCFHeader": 1,
-        f"{VCFR}HeaderLine": header_lines,
-        f"{VCFR}VCFRecord": records,
-        f"{VCFR}VariantCall": records,
+        f"{VCFC}VCFFile": 1,
+        f"{VCFC}VCFHeader": 1,
+        f"{VCFC}ColumnHeaderLine": 1,
+        f"{VCFC}HeaderLine": header_lines,
+        f"{VCFC}VCFRecord": records,
+        f"{VCFC}VariantCall": records,
     }
+    # The mapping's version sentinel resolves to the subclass for the version
+    # the file declares, or back to vcfc:VCFFile when the version has no
+    # conformance overlay -- in which case it adds no new class.
+    version = vocab.parse_vcf_version(parser.get("fileFormat"))
+    if version is not None:
+        classes[f"{VCFC}{version.file_class}"] = 1
     predicates: dict[str, int] = {
-        f"{VCFR}hasHeader": 1,
-        f"{VCFR}hasHeaderLine": header_lines,
-        f"{VCFR}headerKey": header_lines,
-        f"{VCFR}headerValue": parser["headerValueCount"],
-        f"{VCFR}hasRecord": records,
-        f"{VCFR}chrom": records,
-        f"{VCFR}pos": records,
-        f"{VCFR}recordId": records,
-        f"{VCFR}ref": records,
-        f"{VCFR}alt": records,
-        f"{VCFR}hasCall": records,
-        f"{VCFR}qual": records,
-        f"{VCFR}filter": records,
-        f"{VCFR}infoRaw": records,
-        f"{VCFR}formatRaw": parser["recordsWithFormatColumn"],
+        f"{VCFC}hasHeader": 1,
+        f"{VCFC}hasColumnHeader": 1,
+        f"{VCFC}hasHeaderLine": header_lines,
+        f"{VCFC}headerKey": header_lines,
+        f"{VCFC}headerValue": parser["headerValueCount"],
+        f"{VCFC}lineIndex": header_lines,
+        f"{VCFC}hasRecord": records,
+        f"{VCFC}chrom": records,
+        f"{VCFC}pos": records,
+        f"{VCFC}ref": records,
+        f"{VCFC}recordIndex": records,
+        f"{VCFC}hasCall": records,
+        # ID, ALT, QUAL, FILTER and INFO moved out of the mapping and into the
+        # wrapper's emitter, because each may be the VCF missing token and RML
+        # cannot type an object per row. They are still one per record.
+        f"{VCFC}recordId": records,
+        f"{VCFC}alt": records,
+        f"{VCFC}qual": records,
+        f"{VCFC}filter": records,
+        f"{VCFC}infoRaw": records,
+        f"{VCFC}formatRaw": parser["recordsWithFormatColumn"],
     }
     # RMLStreamer emits nothing for an absent value, so an undeclared
     # meta-information line contributes no triple rather than an empty one.
     for field, predicate in (
-        ("fileFormat", f"{VCFR}fileFormat"),
-        ("referenceGenome", f"{VCFR}referenceGenome"),
-        ("sourceSoftware", f"{VCFR}sourceSoftware"),
+        ("fileFormat", f"{VCFC}fileFormat"),
+        ("referenceGenome", f"{VCFC}referenceGenome"),
+        ("sourceSoftware", f"{VCFC}sourceSoftware"),
     ):
         predicates[predicate] = 0 if parser[field] == METADATA_ABSENT else 1
 
+    # A sites-only VCF still declares a profile: vcfc:RepresentationProfileShape
+    # requires exactly one on every file, and a file with no genotype columns
+    # has no genotype data to condense.
+    predicates[f"{VCFC}representationProfile"] = 1
     if samples:
-        predicates[f"{VCFR}representationProfile"] = 1
-        if representation == "expanded":
-            classes[f"{VCFR}SampleCall"] = records * samples
-            classes[f"{VCFR}FormatFieldValue"] = parser["formatValueSlots"]
-            predicates[f"{VCFR}hasSampleCall"] = records * samples
-            predicates[f"{VCFR}sampleId"] = records * samples
-            predicates[f"{VCFR}hasFormatValue"] = parser["formatValueSlots"]
-            predicates[f"{VCFR}fieldValue"] = parser["nonEmptyFormatValues"]
-        else:
-            definitions = parser["distinctFormatKeyCount"]
-            classes[f"{VCFR}SampleSet"] = 1
-            classes[f"{VCFR}VCFSample"] = samples
-            classes[f"{VCFR}CohortCallMatrix"] = parser["recordsWithFormatKeys"]
-            classes[f"{VCFR}FormatValueVector"] = parser["formatKeyOccurrences"]
-            classes[f"{VCFR}FormatFieldDefinition"] = definitions
-            predicates[f"{VCFR}hasSampleSet"] = 1
-            predicates[f"{VCFR}hasSample"] = samples
-            predicates[f"{VCFR}sampleName"] = samples
-            predicates[f"{VCFR}sampleIndex"] = samples
-            predicates[f"{VCFR}hasCallMatrix"] = parser["recordsWithFormatKeys"]
-            predicates[f"{VCFR}appliesToSampleSet"] = parser["recordsWithFormatKeys"]
-            predicates[f"{VCFR}hasFormatValueVector"] = parser["formatKeyOccurrences"]
-            predicates[f"{VCFR}declaredBy"] = parser["formatKeyOccurrences"]
-            predicates[f"{VCFR}valueEncoding"] = parser["formatKeyOccurrences"]
-            predicates[f"{VCFR}encodedValues"] = parser["formatKeyOccurrences"]
-            predicates[f"{VCFR}fieldId"] = definitions
-            predicates[f"{VCFR}fieldNumber"] = definitions
-            predicates[f"{VCFR}fieldDescription"] = definitions
+        definitions = parser["distinctFormatKeyCount"]
+        # The reusable sample set is file-scoped, not profile-scoped: both
+        # profiles emit it, and the #CHROM line links to its members.
+        classes[f"{VCFC}SampleSet"] = 1
+        classes[f"{VCFC}VCFSample"] = samples
+        classes[f"{VCFC}FormatFieldDefinition"] = definitions
+        predicates[f"{VCFC}hasSampleSet"] = 1
+        predicates[f"{VCFC}hasSample"] = samples
+        predicates[f"{VCFC}sampleName"] = samples
+        predicates[f"{VCFC}sampleIndex"] = samples
+        predicates[f"{VCFC}hasGenotypeColumns"] = samples
+        # A FORMAT key declared by a '##FORMAT' line gets its
+        # ID/Number/Type/Description from the header emitter, at the same IRI.
+        # Only a key the header never declared needs an invented definition
+        # here, so only those are counted.
+        _count_definitions(predicates, parser.get("synthesizedFormatNumbers", []))
 
-    predicates[f"{VCFR}fileDate"] = 0 if parser["fileDate"] == METADATA_ABSENT else 1
+        if representation == "expanded":
+            for class_name, count in parser.get("emittedGenotypeClasses", {}).items():
+                classes[f"{VCFC}{class_name}"] = classes.get(f"{VCFC}{class_name}", 0) + count
+            for name, count in parser.get("emittedGenotypePredicates", {}).items():
+                predicates[f"{VCFC}{name}"] = predicates.get(f"{VCFC}{name}", 0) + count
+            classes[f"{VCFC}SampleCall"] = records * samples
+            classes[f"{VCFC}FormatFieldValue"] = parser["formatValueSlots"]
+            predicates[f"{VCFC}hasSampleCall"] = records * samples
+            predicates[f"{VCFC}sampleId"] = records * samples
+            predicates[f"{VCFC}forSample"] = records * samples
+            predicates[f"{VCFC}hasFormatValue"] = parser["formatValueSlots"]
+            predicates[f"{VCFC}fieldValue"] = parser["nonEmptyFormatValues"]
+            # Every expanded FORMAT value now cites its declaration.
+            predicates[f"{VCFC}declaredBy"] = (
+                predicates.get(f"{VCFC}declaredBy", 0) + parser["formatValueSlots"]
+            )
+        else:
+            classes[f"{VCFC}CohortCallMatrix"] = parser["recordsWithFormatKeys"]
+            classes[f"{VCFC}FormatValueVector"] = parser["formatKeyOccurrences"]
+            predicates[f"{VCFC}hasCallMatrix"] = parser["recordsWithFormatKeys"]
+            predicates[f"{VCFC}appliesToSampleSet"] = parser["recordsWithFormatKeys"]
+            predicates[f"{VCFC}hasFormatValueVector"] = parser["formatKeyOccurrences"]
+            predicates[f"{VCFC}valueEncoding"] = parser["formatKeyOccurrences"]
+            predicates[f"{VCFC}encodedValues"] = parser["formatKeyOccurrences"]
+            predicates[f"{VCFC}declaredBy"] = (
+                predicates.get(f"{VCFC}declaredBy", 0) + parser["formatKeyOccurrences"]
+            )
+
+    predicates[f"{VCFC}fileDate"] = 0 if parser["fileDate"] == METADATA_ABSENT else 1
 
     if header_representation == "structured":
-        for class_name, count in parser["headerLineClassCounts"].items():
-            classes[f"{VCFR}{class_name}"] = classes.get(f"{VCFR}{class_name}", 0) + count
-        # A FILTER/ALT line carries both its header-line subclass and its
-        # definition class, so it contributes two rdf:type triples.
-        classes[f"{VCFR}FilterDefinition"] = parser["filterDefinitionCount"]
-        classes[f"{VCFR}AltDefinition"] = parser["altDefinitionCount"]
-        predicates[f"{VCFR}filterId"] = parser["filterDefinitionCount"]
-        predicates[f"{VCFR}altId"] = parser["altDefinitionCount"]
-        predicates[f"{VCFR}contigId"] = parser["contigCount"]
-        predicates[f"{VCFR}contigCount"] = 1 if parser["contigCount"] else 0
-        for attribute, predicate in (
-            ("length", "contigLength"), ("md5", "contigMd5"), ("assembly", "contigAssembly"),
-        ):
-            predicates[f"{VCFR}{predicate}"] = parser["contigAttributeCounts"].get(attribute, 0)
-        predicates[f"{VCFR}fieldDescription"] = (
-            predicates.get(f"{VCFR}fieldDescription", 0)
-            + parser["describedDefinitionCount"]
-        )
+        # Every structured-header family is counted once, by
+        # emitted_header_counters, from the same '##' lines the emitter reads.
+        # vcfc:FilterDefinition and vcfc:AltDefinition are no longer asserted:
+        # vcfc:FILTERHeaderLine and vcfc:ALTHeaderLine are subclasses of them in
+        # the vocabulary, so RDFS supplies the type and an explicit triple would
+        # be redundant.
+        for class_name, count in parser["emittedHeaderClasses"].items():
+            classes[f"{VCFC}{class_name}"] = classes.get(f"{VCFC}{class_name}", 0) + count
+        for name, count in parser["emittedHeaderPredicates"].items():
+            predicates[f"{VCFC}{name}"] = predicates.get(f"{VCFC}{name}", 0) + count
 
     if info_representation == "structured":
         values = parser["infoValueCount"]
         definitions = parser["infoDefinitionCount"]
-        classes[f"{VCFR}InfoFieldValue"] = values
-        classes[f"{VCFR}InfoFieldDefinition"] = definitions
-        predicates[f"{VCFR}hasInfoValue"] = values
-        predicates[f"{VCFR}fieldValueBoolean"] = parser["infoFlagCount"]
-        predicates[f"{VCFR}fieldValueInteger"] = parser["infoTypedIntegerCount"]
-        predicates[f"{VCFR}fieldValueDecimal"] = parser["infoTypedDecimalCount"]
-        predicates[f"{VCFR}fieldType"] = definitions
-        # declaredBy and the field* descriptors are shared with the condensed
-        # FORMAT definitions, so accumulate rather than overwrite.
-        for predicate, count in (
-            (f"{VCFR}declaredBy", values),
-            (f"{VCFR}fieldId", definitions),
-            (f"{VCFR}fieldNumber", definitions),
-            (f"{VCFR}fieldDescription", definitions),
-        ):
-            predicates[predicate] = predicates.get(predicate, 0) + count
-        predicates[f"{VCFR}fieldValue"] = (
-            predicates.get(f"{VCFR}fieldValue", 0) + values - parser["infoFlagCount"]
+        classes[f"{VCFC}InfoFieldValue"] = values
+        classes[f"{VCFC}InfoFieldDefinition"] = definitions
+        predicates[f"{VCFC}hasInfoValue"] = values
+        predicates[f"{VCFC}fieldValueBoolean"] = parser["infoFlagCount"]
+        predicates[f"{VCFC}fieldValueInteger"] = parser["infoTypedIntegerCount"]
+        predicates[f"{VCFC}fieldValueDecimal"] = parser["infoTypedDecimalCount"]
+        # declaredBy and the field* descriptors are shared with the FORMAT
+        # definitions, so accumulate rather than overwrite.
+        predicates[f"{VCFC}declaredBy"] = predicates.get(f"{VCFC}declaredBy", 0) + values
+        # As above: only an INFO key with no '##INFO' declaration needs its
+        # definition invented, and only those contribute field* triples here.
+        _count_definitions(predicates, parser.get("synthesizedInfoNumbers", []))
+        predicates[f"{VCFC}fieldValue"] = (
+            predicates.get(f"{VCFC}fieldValue", 0) + values - parser["infoFlagCount"]
         )
+
+        # The allele layer, the value items, the SV carriers and the parsed
+        # genotype layer travel with the structured INFO representation.
+        for class_name, count in parser["emittedRecordClasses"].items():
+            classes[f"{VCFC}{class_name}"] = classes.get(f"{VCFC}{class_name}", 0) + count
+        for name, count in parser["emittedRecordPredicates"].items():
+            predicates[f"{VCFC}{name}"] = predicates.get(f"{VCFC}{name}", 0) + count
 
     classes = _nonzero(classes)
     predicates = _nonzero(predicates)
@@ -515,76 +936,13 @@ def sample_uri_ids(sample_ids: list[str]) -> list[str]:
     return out
 
 
-#: '##' key (lower-cased) -> vocabulary subclass. Mirrors HEADER_LINE_CLASSES
-#: in vcf_rdfizer.py; the unit tests assert the two stay identical.
-HEADER_LINE_CLASSES = {
-    "fileformat": "FileFormatHeaderLine",
-    "filedate": "FileDateHeaderLine",
-    "source": "SourceHeaderLine",
-    "reference": "ReferenceHeaderLine",
-    "info": "INFOHeaderLine",
-    "format": "FORMATHeaderLine",
-    "filter": "FILTERHeaderLine",
-    "alt": "ALTHeaderLine",
-    "contig": "ContigHeaderLine",
-}
-
-
-def parse_structured_header_fields(value: str) -> dict[str, str]:
-    """Parse '<ID=..,Description="..">' attributes, respecting quoting.
-
-    Mirrors ``_parse_structured_header_fields`` in ``vcf_rdfizer.py``; the unit
-    tests assert the two agree.
-    """
-    inner = value.strip()
-    if inner.startswith("<") and inner.endswith(">"):
-        inner = inner[1:-1]
-    tokens: list[str] = []
-    token: list[str] = []
-    in_quotes = escaped = False
-    for character in inner:
-        if escaped:
-            token.append(character)
-            escaped = False
-        elif character == "\\" and in_quotes:
-            token.append(character)
-            escaped = True
-        elif character == '"':
-            token.append(character)
-            in_quotes = not in_quotes
-        elif character == "," and not in_quotes:
-            tokens.append("".join(token))
-            token = []
-        else:
-            token.append(character)
-    tokens.append("".join(token))
-    fields: dict[str, str] = {}
-    for item in tokens:
-        if "=" not in item:
-            continue
-        key, raw_value = item.split("=", 1)
-        parsed = raw_value.strip()
-        if len(parsed) >= 2 and parsed[0] == parsed[-1] == '"':
-            parsed = parsed[1:-1].replace('\\"', '"').replace("\\\\", "\\")
-        fields[key.strip()] = parsed
-    return fields
-
-
-def parse_info_entries(info: str) -> list[tuple[str, str | None]]:
-    """Split an INFO column into ``(key, value)`` pairs; a bare key is a Flag.
-
-    Mirrors ``parse_info_entries`` in ``vcf_rdfizer.py``. The two are asserted
-    to agree in ``test_validation_logic_unit.py``.
-    """
-    if info in ("", "."):
-        return []
-    entries: list[tuple[str, str | None]] = []
-    for item in info.split(";"):
-        if not item:
-            continue
-        key, separator, value = item.partition("=")
-        entries.append((key, value if separator else None))
-    return entries
+# Shared with the wrapper through vcf_rdfizer_vocab, so the oracle and the
+# emitter cannot disagree about what a '##' line means or how it parses.
+HEADER_LINE_CLASSES = vocab.HEADER_LINE_CLASSES
+STRUCTURED_HEADER_KEYS = vocab.STRUCTURED_HEADER_KEYS
+parse_structured_header_fields = vocab.parse_structured_header_fields
+parse_structured_header_attributes = vocab.parse_structured_header_attributes
+parse_info_entries = vocab.parse_info_entries
 
 
 def info_declared_types(raw_header: str) -> dict[str, str]:
@@ -650,42 +1008,44 @@ def parse_header_metadata(raw_header: str) -> dict[str, Any]:
         # A repeated declaration keeps the first, matching the awk parser.
         if field is not None and metadata[field] == METADATA_ABSENT:
             metadata[field] = value
-    # Header-representation counters. The class map mirrors HEADER_LINE_CLASSES
-    # in vcf_rdfizer.py; the two are asserted to agree in the unit tests.
-    header_classes: Counter[str] = Counter()
-    filter_definitions = alt_definitions = contigs = described = 0
-    contig_attributes: Counter[str] = Counter()
+    # Header-representation counters, derived by the one shared implementation
+    # the emitter's shape is described by.
+    header_lines: list[tuple[str, str]] = []
+    contig_ids: set[str] = set()
+    alt_ids: set[str] = set()
+    info_numbers: dict[str, str] = {}
+    format_numbers: dict[str, str] = {}
     for line in raw_header.splitlines():
         if not line.startswith("##"):
             continue
         key, _, value = line[2:].partition("=")
-        class_name = HEADER_LINE_CLASSES.get(key.lower())
-        if class_name is None:
-            continue
-        header_classes[class_name] += 1
-        if key.lower() not in {"filter", "alt", "contig"}:
+        header_lines.append((key, value))
+        lowered = key.lower()
+        if lowered not in {"contig", "alt", "info", "format"}:
             continue
         fields = parse_structured_header_fields(value)
-        if not (fields.get("ID") or "").strip():
+        identifier = (fields.get("ID") or "").strip()
+        if not identifier:
             continue
-        if key.lower() == "contig":
-            contigs += 1
-            for attribute in ("length", "md5", "assembly"):
-                if fields.get(attribute):
-                    contig_attributes[attribute] += 1
-            continue
-        if key.lower() == "filter":
-            filter_definitions += 1
+        if lowered == "contig":
+            contig_ids.add(identifier)
+        elif lowered == "alt":
+            alt_ids.add(identifier)
+        elif lowered == "info":
+            info_numbers.setdefault(identifier, fields.get("Number") or ".")
         else:
-            alt_definitions += 1
-        if fields.get("Description"):
-            described += 1
-    metadata["headerLineClassCounts"] = dict(header_classes)
-    metadata["filterDefinitionCount"] = filter_definitions
-    metadata["altDefinitionCount"] = alt_definitions
-    metadata["contigCount"] = contigs
-    metadata["contigAttributeCounts"] = dict(contig_attributes)
-    metadata["describedDefinitionCount"] = described
+            format_numbers.setdefault(identifier, fields.get("Number") or ".")
+
+    metadata.update(emitted_header_counters(header_lines))
+    metadata["headerLines"] = header_lines
+    metadata["contigIds"] = sorted(contig_ids)
+    metadata["hasAssemblyLine"] = any(
+        key.lower() == "assembly" and value for key, value in header_lines
+    )
+    metadata["altDeclarationIds"] = sorted(alt_ids)
+    metadata["infoKeyNumbers"] = info_numbers
+    metadata["formatKeyNumbers"] = format_numbers
+    metadata["contigCount"] = len(contig_ids)
     metadata["headerLineCount"] = sum(keys.values())
     metadata["headerValueCount"] = sum(
         1 for line in raw_header.splitlines()
@@ -719,7 +1079,35 @@ def attach_census_expectations(
     return parser
 
 
-def parse_vcf(vcf_path: Path, *, filter_oracle: str) -> dict[str, Any]:
+def parse_vcf(
+    vcf_path: Path, *, filter_oracle: str, timing: dict[str, float] | None = None
+) -> dict[str, Any]:
+    """Compute every query's expected value in ONE pass over the VCF.
+
+    ``timing``, when supplied, is filled with the phase breakdown below. It is
+    opt-in because the sample-block measurement costs two clock reads per
+    record, which is negligible next to a real parse but pointless when nobody
+    is going to read it.
+
+        readerOpenSeconds     open the file and parse the header
+        scanSeconds           the record loop, in total
+        sampleBlockSeconds    the per-sample genotype/AC-AN portion INSIDE the
+                              scan -- the only part of the pass whose cost
+                              depends on which queries you want
+        assemblySeconds       building the per-query expected structures after
+                              the loop
+
+    Why phases and not per-query totals: this is a single pass that accumulates
+    every query's counters together, so there is no per-query slice of it to
+    measure. Attributing the shared scan to individual queries is a decision
+    about what a one-question script would have paid, not a measurement, so it
+    is made explicitly in the analysis (see ORACLE_QUERY_PHASES) rather than
+    silently here.
+
+    Gating the pass per query was considered and rejected: the accumulators in
+    the sample block feed the expected values, so a gate left on in a
+    correctness run would corrupt the oracle every equality claim rests on.
+    """
     if VCF is None:
         raise RuntimeError(
             "cyvcf2 is unavailable; the validator must run inside the "
@@ -731,9 +1119,16 @@ def parse_vcf(vcf_path: Path, *, filter_oracle: str) -> dict[str, Any]:
     if filter_oracle == "bcftools" and not shutil.which("bcftools"):
         raise RuntimeError("--filter-oracle=bcftools requested but bcftools is unavailable")
     filters = filters_with_bcftools(vcf_path) if use_bcftools else Counter()
+    _open_started = time.monotonic()
     reader = VCF(str(vcf_path), strict_gt=True)
     samples = list(reader.samples)
     header_metadata = parse_header_metadata(read_vcf_header_text(vcf_path))
+    if timing is not None:
+        timing["readerOpenSeconds"] = time.monotonic() - _open_started
+    # Hoisted out of the loop: a per-record attribute lookup on `timing` would
+    # be measuring the measurement.
+    _time_samples = timing is not None
+    _sample_block_seconds = 0.0
     density: Counter[tuple[str, int]] = Counter()
     shapes: Counter[str] = Counter()
     genotypes: Counter[tuple[str, str]] = Counter()
@@ -751,9 +1146,11 @@ def parse_vcf(vcf_path: Path, *, filter_oracle: str) -> dict[str, Any]:
     info_definitions: set[str] = set()
     info_values = info_flags = info_typed_integers = info_typed_decimals = 0
     source_component = rml_uri_component(vcf_path.name)
+    record_rows: list[list[str]] = []
     records_with_format_column = records_with_format_keys = 0
     format_key_occurrences = format_value_slots = non_empty_format_values = 0
     distinct_format_keys: set[str] = set()
+    _scan_started = time.monotonic()
     try:
         for variant in reader:
             total_records += 1
@@ -781,12 +1178,13 @@ def parse_vcf(vcf_path: Path, *, filter_oracle: str) -> dict[str, Any]:
             if has_gt:
                 gt_records += 1
 
-            # `vcfr:formatRaw` comes from the FORMAT column itself, so it is
+            # `vcfc:formatRaw` comes from the FORMAT column itself, so it is
             # present whenever that column is non-empty - samples or not.
             if format_keys:
                 records_with_format_column += 1
 
             columns = str(variant).rstrip("\r\n").split("\t")
+            record_rows.append(columns)
             # The record digest is computed from the raw line so it matches the
             # lexical values the mapping puts in the graph, character for
             # character, with no round-trip through cyvcf2's typed accessors.
@@ -872,6 +1270,7 @@ def parse_vcf(vcf_path: Path, *, filter_oracle: str) -> dict[str, Any]:
                     condensed_format_digest[
                         record_digest_bucket([vector_iri, encoded])
                     ] += 1
+            _sample_started = time.monotonic() if _time_samples else 0.0
             alleles = [None] * len(samples)
             if samples and has_gt:
                 raw_genotypes = list(variant.genotypes)
@@ -895,26 +1294,44 @@ def parse_vcf(vcf_path: Path, *, filter_oracle: str) -> dict[str, Any]:
                     if an:
                         ac_an[(an, ac)] += 1
                         q06_eligible += 1
+            if _time_samples:
+                _sample_block_seconds += time.monotonic() - _sample_started
     finally:
         reader.close()
+    if timing is not None:
+        timing["scanSeconds"] = time.monotonic() - _scan_started
+        timing["sampleBlockSeconds"] = _sample_block_seconds
+    _assembly_started = time.monotonic()
     if sum(filters.values()) != total_records:
         raise ValueError("FILTER oracle record count differs from the VCF record count")
     q05 = [
         {"sampleId": sample, "genotypeClass": genotype_class, "callCount": int(count)}
         for (sample, genotype_class), count in sorted(genotypes.items())
     ]
-    return {
+    result = {
         "source": str(vcf_path),
         "sourceSha256": sha256_file(vcf_path),
         "filterOracle": "bcftools" if use_bcftools else "cyvcf2-serialization",
         "headerLineCount": header_metadata["headerLineCount"],
         "fileDate": header_metadata["fileDate"],
-        "headerLineClassCounts": header_metadata["headerLineClassCounts"],
-        "filterDefinitionCount": header_metadata["filterDefinitionCount"],
-        "altDefinitionCount": header_metadata["altDefinitionCount"],
+        "emittedHeaderClasses": header_metadata["emittedHeaderClasses"],
+        "emittedHeaderPredicates": header_metadata["emittedHeaderPredicates"],
         "contigCount": header_metadata["contigCount"],
-        "contigAttributeCounts": header_metadata["contigAttributeCounts"],
-        "describedDefinitionCount": header_metadata["describedDefinitionCount"],
+        **emitted_record_counters(
+            record_rows,
+            samples,
+            version=vocab.resolve_vcf_version(header_metadata["fileFormat"])[0],
+            contig_ids=set(header_metadata["contigIds"]),
+            alt_declaration_ids=set(header_metadata["altDeclarationIds"]),
+            has_assembly_line=header_metadata["hasAssemblyLine"],
+            info_numbers=header_metadata["infoKeyNumbers"],
+            format_numbers=header_metadata["formatKeyNumbers"],
+        ),
+        **synthesized_definition_numbers(
+            record_rows,
+            declared_info=set(header_metadata["infoKeyNumbers"]),
+            declared_format=set(header_metadata["formatKeyNumbers"]),
+        ),
         "headerValueCount": header_metadata["headerValueCount"],
         "recordsWithFormatColumn": records_with_format_column,
         "recordsWithFormatKeys": records_with_format_keys,
@@ -981,6 +1398,9 @@ def parse_vcf(vcf_path: Path, *, filter_oracle: str) -> dict[str, Any]:
             for (an, ac), count in sorted(ac_an.items())
         ],
     }
+    if timing is not None:
+        timing["assemblySeconds"] = time.monotonic() - _assembly_started
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1031,25 +1451,115 @@ def _resolve_binary(env_var: str, *candidates: str) -> str:
     raise RuntimeError(f"Required binary not found in container: {candidates[0]}")
 
 
+#: Substrings that mean a decode step failed even though it exited 0. hdt-cpp's
+#: ``hdt2rdf`` is the reason this list exists: its raptor file serializer emits
+#: ``error: :0:0: write error`` once per triple and still returns success.
+STEP_ERROR_MARKERS = ("write error", "error:", "ERROR:")
+
+
 def _run_step(
-    command: list[str], *, label: str, log_dir: Path, env: dict[str, str] | None = None
+    command: list[str],
+    *,
+    label: str,
+    log_dir: Path,
+    env: dict[str, str] | None = None,
+    stdout_path: Path | None = None,
+    error_markers: tuple[str, ...] = (),
 ) -> None:
-    """Run one decode step, preserving its output for diagnosis on failure."""
+    """Run one decode step, preserving its output for diagnosis on failure.
+
+    ``stdout_path`` redirects the command's stdout to that file and keeps only
+    stderr in the log, which is how a tool that can only serialize correctly to
+    stdout is driven.
+
+    ``error_markers`` are matched against the log after a *successful* exit. An
+    exit code is only as trustworthy as the tool that returns it, and a decode
+    step that reports success while writing garbage is worse than one that
+    fails: the garbage flows downstream and the run dies somewhere unrelated,
+    hours later.
+    """
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{label}.log"
-    with log_path.open("wb") as log:
-        result = subprocess.run(
-            command, check=False, stdout=log, stderr=subprocess.STDOUT, env=env
-        )
+    if stdout_path is not None:
+        stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        with stdout_path.open("wb") as out, log_path.open("wb") as log:
+            result = subprocess.run(command, check=False, stdout=out, stderr=log, env=env)
+    else:
+        with log_path.open("wb") as log:
+            result = subprocess.run(
+                command, check=False, stdout=log, stderr=subprocess.STDOUT, env=env
+            )
+
+    tail = ""
+    try:
+        tail = log_path.read_text(encoding="utf-8", errors="replace")[-2000:]
+    except OSError:
+        pass
+
     if result.returncode != 0:
-        tail = ""
-        try:
-            tail = log_path.read_text(encoding="utf-8", errors="replace")[-2000:]
-        except OSError:
-            pass
         raise RuntimeError(
             f"{label} failed with exit code {result.returncode}. Output tail: {tail}"
         )
+
+    if error_markers:
+        try:
+            log_text = log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            log_text = tail
+        hit = next((m for m in error_markers if m in log_text), None)
+        if hit is not None:
+            raise RuntimeError(
+                f"{label} exited 0 but reported errors on stderr "
+                f"(matched {hit!r}); treating the step as failed because its "
+                f"output cannot be trusted. Output tail: {tail}"
+            )
+
+
+def _verify_ntriples(path: Path, *, label: str) -> int:
+    """Reject a materialized N-Triples file that is structurally impossible.
+
+    Cheap enough to run on any size (it reads a prefix and a suffix, never the
+    whole file) and it catches the failure mode that cost this project days: a
+    4.4 GiB "N-Triples" file containing no newline at all, whose every line was
+    a truncated subject IRI. Raptor accepts that as one enormous line and
+    degrades to quadratic behaviour, so the run does not fail -- it crawls, at
+    roughly 7 KiB/s, and looks like a hang rather than a bug.
+
+    Returns the size in bytes. Raises RuntimeError with a diagnosis otherwise.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError as error:
+        raise RuntimeError(f"{label} produced no readable output at {path}: {error}") from error
+    if size == 0:
+        raise RuntimeError(f"{label} produced an empty N-Triples file at {path}")
+
+    probe = 1024 * 1024
+    with path.open("rb") as handle:
+        head = handle.read(probe)
+        if b"\n" not in head:
+            raise RuntimeError(
+                f"{label} produced {size} bytes with no newline in the first "
+                f"{min(probe, size)}; this is not N-Triples. First 200 bytes: "
+                f"{head[:200]!r}"
+            )
+        first_line = head.split(b"\n", 1)[0].strip()
+        if not (first_line.startswith(b"<") or first_line.startswith(b"_:")):
+            raise RuntimeError(
+                f"{label} produced a first line that does not begin a triple: {first_line[:200]!r}"
+            )
+        if not first_line.endswith(b"."):
+            raise RuntimeError(
+                f"{label} produced a first line with no statement terminator: "
+                f"{first_line[:200]!r}"
+            )
+        handle.seek(max(0, size - 4096))
+        if not handle.read().endswith(b"\n"):
+            raise RuntimeError(
+                f"{label} produced a file not terminated by a newline; it is "
+                f"most likely truncated ({size} bytes)"
+            )
+    return size
 
 
 def materialize_ntriples(
@@ -1075,6 +1585,7 @@ def materialize_ntriples(
     if rdf_format == "nt.gz":
         with gzip.open(source, "rb") as handle, target.open("wb") as out:
             shutil.copyfileobj(handle, out, length=1024 * 1024)
+        _verify_ntriples(target, label="gzip-decompress")
         provenance["steps"].append({"tool": "python-gzip", "output": str(target)})
         return target, provenance
 
@@ -1082,13 +1593,31 @@ def materialize_ntriples(
         brotli = _resolve_binary("BROTLI_BIN", "brotli")
         _run_step([brotli, "-d", "-c", "-o", str(target), str(source)],
                   label="brotli-decompress", log_dir=log_dir)
+        _verify_ntriples(target, label="brotli-decompress")
         provenance["steps"].append({"tool": brotli, "output": str(target)})
         return target, provenance
 
     if rdf_format == "hdt":
         hdt2rdf = _resolve_binary("HDT2RDF_BIN", "hdt2rdf", "/usr/local/bin/hdt2rdf")
-        _run_step([hdt2rdf, str(source), str(target)], label="hdt2rdf", log_dir=log_dir)
-        provenance["steps"].append({"tool": hdt2rdf, "output": str(target)})
+        # hdt-cpp's file-output path is broken: for every output format its
+        # raptor iostream serializer emits "error: :0:0: write error" per
+        # triple, writes a truncated subject IRI with no terminator and no
+        # newline, and still exits 0. Its stdout serializer takes a different
+        # code path and is correct, verified at 200k triples with empty
+        # stderr, so the dump is taken from stdout and redirected here.
+        _run_step(
+            [hdt2rdf, "-f", "ntriples", str(source), "-"],
+            label="hdt2rdf",
+            log_dir=log_dir,
+            stdout_path=target,
+            error_markers=STEP_ERROR_MARKERS,
+        )
+        _verify_ntriples(target, label="hdt2rdf")
+        provenance["steps"].append({
+            "tool": hdt2rdf,
+            "output": str(target),
+            "mode": "stdout-redirect",
+        })
         return target, provenance
 
     if rdf_format in {"cottas", "cottas.gz", "cottas.br"}:
@@ -1112,6 +1641,7 @@ def materialize_ntriples(
             label="cottas-decompress",
             log_dir=log_dir,
         )
+        _verify_ntriples(target, label="cottas-decompress")
         provenance["steps"].append({"tool": f"{python_bin} cottas_tool.py decompress",
                                     "output": str(target)})
         if cottas_input != source:
@@ -1254,6 +1784,17 @@ DEFAULT_QLEVER_PORT = 7019
 DEFAULT_QLEVER_MEMORY_GB = 4
 DEFAULT_QLEVER_STARTUP_TIMEOUT = 900
 DEFAULT_QUERY_TIMEOUT = 3600
+DEFAULT_COMUNICA_PORT = 7020
+#: Seconds to wait for comunica-sparql-file-http to bind its port. The graph is
+#: not read yet at that point, so this is process startup only and stays short.
+DEFAULT_COMUNICA_BIND_TIMEOUT = 120
+#: Seconds allowed for the warm-up query that proves the endpoint can read the
+#: source before the suite commits to it. Budgeted separately from a normal
+#: query because on a large graph even a LIMIT 1 has to start streaming it.
+DEFAULT_COMUNICA_WARMUP_TIMEOUT = 3600
+#: The HDT endpoint runs alongside the N-Triples one within a single run, so
+#: they must not contend for a port.
+DEFAULT_HDT_ENDPOINT_PORT = 7021
 
 
 QLEVER_STATUS_FILE = Path("/opt/vcf-rdfizer/qlever-status.txt")
@@ -1342,62 +1883,336 @@ class QueryEngine:
         return envelope
 
 
-class ComunicaEngine(QueryEngine):
-    """Query the N-Triples file directly with comunica-sparql-file."""
+#: Above this decoded-graph size, an engine with no persistent index spends
+#: more time parsing than querying. It is not a hard limit -- host memory and
+#: query shape decide the real ceiling -- but it is the point at which the
+#: per-query parse starts to dominate, and where a 27-query run stops being a
+#: reasonable thing to start without knowing that.
+UNINDEXED_ENGINE_ADVICE_BYTES = 4 * 1024 * 1024 * 1024
 
-    name = "comunica"
 
-    def start(self) -> None:
-        self.executable = shutil.which("comunica-sparql-file")
+def engine_advice(engine_name: str, source: Path, query_count: int, timeout: int) -> str | None:
+    """Warn before a run commits to an engine that cannot finish it.
+
+    Comunica still has no index. The endpoint removes per-query engine startup
+    but streams the source for every query, so a full-scan query re-reads the
+    whole graph each time. On a large graph that is the dominant cost and no
+    amount of tuning fixes it -- only an engine that indexes will.
+    """
+    if engine_name != "comunica":
+        return None
+    try:
+        size = source.stat().st_size
+    except OSError:
+        return None
+    if size < UNINDEXED_ENGINE_ADVICE_BYTES:
+        return None
+    return (
+        f"comunica has no index and streams the source for every query, so "
+        f"each of the {query_count} full-scan queries re-reads all "
+        f"{size / (1024 ** 3):.1f} GiB. Prefer --engine qlever, or validate an "
+        f"indexed artifact (--validation-targets hdt)."
+    )
+
+
+def run_query_process(
+    command: list[str], *, stdout_path: Path, stderr_path: Path, timeout: int
+) -> tuple[int, str | None]:
+    """Run one query process, killing its whole process tree on timeout.
+
+    ``subprocess.run(timeout=...)`` signals only the process it started. Every
+    query here is wrapped in ``/usr/bin/time``, which forks the real engine, so
+    killing the wrapper leaves the engine running -- holding the entire graph in
+    memory, because that is what an in-memory SPARQL engine does. A handful of
+    those orphans is enough to push a host into swap and make the rest of the
+    run appear to hang rather than fail.
+
+    Starting a new session and signalling the group kills the wrapper and the
+    engine together. SIGTERM first so the engine can unmap its store, SIGKILL if
+    it does not go.
+    """
+    with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+        process = subprocess.Popen(
+            command, stdout=stdout, stderr=stderr, start_new_session=True
+        )
+        try:
+            return process.wait(timeout=timeout), None
+        except subprocess.TimeoutExpired:
+            _terminate_process_group(process)
+            return 124, f"query exceeded {timeout}s"
+
+
+def _terminate_process_group(process: subprocess.Popen) -> None:
+    """Signal a process group, escalating to SIGKILL, and reap the leader."""
+    for signal_number, grace in ((signal.SIGTERM, 10), (signal.SIGKILL, 5)):
+        try:
+            os.killpg(os.getpgid(process.pid), signal_number)
+        except (ProcessLookupError, PermissionError):
+            break
+        try:
+            process.wait(timeout=grace)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+class ComunicaHttpEndpointMixin:
+    """One long-lived Comunica endpoint, shared by every query in the suite.
+
+    Comunica's one-shot CLIs (``comunica-sparql-file``, ``comunica-sparql-hdt``)
+    were spawned once per query, so each of the 27 queries paid Node startup
+    and engine initialisation again. The matching ``*-http`` binaries pay that
+    once and answer every query from the running process.
+
+    Measured in this image on 1.5M N-Triples, per ``SELECT (COUNT(*))``:
+
+    ==========================  ========
+    one-shot ``comunica-sparql-file``  26.0s
+    this endpoint                      10.3s
+    ==========================  ========
+
+    What it does **not** do is materialize the graph. ``LIMIT 1`` answers in
+    0.59s while ``COUNT(*)`` takes 10s on every repeat, which is the signature
+    of a source streamed per query rather than an in-memory store. Loading it
+    into one instead was measured and rejected: an ``N3.Store`` of the same
+    1.5M triples cost 2.45 GiB and made ``COUNT`` *slower* (15.0s), which
+    extrapolates to roughly 145 GiB for an 88M-triple cohort graph. For a graph
+    that large the answer is an engine that indexes -- QLever, or the HDT
+    artifact -- not a bigger heap.
+
+    So the saving here is per-query engine startup, which is real and repeated
+    27 times, and the scan cost is unchanged. Per-query worker recycling
+    (``--freshWorker``) would give the startup cost straight back and is never
+    passed. The worker count is pinned to 1: workers do not share state, so
+    each extra one only adds another process reading the same file.
+    """
+
+    #: Endpoint binary, e.g. "comunica-sparql-file-http".
+    endpoint_binary = ""
+    #: Key in ``options`` holding this endpoint's port.
+    endpoint_port_option = "comunica_port"
+    default_endpoint_port = DEFAULT_COMUNICA_PORT
+    #: Guidance appended when the binary is missing from the image.
+    endpoint_missing_hint = "rebuild the image or select --engine qlever"
+
+    def _init_endpoint(self, options: dict[str, Any]) -> None:
+        self.port = int(
+            options.get(self.endpoint_port_option) or self.default_endpoint_port
+        )
+        self.bind_timeout = int(
+            options.get("comunica_bind_timeout") or DEFAULT_COMUNICA_BIND_TIMEOUT
+        )
+        self.warmup_timeout = int(
+            options.get("comunica_warmup_timeout")
+            or max(DEFAULT_COMUNICA_WARMUP_TIMEOUT, self.query_timeout)
+        )
+        self.server: subprocess.Popen | None = None
+        self.executable: str | None = None
+        self.endpoint: str | None = None
+        self.warmup_seconds: float | None = None
+        self.command: list[str] = []
+
+    def _endpoint_source_argument(self) -> str:
+        """The source argv entry, in whatever form this engine's binary needs."""
+        raise NotImplementedError
+
+    def _candidate_endpoints(self) -> list[str]:
+        return [
+            f"http://127.0.0.1:{self.port}/sparql",
+            f"http://127.0.0.1:{self.port}/",
+        ]
+
+    def _require_endpoint_binary(self) -> str:
+        """Fail before any expensive setup when the binary is missing.
+
+        An engine that cannot possibly run should say so before an artifact is
+        built for it, not after.
+        """
+        self.executable = shutil.which(self.endpoint_binary)
         if not self.executable:
             raise RuntimeError(
-                "comunica-sparql-file is not installed in this image; rebuild it or "
-                "select --engine qlever"
+                f"{self.endpoint_binary} is not installed in this image; "
+                f"{self.endpoint_missing_hint}"
+            )
+        return self.executable
+
+    def _start_endpoint(self) -> None:
+        if not self.executable:
+            self._require_endpoint_binary()
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.command = [
+            self.executable,
+            self._endpoint_source_argument(),
+            "-p", str(self.port),
+            # One worker: workers share no state, so extra ones would only add
+            # more processes reading the same source.
+            "-w", "1",
+            # Comunica's own per-query ceiling, aligned with the client side so
+            # neither silently pre-empts the other.
+            "-t", str(self.query_timeout),
+        ]
+        server_log = self.log_dir / f"{self.name}-server.log"
+        self.server = subprocess.Popen(
+            self.command,
+            stdout=server_log.open("wb"),
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        self._await_bind(server_log)
+        self._await_warm(server_log)
+
+    def _await_bind(self, server_log: Path) -> None:
+        """Wait for the port to answer at all. The graph is not read yet."""
+        deadline = time.monotonic() + self.bind_timeout
+        last_error = "endpoint never bound"
+        while time.monotonic() < deadline:
+            self._assert_alive(server_log)
+            for endpoint in self._candidate_endpoints():
+                try:
+                    self._post(endpoint, "ASK { }", timeout=10)
+                    self.endpoint = endpoint
+                    return
+                except Exception as error:  # noqa: BLE001 - readiness probe
+                    last_error = str(error)
+            time.sleep(0.5)
+        raise RuntimeError(
+            f"comunica endpoint did not bind port {self.port} within "
+            f"{self.bind_timeout}s: {last_error}"
+        )
+
+    def _await_warm(self, server_log: Path) -> None:
+        """Prove the endpoint can actually read the source, before the suite runs.
+
+        Charged to setup rather than to the first query, so one query is not
+        billed for readiness that every later query got for free.
+        """
+        assert self.endpoint is not None
+        started = time.monotonic()
+        try:
+            self._post(
+                self.endpoint, "SELECT * WHERE { ?s ?p ?o } LIMIT 1",
+                timeout=self.warmup_timeout,
+            )
+        except Exception as error:  # noqa: BLE001 - surfaced as engine failure
+            self._assert_alive(server_log)
+            raise RuntimeError(
+                f"{self.name} could not read {self._endpoint_source_argument()} "
+                f"within {self.warmup_timeout}s (raise --comunica-warmup-timeout, "
+                f"or use --engine qlever): {error}"
+            ) from error
+        self.warmup_seconds = time.monotonic() - started
+
+    def _assert_alive(self, server_log: Path) -> None:
+        if self.server is not None and self.server.poll() is not None:
+            tail = ""
+            try:
+                tail = server_log.read_text(encoding="utf-8", errors="replace")[-2000:]
+            except OSError:
+                pass
+            raise RuntimeError(
+                f"{self.name} endpoint exited with code {self.server.returncode}. "
+                f"Log tail: {tail}"
             )
 
-    def describe(self) -> dict[str, Any]:
+    def _post(self, endpoint: str, query: str, *, timeout: int) -> bytes:
+        import urllib.request
+
+        request = urllib.request.Request(
+            endpoint,
+            data=urllib.parse.urlencode({"query": query}).encode("utf-8"),
+            headers={
+                "Accept": "application/sparql-results+json",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.read()
+
+    def endpoint_describe(self) -> dict[str, Any]:
+        """Endpoint-specific report fields, merged by each engine's describe."""
         return {
-            "engine": self.name,
-            "setupSeconds": self.setup_seconds,
             "version": tool_version(
-                ["comunica-sparql-file", "--version"], table_label="Comunica Engine"
+                [self.endpoint_binary, "--version"], table_label="Comunica Engine"
             ),
-            "mode": "in-memory file query",
+            "mode": "one long-lived endpoint, source streamed per query",
+            "endpoint": self.endpoint,
+            "port": self.port,
+            # Readiness, not a graph load: the source is not materialized.
+            "warmupSeconds": self.warmup_seconds,
+            "command": list(self.command),
         }
 
     def execute(self, query_id: str, query_path: Path) -> dict[str, Any]:
         raw_path = self.raw_dir / f"{query_id}.sparql.json"
         stderr_path = self.raw_dir / f"{query_id}.stderr.txt"
-        time_path = self.raw_dir / f"{query_id}.time.txt"
-        command = [
-            self.executable,
-            str(self.source),
-            "-f",
-            str(query_path),
-            "-t",
-            "application/sparql-results+json",
-        ]
-        timed = (
-            ["/usr/bin/time", "-v", "-o", str(time_path), *command]
-            if tool_version(["/usr/bin/time", "--version"])
-            else command
-        )
         started = time.monotonic()
+        if self.endpoint is None:
+            message = f"{self.name} endpoint is not running"
+            stderr_path.write_text(message, encoding="utf-8")
+            raw_path.write_bytes(b"")
+            return self._envelope(
+                query_id, query_path, returncode=1, started=started,
+                raw_path=raw_path, stderr_path=stderr_path, error=message,
+            )
         try:
-            with raw_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
-                result = subprocess.run(
-                    timed, check=False, stdout=stdout, stderr=stderr,
-                    timeout=self.query_timeout,
-                )
-            returncode = result.returncode
-            error = None
-        except subprocess.TimeoutExpired:
-            returncode = 124
-            error = f"query exceeded {self.query_timeout}s"
+            payload = self._post(
+                self.endpoint, query_path.read_text(encoding="utf-8"),
+                timeout=self.query_timeout,
+            )
+        except Exception as error:  # noqa: BLE001 - reported as EXECUTION_FAILED
+            stderr_path.write_text(str(error), encoding="utf-8")
+            raw_path.write_bytes(b"")
+            return self._envelope(
+                query_id, query_path, returncode=1, started=started,
+                raw_path=raw_path, stderr_path=stderr_path, error=str(error),
+            )
+        raw_path.write_bytes(payload)
+        stderr_path.write_bytes(b"")
         return self._envelope(
-            query_id, query_path, returncode=returncode, started=started,
-            raw_path=raw_path, stderr_path=stderr_path, time_path=time_path, error=error,
+            query_id, query_path, returncode=0, started=started,
+            raw_path=raw_path, stderr_path=stderr_path,
         )
+
+    def stop(self) -> None:
+        if self.server is not None and self.server.poll() is None:
+            # The endpoint holds the whole graph in memory; a survivor would
+            # starve everything that runs after it, so the group is signalled
+            # rather than just the leader.
+            _terminate_process_group(self.server)
+        self.server = None
+        self.endpoint = None
+
+
+class ComunicaEngine(ComunicaHttpEndpointMixin, QueryEngine):
+    """Serve the N-Triples file from one load via comunica-sparql-file-http."""
+
+    name = "comunica"
+    endpoint_binary = "comunica-sparql-file-http"
+    endpoint_port_option = "comunica_port"
+    default_endpoint_port = DEFAULT_COMUNICA_PORT
+
+    def __init__(self, source: Path, *, raw_dir: Path, scratch: Path, options: dict[str, Any]):
+        super().__init__(source, raw_dir=raw_dir, scratch=scratch, options=options)
+        self.log_dir = raw_dir / "engine"
+        self._init_endpoint(options)
+
+    def _endpoint_source_argument(self) -> str:
+        return str(self.source)
+
+    def start(self) -> None:
+        self._start_endpoint()
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            "engine": self.name,
+            "setupSeconds": self.setup_seconds,
+            **self.endpoint_describe(),
+        }
 
 
 class QleverEngine(QueryEngine):
@@ -1665,11 +2480,30 @@ class NativeArtifactEngine(QueryEngine):
         }
 
 
-class HdtEngine(NativeArtifactEngine):
-    """Query a .hdt artifact in place with Comunica's HDT engine."""
+class HdtEngine(ComunicaHttpEndpointMixin, NativeArtifactEngine):
+    """Query a .hdt artifact in place, from one load, over Comunica's endpoint.
+
+    The one-shot ``comunica-sparql-hdt`` CLI was previously spawned per query,
+    so every query re-opened the artifact and re-initialised the engine. HDT is
+    memory-mapped rather than parsed, so the per-query cost is far smaller than
+    Comunica's N-Triples reload -- but it is still paid 27 times for nothing,
+    and it makes the measured query time include engine startup, which is
+    exactly what a benchmark must not do.
+    """
 
     name = "hdt"
     artifact_format = "hdt"
+    endpoint_binary = "comunica-sparql-hdt-http"
+    endpoint_port_option = "hdt_port"
+    default_endpoint_port = DEFAULT_HDT_ENDPOINT_PORT
+    endpoint_missing_hint = (
+        "so HDT cannot be queried natively. Rebuild the image, or validate the "
+        "HDT artifact by decoding it (--rdf file.hdt --engine comunica)"
+    )
+
+    def __init__(self, source: Path, *, raw_dir: Path, scratch: Path, options: dict[str, Any]):
+        super().__init__(source, raw_dir=raw_dir, scratch=scratch, options=options)
+        self._init_endpoint(options)
 
     def build_artifact(self, target: Path) -> None:
         rdf2hdt = _resolve_binary("RDF2HDT_BIN", "rdf2hdt", "/usr/local/bin/rdf2hdt")
@@ -1678,41 +2512,25 @@ class HdtEngine(NativeArtifactEngine):
             label="hdt-engine-build", log_dir=self.log_dir,
         )
 
-    def start(self) -> None:
-        self.executable = shutil.which("comunica-sparql-hdt")
-        if not self.executable:
-            raise RuntimeError(
-                "comunica-sparql-hdt is not installed in this image, so HDT cannot "
-                "be queried natively. Rebuild the image, or validate the HDT "
-                "artifact by decoding it (--rdf file.hdt --engine comunica)"
-            )
-        super().start()
+    def _endpoint_source_argument(self) -> str:
+        # Comunica needs the source type declared: a bare path is treated as a
+        # link to dereference and fails with "could not dereference".
+        return f"hdt@{self.artifact}"
 
-    def execute(self, query_id: str, query_path: Path) -> dict[str, Any]:
-        raw_path = self.raw_dir / f"{query_id}.sparql.json"
-        stderr_path = self.raw_dir / f"{query_id}.stderr.txt"
-        command = [
-            self.executable,
-            # Comunica needs the source type declared: a bare path is treated
-            # as a link to dereference and fails with "could not dereference".
-            f"hdt@{self.artifact}",
-            "-f", str(query_path),
-            "-t", "application/sparql-results+json",
-        ]
-        started = time.monotonic()
-        try:
-            with raw_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
-                result = subprocess.run(
-                    command, check=False, stdout=stdout, stderr=stderr,
-                    timeout=self.query_timeout,
-                )
-            returncode, error = result.returncode, None
-        except subprocess.TimeoutExpired:
-            returncode, error = 124, f"query exceeded {self.query_timeout}s"
-        return self._envelope(
-            query_id, query_path, returncode=returncode, started=started,
-            raw_path=raw_path, stderr_path=stderr_path, error=error,
-        )
+    def start(self) -> None:
+        # Check the binary before resolving the artifact: building an HDT for
+        # an engine that cannot run wastes the most expensive step in the run.
+        self._require_endpoint_binary()
+        # Then resolve (or build) the artifact; the endpoint needs its path.
+        NativeArtifactEngine.start(self)
+        self._start_endpoint()
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            **NativeArtifactEngine.describe(self),
+            **self.endpoint_describe(),
+            "mode": "native hdt query, no decode, single load served over HTTP",
+        }
 
 
 class CottasEngine(NativeArtifactEngine):
@@ -2159,10 +2977,44 @@ BENCHMARK_CSV_HEADER = [
     "query_id",
     "status",
     "wall_seconds",
+    # The parser's cost for THIS query, comparable row-wise against
+    # `wall_seconds`. Empty unless the oracle recorded its phase breakdown.
+    "oracle_query_seconds",
+    # The parser's total for ALL queries, repeated on every row so the file
+    # needs no join. NOT comparable row-wise against `wall_seconds`.
     "oracle_wall_seconds",
     "engine_setup_seconds",
     "artifact_origin",
 ]
+
+
+def oracle_query_seconds(
+    phases: dict[str, float] | None, query_ids: tuple[str, ...]
+) -> dict[str, float]:
+    """Attribute the oracle's measured phases to individual queries.
+
+    Not a measurement of each query in isolation -- see
+    :data:`ORACLE_SAMPLE_LEVEL_QUERIES` for why that does not exist -- but the
+    cost a one-question script would have paid, composed from phases that were
+    each measured directly.
+    """
+    if not phases:
+        return {}
+    reader_open = phases.get("readerOpenSeconds") or 0.0
+    scan = phases.get("scanSeconds") or 0.0
+    sample_block = phases.get("sampleBlockSeconds") or 0.0
+    assembly = phases.get("assemblySeconds") or 0.0
+    record_level_scan = max(scan - sample_block, 0.0)
+
+    out: dict[str, float] = {}
+    for query_id in query_ids:
+        pays_sample_block = query_id in ORACLE_SAMPLE_LEVEL_QUERIES
+        out[query_id] = (
+            reader_open
+            + (scan if pays_sample_block else record_level_scan)
+            + assembly
+        )
+    return out
 
 
 def build_benchmark(
@@ -2204,6 +3056,8 @@ def build_benchmark(
             "queries": queries,
         }
 
+    oracle_phases = oracle_seconds.get("phases") or {}
+    per_query_oracle = oracle_query_seconds(oracle_phases, query_ids)
     return {
         "oracle": {
             # The parser side of the comparison: what it costs to compute the
@@ -2211,6 +3065,16 @@ def build_benchmark(
             "totalSeconds": oracle_seconds.get("total"),
             "vcfParseSeconds": oracle_seconds.get("parse"),
             "censusSeconds": oracle_seconds.get("census"),
+            # Directly measured phases of the single pass.
+            "phases": oracle_phases or None,
+            # Per-query cost a one-question script would have paid, composed
+            # from those phases. `sampleLevelQueries` names the ones that pay
+            # for the per-sample block, so the attribution is auditable rather
+            # than implicit.
+            "perQuerySeconds": per_query_oracle or None,
+            "sampleLevelQueries": sorted(
+                q for q in query_ids if q in ORACLE_SAMPLE_LEVEL_QUERIES
+            ) or None,
         },
         "preparation": {
             "materializationSeconds": materialization_seconds,
@@ -2234,6 +3098,7 @@ def write_benchmark_csv(path: Path, benchmark: dict[str, Any]) -> Path:
     """Write one row per engine and query, for direct analysis."""
     path.parent.mkdir(parents=True, exist_ok=True)
     oracle_total = benchmark["oracle"]["totalSeconds"]
+    per_query = benchmark["oracle"].get("perQuerySeconds") or {}
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=BENCHMARK_CSV_HEADER)
         writer.writeheader()
@@ -2244,6 +3109,7 @@ def write_benchmark_csv(path: Path, benchmark: dict[str, Any]) -> Path:
                     "query_id": query_id,
                     "status": entry["status"],
                     "wall_seconds": entry["wallSeconds"],
+                    "oracle_query_seconds": per_query.get(query_id),
                     # Repeated on each row so the CSV is usable without a join.
                     "oracle_wall_seconds": oracle_total,
                     "engine_setup_seconds": engine["setupSeconds"],
@@ -2323,7 +3189,7 @@ def build_manifest(
             "python": platform.python_version(),
             "cyvcf2": getattr(cyvcf2, "__version__", None),
             "bcftools": tool_version(["bcftools", "--version"]), "node": tool_version(["node", "--version"]),
-            "comunicaQuerySparqlFile": tool_version(["comunica-sparql-file", "--version"], table_label="Comunica Engine"),
+            "comunicaQuerySparqlFile": tool_version(["comunica-sparql-file-http", "--version"], table_label="Comunica Engine"),
             "rapper": tool_version(["rapper", "--version"]),
         },
         "queries": {path.stem: {"path": str(path), "sha256": sha256_file(path)} for path in query_paths},
@@ -2382,14 +3248,21 @@ def run_validation(args: argparse.Namespace) -> int:
                 detail="parsing source VCF",
             )
             oracle_started = time.monotonic()
-            parser = parse_vcf(args.vcf, filter_oracle=args.filter_oracle)
+            oracle_phases: dict[str, float] = {}
+            parser = parse_vcf(
+                args.vcf, filter_oracle=args.filter_oracle, timing=oracle_phases
+            )
             parse_seconds = time.monotonic() - oracle_started
             census_started = time.monotonic()
             parser = attach_census_expectations(parser, args.representation)
+            oracle_phases["censusSeconds"] = time.monotonic() - census_started
             oracle_seconds = {
                 "parse": parse_seconds,
-                "census": time.monotonic() - census_started,
+                "census": oracle_phases["censusSeconds"],
                 "total": time.monotonic() - oracle_started,
+                # Phase breakdown, so per-query oracle cost can be attributed
+                # from measured parts rather than guessed.
+                "phases": dict(oracle_phases),
             }
             parser["oracleSeconds"] = oracle_seconds
             write_json(results_dir / "parser.json", parser)
@@ -2413,6 +3286,10 @@ def run_validation(args: argparse.Namespace) -> int:
                 "query_timeout": args.query_timeout,
                 "extra_index_args": list(args.qlever_index_arg),
                 "extra_server_args": list(args.qlever_server_arg),
+                "comunica_port": args.comunica_port,
+                "hdt_port": args.hdt_port,
+                "comunica_bind_timeout": args.comunica_bind_timeout,
+                "comunica_warmup_timeout": args.comunica_warmup_timeout,
             }
             engine_options["artifact_path"] = str(args.rdf)
             engine_options["artifact_format"] = args.rdf_format
@@ -2440,6 +3317,7 @@ def run_validation(args: argparse.Namespace) -> int:
             # multi-engine run usable as a benchmark.
             per_engine: dict[str, dict[str, Any]] = {}
             engine_descriptions: dict[str, Any] = {}
+            engine_warnings: dict[str, list[str]] = {}
             for engine_name in args.engines:
                 engine_raw_dir = raw_dir / engine_name
                 engine_raw_dir.mkdir(parents=True, exist_ok=True)
@@ -2450,6 +3328,12 @@ def run_validation(args: argparse.Namespace) -> int:
                 progress.emit("progress", completed=0, detail=f"preparing {engine_name} engine")
                 if not quiet:
                     print(f"[{args.dataset_id}] preparing {engine_name} engine", flush=True)
+                advice = engine_advice(
+                    engine_name, decoded, len(query_ids), args.query_timeout
+                )
+                if advice:
+                    engine_warnings.setdefault(engine_name, []).append(advice)
+                    eprint(f"[{args.dataset_id}] warning: {advice}")
                 try:
                     engine.prepare()
                 except (RuntimeError, OSError) as error:
@@ -2461,6 +3345,8 @@ def run_validation(args: argparse.Namespace) -> int:
                     continue
 
                 executions: dict[str, dict[str, Any]] = {}
+                abandoned: str | None = None
+                engine_started = time.monotonic()
                 try:
                     engine_descriptions[engine_name] = engine.describe()
                     for completed, query_id in enumerate(query_ids, start=1):
@@ -2481,16 +3367,66 @@ def run_validation(args: argparse.Namespace) -> int:
                             "progress", completed=completed, query_id=query_id,
                             detail=f"{engine_name}: completed {query_id}",
                         )
+
+                        # A query that fails, times out, or returns the wrong
+                        # answer never stops the suite: its verdict is recorded
+                        # and the next query runs. Coverage is the point --
+                        # "26 of 27 passed, q11 disagreed" is a result, while
+                        # "stopped at q01" is not.
+                        #
+                        # --stop-after-query-timeout opts back into abandoning
+                        # the rest, which caps the worst case at one timeout
+                        # per engine rather than one per query. It is off by
+                        # default now that each engine loads the graph once
+                        # instead of once per query, so the remaining queries
+                        # no longer each re-pay that load.
+                        if (
+                            args.stop_after_query_timeout
+                            and executions[query_id].get("exitCode") == 124
+                        ):
+                            abandoned = (
+                                f"{query_id} exceeded the {engine.query_timeout}s "
+                                f"per-query timeout; skipped "
+                                f"{len(query_ids) - completed} further queries "
+                                f"rather than spending that timeout on each. "
+                                f"Raise --query-timeout, or use an indexed "
+                                f"engine or artifact for a graph this size."
+                            )
+                            break
+
+                        budget = args.validation_time_budget
+                        if budget and time.monotonic() - engine_started > budget:
+                            abandoned = (
+                                f"engine exceeded the {budget}s validation time "
+                                f"budget after {completed} of {len(query_ids)} "
+                                f"queries. Raise or clear "
+                                f"--validation-time-budget to allow more."
+                            )
+                            break
                 finally:
                     engine.stop()
+
+                if abandoned is not None:
+                    if not quiet:
+                        eprint(f"[{args.dataset_id}] {engine_name}: {abandoned}")
+                    progress.emit(
+                        "progress", completed=len(query_ids),
+                        detail=f"{engine_name}: abandoned",
+                    )
 
                 engine_dir = results_dir / "engines" / engine_name
                 engine_dir.mkdir(parents=True, exist_ok=True)
                 write_json(engine_dir / "query-executions.json", executions)
-                if any(item["status"] != "PASS" for item in executions.values()):
+                if abandoned is not None or any(
+                    item["status"] != "PASS" for item in executions.values()
+                ):
                     per_engine[engine_name] = {
                         "status": "EXECUTION_FAILED", "queryExecutions": executions,
                     }
+                    if abandoned is not None:
+                        per_engine[engine_name]["abandoned"] = abandoned
+                        per_engine[engine_name]["queriesRun"] = len(executions)
+                        per_engine[engine_name]["queriesPlanned"] = len(query_ids)
                     continue
 
                 verdict = evaluate_validation(
@@ -2505,6 +3441,10 @@ def run_validation(args: argparse.Namespace) -> int:
                     write_json(engine_dir / "comparison.json", verdict["comparison"])
                 verdict["executions"] = executions
                 per_engine[engine_name] = verdict
+
+            for engine_name, warnings in engine_warnings.items():
+                if engine_name in per_engine:
+                    per_engine[engine_name]["warnings"] = warnings
 
             benchmark = build_benchmark(
                 per_engine, engine_descriptions,
@@ -2636,6 +3576,40 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--validation-time-budget",
+        type=int,
+        default=0,
+        help=(
+            "Wall-clock ceiling in seconds for one engine's whole query set "
+            "(default: 0, no ceiling). A backstop for queries that are slow but "
+            "never individually time out; the per-query timeout and "
+            "--stop-after-query-timeout handle the common case."
+        ),
+    )
+    parser.add_argument(
+        "--stop-after-query-timeout",
+        dest="stop_after_query_timeout",
+        action="store_true",
+        default=False,
+        help=(
+            "Abandon an engine's remaining queries once one exceeds the "
+            "per-query timeout. Off by default: a validation suite reports "
+            "coverage, so a run is worth far more when every query has a "
+            "recorded verdict than when it stops at the first slow one. Turn "
+            "this on to cap the worst case at one timeout per engine instead "
+            "of one per query"
+        ),
+    )
+    parser.add_argument(
+        "--continue-after-query-timeout",
+        dest="stop_after_query_timeout",
+        action="store_false",
+        help=(
+            "Run every query even after one times out. This is now the "
+            "default; the flag is kept so existing callers keep working"
+        ),
+    )
+    parser.add_argument(
         "--query-timeout",
         type=int,
         default=DEFAULT_QUERY_TIMEOUT,
@@ -2652,6 +3626,40 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_QLEVER_PORT,
         help=f"Container-local QLever port (default: {DEFAULT_QLEVER_PORT})",
+    )
+    parser.add_argument(
+        "--comunica-port",
+        type=int,
+        default=DEFAULT_COMUNICA_PORT,
+        help=f"Container-local Comunica endpoint port (default: {DEFAULT_COMUNICA_PORT})",
+    )
+    parser.add_argument(
+        "--hdt-port",
+        type=int,
+        default=DEFAULT_HDT_ENDPOINT_PORT,
+        help=(
+            "Container-local port for the native HDT endpoint "
+            f"(default: {DEFAULT_HDT_ENDPOINT_PORT})"
+        ),
+    )
+    parser.add_argument(
+        "--comunica-bind-timeout",
+        type=int,
+        default=DEFAULT_COMUNICA_BIND_TIMEOUT,
+        help=(
+            "Seconds to wait for the Comunica endpoint to bind its port, before "
+            f"the graph is read (default: {DEFAULT_COMUNICA_BIND_TIMEOUT})"
+        ),
+    )
+    parser.add_argument(
+        "--comunica-warmup-timeout",
+        type=int,
+        default=DEFAULT_COMUNICA_WARMUP_TIMEOUT,
+        help=(
+            "Seconds allowed for the Comunica endpoint's warm-up query, which "
+            "proves it can read the source before the suite starts "
+            f"(default: {DEFAULT_COMUNICA_WARMUP_TIMEOUT})"
+        ),
     )
     parser.add_argument(
         "--qlever-startup-timeout",
@@ -2688,7 +3696,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Treat a missing-token conformance failure (a plain '.' literal not "
-            "typed as vcfr:Null) as a validation failure instead of a report-only "
+            "typed as vcfc:Null) as a validation failure instead of a report-only "
             "observation"
         ),
     )
@@ -2789,11 +3797,22 @@ def resolve_args(parser: argparse.ArgumentParser, argv: list[str] | None = None)
         ("--query-timeout", args.query_timeout),
         ("--qlever-memory-gb", args.qlever_memory_gb),
         ("--qlever-startup-timeout", args.qlever_startup_timeout),
+        ("--comunica-bind-timeout", args.comunica_bind_timeout),
+        ("--comunica-warmup-timeout", args.comunica_warmup_timeout),
     ):
         if value <= 0:
             parser.error(f"{name} must be a positive integer")
+    # 0 is meaningful here: no ceiling.
+    if args.validation_time_budget < 0:
+        parser.error("--validation-time-budget must be zero or a positive integer")
     if not 1 <= args.qlever_port <= 65535:
         parser.error("--qlever-port must be between 1 and 65535")
+    if not 1 <= args.comunica_port <= 65535:
+        parser.error("--comunica-port must be between 1 and 65535")
+    if not 1 <= args.hdt_port <= 65535:
+        parser.error("--hdt-port must be between 1 and 65535")
+    if len({args.comunica_port, args.qlever_port, args.hdt_port}) != 3:
+        parser.error("--comunica-port, --qlever-port and --hdt-port must all differ")
     if args.shacl_shapes is not None:
         args.shacl_shapes = args.shacl_shapes.resolve()
         if not args.shacl_shapes.is_file():

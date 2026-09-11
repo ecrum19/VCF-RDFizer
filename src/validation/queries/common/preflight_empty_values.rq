@@ -1,10 +1,10 @@
-PREFIX vcfr: <https://w3id.org/vcf-rdfizer/vocab#>
+PREFIX vcfc: <https://w3id.org/vcf-core/vocab#>
 
 # Empty or whitespace-only terms.
 #
 # The pipeline should never materialize one. RML emits no triple for an empty
 # reference, and every direct emitter either guards on a non-empty value or
-# substitutes the VCF missing token, which becomes "."^^vcfr:Null. An empty
+# substitutes the VCF missing token, which becomes "."^^vcfc:Null. An empty
 # literal therefore means a value was lost rather than marked missing, and an
 # empty IRI means a template substitution collapsed.
 #

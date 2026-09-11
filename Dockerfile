@@ -166,9 +166,14 @@ COPY THIRD_PARTY_NOTICES.md /usr/share/licenses/vcf-rdfizer/THIRD_PARTY_NOTICES.
 COPY src/*.sh /opt/vcf-rdfizer/
 COPY src/*.py /opt/vcf-rdfizer/
 COPY src/validation/ /opt/vcf-rdfizer/validation/
-# Shared, dependency-free helper used by both the host CLI and the in-container
-# conversion runner, so it lives at the repository root rather than in src/.
+# Shared, dependency-free helpers used by both the host CLI and the in-container
+# runners, so they live at the repository root rather than in src/.
 COPY vcf_rdfizer_gzip.py /opt/vcf-rdfizer/
+# The vocabulary terms, the VCF-version model and the lexical parsers. The
+# validation runner imports this as a sibling module, so the oracle and the
+# emitters share one description of what the graph should contain instead of
+# mirroring each other.
+COPY vcf_rdfizer_vocab.py /opt/vcf-rdfizer/validation/
 
 RUN chmod +x /opt/vcf-rdfizer/*.sh \
   && chmod +x /usr/local/bin/rdf2hdt \

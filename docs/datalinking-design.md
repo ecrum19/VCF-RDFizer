@@ -1,14 +1,17 @@
 # Data linking: a plug-in architecture
 
-*Status: **design proposal**. Nothing described here is implemented yet. This
-document exists to fix the extension contract before code is written, because
-third-party linkers are the point and a contract is much harder to change once
-people depend on it.*
+*Status: **partially implemented**. Runnable examples now cover all three
+plug-in tiers, with a shared runner, discovery/authoring CLI, full and post-hoc
+entry points, side-graphs, provenance and network safeguards. See
+[`datalinking.md`](datalinking.md) for the implemented contract and worked
+commands. This document retains the broader proposal: allele normalization,
+link merging, and automatic plug-in query/mutation discovery remain planned.
+The manifest vocabulary is still provisional.*
 
 VCF-RDFizer converts a VCF into RDF that is faithful to the VCF and to nothing
 else. Every IRI it mints is derived from the source file, so the graph is
 self-contained, reproducible, and — deliberately — an island. It says
-`vcfr:recordId "rs334"` and stops there.
+`vcfc:recordId "rs334"` and stops there.
 
 Data linking is the step that connects that island to the rest of the
 linked-data web: the rsID becomes a dbSNP resource, the coordinate becomes an

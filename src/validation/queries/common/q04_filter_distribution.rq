@@ -1,9 +1,9 @@
-PREFIX vcfr: <https://w3id.org/vcf-rdfizer/vocab#>
+PREFIX vcfc: <https://w3id.org/vcf-core/vocab#>
 
 SELECT ?filterStatus ?filterLexical (COUNT(DISTINCT ?record) AS ?recordCount)
 WHERE {
-  ?record a vcfr:VCFRecord ; vcfr:hasCall ?call .
-  ?call vcfr:filter ?filterLiteral .
+  ?record a vcfc:VCFRecord ; vcfc:hasCall ?call .
+  ?call vcfc:filter ?filterLiteral .
   BIND(STR(?filterLiteral) AS ?filterLexical)
   BIND(IF(?filterLexical = "PASS", "PASS", IF(?filterLexical = ".", "NOT_APPLIED", "FAILED")) AS ?filterStatus)
 }
