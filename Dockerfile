@@ -91,6 +91,12 @@ RUN cargo build --locked --release \
 # Named stage so the runtime image can COPY QLever's binaries out of it.
 FROM ${QLEVER_IMAGE} AS qlever
 
+# Upstream's image runs as a non-root user, so writing anywhere outside that
+# user's own tree fails. This stage needs to write a staging directory, so it
+# switches to root; the stage is discarded after the COPY below, and nothing
+# here changes the user the published image runs as.
+USER root
+
 # Stage QLever's binaries and the release-specific libraries they need into one
 # fixed layout, so the runtime image copies from architecture-independent paths.
 #
@@ -112,20 +118,22 @@ FROM ${QLEVER_IMAGE} AS qlever
 # runtime base is newer than QLever's. Only the families the binaries cannot
 # find in that base are taken, which is the same set the previous soname list
 # named.
+# /tmp rather than /opt: it is world-writable in every base image, so the
+# staging directory is created even if this stage ever runs unprivileged again.
 RUN set -eu; \
-  mkdir -p /opt/qlever-stage/bin /opt/qlever-stage/lib; \
+  mkdir -p /tmp/qlever-stage/bin /tmp/qlever-stage/lib; \
   for binary in qlever-index qlever-server; do \
     [ -f "/qlever/$binary" ] || continue; \
-    cp "/qlever/$binary" /opt/qlever-stage/bin/; \
+    cp "/qlever/$binary" /tmp/qlever-stage/bin/ || continue; \
     ldd "/qlever/$binary" 2>/dev/null \
       | sed -n 's/.*=> \(\/[^ ]*\).*/\1/p' \
       | grep -E '/(libboost_|libicu|libjemalloc|liburing|libgomp)[^/]*$' \
       | while read -r library; do \
-          cp -Ln "$library" /opt/qlever-stage/lib/ 2>/dev/null || true; \
-        done; \
+          cp -Ln "$library" /tmp/qlever-stage/lib/ 2>/dev/null || true; \
+        done || true; \
   done; \
-  echo "staged QLever binaries:"; ls -1 /opt/qlever-stage/bin || true; \
-  echo "staged QLever libraries:"; ls -1 /opt/qlever-stage/lib || true
+  echo "staged QLever binaries:"; ls -1 /tmp/qlever-stage/bin || true; \
+  echo "staged QLever libraries:"; ls -1 /tmp/qlever-stage/lib || true
 
 
 FROM eclipse-temurin:11-jre
@@ -205,8 +213,8 @@ COPY --from=build-hdtc /opt/third_party_licenses/ /usr/share/licenses/vcf-rdfize
 # pointed at, so they cannot shadow anything the rest of the image links
 # against. (glibc itself is not copied - it is backward compatible, and this
 # base is newer than QLever's.)
-COPY --from=qlever /opt/qlever-stage/bin/ /opt/qlever/bin/
-COPY --from=qlever /opt/qlever-stage/lib/ /opt/qlever/lib/
+COPY --from=qlever /tmp/qlever-stage/bin/ /opt/qlever/bin/
+COPY --from=qlever /tmp/qlever-stage/lib/ /opt/qlever/lib/
 COPY THIRD_PARTY_NOTICES.md /usr/share/licenses/vcf-rdfizer/THIRD_PARTY_NOTICES.md
 COPY src/*.sh /opt/vcf-rdfizer/
 COPY src/*.py /opt/vcf-rdfizer/
