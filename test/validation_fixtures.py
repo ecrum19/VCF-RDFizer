@@ -447,6 +447,55 @@ def _record_shape() -> dict:
     ))
 
 
+def _declared_types(header_key: str) -> dict[str, str]:
+    """Map each declared INFO or FORMAT key to its VCF Type."""
+    import re as _re
+
+    declared: dict[str, str] = {}
+    for key, value in HEADER_LINES:
+        if key != header_key:
+            continue
+        fields = dict(_re.findall(r'(\w+)=("[^"]*"|[^,>]*)', value))
+        ident = fields.get("ID", "").strip()
+        if ident:
+            declared[ident] = fields.get("Type", "String").strip('"')
+    return declared
+
+
+def _format_typed_shape() -> dict:
+    """FORMAT cells that gain a typed companion, by the runner's own rule.
+
+    The emitter types a single, non-missing Integer/Float FORMAT value exactly
+    as it types an INFO one, so the census has to expect those triples too.
+    """
+    runner = _runner()
+    declared = _declared_types("FORMAT")
+    typed_int = typed_dec = 0
+    for row in _record_rows():
+        format_keys = row[8].split(":") if len(row) > 8 and row[8] else []
+        payload_fields = [payload.split(":") if payload else [] for payload in row[9:]]
+        width = max(
+            [len(format_keys), *(len(fields) for fields in payload_fields)], default=0
+        )
+        for index in range(width):
+            key = (format_keys[index]
+                   if index < len(format_keys) and format_keys[index]
+                   else f"FIELD_{index + 1}")
+            for fields in payload_fields:
+                cell = fields[index] if index < len(fields) else ""
+                if not cell:
+                    continue
+                kind = runner.typed_value_kind(cell, declared.get(key, "String"))
+                if kind == "Integer":
+                    typed_int += 1
+                elif kind == "Float":
+                    typed_dec += 1
+    return {
+        "formatTypedIntegerCount": typed_int,
+        "formatTypedDecimalCount": typed_dec,
+    }
+
+
 def _info_shape() -> dict:
     """INFO counters the census needs, mirroring the emitter's typing rules."""
     declared = {}
@@ -548,6 +597,7 @@ def parser_summary(
         "q06EligibleSiteCount": q06_eligible,
         "headerLineCount": len(HEADER_LINES),
         **_format_shape(),
+        **_format_typed_shape(),
         **_info_shape(),
         "fileFormat": FILE_FORMAT,
         "referenceGenome": REFERENCE_GENOME,
