@@ -480,9 +480,16 @@ validation failure.
 
 `--shacl-shapes PATH` adds an independent structural layer: the graph is checked
 against a SHACL shapes file (for example the vocabulary's published
-`shacl/vcf-rdfizer-vocabulary.shacl.ttl`) with `pyshacl`, inside the container.
+`shacl/vcf-core-vocabulary.shacl.ttl`) with `pyshacl`, inside the container.
 A violation blocks the run, because a structurally wrong graph makes the
 aggregate comparisons uninterpretable.
+
+The shapes are checked against the vocabulary, loaded with RDFS inference. The
+emitted graph carries no class hierarchy of its own, so without the vocabulary
+an `sh:class` constraint cannot see that `vcfc:AltAllele` is a `vcfc:Allele`,
+and a conforming graph is reported as violations. In a vocabulary checkout the
+bundle sits one level up from the shapes, in `ontology/`, and is found
+automatically; `--shacl-ontology PATH` names it explicitly anywhere else.
 
 It is **off by default**: `pyshacl` loads the whole graph into memory, so it is
 suitable for a single-sample graph or a sample of a cohort, not for a
@@ -492,7 +499,7 @@ violations; the full text is written alongside it.
 
 ```bash
 vcf-rdfizer --mode validation -i ./sample.vcf.gz --rdf ./results/sample/sample.nt.gz \
-  --shacl-shapes ./vocabulary/shacl/vcf-rdfizer-vocabulary.shacl.ttl \
+  --shacl-shapes ./vocabulary/shacl/vcf-core-vocabulary.shacl.ttl \
   -o ./validation-results
 ```
 

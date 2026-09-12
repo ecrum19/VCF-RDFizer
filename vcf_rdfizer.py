@@ -2698,6 +2698,15 @@ def append_expanded_sample_rdf(
                                 f"<{format_uri}> <{_vocab('fieldValue')}> "
                                 f"{_ntriples_literal(format_value)} .\n"
                             )
+                            typed = _typed_field_object(
+                                format_value, definition.value_type
+                            )
+                            if typed is not None:
+                                predicate, literal = typed
+                                emit(
+                                    f"<{format_uri}> <{_vocab(predicate)}> "
+                                    f"{literal} .\n"
+                                )
                             if alt_count:
                                 _emit_value_items(
                                     emit,
@@ -2832,7 +2841,7 @@ class FormatDefinition:
 #: Kept as module-level names because the emitters and the unit tests use them.
 _parse_structured_header_fields = vocab.parse_structured_header_fields
 _parse_structured_header_attributes = vocab.parse_structured_header_attributes
-_typed_info_object = vocab.typed_field_object
+_typed_field_object = vocab.typed_field_object
 
 
 def _load_field_definitions(
@@ -3948,7 +3957,7 @@ def append_record_detail_rdf(
                             f"<{info_uri}> <{_vocab('fieldValue')}> "
                             f"{_ntriples_literal(value)} .\n"
                         )
-                        typed = _typed_info_object(value, definition.value_type)
+                        typed = _typed_field_object(value, definition.value_type)
                         if typed is not None:
                             predicate, literal = typed
                             emit(
@@ -6629,6 +6638,7 @@ def run_full_mode(
     validation_engine_options: dict | None = None,
     validation_strict_conformance: bool = False,
     validation_shacl_shapes: Path | None = None,
+    validation_shacl_ontology: Path | None = None,
     filter_oracle: str = "auto",
     rdf_storage_mode: str,
     methods: list[str],
@@ -7295,6 +7305,7 @@ def run_full_mode(
                         engine_options=validation_engine_options,
                         strict_conformance=validation_strict_conformance,
                         shacl_shapes=validation_shacl_shapes,
+                        shacl_ontology=validation_shacl_ontology,
                         wrapper_log_path=wrapper_log_path,
                         run_tracker=run_tracker,
                         stage_result=target_result,
@@ -8164,6 +8175,7 @@ def run_validation_mode(
     rdf_format: str | None = None,
     strict_conformance: bool = False,
     shacl_shapes: Path | None = None,
+    shacl_ontology: Path | None = None,
     run_tracker: RunTracker | None = None,
     stage_result: dict | None = None,
     write_metrics_csv: bool = False,
@@ -8232,6 +8244,15 @@ def run_validation_mode(
         # anywhere on the host without exposing its parent tree for writing.
         shacl_mount = ["-v", f"{shacl_shapes.parent.resolve()}:/data/shacl:ro"]
         engine_args.extend(["--shacl-shapes", f"/data/shacl/{shacl_shapes.name}"])
+        if shacl_ontology is not None:
+            # The ontology is a sibling directory in a vocabulary checkout, so
+            # it needs its own mount rather than the shapes' one.
+            shacl_mount.extend(
+                ["-v", f"{shacl_ontology.parent.resolve()}:/data/shacl-ontology:ro"]
+            )
+            engine_args.extend(
+                ["--shacl-ontology", f"/data/shacl-ontology/{shacl_ontology.name}"]
+            )
 
     cmd = [
         *docker_run_base(),
@@ -8698,6 +8719,16 @@ def main():
         ),
     )
     parser.add_argument(
+        "--shacl-ontology",
+        default=None,
+        help=(
+            "Vocabulary the SHACL shapes belong to, loaded with RDFS inference "
+            "so sh:class constraints can see the class hierarchy. Defaults to "
+            "the bundle beside the shapes in a vocabulary checkout; without it "
+            "a conforming graph reports subclass violations"
+        ),
+    )
+    parser.add_argument(
         "--strict-conformance",
         action="store_true",
         help=(
@@ -8844,6 +8875,7 @@ def main():
     validation_engines: list[str] = [DEFAULT_VALIDATION_ENGINE]
     validation_engine_options: dict = {}
     shacl_shapes_path: Path | None = None
+    shacl_ontology_path: Path | None = None
     linking_manifests = []
     try:
         if args.link:
@@ -8886,6 +8918,23 @@ def main():
             shacl_shapes_path = Path(args.shacl_shapes).expanduser().resolve()
             if not shacl_shapes_path.is_file():
                 raise ValueError(f"SHACL shapes file not found: {shacl_shapes_path}")
+            if args.shacl_ontology is not None:
+                shacl_ontology_path = Path(args.shacl_ontology).expanduser().resolve()
+                if not shacl_ontology_path.is_file():
+                    raise ValueError(
+                        f"SHACL ontology file not found: {shacl_ontology_path}"
+                    )
+            else:
+                # A vocabulary checkout keeps the bundle one level up from the
+                # shapes, in ontology/. Use it when it is there, so the
+                # documented command needs no second flag.
+                candidate = (
+                    shacl_shapes_path.parent.parent
+                    / "ontology"
+                    / "vcf-core-vocabulary.bundle.ttl"
+                )
+                if candidate.is_file():
+                    shacl_ontology_path = candidate
 
         chunk_target_bytes = parse_positive_int(
             args.chunk_target_bytes, name="--chunk-target-bytes"
@@ -9213,6 +9262,7 @@ def main():
         "validation_engine": validation_engines if mode in {"full", "validation"} else None,
         "validation_strict_conformance": bool(args.strict_conformance) if mode in {"full", "validation"} else None,
         "validation_shacl_shapes": str(shacl_shapes_path) if shacl_shapes_path else None,
+        "validation_shacl_ontology": str(shacl_ontology_path) if shacl_ontology_path else None,
         "validation_engine_options": validation_engine_options or None,
         "filter_oracle": args.filter_oracle if mode in {"full", "validation"} else None,
         "quiet": bool(args.quiet),
@@ -9415,6 +9465,7 @@ def main():
                 validation_engine_options=validation_engine_options,
                 validation_strict_conformance=args.strict_conformance,
                 validation_shacl_shapes=shacl_shapes_path,
+                validation_shacl_ontology=shacl_ontology_path,
                 filter_oracle=args.filter_oracle,
                 rdf_storage_mode=args.rdf_storage_mode,
                 methods=full_methods,
@@ -9478,6 +9529,7 @@ def main():
                 engine_options=validation_engine_options,
                 strict_conformance=args.strict_conformance,
                 shacl_shapes=shacl_shapes_path,
+                shacl_ontology=shacl_ontology_path,
                 wrapper_log_path=wrapper_log_path,
                 write_metrics_csv=True,
             )

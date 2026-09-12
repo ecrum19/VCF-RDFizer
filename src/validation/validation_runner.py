@@ -848,6 +848,16 @@ def expected_census(
             predicates[f"{VCFC}forSample"] = records * samples
             predicates[f"{VCFC}hasFormatValue"] = parser["formatValueSlots"]
             predicates[f"{VCFC}fieldValue"] = parser["nonEmptyFormatValues"]
+            # A single, non-missing Integer/Float FORMAT cell also gains the
+            # typed companion property, exactly as an INFO value does.
+            predicates[f"{VCFC}fieldValueInteger"] = (
+                predicates.get(f"{VCFC}fieldValueInteger", 0)
+                + parser.get("formatTypedIntegerCount", 0)
+            )
+            predicates[f"{VCFC}fieldValueDecimal"] = (
+                predicates.get(f"{VCFC}fieldValueDecimal", 0)
+                + parser.get("formatTypedDecimalCount", 0)
+            )
             # Every expanded FORMAT value now cites its declaration.
             predicates[f"{VCFC}declaredBy"] = (
                 predicates.get(f"{VCFC}declaredBy", 0) + parser["formatValueSlots"]
@@ -885,8 +895,14 @@ def expected_census(
         classes[f"{VCFC}InfoFieldDefinition"] = definitions
         predicates[f"{VCFC}hasInfoValue"] = values
         predicates[f"{VCFC}fieldValueBoolean"] = parser["infoFlagCount"]
-        predicates[f"{VCFC}fieldValueInteger"] = parser["infoTypedIntegerCount"]
-        predicates[f"{VCFC}fieldValueDecimal"] = parser["infoTypedDecimalCount"]
+        predicates[f"{VCFC}fieldValueInteger"] = (
+            predicates.get(f"{VCFC}fieldValueInteger", 0)
+            + parser["infoTypedIntegerCount"]
+        )
+        predicates[f"{VCFC}fieldValueDecimal"] = (
+            predicates.get(f"{VCFC}fieldValueDecimal", 0)
+            + parser["infoTypedDecimalCount"]
+        )
         # declaredBy and the field* descriptors are shared with the FORMAT
         # definitions, so accumulate rather than overwrite.
         predicates[f"{VCFC}declaredBy"] = predicates.get(f"{VCFC}declaredBy", 0) + values
@@ -945,13 +961,40 @@ parse_structured_header_attributes = vocab.parse_structured_header_attributes
 parse_info_entries = vocab.parse_info_entries
 
 
-def info_declared_types(raw_header: str) -> dict[str, str]:
-    """Map each declared INFO key to its VCF Type, for typed-value counting."""
+#: VCF 4.5 reserves Integer -2147483648..-2147483641 for BCF, and a non-finite
+#: Float has no xsd:decimal form. Both keep only vcfc:fieldValue, so neither
+#: counts here. Stated independently of the emitter on purpose: an expectation
+#: computed by the emitter's own helper would only prove it agrees with itself.
+_RESERVED_INTEGER_LOW = -2147483648
+_RESERVED_INTEGER_HIGH = -2147483641
+_FINITE_FLOAT_RE = re.compile(r"^[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?$")
+
+
+def typed_value_kind(value: str, declared_type: str) -> str | None:
+    """Return "Integer", "Float" or None: the typed companion this cell gains."""
+    if "," in value or value == ".":
+        return None
+    if declared_type == "Integer":
+        try:
+            parsed = int(value)
+        except ValueError:
+            return None
+        if _RESERVED_INTEGER_LOW <= parsed <= _RESERVED_INTEGER_HIGH:
+            return None
+        return "Integer"
+    if declared_type == "Float":
+        return "Float" if _FINITE_FLOAT_RE.match(value) else None
+    return None
+
+
+def declared_field_types(raw_header: str, header_key: str = "INFO") -> dict[str, str]:
+    """Map each declared INFO or FORMAT key to its VCF Type, for typed-value counting."""
+    prefix = f"##{header_key}="
     types: dict[str, str] = {}
     for line in raw_header.splitlines():
-        if not line.startswith("##INFO="):
+        if not line.startswith(prefix):
             continue
-        body = line[len("##INFO=") :].strip()
+        body = line[len(prefix) :].strip()
         if body.startswith("<") and body.endswith(">"):
             body = body[1:-1]
         fields: dict[str, str] = {}
@@ -964,6 +1007,10 @@ def info_declared_types(raw_header: str) -> dict[str, str]:
         if key:
             types.setdefault(key, fields.get("Type") or "String")
     return types
+
+
+#: Retained name for the INFO-only callers that predate the FORMAT counting.
+info_declared_types = declared_field_types
 
 
 def read_vcf_header_text(vcf_path: Path) -> str:
@@ -1142,9 +1189,12 @@ def parse_vcf(
     expanded_format_digest: Counter[str] = Counter()
     condensed_format_digest: Counter[str] = Counter()
     sample_components = [rml_uri_component(uri_id) for uri_id in sample_uri_ids(samples)]
-    declared_info_types = info_declared_types(read_vcf_header_text(vcf_path))
+    _raw_header = read_vcf_header_text(vcf_path)
+    declared_info_types = declared_field_types(_raw_header, "INFO")
+    declared_format_types = declared_field_types(_raw_header, "FORMAT")
     info_definitions: set[str] = set()
     info_values = info_flags = info_typed_integers = info_typed_decimals = 0
+    format_typed_integers = format_typed_decimals = 0
     source_component = rml_uri_component(vcf_path.name)
     record_rows: list[list[str]] = []
     records_with_format_column = records_with_format_keys = 0
@@ -1194,9 +1244,8 @@ def parse_vcf(
             )
             digest_buckets[record_digest_bucket([record_iri, *columns[:8]])] += 1
 
-            # Structured INFO counts. The typed-value rules mirror
-            # `_typed_info_object` in vcf_rdfizer.py: only a single-valued
-            # Integer/Float that actually parses gains a typed predicate.
+            # Structured INFO counts; `typed_value_kind` states the same rule
+            # `_typed_field_object` applies in vcf_rdfizer.py.
             row_component = rml_uri_component(str(total_records))
             for key, value in parse_info_entries(columns[7] if len(columns) > 7 else ""):
                 info_values += 1
@@ -1209,18 +1258,11 @@ def parse_vcf(
                     f"/info/{rml_uri_component(key)}"
                 )
                 info_value_digest[record_digest_bucket([info_iri, value])] += 1
-                declared = declared_info_types.get(key, "String")
-                if "," in value or value == ".":
-                    continue
-                try:
-                    if declared == "Integer":
-                        int(value)
-                        info_typed_integers += 1
-                    elif declared == "Float":
-                        float(value)
-                        info_typed_decimals += 1
-                except ValueError:
-                    pass
+                kind = typed_value_kind(value, declared_info_types.get(key, "String"))
+                if kind == "Integer":
+                    info_typed_integers += 1
+                elif kind == "Float":
+                    info_typed_decimals += 1
             payload_fields = [
                 payload.split(":") if payload else [] for payload in columns[9:]
             ]
@@ -1261,6 +1303,13 @@ def parse_vcf(
                         expanded_format_digest[
                             record_digest_bucket([value_iri, cell])
                         ] += 1
+                        kind = typed_value_kind(
+                            cell, declared_format_types.get(key, "String")
+                        )
+                        if kind == "Integer":
+                            format_typed_integers += 1
+                        elif kind == "Float":
+                            format_typed_decimals += 1
                     encoded = "\t".join(
                         (fields[key_index] if key_index < len(fields) and fields[key_index]
                          else ".")
@@ -1356,6 +1405,8 @@ def parse_vcf(
         "infoFlagCount": info_flags,
         "infoTypedIntegerCount": info_typed_integers,
         "infoTypedDecimalCount": info_typed_decimals,
+        "formatTypedIntegerCount": format_typed_integers,
+        "formatTypedDecimalCount": format_typed_decimals,
         "q11_record_digest": [
             {"bucket": bucket, "recordCount": int(count)}
             for bucket, count in sorted(digest_buckets.items())
@@ -1656,12 +1707,24 @@ def materialize_ntriples(
 SHACL_SAMPLE_LIMIT = 50
 
 
-def validate_shacl(source: Path, shapes: Path, results_dir: Path) -> dict[str, Any]:
+def validate_shacl(
+    source: Path,
+    shapes: Path,
+    results_dir: Path,
+    ontology: Path | None = None,
+) -> dict[str, Any]:
     """Validate the graph against SHACL shapes, if pyshacl is available.
 
     This is an independent structural layer: it checks the shapes the
     vocabulary publishes, rather than comparing counts against the VCF, so it
     catches a different class of defect from everything else here.
+
+    ``ontology`` must be the vocabulary the shapes belong to. The emitted graph
+    carries no class hierarchy, so without it an ``sh:class`` constraint cannot
+    see that vcfc:AltAllele is a vcfc:Allele, nor that vcfc:ExpandedRepresentation
+    is a vcfc:RepresentationProfile, and a conforming graph is reported as five
+    violations. Supplying it with RDFS inference is the configuration the
+    vocabulary's own tests/validate_shacl.py uses.
 
     pyshacl loads the graph into memory, so this is opt-in and unsuitable for a
     cohort-scale aggregate. It is reported as EXECUTION_FAILED rather than a
@@ -1685,10 +1748,12 @@ def validate_shacl(source: Path, shapes: Path, results_dir: Path) -> dict[str, A
         conforms, _graph, text = pyshacl_validate(
             str(source),
             shacl_graph=str(shapes),
+            ont_graph=str(ontology) if ontology is not None else None,
             data_graph_format="nt",
             shacl_graph_format="turtle",
-            inference="none",
-            advanced=False,
+            ont_graph_format="turtle" if ontology is not None else None,
+            inference="rdfs" if ontology is not None else "none",
+            advanced=True,
         )
     except Exception as error:  # noqa: BLE001 - reported, never fatal here
         result = {
@@ -1713,6 +1778,7 @@ def validate_shacl(source: Path, shapes: Path, results_dir: Path) -> dict[str, A
         "status": "PASS" if conforms else "FAIL",
         "conforms": bool(conforms),
         "shapes": str(shapes),
+        "ontology": str(ontology) if ontology is not None else None,
         "violationCount": len(violations),
         "violationPaths": paths,
         "report": str(log_path),
@@ -3275,7 +3341,9 @@ def run_validation(args: argparse.Namespace) -> int:
             shacl_result = None
             if args.shacl_shapes is not None:
                 progress.emit("progress", completed=0, detail="validating SHACL shapes")
-                shacl_result = validate_shacl(decoded, args.shacl_shapes, results_dir)
+                shacl_result = validate_shacl(
+                    decoded, args.shacl_shapes, results_dir, args.shacl_ontology
+                )
             write_json(results_dir / "rdf-validation.json", rdf_validation)
             materialization["decodedTripleCount"] = rdf_validation.get("tripleCount")
             write_json(results_dir / "materialization.json", materialization)
@@ -3681,6 +3749,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--shacl-ontology",
+        type=Path,
+        default=None,
+        help=(
+            "Vocabulary the shapes belong to, loaded with RDFS inference so "
+            "sh:class constraints can see the class hierarchy. Without it a "
+            "conforming graph reports subclass violations"
+        ),
+    )
+    parser.add_argument(
         "--mapping-policy",
         choices=MAPPING_POLICIES,
         default="strict",
@@ -3817,6 +3895,10 @@ def resolve_args(parser: argparse.ArgumentParser, argv: list[str] | None = None)
         args.shacl_shapes = args.shacl_shapes.resolve()
         if not args.shacl_shapes.is_file():
             parser.error(f"SHACL shapes file does not exist: {args.shacl_shapes}")
+    if args.shacl_ontology is not None:
+        args.shacl_ontology = args.shacl_ontology.resolve()
+        if not args.shacl_ontology.is_file():
+            parser.error(f"SHACL ontology file does not exist: {args.shacl_ontology}")
     if args.progress_path is not None:
         args.progress_path = args.progress_path.resolve()
     return args
