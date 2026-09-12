@@ -2432,9 +2432,17 @@ def _emit_genotype(
         f"<{genotype_uri}> <{_vocab('ploidy')}> "
         f"{_ordinal_literal(parsed.ploidy)} .\n"
     )
+    indicators = {call.phase_indicator for call in parsed.calls}
+    if len(indicators) > 1:
+        # vcfc:MixedPhasing exists for exactly this: the per-call indicators
+        # carry the precise semantics, and a single Phased/Unphased verdict
+        # would misdescribe the genotype.
+        status = "MixedPhasing"
+    else:
+        status = "Phased" if parsed.is_phased else "Unphased"
     emit(
         f"<{genotype_uri}> <{_vocab('phasingStatus')}> "
-        f"<{_vocab('Phased' if parsed.is_phased else 'Unphased')}> .\n"
+        f"<{_vocab(status)}> .\n"
     )
     for call in parsed.calls:
         call_uri = f"{genotype_uri}/call/{call.call_index}"
@@ -2450,6 +2458,10 @@ def _emit_genotype(
         emit(
             f"<{call_uri}> <{_vocab('isNoCall')}> "
             f'"{"true" if call.is_no_call else "false"}"^^<{XSD_BOOLEAN_URI}> .\n'
+        )
+        emit(
+            f"<{call_uri}> <{_vocab('phaseIndicator')}> "
+            f"{_ntriples_string_literal(call.phase_indicator)} .\n"
         )
         if call.allele_index is not None and call.allele_index <= alt_count:
             emit(
@@ -2509,8 +2521,22 @@ def _emit_local_allele_set(
     for local_index, allele_index in enumerate(indices, start=1):
         allele_uri = f"{record_uri}/allele/{allele_index}"
         emit(f"<{set_uri}> <{_vocab('hasLocalAllele')}> <{allele_uri}> .\n")
+        # The local ordinal belongs to the membership, not to the allele: the
+        # allele resource is shared across samples, and two samples can give the
+        # same ALT different local positions. vcfc:localAlleleIndex is deprecated
+        # for exactly that reason.
+        membership_uri = f"{set_uri}/member/{local_index}"
         emit(
-            f"<{allele_uri}> <{_vocab('localAlleleIndex')}> "
+            f"<{set_uri}> <{_vocab('hasLocalAlleleMembership')}> "
+            f"<{membership_uri}> .\n"
+        )
+        emit(
+            f"<{membership_uri}> <{RDF_TYPE_URI}> "
+            f"<{_vocab('LocalAlleleMembership')}> .\n"
+        )
+        emit(f"<{membership_uri}> <{_vocab('localAllele')}> <{allele_uri}> .\n")
+        emit(
+            f"<{membership_uri}> <{_vocab('localIndex')}> "
             f"{_ordinal_literal(local_index)} .\n"
         )
     stats["local_allele_sets"] += 1
@@ -2662,6 +2688,17 @@ def append_expanded_sample_rdf(
                     sample_call_count += 1
 
                     phase_fields: dict[str, str] = {}
+                    # LAA has to be read before any Number=LA/LR field, and the
+                    # FORMAT string is free to list it afterwards.
+                    local_alleles: list[int] = []
+                    if version.local_alleles and "LAA" in format_keys:
+                        local_alleles = [
+                            index
+                            for index in vocab.parse_local_allele_indices(
+                                sample_values[format_keys.index("LAA")]
+                            )
+                            if index <= alt_count
+                        ]
                     for format_index, format_key in enumerate(format_keys):
                         format_value = sample_values[format_index]
                         format_component = format_components.get(format_key)
@@ -2720,6 +2757,7 @@ def append_expanded_sample_rdf(
                                     },
                                     version=version,
                                     stats=stats,
+                                    local_alleles=local_alleles,
                                 )
                         format_value_count += 1
 
@@ -3374,6 +3412,81 @@ def _emit_breakend(emit, allele_uri: str, breakend) -> None:
         )
 
 
+def _emit_record_identifiers(emit, *, record_uri: str, value: str, stats: dict) -> None:
+    """Decompose the semicolon-separated ID column into ordered components.
+
+    The whole column stays on vcfc:recordId; this adds the parts, so a query can
+    ask for one identifier without splitting a string. The missing token is a
+    status, not an identifier, so '.' produces no component.
+    """
+    if vocab.is_missing(value):
+        return
+    for position, component in enumerate(
+        (part for part in value.split(";") if part), start=1
+    ):
+        identifier_uri = f"{record_uri}/id/{position}"
+        emit(f"<{record_uri}> <{_vocab('hasIdentifier')}> <{identifier_uri}> .\n")
+        emit(
+            f"<{identifier_uri}> <{RDF_TYPE_URI}> "
+            f"<{_vocab('RecordIdentifier')}> .\n"
+        )
+        emit(
+            f"<{identifier_uri}> <{_vocab('identifierValue')}> "
+            f"{_ntriples_string_literal(component)} .\n"
+        )
+        emit(
+            f"<{identifier_uri}> <{_vocab('componentIndex')}> "
+            f"{_ordinal_literal(position)} .\n"
+        )
+        stats["record_identifiers"] += 1
+
+
+#: PASS and the missing token are FILTER statuses rather than failure codes.
+_FILTER_STATUS = {"PASS": "FiltersPassed", ".": "FiltersNotApplied"}
+
+
+def _emit_filter_codes(
+    emit, *, subject_uri: str, value: str, filter_definitions: dict, stats: dict
+) -> None:
+    """Emit the FILTER/FT status and, when it failed, the ordered codes.
+
+    A failure code links back to its '##FILTER' declaration where one exists, so
+    a consumer can read the description without re-reading the header.
+    """
+    status = _FILTER_STATUS.get(value.strip())
+    if status is not None:
+        emit(
+            f"<{subject_uri}> <{_vocab('filterStatus')}> "
+            f"<{_vocab(status)}> .\n"
+        )
+        return
+    emit(
+        f"<{subject_uri}> <{_vocab('filterStatus')}> "
+        f"<{_vocab('FiltersFailed')}> .\n"
+    )
+    for position, code in enumerate(
+        (part for part in value.split(";") if part), start=1
+    ):
+        code_uri = f"{subject_uri}/filter/{position}"
+        emit(f"<{subject_uri}> <{_vocab('hasFilterCode')}> <{code_uri}> .\n")
+        emit(f"<{code_uri}> <{RDF_TYPE_URI}> <{_vocab('FilterCode')}> .\n")
+        emit(
+            f"<{code_uri}> <{_vocab('filterCodeValue')}> "
+            f"{_ntriples_string_literal(code)} .\n"
+        )
+        emit(
+            f"<{code_uri}> <{_vocab('componentIndex')}> "
+            f"{_ordinal_literal(position)} .\n"
+        )
+        declaration = filter_definitions.get(code)
+        if declaration is not None:
+            emit(
+                f"<{code_uri}> <{_vocab('declaredByFilter')}> "
+                f"<{declaration}> .\n"
+            )
+        stats["filter_codes"] += 1
+
+
 def _emit_value_items(
     emit,
     *,
@@ -3384,6 +3497,7 @@ def _emit_value_items(
     allele_uris: dict[int, str],
     version: "vocab.VCFVersion",
     stats: dict,
+    local_alleles: list[int] | None = None,
 ) -> None:
     """Decompose a comma-separated payload into indexed vcfc:FieldValueItems.
 
@@ -3421,7 +3535,9 @@ def _emit_value_items(
                 f"<{item_uri}> <{_vocab('tupleArity')}> "
                 f"{_ordinal_literal(tuple_arity)} .\n"
             )
-        link = version.value_item_link(field_key, number, item_index)
+        link = version.value_item_link(
+            field_key, number, item_index, local_alleles=local_alleles
+        )
         if link.allele_index is not None:
             allele_uri = allele_uris.get(link.allele_index)
             if allele_uri is not None:
@@ -3771,6 +3887,8 @@ def append_record_detail_rdf(
         "qual_values": 0,
         "info_values": 0,
         "info_definitions": 0,
+        "record_identifiers": 0,
+        "filter_codes": 0,
         "alleles": 0,
         "breakends": 0,
         "value_items": 0,
@@ -3798,6 +3916,18 @@ def append_record_detail_rdf(
         identifier: definition.uri
         for identifier, definition in _load_field_definitions(
             header_lines_tsv, "ALT"
+        ).items()
+    }
+    filter_definition_uris = {
+        identifier: definition.uri
+        for identifier, definition in _load_field_definitions(
+            header_lines_tsv, "FILTER"
+        ).items()
+    }
+    format_definition_uris = {
+        identifier: definition.uri
+        for identifier, definition in _load_field_definitions(
+            header_lines_tsv, "FORMAT"
         ).items()
     }
 
@@ -3833,6 +3963,40 @@ def append_record_detail_rdf(
                 emit(
                     f"<{call_uri}> <{_vocab('filter')}> "
                     f"{_ntriples_literal(record.filter_value or '.')} .\n"
+                )
+                for key_position, format_key in enumerate(record.format_keys, start=1):
+                    # IRI shape follows vcfc:FormatKey's own iriTemplate.
+                    format_key_uri = f"{call_uri}/formatKey/{key_position}"
+                    emit(
+                        f"<{call_uri}> <{_vocab('hasFormatKey')}> "
+                        f"<{format_key_uri}> .\n"
+                    )
+                    emit(
+                        f"<{format_key_uri}> <{RDF_TYPE_URI}> "
+                        f"<{_vocab('FormatKey')}> .\n"
+                    )
+                    emit(
+                        f"<{format_key_uri}> <{_vocab('fieldIndex')}> "
+                        f"{_ordinal_literal(key_position)} .\n"
+                    )
+                    declaration = format_definition_uris.get(format_key)
+                    if declaration is not None:
+                        emit(
+                            f"<{format_key_uri}> <{_vocab('declaredBy')}> "
+                            f"<{declaration}> .\n"
+                        )
+                _emit_record_identifiers(
+                    emit,
+                    record_uri=record_uri,
+                    value=record.record_id or ".",
+                    stats=stats,
+                )
+                _emit_filter_codes(
+                    emit,
+                    subject_uri=call_uri,
+                    value=record.filter_value or ".",
+                    filter_definitions=filter_definition_uris,
+                    stats=stats,
                 )
                 emit(
                     f"<{call_uri}> <{_vocab('infoRaw')}> "
@@ -3900,7 +4064,7 @@ def append_record_detail_rdf(
                     )
 
                 info_entries = parse_info_entries(record.info) if emit_info else []
-                for key, value in info_entries:
+                for entry_position, (key, value) in enumerate(info_entries, start=1):
                     key_component = key_components.get(key)
                     if key_component is None:
                         key_component = _rml_uri_component(key)
@@ -3946,6 +4110,10 @@ def append_record_detail_rdf(
                     emit(
                         f"<{info_uri}> <{_vocab('declaredBy')}> "
                         f"<{definition.uri}> .\n"
+                    )
+                    emit(
+                        f"<{info_uri}> <{_vocab('fieldIndex')}> "
+                        f"{_ordinal_literal(entry_position)} .\n"
                     )
                     if value is None:
                         emit(

@@ -254,12 +254,37 @@ class ValueItemLink:
         )
 
 
-def value_item_link(number: str, item_index: int, *, tuple_arity: int | None) -> ValueItemLink:
+def _local_allele_index(position: int, local_alleles: list[int] | None) -> ValueItemLink:
+    """Resolve one position in a sample's local allele list to a global allele.
+
+    ``local_alleles`` is that sample's LAA value: the one-based ALT indices it
+    declares, which are also the record-global allele indices, since global
+    index 0 is REF and ALT *i* is index *i*. Without an LAA the local ordering
+    is undefined, so the item gets no vcfc:forAllele rather than a positional
+    guess -- a wrong allele link is worse than none.
+    """
+    if not local_alleles or position < 0 or position >= len(local_alleles):
+        return ValueItemLink()
+    return ValueItemLink(allele_index=local_alleles[position])
+
+
+def value_item_link(
+    number: str,
+    item_index: int,
+    *,
+    tuple_arity: int | None,
+    local_alleles: list[int] | None = None,
+) -> ValueItemLink:
     """Resolve which allele or ordinal one comma-list item belongs to.
 
     ``item_index`` is zero-based within the comma list. When the field flattens
     fixed-width tuples, the allele stride is the tuple width, so items 0 and 1
     of a per-ALT CIPOS list both belong to ALT allele 1.
+
+    The VCF 4.5 local-allele codes are indexed by the sample's own allele
+    subset, not by the record's ALT list: with ``LAA=2,4`` a ``Number=LR`` list
+    runs REF, ALT2, ALT4. Resolving them positionally would attach each value to
+    the wrong allele, so they go through ``local_alleles``.
 
     This is the version-neutral form, driven only by the declared Number token.
     Prefer :meth:`VCFVersion.value_item_link`, which also knows which keys are
@@ -268,11 +293,20 @@ def value_item_link(number: str, item_index: int, *, tuple_arity: int | None) ->
     token = (number or "").strip()
     stride = tuple_arity or 1
     group = item_index // stride
+    if token == "LA":
+        return _local_allele_index(group, local_alleles)
+    if token == "LR":
+        # Item 0 is the reference; the rest index the local ALT subset.
+        if group == 0:
+            return ValueItemLink(allele_index=0)
+        return _local_allele_index(group - 1, local_alleles)
     if token in _ARITY_PER_ALT:
         return ValueItemLink(allele_index=group + 1)
     if token in _ARITY_PER_ALLELE:
         return ValueItemLink(allele_index=group)
     if token in _ARITY_PER_GENOTYPE:
+        # Number=LG orders genotypes over the local allele set, so this ordinal
+        # is local to the sample; it is not a record-global genotype index.
         return ValueItemLink(genotype_index=group)
     if token == "P":
         return ValueItemLink(gt_allele_index=group)
@@ -350,7 +384,13 @@ class VCFVersion:
             return True
         return not value_item_link(number, 0, tuple_arity=None).is_empty
 
-    def value_item_link(self, field_id: str, number: str, item_index: int) -> ValueItemLink:
+    def value_item_link(
+        self,
+        field_id: str,
+        number: str,
+        item_index: int,
+        local_alleles: list[int] | None = None,
+    ) -> ValueItemLink:
         """Resolve one comma-list item's allele or ordinal, for this version."""
         arity = self.tuple_arity(field_id)
         if arity is not None:
@@ -359,7 +399,9 @@ class VCFVersion:
                 # has an index but nothing to point vcfc:forAllele at.
                 return ValueItemLink()
             return ValueItemLink(allele_index=(item_index // arity) + 1)
-        return value_item_link(number, item_index, tuple_arity=None)
+        return value_item_link(
+            number, item_index, tuple_arity=None, local_alleles=local_alleles
+        )
 
 
 def _version(
@@ -709,6 +751,9 @@ class ParsedGenotypeCall:
     call_index: int
     #: The record-global allele index, or None when the position is a no-call.
     allele_index: int | None
+    #: The / or | preceding this position. VCF omits it before the first allele
+    #: except in 4.4+, so the effective one is carried here either way.
+    phase_indicator: str = "/"
 
     @property
     def is_no_call(self) -> bool:
@@ -754,13 +799,20 @@ def parse_genotype(value: str) -> ParsedGenotype | None:
     allele_tokens = tokens[0::2]
     separators = tokens[1::2]
 
+    # The indicator before the first allele is usually absent. VCF phases a GT
+    # as a whole unless the indicators disagree, so an omitted one takes the
+    # value the rest of the string uses.
+    default_indicator = "/" if "/" in value else "|"
+    first_indicator = ("|" if leading_phased else "/") if value[0] in "|/" else default_indicator
+
     calls = []
     for call_index, token in enumerate(allele_tokens):
+        indicator = first_indicator if call_index == 0 else separators[call_index - 1]
         if token == "." or token == "":
-            calls.append(ParsedGenotypeCall(call_index, None))
+            calls.append(ParsedGenotypeCall(call_index, None, indicator))
         else:
             try:
-                calls.append(ParsedGenotypeCall(call_index, int(token)))
+                calls.append(ParsedGenotypeCall(call_index, int(token), indicator))
             except ValueError:
                 return None
 
@@ -842,6 +894,24 @@ _BASE_MODIFICATION_PROPERTIES = {
     "ADM": "modificationAlleleDepth",
 }
 
+#: VCF 4.5 also reserves a named alias for each common modification, so M5mC
+#: and M27551C denote the same thing. The spec's reserved-FORMAT table lists
+#: them as "Alias for ..."; the same ten modifications exist in all three
+#: families. The vocabulary carries the correspondence as vcfc:aliasOf on each
+#: reserved key, so a graph that resolves the alias agrees with it.
+_BASE_MODIFICATION_ALIASES = {
+    "5mC": ("27551", "C"),
+    "5hmC": ("76792", "C"),
+    "5fC": ("76794", "C"),
+    "5caC": ("76793", "C"),
+    "5hmU": ("16964", "T"),
+    "5fU": ("80961", "T"),
+    "5caU": ("17477", "T"),
+    "6mA": ("28871", "A"),
+    "8oxoG": ("44605", "G"),
+    "XaoN": ("18107", "N"),
+}
+
 
 @dataclass(frozen=True)
 class ParsedBaseModification:
@@ -852,28 +922,60 @@ class ParsedBaseModification:
     base: str
     #: The vcfc property that carries this family's value.
     value_property: str
+    #: The key as the file wrote it. An alias keeps its own spelling here so
+    #: the graph traces back to the source column, while the residue below
+    #: still resolves to the ChEBI the alias denotes.
+    source_key: str | None = None
 
     @property
     def residue_uri(self) -> str:
         return f"{CHEBI_NAMESPACE}{self.chebi_id}"
 
     @property
-    def key(self) -> str:
+    def canonical_key(self) -> str:
         return f"{self.family}{self.chebi_id}{self.base}"
+
+    @property
+    def key(self) -> str:
+        return self.source_key or self.canonical_key
+
+    @property
+    def is_alias(self) -> bool:
+        return self.key != self.canonical_key
 
 
 def parse_base_modification_key(key: str) -> ParsedBaseModification | None:
-    """Recognize a base-modification FORMAT key and resolve its ChEBI residue."""
+    """Recognize a base-modification FORMAT key and resolve its ChEBI residue.
+
+    Accepts both spellings VCF 4.5 reserves: the ChEBI-numeric form M27551C and
+    the named alias M5mC. Resolving the alias is what lets one query answer over
+    either spelling.
+    """
     match = BASE_MODIFICATION_KEY_RE.match(key)
-    if not match:
-        return None
-    family = match.group("family")
-    return ParsedBaseModification(
-        family=family,
-        chebi_id=match.group("chebi"),
-        base=match.group("base"),
-        value_property=_BASE_MODIFICATION_PROPERTIES[family],
-    )
+    if match:
+        family = match.group("family")
+        return ParsedBaseModification(
+            family=family,
+            chebi_id=match.group("chebi"),
+            base=match.group("base"),
+            value_property=_BASE_MODIFICATION_PROPERTIES[family],
+            source_key=key,
+        )
+    for family in ("ADM", "DPM", "M"):  # longest prefix first
+        if not key.startswith(family):
+            continue
+        alias = _BASE_MODIFICATION_ALIASES.get(key[len(family):])
+        if alias is None:
+            continue
+        chebi_id, base = alias
+        return ParsedBaseModification(
+            family=family,
+            chebi_id=chebi_id,
+            base=base,
+            value_property=_BASE_MODIFICATION_PROPERTIES[family],
+            source_key=key,
+        )
+    return None
 
 
 def split_value_items(value: str) -> list[str]:
