@@ -15,6 +15,7 @@ build:
   script: {{ PYTHON }} -m pip install . -vv
   entry_points:
     - vcf-rdfizer=vcf_rdfizer:main
+    - vcf-rdfizer-rules=vcf_rdfizer_rules:main
     - vcf-rdfizer-link=vcf_rdfizer_link:main
 
 requirements:
@@ -33,6 +34,7 @@ test:
     - python {{ python_min }}
   commands:
     - vcf-rdfizer --help
+    - vcf-rdfizer-rules --help
     - vcf-rdfizer-link list
   imports:
     - vcf_rdfizer
