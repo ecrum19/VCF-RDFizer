@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vcf-rdfizer"
-version = "3.0.1"
+version = "3.0.2"
 description = "Docker-first VCF to RDF conversion targeting the VCF Core vocabulary, with compressed queryable representations (HDT, COTTAS), semantic validation, and data linking"
 readme = "README.md"
 requires-python = ">=3.10"
