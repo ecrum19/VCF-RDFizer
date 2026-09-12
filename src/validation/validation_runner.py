@@ -814,6 +814,35 @@ def expected_census(
     ):
         predicates[predicate] = 0 if parser[field] == METADATA_ABSENT else 1
 
+    # ID and FILTER decompositions, and the record's declared FORMAT keys.
+    # All three are record-level, so both sample profiles carry them.
+    identifiers = parser.get("recordIdentifierCount", 0)
+    filter_codes = parser.get("filterCodeCount", 0)
+    format_keys = parser.get("formatKeyOccurrences", 0)
+    if identifiers:
+        classes[f"{VCFC}RecordIdentifier"] = identifiers
+        predicates[f"{VCFC}hasIdentifier"] = identifiers
+        predicates[f"{VCFC}identifierValue"] = identifiers
+    if filter_codes:
+        classes[f"{VCFC}FilterCode"] = filter_codes
+        predicates[f"{VCFC}hasFilterCode"] = filter_codes
+        predicates[f"{VCFC}filterCodeValue"] = filter_codes
+        predicates[f"{VCFC}declaredByFilter"] = parser.get("declaredFilterCodeCount", 0)
+    # componentIndex is shared by both decompositions.
+    if identifiers or filter_codes:
+        predicates[f"{VCFC}componentIndex"] = identifiers + filter_codes
+    # Every record gets a status, including PASS and the missing token.
+    predicates[f"{VCFC}filterStatus"] = records
+    if format_keys:
+        classes[f"{VCFC}FormatKey"] = format_keys
+        predicates[f"{VCFC}hasFormatKey"] = format_keys
+        predicates[f"{VCFC}fieldIndex"] = (
+            predicates.get(f"{VCFC}fieldIndex", 0) + format_keys
+        )
+        predicates[f"{VCFC}declaredBy"] = (
+            predicates.get(f"{VCFC}declaredBy", 0) + format_keys
+        )
+
     # A sites-only VCF still declares a profile: vcfc:RepresentationProfileShape
     # requires exactly one on every file, and a file with no genotype columns
     # has no genotype data to condense.
@@ -848,6 +877,11 @@ def expected_census(
             predicates[f"{VCFC}forSample"] = records * samples
             predicates[f"{VCFC}hasFormatValue"] = parser["formatValueSlots"]
             predicates[f"{VCFC}fieldValue"] = parser["nonEmptyFormatValues"]
+            # One preceding indicator per allele call, including the effective
+            # first one the source omits.
+            calls = parser.get("emittedGenotypePredicates", {}).get("callIndex", 0)
+            if calls:
+                predicates[f"{VCFC}phaseIndicator"] = calls
             # A single, non-missing Integer/Float FORMAT cell also gains the
             # typed companion property, exactly as an INFO value does.
             predicates[f"{VCFC}fieldValueInteger"] = (
@@ -911,6 +945,11 @@ def expected_census(
         _count_definitions(predicates, parser.get("synthesizedInfoNumbers", []))
         predicates[f"{VCFC}fieldValue"] = (
             predicates.get(f"{VCFC}fieldValue", 0) + values - parser["infoFlagCount"]
+        )
+        # Source order within the INFO column; the FORMAT keys add their own
+        # below, and both use the same predicate.
+        predicates[f"{VCFC}fieldIndex"] = (
+            predicates.get(f"{VCFC}fieldIndex", 0) + values
         )
 
         # The allele layer, the value items, the SV carriers and the parsed
@@ -1195,6 +1234,8 @@ def parse_vcf(
     info_definitions: set[str] = set()
     info_values = info_flags = info_typed_integers = info_typed_decimals = 0
     format_typed_integers = format_typed_decimals = 0
+    declared_filter_ids = set(declared_field_types(_raw_header, "FILTER"))
+    record_identifiers = filter_codes = declared_filter_codes = 0
     source_component = rml_uri_component(vcf_path.name)
     record_rows: list[list[str]] = []
     records_with_format_column = records_with_format_keys = 0
@@ -1235,6 +1276,18 @@ def parse_vcf(
 
             columns = str(variant).rstrip("\r\n").split("\t")
             record_rows.append(columns)
+            # ID and FILTER are semicolon-separated lists the emitter breaks
+            # into ordered resources. PASS and '.' are FILTER statuses rather
+            # than failure codes, so they contribute no vcfc:FilterCode.
+            record_id = columns[2] if len(columns) > 2 else "."
+            if record_id != ".":
+                record_identifiers += sum(1 for part in record_id.split(";") if part)
+            filter_column = columns[6] if len(columns) > 6 else "."
+            if filter_column not in ("PASS", "."):
+                for code in (part for part in filter_column.split(";") if part):
+                    filter_codes += 1
+                    if code in declared_filter_ids:
+                        declared_filter_codes += 1
             # The record digest is computed from the raw line so it matches the
             # lexical values the mapping puts in the graph, character for
             # character, with no round-trip through cyvcf2's typed accessors.
@@ -1407,6 +1460,9 @@ def parse_vcf(
         "infoTypedDecimalCount": info_typed_decimals,
         "formatTypedIntegerCount": format_typed_integers,
         "formatTypedDecimalCount": format_typed_decimals,
+        "recordIdentifierCount": record_identifiers,
+        "filterCodeCount": filter_codes,
+        "declaredFilterCodeCount": declared_filter_codes,
         "q11_record_digest": [
             {"bucket": bucket, "recordCount": int(count)}
             for bucket, count in sorted(digest_buckets.items())
