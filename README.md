@@ -1080,7 +1080,7 @@ Safe termination:
 
 If you use VCF-RDFizer in a publication, please cite:
 
-VCF-RDFizer maintainers. (2026). *VCF-RDFizer* (Version 3.0.1) [Computer software]. GitHub. https://github.com/ecrum19/VCF-RDFizer
+VCF-RDFizer maintainers. (2026). *VCF-RDFizer* (Version 3.0.2) [Computer software]. GitHub. https://github.com/ecrum19/VCF-RDFizer
 
 BibTeX:
 
@@ -1089,7 +1089,7 @@ BibTeX:
   author  = {{VCF-RDFizer maintainers}},
   title   = {VCF-RDFizer},
   year    = {2026},
-  version = {3.0.1},
+  version = {3.0.2},
   url     = {https://github.com/ecrum19/VCF-RDFizer},
   note    = {Computer software}
 }
