@@ -2542,32 +2542,123 @@ def _emit_local_allele_set(
     stats["local_allele_sets"] += 1
 
 
-def _emit_base_modification(
-    emit, *, sample_uri: str, modification, value: str, stats: dict
+def _gt_allele_sequences(sample_values, format_keys, ref: str, alt: str):
+    """This sample's called allele sequences, in GT order.
+
+    VCF 4.5 encodes a Number=M field over the concatenated genotype allele
+    bases, so the order is the GT's, not the ALT column's. Missing and symbolic
+    alleles are dropped: the specification says they "encode no base
+    modification values".
+    """
+    if "GT" not in format_keys:
+        return []
+    parsed = vocab.parse_genotype(sample_values[format_keys.index("GT")])
+    if parsed is None:
+        return []
+    alleles = [ref] + ([] if vocab.is_missing(alt) else alt.split(","))
+    out = []
+    for call in parsed.calls:
+        index = call.allele_index
+        if index is None or index >= len(alleles):
+            continue
+        sequence = alleles[index]
+        if vocab.is_missing(sequence) or sequence.startswith("<"):
+            continue
+        out.append((index, sequence))
+    return out
+
+
+def _emit_modification_items(
+    emit,
+    *,
+    parent_uri: str,
+    modification_uri: str,
+    modification,
+    value: str,
+    record_uri: str,
+    allele_sequences,
+    stats: dict,
 ) -> None:
+    """Decompose a Number=M payload into one item per modifiable base.
+
+    Each item names the allele the base belongs to, its offset within that
+    allele, and the modification it reports, so a query can reach one base's
+    value without splitting the comma list. When the payload and the positions
+    the sequences imply disagree, no item is emitted: a value bound to the wrong
+    base would be worse than leaving the list whole on vcfc:fieldValue.
+    """
+    items = vocab.split_value_items(value)
+    if not items:
+        return
+    positions = vocab.base_modification_positions(
+        allele_sequences, modification.base
+    )
+    if len(positions) != len(items):
+        stats["modification_arity_mismatches"] += 1
+        return
+    for item_index, (item, (allele_index, offset, strand)) in enumerate(
+        zip(items, positions, strict=True)
+    ):
+        item_uri = f"{parent_uri}/value/{item_index}"
+        emit(f"<{parent_uri}> <{_vocab('hasValueItem')}> <{item_uri}> .\n")
+        emit(f"<{item_uri}> <{RDF_TYPE_URI}> <{_vocab('FieldValueItem')}> .\n")
+        emit(
+            f"<{item_uri}> <{_vocab('valueIndex')}> "
+            f"{_ordinal_literal(item_index)} .\n"
+        )
+        emit(f"<{item_uri}> <{_vocab('itemValue')}> {_ntriples_literal(item)} .\n")
+        emit(
+            f"<{item_uri}> <{_vocab('forAllele')}> "
+            f"<{record_uri}/allele/{allele_index}> .\n"
+        )
+        emit(
+            f"<{item_uri}> <{_vocab('forBaseModification')}> "
+            f"<{modification_uri}> .\n"
+        )
+        emit(
+            f"<{item_uri}> <{_vocab('modifiedBaseOffset')}> "
+            f"{_ordinal_literal(offset)} .\n"
+        )
+        stats["value_items"] += 1
+        if strand == "-":
+            stats["modification_reverse_strand"] += 1
+
+
+def _emit_base_modification(
+    emit,
+    *,
+    sample_uri: str,
+    modification,
+    value: str,
+    stats: dict,
+    emitted_modifications: set,
+) -> str | None:
     """Emit the vcfc:BaseModification carrier for one M/DPM/ADM FORMAT key."""
     if vocab.is_missing(value):
-        return
-    modification_uri = f"{sample_uri}/basemod/{_rml_uri_component(modification.key)}"
-    emit(
-        f"<{modification_uri}> <{RDF_TYPE_URI}> "
-        f"<{_vocab('BaseModification')}> .\n"
+        return None
+    # Keyed by the modification itself, not by the FORMAT key: M, DPM and ADM
+    # describe one modification from three angles, and vcfc:BaseModification is
+    # the modification. Keying by column would split it across three subjects
+    # and no query could ask for a fraction and its depth together.
+    modification_uri = (
+        f"{sample_uri}/basemod/{_rml_uri_component(modification.modification_id)}"
     )
-    emit(
-        f"<{modification_uri}> <{_vocab('modifiedResidue')}> "
-        f"<{modification.residue_uri}> .\n"
-    )
-    # VCF 4.5 gives the base-modification FORMAT families a per-base offset;
-    # without an explicit one, position 0 is the modified base named by the key.
-    emit(
-        f"<{modification_uri}> <{_vocab('modifiedBaseOffset')}> "
-        f"{_ordinal_literal(0)} .\n"
-    )
+    if modification_uri not in emitted_modifications:
+        emitted_modifications.add(modification_uri)
+        emit(
+            f"<{modification_uri}> <{RDF_TYPE_URI}> "
+            f"<{_vocab('BaseModification')}> .\n"
+        )
+        emit(
+            f"<{modification_uri}> <{_vocab('modifiedResidue')}> "
+            f"<{modification.residue_uri}> .\n"
+        )
+        stats["base_modifications"] += 1
     emit(
         f"<{modification_uri}> <{_vocab(modification.value_property)}> "
         f"{_ntriples_literal(value)} .\n"
     )
-    stats["base_modifications"] += 1
+    return modification_uri
 
 
 def append_expanded_sample_rdf(
@@ -2603,6 +2694,8 @@ def append_expanded_sample_rdf(
         "phase_sets": 0,
         "local_allele_sets": 0,
         "base_modifications": 0,
+        "modification_arity_mismatches": 0,
+        "modification_reverse_strand": 0,
         "value_items": 0,
         "triples": 0,
         "appended_bytes": 0,
@@ -2688,6 +2781,7 @@ def append_expanded_sample_rdf(
                     sample_call_count += 1
 
                     phase_fields: dict[str, str] = {}
+                    emitted_modifications: set[str] = set()
                     # LAA has to be read before any Number=LA/LR field, and the
                     # FORMAT string is free to list it afterwards.
                     local_alleles: list[int] = []
@@ -2808,13 +2902,30 @@ def append_expanded_sample_rdf(
                                 )
                             modification = base_modifications[format_key]
                             if modification is not None:
-                                _emit_base_modification(
+                                modification_uri = _emit_base_modification(
                                     emit,
                                     sample_uri=sample_uri,
                                     modification=modification,
                                     value=format_value,
                                     stats=stats,
+                                    emitted_modifications=emitted_modifications,
                                 )
+                                if modification_uri is not None:
+                                    _emit_modification_items(
+                                        emit,
+                                        parent_uri=format_uri,
+                                        modification_uri=modification_uri,
+                                        modification=modification,
+                                        value=format_value,
+                                        record_uri=record_uri,
+                                        allele_sequences=_gt_allele_sequences(
+                                            sample_values,
+                                            format_keys,
+                                            record.ref,
+                                            record.alt,
+                                        ),
+                                        stats=stats,
+                                    )
 
                     if phase_fields:
                         _emit_phase_set(

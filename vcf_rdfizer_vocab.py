@@ -936,6 +936,15 @@ class ParsedBaseModification:
         return f"{self.family}{self.chebi_id}{self.base}"
 
     @property
+    def modification_id(self) -> str:
+        """The modification itself, independent of which family reported it.
+
+        M, DPM and ADM describe one modification from three angles -- fraction,
+        depth, allele depth -- so they must name one vcfc:BaseModification.
+        """
+        return f"{self.chebi_id}{self.base}"
+
+    @property
     def key(self) -> str:
         return self.source_key or self.canonical_key
 
@@ -976,6 +985,43 @@ def parse_base_modification_key(key: str) -> ParsedBaseModification | None:
             source_key=key,
         )
     return None
+
+
+#: Watson-Crick complements, for reading a modification off the reverse strand.
+_COMPLEMENT = {"A": "T", "C": "G", "G": "C", "T": "A", "U": "A", "N": "N"}
+
+
+def base_modification_positions(
+    allele_sequences: list[tuple[int, str]], modified_base: str
+) -> list[tuple[int, int, str]]:
+    """Positions a Number=M field carries a value for, in source order.
+
+    VCF 4.5: a Number=M field has one value per base, on either strand, of the
+    concatenated genotype allele sequences that could carry the modification,
+    ordered as the bases occur. The specification's own example is an allele of
+    CGA with two M5mC values -- the forward-strand C at the first base and the
+    reverse-strand C at the second, whose forward base is G.
+
+    ``allele_sequences`` is (global allele index, sequence) in GT order, with
+    missing and symbolic alleles already dropped: the specification says they
+    "encode no base modification values". Returns (allele index, offset within
+    that allele, strand).
+
+    N is the exception the specification calls out: every base could carry it,
+    so each position yields both strands, negative immediately after positive.
+    """
+    base = (modified_base or "").upper()
+    out: list[tuple[int, int, str]] = []
+    for allele_index, sequence in allele_sequences:
+        for offset, residue in enumerate(sequence.upper()):
+            if base == "N":
+                out.append((allele_index, offset, "+"))
+                out.append((allele_index, offset, "-"))
+            elif residue == base:
+                out.append((allele_index, offset, "+"))
+            elif _COMPLEMENT.get(residue) == base:
+                out.append((allele_index, offset, "-"))
+    return out
 
 
 def split_value_items(value: str) -> list[str]:
