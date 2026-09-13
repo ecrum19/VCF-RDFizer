@@ -802,7 +802,10 @@ def parse_genotype(value: str) -> ParsedGenotype | None:
     # The indicator before the first allele is usually absent. VCF phases a GT
     # as a whole unless the indicators disagree, so an omitted one takes the
     # value the rest of the string uses.
-    default_indicator = "/" if "/" in value else "|"
+    # Phased only when the string actually says so. A bare haploid call has no
+    # separator at all, and calling it phased would contradict the is_phased
+    # rule below, which holds that there is nothing to phase against.
+    default_indicator = "|" if "|" in value and "/" not in value else "/"
     first_indicator = ("|" if leading_phased else "/") if value[0] in "|/" else default_indicator
 
     calls = []

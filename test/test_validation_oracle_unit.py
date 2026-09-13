@@ -232,6 +232,72 @@ class SourceDataColumnTests(VerboseTestCase):
         self.assertEqual([c[1] for c in columns], ["1", "2"])
 
 
+class TypedValueKindTests(VerboseTestCase):
+    """The rule deciding which cells gain a typed companion property.
+
+    Stated independently of the emitter on purpose: an expectation computed by
+    the code under test would only prove it agrees with itself.
+    """
+
+    def test_a_single_integer_gains_an_integer_companion(self):
+        self.assertEqual(V.typed_value_kind("42", "Integer"), "Integer")
+
+    def test_a_single_float_gains_a_decimal_companion(self):
+        self.assertEqual(V.typed_value_kind("0.5", "Float"), "Float")
+
+    def test_a_string_field_gains_nothing(self):
+        self.assertIsNone(V.typed_value_kind("0/1", "String"))
+
+    def test_a_comma_list_gains_nothing(self):
+        """A list is represented by value items, not one typed literal."""
+        self.assertIsNone(V.typed_value_kind("1,2", "Integer"))
+
+    def test_the_missing_token_gains_nothing(self):
+        self.assertIsNone(V.typed_value_kind(".", "Integer"))
+
+    def test_a_BCF_reserved_integer_gains_nothing(self):
+        """VCF 4.5 reserves -2147483648..-2147483641; they keep only fieldValue."""
+        for value in ("-2147483648", "-2147483641"):
+            with self.subTest(value=value):
+                self.assertIsNone(V.typed_value_kind(value, "Integer"))
+        self.assertEqual(V.typed_value_kind("-2147483640", "Integer"), "Integer")
+
+    def test_a_non_finite_float_gains_nothing(self):
+        """INF and NaN have no xsd:decimal form."""
+        for value in ("NaN", "inf", "-INF", "INFINITY"):
+            with self.subTest(value=value):
+                self.assertIsNone(V.typed_value_kind(value, "Float"))
+
+    def test_a_value_that_does_not_parse_gains_nothing(self):
+        self.assertIsNone(V.typed_value_kind("twelve", "Integer"))
+
+
+class DeclaredFieldTypeTests(VerboseTestCase):
+    """FORMAT declarations are read the same way INFO ones are."""
+
+    def test_format_declarations_are_read_when_asked_for(self):
+        header = "\n".join([
+            '##INFO=<ID=DP,Number=1,Type=Integer,Description="i">',
+            '##FORMAT=<ID=AD,Number=R,Type=Integer,Description="f">',
+            '##FORMAT=<ID=GT,Number=1,Type=String,Description="g">',
+        ])
+        self.assertEqual(V.declared_field_types(header, "FORMAT"),
+                         {"AD": "Integer", "GT": "String"})
+
+    def test_asking_for_one_key_does_not_return_the_other(self):
+        header = "\n".join([
+            '##INFO=<ID=DP,Number=1,Type=Integer,Description="i">',
+            '##FORMAT=<ID=DP,Number=1,Type=Float,Description="f">',
+        ])
+        self.assertEqual(V.declared_field_types(header, "INFO"), {"DP": "Integer"})
+        self.assertEqual(V.declared_field_types(header, "FORMAT"), {"DP": "Float"})
+
+    def test_filter_declarations_expose_their_ids(self):
+        """A failure code links to its declaration, so the ids must be readable."""
+        header = '##FILTER=<ID=q10,Description="Quality below ten">'
+        self.assertEqual(set(V.declared_field_types(header, "FILTER")), {"q10"})
+
+
 class InfoDeclaredTypeTests(VerboseTestCase):
     def test_each_declared_info_key_maps_to_its_type(self):
         """The INFO Type drives typed-value counting, so it is read per key."""
