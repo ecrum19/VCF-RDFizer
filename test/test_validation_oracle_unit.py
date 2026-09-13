@@ -192,6 +192,46 @@ class GenotypeClassificationTests(VerboseTestCase):
         self.assertEqual(V.classify_genotype((), has_gt=True), "MISSING")
 
 
+class SourceDataColumnTests(VerboseTestCase):
+    """The census must see the file's cells, not htslib's rendering of them."""
+
+    def _write(self, body):
+        import tempfile, pathlib
+        path = pathlib.Path(tempfile.mkdtemp()) / "s.vcf"
+        path.write_text(body, encoding="utf-8")
+        return path
+
+    def test_a_dropped_trailing_format_field_stays_dropped(self):
+        """VCF 4.5 lets a sample omit trailing FORMAT fields.
+
+        cyvcf2 re-serializes that sample as '0:.', so a census taken from
+        str(variant) counts a cell the file does not contain -- and could never
+        catch an emitter that invented it.
+        """
+        path = self._write(
+            "##fileformat=VCFv4.5\n"
+            '##FORMAT=<ID=GT,Number=1,Type=String,Description="g">\n'
+            '##FORMAT=<ID=DP,Number=1,Type=Integer,Description="d">\n'
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n"
+            "chr1\t1\t.\tA\tG\t.\t.\t.\tGT:DP\t0\n"
+        )
+        columns = list(V.read_vcf_data_columns(path))
+        self.assertEqual(len(columns), 1)
+        self.assertEqual(columns[0][9], "0")
+
+    def test_header_lines_and_blank_lines_are_skipped(self):
+        """Only data lines reach the census."""
+        path = self._write(
+            "##fileformat=VCFv4.5\n"
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n"
+            "chr1\t1\t.\tA\tG\t.\t.\t.\n"
+            "\n"
+            "chr1\t2\t.\tC\tT\t.\t.\t.\n"
+        )
+        columns = list(V.read_vcf_data_columns(path))
+        self.assertEqual([c[1] for c in columns], ["1", "2"])
+
+
 class InfoDeclaredTypeTests(VerboseTestCase):
     def test_each_declared_info_key_maps_to_its_type(self):
         """The INFO Type drives typed-value counting, so it is read per key."""

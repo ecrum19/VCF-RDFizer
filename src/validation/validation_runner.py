@@ -1052,6 +1052,26 @@ def declared_field_types(raw_header: str, header_key: str = "INFO") -> dict[str,
 info_declared_types = declared_field_types
 
 
+def read_vcf_data_columns(vcf_path: Path):
+    """Yield each data line's columns, from the file's own text.
+
+    Same reason as :func:`read_vcf_header_text`: htslib normalises what it
+    re-serializes. ``str(variant)`` restores a trailing FORMAT field the file
+    omitted -- a sample written ``0`` comes back as ``0:.`` -- so a census taken
+    from it counts cells the file does not contain. Worse, it makes the
+    validator blind to exactly the case VCF Core models deliberately: an emitter
+    that invented the dropped field would look correct.
+    """
+    opener = gzip.open if vcf_path.name.endswith(".gz") else open
+    with opener(vcf_path, "rt", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if line.startswith("#"):
+                continue
+            stripped = line.rstrip("\r\n")
+            if stripped:
+                yield stripped.split("\t")
+
+
 def read_vcf_header_text(vcf_path: Path) -> str:
     """Read the header block straight from the VCF file.
 
@@ -1242,6 +1262,7 @@ def parse_vcf(
     format_key_occurrences = format_value_slots = non_empty_format_values = 0
     distinct_format_keys: set[str] = set()
     _scan_started = time.monotonic()
+    source_columns = read_vcf_data_columns(vcf_path)
     try:
         for variant in reader:
             total_records += 1
@@ -1274,7 +1295,16 @@ def parse_vcf(
             if format_keys:
                 records_with_format_column += 1
 
-            columns = str(variant).rstrip("\r\n").split("\t")
+            # The file's own columns, not str(variant)'s: see
+            # read_vcf_data_columns. cyvcf2 yields records in file order, so the
+            # two iterators stay aligned; a short read means the reader skipped
+            # a line and the census would be silently wrong, so it is an error.
+            columns = next(source_columns, None)
+            if columns is None:
+                raise ValueError(
+                    f"{vcf_path.name}: fewer data lines than parsed records at "
+                    f"record {total_records}"
+                )
             record_rows.append(columns)
             # ID and FILTER are semicolon-separated lists the emitter breaks
             # into ordered resources. PASS and '.' are FILTER statuses rather
