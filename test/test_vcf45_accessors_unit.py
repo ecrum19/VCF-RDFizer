@@ -328,3 +328,36 @@ class ModificationItemTests(VerboseTestCase):
         out, stats = self._run(".", [(0, "C")])
         self.assertEqual(out, [])
         self.assertEqual(stats["modification_arity_mismatches"], 0)
+
+
+class PhasingStatusEmissionTests(VerboseTestCase):
+    """A genotype whose indicators disagree is neither Phased nor Unphased."""
+
+    def _status(self, gt):
+        emit, out = _emit_to_list()
+        stats = {"genotypes": 0, "genotype_calls": 0}
+        R._emit_genotype(emit, sample_uri="F#sample/1/S1", record_uri="F#record/1",
+                         value=gt, alt_count=3, stats=stats)
+        return [o for o in _objects(out, "phasingStatus")]
+
+    def test_mixed_indicators_emit_MixedPhasing(self):
+        """vcfc:MixedPhasing exists for exactly this; the per-call indicators
+        carry the precise semantics."""
+        self.assertEqual(self._status("0|1/2"), ["vcfc:MixedPhasing"])
+
+    def test_a_wholly_phased_genotype_is_Phased(self):
+        self.assertEqual(self._status("0|1"), ["vcfc:Phased"])
+
+    def test_a_wholly_unphased_genotype_is_Unphased(self):
+        self.assertEqual(self._status("0/1"), ["vcfc:Unphased"])
+
+    def test_a_malformed_genotype_produces_no_resource(self):
+        """The value survives on fieldValue; inventing a Genotype would fail
+        vcfc:GenotypeShape."""
+        self.assertEqual(self._status("not-a-genotype"), [])
+
+
+class MalformedGenotypeSequenceTests(VerboseTestCase):
+    def test_a_genotype_outside_the_lexical_space_yields_no_sequences(self):
+        """Number=M cannot be decomposed without a parsable GT."""
+        self.assertEqual(R._gt_allele_sequences(("x/y",), ("GT",), "G", "A"), [])

@@ -756,3 +756,35 @@ class ResolvedArgumentTests(VerboseTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RecordDecompositionCountTests(VerboseTestCase):
+    """The census counts the same ID and FILTER parts the emitter builds."""
+
+    def _cols(self, record_id=".", filter_column="."):
+        return ["chr1", "1", record_id, "A", "G", ".", filter_column, ".", "GT", "0/1"]
+
+    def test_semicolon_separated_identifiers_are_counted(self):
+        self.assertEqual(V.record_decomposition_counts(self._cols("idA;idB"), set()),
+                         (2, 0, 0))
+
+    def test_the_missing_id_token_contributes_no_identifier(self):
+        self.assertEqual(V.record_decomposition_counts(self._cols("."), set()), (0, 0, 0))
+
+    def test_pass_and_missing_are_statuses_not_codes(self):
+        for value in ("PASS", "."):
+            with self.subTest(filter=value):
+                self.assertEqual(
+                    V.record_decomposition_counts(self._cols(".", value), {"q10"}),
+                    (0, 0, 0),
+                )
+
+    def test_failure_codes_are_counted_and_matched_against_declarations(self):
+        """Only a code with a ##FILTER line can cite one."""
+        self.assertEqual(
+            V.record_decomposition_counts(self._cols(".", "q10;s50"), {"q10"}),
+            (0, 2, 1),
+        )
+
+    def test_a_truncated_record_is_treated_as_missing_rather_than_crashing(self):
+        self.assertEqual(V.record_decomposition_counts(["chr1", "1"], set()), (0, 0, 0))

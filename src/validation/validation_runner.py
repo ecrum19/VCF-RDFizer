@@ -1052,6 +1052,30 @@ def declared_field_types(raw_header: str, header_key: str = "INFO") -> dict[str,
 info_declared_types = declared_field_types
 
 
+def record_decomposition_counts(columns, declared_filter_ids):
+    """Count the ID and FILTER components one record contributes.
+
+    The emitter breaks both columns into ordered resources, so the census has to
+    count the same parts. PASS and the missing token are FILTER statuses rather
+    than failure codes and contribute no vcfc:FilterCode; a missing ID column
+    contributes no vcfc:RecordIdentifier.
+
+    Returns (identifiers, filter codes, filter codes that cite a declaration).
+    """
+    record_id = columns[2] if len(columns) > 2 else "."
+    identifiers = 0
+    if record_id != ".":
+        identifiers = sum(1 for part in record_id.split(";") if part)
+    codes = declared = 0
+    filter_column = columns[6] if len(columns) > 6 else "."
+    if filter_column not in ("PASS", "."):
+        for code in (part for part in filter_column.split(";") if part):
+            codes += 1
+            if code in declared_filter_ids:
+                declared += 1
+    return identifiers, codes, declared
+
+
 def read_vcf_data_columns(vcf_path: Path):
     """Yield each data line's columns, from the file's own text.
 
@@ -1306,18 +1330,12 @@ def parse_vcf(
                     f"record {total_records}"
                 )
             record_rows.append(columns)
-            # ID and FILTER are semicolon-separated lists the emitter breaks
-            # into ordered resources. PASS and '.' are FILTER statuses rather
-            # than failure codes, so they contribute no vcfc:FilterCode.
-            record_id = columns[2] if len(columns) > 2 else "."
-            if record_id != ".":
-                record_identifiers += sum(1 for part in record_id.split(";") if part)
-            filter_column = columns[6] if len(columns) > 6 else "."
-            if filter_column not in ("PASS", "."):
-                for code in (part for part in filter_column.split(";") if part):
-                    filter_codes += 1
-                    if code in declared_filter_ids:
-                        declared_filter_codes += 1
+            _ids, _codes, _declared = record_decomposition_counts(
+                columns, declared_filter_ids
+            )
+            record_identifiers += _ids
+            filter_codes += _codes
+            declared_filter_codes += _declared
             # The record digest is computed from the raw line so it matches the
             # lexical values the mapping puts in the graph, character for
             # character, with no round-trip through cyvcf2's typed accessors.
