@@ -247,7 +247,7 @@ published vocabulary is worth knowing about: the ontology declares
 shape constrains them with `sh:datatype xsd:integer`, and a SHACL datatype
 constraint compares the datatype IRI exactly. This converter emits
 `xsd:integer`, which satisfies both. See
-[`validation-migration-notes.md`](validation-migration-notes.md#3-ordinals-are-now-xsdinteger-not-xsdpositiveinteger).
+[`validation-migration-notes.md`](validation-migration-notes.md#5-ordinals-are-xsdinteger).
 
 ---
 

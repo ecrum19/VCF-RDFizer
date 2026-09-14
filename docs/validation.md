@@ -155,6 +155,15 @@ vcf-rdfizer --mode full \
 For standalone validation, the input VCF and the RDF artifact must originate
 from the same conversion.
 
+> **The validator ships inside the image.** `src/validation/` is copied into
+> the Docker image at build time, so `--mode validation` runs the image's
+> expectations, not the working tree's. A release that teaches the converter a
+> new resource family teaches the runner to expect it in the same commit — but
+> an image built before that commit will report the new predicates as
+> unexpected. Pull the image matching your wrapper version (`docker pull
+> ecrum19/vcf-rdfizer:latest`, or pin with `--image-version`) before reading a
+> `MISMATCH` on Q9 or Q10 as a conversion defect.
+
 ## Which artifact is validated
 
 `--rdf` accepts any artifact the pipeline produces:

@@ -33,7 +33,7 @@ a record with `ALT=.` satisfies both the shape and `vcfc:missingValuePolicy`.
 
 ### ~~1. The validation suite has not been migrated~~ — **done**
 
-The suite passes: 415 tests, mutation score 96/113 (85%) across 60 mutations.
+The suite passes: 703 tests, mutation score 96/113 (85%) across 60 mutations.
 The runner and the wrapper now share one vocabulary module instead of mirroring
 each other, and the census derives every new resource family from the VCF. Ten
 of the eighteen new mutations are recorded gaps, each with what would close it.

@@ -3978,12 +3978,17 @@ def append_record_detail_rdf(
 ) -> dict:
     """Append per-record detail the RML mapping cannot express.
 
-    Three groups of things land here, all of them per-record, so they share one
+    Four groups of things land here, all of them per-record, so they share one
     pass over ``records.tsv``:
 
     * The fixed fields whose datatype depends on the row -- ID, ALT, QUAL and
       FILTER. Each may be the VCF missing token, which the vocabulary requires
       as ``"."^^vcfc:Null``, and RML cannot switch datatype per row.
+    * The decompositions of those cells: ``vcfc:RecordIdentifier`` per
+      semicolon-separated ID, the ``vcfc:filterStatus`` and its
+      ``vcfc:FilterCode`` resources, and the ordered ``vcfc:FormatKey`` list.
+      A single source cell becomes several resources, which is the other thing
+      RML cannot do here.
     * The allele layer: ``vcfc:ReferenceAllele`` and ``vcfc:AltAllele``
       resources parsed out of REF and ALT, with their index, kind, symbolic
       type and breakend components, plus the ``vcfc:chromosome`` link to the

@@ -231,8 +231,8 @@ a decoder or an application-level vector function. If you need to query
 genotypes directly, that is the argument for expanded mode.
 
 Everything *not* per-sample is identical in both profiles: the header layer, the
-allele layer, structured INFO with its value items, and the SV carriers are all
-emitted the same way.
+allele layer, structured INFO with its value items, the SV carriers, and the
+record-level ID/FILTER/FORMAT-key decompositions are all emitted the same way.
 
 ### Condensed growth
 
