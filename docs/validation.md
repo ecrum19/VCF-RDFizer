@@ -97,6 +97,29 @@ vcf-rdfizer --mode full -i cohort.vcf.gz --validate \
   --validation-query-timeout 14400 --validation-time-budget 86400 -o ./out
 ```
 
+### A startup probe that fails on a healthy engine
+
+Comunica's endpoint is probed twice at startup: `_await_bind` waits for the
+port to answer at all, then `_await_warm` proves the endpoint can actually read
+the source, so that readiness is charged to setup rather than billed to the
+first query.
+
+The warm-up probe used to be a single request. Comunica answers the bind probe
+and then hands the socket to its worker, so the next connection can be refused
+for a moment while the process is perfectly healthy — and a refused connection
+comes back from the kernel immediately, not after the warm-up budget. The result
+was an engine that failed in milliseconds while reporting
+
+```
+comunica could not read /work/…/expanded.nt within 3600s
+```
+
+a timeout it had never waited for. The probe now retries until the budget is
+genuinely spent, still failing at once if the server process exits or if the
+endpoint *answers* with an error, and the duration in the message is measured
+rather than read back from the flag. If you see that message now, the wait was
+real: raise `--comunica-warmup-timeout`, or use `--engine qlever`.
+
 ### A decode that reports success and writes garbage
 
 Every decode into N-Triples is now checked structurally before anything reads
@@ -154,6 +177,15 @@ vcf-rdfizer --mode full \
 
 For standalone validation, the input VCF and the RDF artifact must originate
 from the same conversion.
+
+> **The validator ships inside the image.** `src/validation/` is copied into
+> the Docker image at build time, so `--mode validation` runs the image's
+> expectations, not the working tree's. A release that teaches the converter a
+> new resource family teaches the runner to expect it in the same commit — but
+> an image built before that commit will report the new predicates as
+> unexpected. Pull the image matching your wrapper version (`docker pull
+> ecrum19/vcf-rdfizer:latest`, or pin with `--image-version`) before reading a
+> `MISMATCH` on Q9 or Q10 as a conversion defect.
 
 ## Which artifact is validated
 

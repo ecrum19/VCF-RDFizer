@@ -814,6 +814,35 @@ def expected_census(
     ):
         predicates[predicate] = 0 if parser[field] == METADATA_ABSENT else 1
 
+    # ID and FILTER decompositions, and the record's declared FORMAT keys.
+    # All three are record-level, so both sample profiles carry them.
+    identifiers = parser.get("recordIdentifierCount", 0)
+    filter_codes = parser.get("filterCodeCount", 0)
+    format_keys = parser.get("formatKeyOccurrences", 0)
+    if identifiers:
+        classes[f"{VCFC}RecordIdentifier"] = identifiers
+        predicates[f"{VCFC}hasIdentifier"] = identifiers
+        predicates[f"{VCFC}identifierValue"] = identifiers
+    if filter_codes:
+        classes[f"{VCFC}FilterCode"] = filter_codes
+        predicates[f"{VCFC}hasFilterCode"] = filter_codes
+        predicates[f"{VCFC}filterCodeValue"] = filter_codes
+        predicates[f"{VCFC}declaredByFilter"] = parser.get("declaredFilterCodeCount", 0)
+    # componentIndex is shared by both decompositions.
+    if identifiers or filter_codes:
+        predicates[f"{VCFC}componentIndex"] = identifiers + filter_codes
+    # Every record gets a status, including PASS and the missing token.
+    predicates[f"{VCFC}filterStatus"] = records
+    if format_keys:
+        classes[f"{VCFC}FormatKey"] = format_keys
+        predicates[f"{VCFC}hasFormatKey"] = format_keys
+        predicates[f"{VCFC}fieldIndex"] = (
+            predicates.get(f"{VCFC}fieldIndex", 0) + format_keys
+        )
+        predicates[f"{VCFC}declaredBy"] = (
+            predicates.get(f"{VCFC}declaredBy", 0) + format_keys
+        )
+
     # A sites-only VCF still declares a profile: vcfc:RepresentationProfileShape
     # requires exactly one on every file, and a file with no genotype columns
     # has no genotype data to condense.
@@ -848,6 +877,11 @@ def expected_census(
             predicates[f"{VCFC}forSample"] = records * samples
             predicates[f"{VCFC}hasFormatValue"] = parser["formatValueSlots"]
             predicates[f"{VCFC}fieldValue"] = parser["nonEmptyFormatValues"]
+            # One preceding indicator per allele call, including the effective
+            # first one the source omits.
+            calls = parser.get("emittedGenotypePredicates", {}).get("callIndex", 0)
+            if calls:
+                predicates[f"{VCFC}phaseIndicator"] = calls
             # A single, non-missing Integer/Float FORMAT cell also gains the
             # typed companion property, exactly as an INFO value does.
             predicates[f"{VCFC}fieldValueInteger"] = (
@@ -911,6 +945,11 @@ def expected_census(
         _count_definitions(predicates, parser.get("synthesizedInfoNumbers", []))
         predicates[f"{VCFC}fieldValue"] = (
             predicates.get(f"{VCFC}fieldValue", 0) + values - parser["infoFlagCount"]
+        )
+        # Source order within the INFO column; the FORMAT keys add their own
+        # below, and both use the same predicate.
+        predicates[f"{VCFC}fieldIndex"] = (
+            predicates.get(f"{VCFC}fieldIndex", 0) + values
         )
 
         # The allele layer, the value items, the SV carriers and the parsed
@@ -1011,6 +1050,50 @@ def declared_field_types(raw_header: str, header_key: str = "INFO") -> dict[str,
 
 #: Retained name for the INFO-only callers that predate the FORMAT counting.
 info_declared_types = declared_field_types
+
+
+def record_decomposition_counts(columns, declared_filter_ids):
+    """Count the ID and FILTER components one record contributes.
+
+    The emitter breaks both columns into ordered resources, so the census has to
+    count the same parts. PASS and the missing token are FILTER statuses rather
+    than failure codes and contribute no vcfc:FilterCode; a missing ID column
+    contributes no vcfc:RecordIdentifier.
+
+    Returns (identifiers, filter codes, filter codes that cite a declaration).
+    """
+    record_id = columns[2] if len(columns) > 2 else "."
+    identifiers = 0
+    if record_id != ".":
+        identifiers = sum(1 for part in record_id.split(";") if part)
+    codes = declared = 0
+    filter_column = columns[6] if len(columns) > 6 else "."
+    if filter_column not in ("PASS", "."):
+        for code in (part for part in filter_column.split(";") if part):
+            codes += 1
+            if code in declared_filter_ids:
+                declared += 1
+    return identifiers, codes, declared
+
+
+def read_vcf_data_columns(vcf_path: Path):
+    """Yield each data line's columns, from the file's own text.
+
+    Same reason as :func:`read_vcf_header_text`: htslib normalises what it
+    re-serializes. ``str(variant)`` restores a trailing FORMAT field the file
+    omitted -- a sample written ``0`` comes back as ``0:.`` -- so a census taken
+    from it counts cells the file does not contain. Worse, it makes the
+    validator blind to exactly the case VCF Core models deliberately: an emitter
+    that invented the dropped field would look correct.
+    """
+    opener = gzip.open if vcf_path.name.endswith(".gz") else open
+    with opener(vcf_path, "rt", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if line.startswith("#"):
+                continue
+            stripped = line.rstrip("\r\n")
+            if stripped:
+                yield stripped.split("\t")
 
 
 def read_vcf_header_text(vcf_path: Path) -> str:
@@ -1195,12 +1278,15 @@ def parse_vcf(
     info_definitions: set[str] = set()
     info_values = info_flags = info_typed_integers = info_typed_decimals = 0
     format_typed_integers = format_typed_decimals = 0
+    declared_filter_ids = set(declared_field_types(_raw_header, "FILTER"))
+    record_identifiers = filter_codes = declared_filter_codes = 0
     source_component = rml_uri_component(vcf_path.name)
     record_rows: list[list[str]] = []
     records_with_format_column = records_with_format_keys = 0
     format_key_occurrences = format_value_slots = non_empty_format_values = 0
     distinct_format_keys: set[str] = set()
     _scan_started = time.monotonic()
+    source_columns = read_vcf_data_columns(vcf_path)
     try:
         for variant in reader:
             total_records += 1
@@ -1233,8 +1319,23 @@ def parse_vcf(
             if format_keys:
                 records_with_format_column += 1
 
-            columns = str(variant).rstrip("\r\n").split("\t")
+            # The file's own columns, not str(variant)'s: see
+            # read_vcf_data_columns. cyvcf2 yields records in file order, so the
+            # two iterators stay aligned; a short read means the reader skipped
+            # a line and the census would be silently wrong, so it is an error.
+            columns = next(source_columns, None)
+            if columns is None:
+                raise ValueError(
+                    f"{vcf_path.name}: fewer data lines than parsed records at "
+                    f"record {total_records}"
+                )
             record_rows.append(columns)
+            _ids, _codes, _declared = record_decomposition_counts(
+                columns, declared_filter_ids
+            )
+            record_identifiers += _ids
+            filter_codes += _codes
+            declared_filter_codes += _declared
             # The record digest is computed from the raw line so it matches the
             # lexical values the mapping puts in the graph, character for
             # character, with no round-trip through cyvcf2's typed accessors.
@@ -1407,6 +1508,9 @@ def parse_vcf(
         "infoTypedDecimalCount": info_typed_decimals,
         "formatTypedIntegerCount": format_typed_integers,
         "formatTypedDecimalCount": format_typed_decimals,
+        "recordIdentifierCount": record_identifiers,
+        "filterCodeCount": filter_codes,
+        "declaredFilterCodeCount": declared_filter_codes,
         "q11_record_digest": [
             {"bucket": bucket, "recordCount": int(count)}
             for bucket, count in sorted(digest_buckets.items())
@@ -2150,27 +2254,72 @@ class ComunicaHttpEndpointMixin:
             f"{self.bind_timeout}s: {last_error}"
         )
 
+    @staticmethod
+    def _is_connection_level_error(error: BaseException) -> bool:
+        """Is this the socket never opening, rather than the server answering?
+
+        An HTTPError means the endpoint replied, so whatever it said is a real
+        result and must not be retried. Everything else at this layer -- a
+        refused, reset or aborted connection, or a socket that timed out -- is
+        about reaching the process, not about what it thinks of the query.
+        """
+        import urllib.error
+
+        if isinstance(error, urllib.error.HTTPError):
+            return False
+        if isinstance(error, urllib.error.URLError):
+            return isinstance(error.reason, (OSError, TimeoutError))
+        return isinstance(error, (ConnectionError, TimeoutError))
+
     def _await_warm(self, server_log: Path) -> None:
         """Prove the endpoint can actually read the source, before the suite runs.
 
         Charged to setup rather than to the first query, so one query is not
         billed for readiness that every later query got for free.
+
+        A refused connection is retried rather than fatal. ``_await_bind``
+        returns as soon as the port answers one probe, but comunica hands the
+        socket to its worker after that reply, so the next connection can be
+        refused for a moment while the process is perfectly healthy. Treating
+        that as failure made the whole engine unusable on a timing accident --
+        and reported it as a timeout that never happened, because a refused
+        connection comes back from the kernel at once rather than after the
+        warm-up budget. Only the server exiting, an answer from the endpoint,
+        or the budget genuinely running out ends this wait.
         """
         assert self.endpoint is not None
         started = time.monotonic()
-        try:
-            self._post(
-                self.endpoint, "SELECT * WHERE { ?s ?p ?o } LIMIT 1",
-                timeout=self.warmup_timeout,
-            )
-        except Exception as error:  # noqa: BLE001 - surfaced as engine failure
+        deadline = started + self.warmup_timeout
+        last_error: BaseException | None = None
+        while True:
             self._assert_alive(server_log)
-            raise RuntimeError(
-                f"{self.name} could not read {self._endpoint_source_argument()} "
-                f"within {self.warmup_timeout}s (raise --comunica-warmup-timeout, "
-                f"or use --engine qlever): {error}"
-            ) from error
-        self.warmup_seconds = time.monotonic() - started
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                self._post(
+                    self.endpoint, "SELECT * WHERE { ?s ?p ?o } LIMIT 1",
+                    timeout=remaining,
+                )
+            except Exception as error:  # noqa: BLE001 - surfaced as engine failure
+                self._assert_alive(server_log)
+                if not self._is_connection_level_error(error):
+                    raise RuntimeError(
+                        f"{self.name} could not read "
+                        f"{self._endpoint_source_argument()}: {error}"
+                    ) from error
+                last_error = error
+                time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+            else:
+                self.warmup_seconds = time.monotonic() - started
+                return
+        self._assert_alive(server_log)
+        raise RuntimeError(
+            f"{self.name} could not read {self._endpoint_source_argument()} "
+            f"within {time.monotonic() - started:.0f}s "
+            f"(raise --comunica-warmup-timeout, or use --engine qlever): "
+            f"{last_error or 'the endpoint never accepted a connection'}"
+        )
 
     def _assert_alive(self, server_log: Path) -> None:
         if self.server is not None and self.server.poll() is not None:

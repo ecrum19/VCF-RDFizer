@@ -7,7 +7,7 @@ and follows each input's declared VCF version. The validation suite has been
 migrated with it. This file records what changed, what it found, and what is
 still open.
 
-**Status: the suite passes.** 415 tests, no failures. The mutation score is
+**Status: the suite passes.** 707 tests, no failures. The mutation score is
 96/113 (85%) across 60 mutations, each listed with its expected detector.
 
 ---
@@ -86,6 +86,33 @@ The fixture's `XSD_POSITIVE_INTEGER` is gone. VCF Core's
 `vcfc:IntegerLiteralShape` accepts `xsd:integer` and every integer-derived
 datatype with the bound applied numerically, so the ontology range and the
 shapes no longer disagree.
+
+### 6. The census counts the file's cells, not htslib's rendering of them
+
+`parse_vcf` read each data row from `str(variant)`. htslib normalises what it
+re-serializes: a sample written `0` under `GT:DP` comes back as `0:.`, so the
+census counted a FORMAT cell the file does not contain. That made the validator
+blind to precisely the case VCF Core models deliberately — an emitter that
+*invented* the dropped field would have looked correct.
+
+`read_vcf_data_columns` now reads the data lines from the file's own text,
+alongside the cyvcf2 reader, the same way `read_vcf_header_text` already read
+the header. The two iterators are asserted to stay aligned: a short read means
+the reader skipped a line, and a silently wrong census is worse than an error.
+
+### 7. The record decompositions are derived, not mirrored
+
+`expected_census` gained the ID, FILTER and FORMAT-key decompositions, the
+per-call `vcfc:phaseIndicator`, and `vcfc:fieldIndex` on both INFO entries and
+FORMAT keys. `record_decomposition_counts` derives the ID and FILTER component
+counts from the source columns — including the rule that `PASS` and the missing
+token are statuses rather than failure codes, so they contribute no
+`vcfc:FilterCode` — rather than asking the emitter what it produced.
+
+`typed_value_kind` now states the typed-value rule once for INFO and FORMAT
+both. The previous INFO mirror used bare `int()`/`float()`, so it would have
+counted a BCF-reserved integer and a non-finite float that the emitter
+deliberately skips.
 
 ## What the suite found
 

@@ -146,6 +146,19 @@ never declared it - making the oracle expect a `FilterDefinition` the graph
 could not contain. The oracle now reads the header block from the file itself,
 which is the same text the conversion reads.
 
+The same normalisation reaches the data lines, and cost a second fix. The census
+read each record from `str(variant)`, which restores a trailing FORMAT field the
+file omitted: a sample written `0` under `GT:DP` comes back as `0:.`, so the
+oracle counted a cell the file does not contain. That made the validator blind
+to exactly the case VCF Core models on purpose - an emitter that *invented* the
+dropped field would have looked correct. The census now reads the data lines
+from the file's own text too, alongside the cyvcf2 reader, and asserts the two
+stay aligned rather than silently miscounting if one skips a line.
+
+The rule generalises: **a parser's re-serialization is not the file.** Anything
+the oracle counts should be read from the source text, not from what a library
+renders back.
+
 **When adding a query**, prefer datatype-*family* checks and lexical
 comparisons over anything that assumes a store's internal representation, and
 run the agreement script before trusting it.

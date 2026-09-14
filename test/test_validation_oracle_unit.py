@@ -192,6 +192,112 @@ class GenotypeClassificationTests(VerboseTestCase):
         self.assertEqual(V.classify_genotype((), has_gt=True), "MISSING")
 
 
+class SourceDataColumnTests(VerboseTestCase):
+    """The census must see the file's cells, not htslib's rendering of them."""
+
+    def _write(self, body):
+        import tempfile, pathlib
+        path = pathlib.Path(tempfile.mkdtemp()) / "s.vcf"
+        path.write_text(body, encoding="utf-8")
+        return path
+
+    def test_a_dropped_trailing_format_field_stays_dropped(self):
+        """VCF 4.5 lets a sample omit trailing FORMAT fields.
+
+        cyvcf2 re-serializes that sample as '0:.', so a census taken from
+        str(variant) counts a cell the file does not contain -- and could never
+        catch an emitter that invented it.
+        """
+        path = self._write(
+            "##fileformat=VCFv4.5\n"
+            '##FORMAT=<ID=GT,Number=1,Type=String,Description="g">\n'
+            '##FORMAT=<ID=DP,Number=1,Type=Integer,Description="d">\n'
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n"
+            "chr1\t1\t.\tA\tG\t.\t.\t.\tGT:DP\t0\n"
+        )
+        columns = list(V.read_vcf_data_columns(path))
+        self.assertEqual(len(columns), 1)
+        self.assertEqual(columns[0][9], "0")
+
+    def test_header_lines_and_blank_lines_are_skipped(self):
+        """Only data lines reach the census."""
+        path = self._write(
+            "##fileformat=VCFv4.5\n"
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n"
+            "chr1\t1\t.\tA\tG\t.\t.\t.\n"
+            "\n"
+            "chr1\t2\t.\tC\tT\t.\t.\t.\n"
+        )
+        columns = list(V.read_vcf_data_columns(path))
+        self.assertEqual([c[1] for c in columns], ["1", "2"])
+
+
+class TypedValueKindTests(VerboseTestCase):
+    """The rule deciding which cells gain a typed companion property.
+
+    Stated independently of the emitter on purpose: an expectation computed by
+    the code under test would only prove it agrees with itself.
+    """
+
+    def test_a_single_integer_gains_an_integer_companion(self):
+        self.assertEqual(V.typed_value_kind("42", "Integer"), "Integer")
+
+    def test_a_single_float_gains_a_decimal_companion(self):
+        self.assertEqual(V.typed_value_kind("0.5", "Float"), "Float")
+
+    def test_a_string_field_gains_nothing(self):
+        self.assertIsNone(V.typed_value_kind("0/1", "String"))
+
+    def test_a_comma_list_gains_nothing(self):
+        """A list is represented by value items, not one typed literal."""
+        self.assertIsNone(V.typed_value_kind("1,2", "Integer"))
+
+    def test_the_missing_token_gains_nothing(self):
+        self.assertIsNone(V.typed_value_kind(".", "Integer"))
+
+    def test_a_BCF_reserved_integer_gains_nothing(self):
+        """VCF 4.5 reserves -2147483648..-2147483641; they keep only fieldValue."""
+        for value in ("-2147483648", "-2147483641"):
+            with self.subTest(value=value):
+                self.assertIsNone(V.typed_value_kind(value, "Integer"))
+        self.assertEqual(V.typed_value_kind("-2147483640", "Integer"), "Integer")
+
+    def test_a_non_finite_float_gains_nothing(self):
+        """INF and NaN have no xsd:decimal form."""
+        for value in ("NaN", "inf", "-INF", "INFINITY"):
+            with self.subTest(value=value):
+                self.assertIsNone(V.typed_value_kind(value, "Float"))
+
+    def test_a_value_that_does_not_parse_gains_nothing(self):
+        self.assertIsNone(V.typed_value_kind("twelve", "Integer"))
+
+
+class DeclaredFieldTypeTests(VerboseTestCase):
+    """FORMAT declarations are read the same way INFO ones are."""
+
+    def test_format_declarations_are_read_when_asked_for(self):
+        header = "\n".join([
+            '##INFO=<ID=DP,Number=1,Type=Integer,Description="i">',
+            '##FORMAT=<ID=AD,Number=R,Type=Integer,Description="f">',
+            '##FORMAT=<ID=GT,Number=1,Type=String,Description="g">',
+        ])
+        self.assertEqual(V.declared_field_types(header, "FORMAT"),
+                         {"AD": "Integer", "GT": "String"})
+
+    def test_asking_for_one_key_does_not_return_the_other(self):
+        header = "\n".join([
+            '##INFO=<ID=DP,Number=1,Type=Integer,Description="i">',
+            '##FORMAT=<ID=DP,Number=1,Type=Float,Description="f">',
+        ])
+        self.assertEqual(V.declared_field_types(header, "INFO"), {"DP": "Integer"})
+        self.assertEqual(V.declared_field_types(header, "FORMAT"), {"DP": "Float"})
+
+    def test_filter_declarations_expose_their_ids(self):
+        """A failure code links to its declaration, so the ids must be readable."""
+        header = '##FILTER=<ID=q10,Description="Quality below ten">'
+        self.assertEqual(set(V.declared_field_types(header, "FILTER")), {"q10"})
+
+
 class InfoDeclaredTypeTests(VerboseTestCase):
     def test_each_declared_info_key_maps_to_its_type(self):
         """The INFO Type drives typed-value counting, so it is read per key."""
@@ -650,3 +756,35 @@ class ResolvedArgumentTests(VerboseTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RecordDecompositionCountTests(VerboseTestCase):
+    """The census counts the same ID and FILTER parts the emitter builds."""
+
+    def _cols(self, record_id=".", filter_column="."):
+        return ["chr1", "1", record_id, "A", "G", ".", filter_column, ".", "GT", "0/1"]
+
+    def test_semicolon_separated_identifiers_are_counted(self):
+        self.assertEqual(V.record_decomposition_counts(self._cols("idA;idB"), set()),
+                         (2, 0, 0))
+
+    def test_the_missing_id_token_contributes_no_identifier(self):
+        self.assertEqual(V.record_decomposition_counts(self._cols("."), set()), (0, 0, 0))
+
+    def test_pass_and_missing_are_statuses_not_codes(self):
+        for value in ("PASS", "."):
+            with self.subTest(filter=value):
+                self.assertEqual(
+                    V.record_decomposition_counts(self._cols(".", value), {"q10"}),
+                    (0, 0, 0),
+                )
+
+    def test_failure_codes_are_counted_and_matched_against_declarations(self):
+        """Only a code with a ##FILTER line can cite one."""
+        self.assertEqual(
+            V.record_decomposition_counts(self._cols(".", "q10;s50"), {"q10"}),
+            (0, 2, 1),
+        )
+
+    def test_a_truncated_record_is_treated_as_missing_rather_than_crashing(self):
+        self.assertEqual(V.record_decomposition_counts(["chr1", "1"], set()), (0, 0, 0))

@@ -496,6 +496,32 @@ def _format_typed_shape() -> dict:
     }
 
 
+def _record_decomposition_shape() -> dict:
+    """ID and FILTER components the emitter turns into ordered resources.
+
+    Derived from the fixture's own columns, mirroring the rule rather than
+    calling the emitter: PASS and the missing token are FILTER statuses, so
+    neither contributes a failure code.
+    """
+    declared_filters = set(_declared_ids("FILTER"))
+    identifiers = codes = declared_codes = 0
+    for row in _record_rows():
+        record_id = row[2] if len(row) > 2 else "."
+        if record_id != ".":
+            identifiers += sum(1 for part in record_id.split(";") if part)
+        filter_column = row[6] if len(row) > 6 else "."
+        if filter_column not in ("PASS", "."):
+            for code in (part for part in filter_column.split(";") if part):
+                codes += 1
+                if code in declared_filters:
+                    declared_codes += 1
+    return {
+        "recordIdentifierCount": identifiers,
+        "filterCodeCount": codes,
+        "declaredFilterCodeCount": declared_codes,
+    }
+
+
 def _info_shape() -> dict:
     """INFO counters the census needs, mirroring the emitter's typing rules."""
     declared = {}
@@ -598,6 +624,7 @@ def parser_summary(
         "headerLineCount": len(HEADER_LINES),
         **_format_shape(),
         **_format_typed_shape(),
+        **_record_decomposition_shape(),
         **_info_shape(),
         "fileFormat": FILE_FORMAT,
         "referenceGenome": REFERENCE_GENOME,

@@ -129,6 +129,23 @@ Float lexical space:
 | `.` or empty | `"."^^vcfc:Null` |
 | anything else | a plain string literal, deliberately kept rather than dropped, and reported by the SHACL layer |
 
+Three of those cells are also **decomposed**, in both INFO representations,
+because a single cell carries a list the vocabulary models as resources:
+
+- **ID.** Each semicolon-separated component becomes a
+  `vcfc:RecordIdentifier` at `…#record/{ROW_ID}/id/{N}`, linked with
+  `vcfc:hasIdentifier` and carrying `identifierValue` and `componentIndex`.
+  The raw `vcfc:recordId` stays beside it.
+- **FILTER.** The call gets a `vcfc:filterStatus` of `vcfc:FiltersPassed`
+  (`PASS`), `vcfc:FiltersNotApplied` (`.`) or `vcfc:FiltersFailed`. In the
+  failed case each code also becomes a `vcfc:FilterCode` with
+  `filterCodeValue` and `componentIndex`, joined to its `##FILTER` declaration
+  with `vcfc:declaredByFilter` so a consumer can read the description without
+  re-reading the header.
+- **FORMAT.** The key list becomes ordered `vcfc:FormatKey` resources carrying
+  `vcfc:fieldIndex` and `vcfc:declaredBy`, beside the raw `vcfc:formatRaw`.
+  The IRI shape follows the class's own `iriTemplate`.
+
 `--info-representation structured` (the default) additionally emits:
 
 - **The allele layer.** `REF` and each `ALT` item become an ordered
@@ -143,7 +160,8 @@ Float lexical space:
   `CHROM` names, with `vcfc:chromosome`.
 - **Structured INFO.** One `vcfc:InfoFieldValue` per record and key at
   `…#call/{ROW_ID}/info/{KEY}`, linked to the `##INFO` declaration through
-  `vcfc:declaredBy`. A single-valued field whose declared `Type` is `Integer` or
+  `vcfc:declaredBy` and carrying `vcfc:fieldIndex`, its position in the INFO
+  column. A single-valued field whose declared `Type` is `Integer` or
   `Float` also gets a typed `fieldValueInteger` / `fieldValueDecimal`; a `Flag`
   gets `vcfc:fieldValueBoolean true`.
 - **Value items.** A field whose declared `Number` gives its positions meaning —
@@ -154,6 +172,11 @@ Float lexical space:
   …) record the width with `vcfc:tupleArity` so a consumer can regroup them.
   This closes the multi-valued-INFO gap that earlier versions recorded in
   `limitations.md`.
+
+  The local-allele codes `LA`/`LR`/`LG` are a special case: they index a
+  *sample's* allele subset, and an INFO field has no sample. Their items are
+  therefore still materialized and indexed, but carry no `vcfc:forAllele` —
+  see the genotype layer below, where the subset exists.
 - **The SV carriers.** `SVLEN`, `SVCLAIM`, `IMPRECISE`, `NOVEL`, `END`, `EVENT`
   with `EVENTTYPE`, the confidence intervals (`CIPOS`/`CIEND` through FALDO
   `InRangePosition`, the rest as `vcfc:ConfidenceInterval`), and the
@@ -224,11 +247,45 @@ instead of relying on repeated `sampleId` literals.
 **Expanded mode additionally parses the per-sample values** into the vocabulary's
 genotype layer: `GT` becomes a `vcfc:Genotype` with `genotypeString`, `ploidy`,
 `phasingStatus` and one `vcfc:GenotypeAlleleCall` per position (each either
-pointing at the allele it called or flagged `isNoCall`); `FT` becomes
-`sampleFilter`; `PS`/`PSL`/`PSO`/`PSQ` become a `vcfc:PhaseSet`; `LAA` becomes a
-`vcfc:LocalAlleleSet`; `CN`/`CNQ`/`CNL`/`CNP` and `HAP`/`AHAP` become their
-copy-number and haplotype properties; and the pattern-defined `M`/`DPM`/`ADM`
-keys become `vcfc:BaseModification` resources pointing at a ChEBI residue.
+pointing at the allele it called or flagged `isNoCall`, and each carrying its
+own `vcfc:phaseIndicator`); `FT` becomes `sampleFilter`; `PS`/`PSL`/`PSO`/`PSQ`
+become a `vcfc:PhaseSet`; `LAA` becomes a `vcfc:LocalAlleleSet`;
+`CN`/`CNQ`/`CNL`/`CNP` and `HAP`/`AHAP` become their copy-number and haplotype
+properties; and the pattern-defined `M`/`DPM`/`ADM` keys become
+`vcfc:BaseModification` resources pointing at a ChEBI residue.
+
+Four details of that layer are worth stating explicitly:
+
+- **Local-allele fields are resolved through `LAA`, not positionally.** A
+  `Number=LA`/`LR` value list indexes the **sample's own local allele subset**,
+  not the record's ALT column. With `LAA=2,4` the local set is
+  {REF, ALT2, ALT4}, so the three values of an `LR` field belong to global
+  alleles 0, 2 and 4 — not 0, 1, 2. Each `vcfc:FieldValueItem` is joined with
+  `vcfc:forAllele` through that mapping. A sample that declares no `LAA` has no
+  local ordering to resolve against, so its items keep `vcfc:valueIndex` and get
+  no `vcfc:forAllele` at all: a wrong link is worse than an absent one, because
+  nothing in the graph would signal it. `LAA` is read before the per-key loop,
+  since a FORMAT string may legally list it after a field that depends on it.
+- **Phasing is per position, not per genotype.** `vcfc:phasingStatus` is
+  `vcfc:Phased` or `vcfc:Unphased` only when every position agrees. A genotype
+  whose indicators disagree — `0|1/2` — gets `vcfc:MixedPhasing`, and the
+  per-call `vcfc:phaseIndicator` carries the precise reading. A single verdict
+  would misdescribe it.
+- **Local-allele position belongs to the membership.** Alongside
+  `vcfc:hasLocalAllele`, each member of a `vcfc:LocalAlleleSet` gets a
+  `vcfc:LocalAlleleMembership` with `vcfc:localAllele` and `vcfc:localIndex`.
+  The ordinal cannot live on the allele resource, which is shared across
+  samples: two samples may give the same ALT different local positions. The
+  vocabulary deprecates `vcfc:localAlleleIndex` for that reason, and the
+  converter no longer emits it.
+- **Base-modification aliases resolve.** VCF 4.5 reserves each modification key
+  in two spellings — `M[0-9]+[ACGTUN]` and a named alias such as `M5mC` for
+  `M27551C` — across all three families, 30 aliased keys in total. Both
+  spellings build the same carrier against the same ChEBI residue, while the
+  key keeps its written spelling in the resource IRI so the graph traces back
+  to the source column. A `Number=M` field is decomposed over the bases the
+  genotype's called alleles actually carry, in GT order, since that is the
+  order the specification defines it over.
 
 **Condensed mode deliberately stops at the vector.** Decomposing GT per sample is
 exactly the per-sample materialization the condensed profile exists to avoid.

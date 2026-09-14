@@ -40,13 +40,16 @@ rather than as silent confidence. Every gap is listed under
 | POS | `POS` | `vcfc:pos` (`xsd:integer`) | yes | `q01`, `q11`, `preflight_position_datatype` | `corrupt_pos`, `drop_pos`, `retype_pos_as_string` |
 | POS ↔ record binding | — | — | yes | `q11_record_digest` | `permute_pos` |
 | ID | `ID` | `vcfc:recordId` | yes | `q11_record_digest` | (covered by digest) |
+| ID components | `ID` | `vcfc:hasIdentifier` → `vcfc:RecordIdentifier` (`identifierValue`, `componentIndex`) | yes | `q09_predicate_census`, `q10_class_census` | — |
 | REF | `REF` | `vcfc:ref` | yes | `q02`, `q03`, `q11` | `corrupt_alt` |
 | ALT | `ALT` | `vcfc:alt` | yes | `q02`, `q03`, `q11` | `corrupt_alt` |
 | REF/ALT ↔ record binding | — | — | yes | `q11_record_digest` | `permute_ref_alt` |
 | QUAL | `QUAL` | `vcfc:qual` (`xsd:decimal` / `vcfc:Null`) | yes | `q09`, `q11` | `drop_qual`, `drop_all_qual`, `corrupt_qual` |
 | FILTER | `FILTER` | `vcfc:filter` | yes | `q04` (exact lexical), `q11` | `drop_filter`, `corrupt_filter_lexical` |
+| FILTER outcome | `FILTER` | `vcfc:filterStatus` → `vcfc:FiltersPassed` / `FiltersFailed` / `FiltersNotApplied` | yes | `q09_predicate_census`, `q10_class_census` | — |
+| FILTER codes | `FILTER` | `vcfc:hasFilterCode` → `vcfc:FilterCode` (`filterCodeValue`, `componentIndex`, `declaredByFilter`) | yes | `q09_predicate_census`, `q10_class_census` | — |
 | INFO (raw) | `INFO` | `vcfc:infoRaw` | yes | `q11_record_digest` | `corrupt_info_raw` |
-| INFO (structured) | `INFO` | `vcfc:hasInfoValue` → `vcfc:InfoFieldValue` → `vcfc:declaredBy` | yes | `q09`, `q12_info_value_digest` | `drop_info_value`, `corrupt_info_value`, `retype_info_value` |
+| INFO (structured) | `INFO` | `vcfc:hasInfoValue` → `vcfc:InfoFieldValue` → `vcfc:declaredBy`, `vcfc:fieldIndex` | yes | `q09`, `q12_info_value_digest` | `drop_info_value`, `corrupt_info_value`, `retype_info_value` |
 
 INFO values carry `vcfc:fieldValue` plus a typed `fieldValueInteger` /
 `fieldValueDecimal` when the declaration says `Number=1` and the value parses;
@@ -86,6 +89,7 @@ into ordered `vcfc:FieldValueItem` resources joined to their allele with
 | VCF element | RDF term | Represented | Validated by | Mutation |
 | --- | --- | --- | --- | --- |
 | FORMAT declaration | `vcfc:formatRaw` | yes | `q09_predicate_census` | — |
+| FORMAT keys, in order | `vcfc:hasFormatKey` → `vcfc:FormatKey` (`fieldIndex`, `declaredBy`) | yes | `q09_predicate_census`, `q10_class_census` | — |
 | Sample identity | `vcfc:sampleId` / `vcfc:sampleName` | yes | `preflight_sample_gt_inventory`, `q09` | `drop_sample_call` |
 | GT values (lexical) | `vcfc:hasFormatValue` → `vcfc:fieldValue` | yes | `q05`, `q06`, `q13` | `flip_genotype` |
 | Non-GT FORMAT (DP, GQ, AD, PL…) | `vcfc:FormatFieldValue` / `vcfc:FormatValueVector` | yes | `q13_format_value_digest` | `drop_format_value_dp`, `corrupt_format_value_dp`, `corrupt_format_vector` |
@@ -99,14 +103,16 @@ these values inside `vcfc:encodedValues`, which is the point of the profile.
 | VCF element | RDF term | Represented | Validated by | Mutation |
 | --- | --- | --- | --- | --- |
 | `GT` parsed | `vcfc:hasGenotype` → `vcfc:Genotype` (`genotypeString`, `ploidy`) | expanded only | — | — |
-| Phasing (`\|` vs `/`) | `vcfc:phasingStatus` → `vcfc:Phased` / `vcfc:Unphased` | expanded only | — | — |
+| Phasing (`\|` vs `/`) | `vcfc:phasingStatus` → `vcfc:Phased` / `vcfc:Unphased` / `vcfc:MixedPhasing` | expanded only | — | — |
+| Per-position phase indicator | `vcfc:phaseIndicator` on each `vcfc:GenotypeAlleleCall` | expanded only | `q09_predicate_census` | — |
 | Each GT position | `vcfc:hasAlleleCall` → `vcfc:GenotypeAlleleCall` (`callIndex`, `isNoCall`, `calledAllele`) | expanded only | — | — |
 | `FT` | `vcfc:sampleFilter` | expanded only | — | — |
 | `PS`/`PSL`/`PSO`/`PSQ` | `vcfc:inPhaseSet` → `vcfc:PhaseSet` | expanded only | — | — |
-| `LAA` | `vcfc:hasLocalAlleleSet` → `vcfc:LocalAlleleSet` | expanded only | — | — |
+| `LAA` | `vcfc:hasLocalAlleleSet` → `vcfc:LocalAlleleSet` → `vcfc:hasLocalAllele` | expanded only | — | — |
+| `LAA` membership order | `vcfc:hasLocalAlleleMembership` → `vcfc:LocalAlleleMembership` (`localAllele`, `localIndex`) | expanded only | — | — |
 | `CN`/`CNQ`/`CNL`/`CNP` | `vcfc:copyNumber` and friends | expanded only | — | — |
 | `HAP`/`AHAP` | `vcfc:haplotypeId`, `vcfc:ancestralHaplotypeId` | expanded only | — | — |
-| `M*`/`DPM*`/`ADM*` | `vcfc:BaseModification` with a ChEBI `modifiedResidue` | expanded only | — | — |
+| `M*`/`DPM*`/`ADM*`, numeric or aliased | `vcfc:BaseModification` with a ChEBI `modifiedResidue` | expanded only | — | — |
 
 ## Header section
 
@@ -187,6 +193,13 @@ conformant graph.
    resources, the way `q11` already covers the record fields — or leaning on the
    vocabulary's own consistency SHACL profile, which checks several of these
    agreements directly.
+
+   The ID, FILTER and FORMAT-key decompositions join this group rather than
+   forming a new one: `q09`/`q10` expect an exact count of each
+   `vcfc:RecordIdentifier`, `vcfc:FilterCode` and `vcfc:FormatKey`, derived from
+   the source columns, so dropping one or emitting a spurious one is caught —
+   but `identifierValue`, `filterCodeValue` and the component ordinals are not
+   compared against the file. No mutation targets them yet.
 5. **Ordering is checked by shapes, not by queries.** `vcfc:lineIndex` and
    `vcfc:recordIndex` are counted, but `corrupt_record_index` is undetected by
    the query layer. The SPARQL SHACL profile enforces uniqueness, nondecreasing
@@ -240,18 +253,26 @@ changes in the emitted graph.
 
 VCF Core 2.0.0 defines 338 terms. The converter emits from most of them, and its
 output is conformant, but the vocabulary can express more than the converter
-currently derives. Ten families are entirely unemitted:
+currently derives.
+
+Five of the ten families previously listed here as entirely unemitted are now
+emitted. Two are complete; one term each remains in the other three:
+
+| Family | Emitted | Still unemitted |
+| --- | --- | --- |
+| Parsed FILTER | `filterStatus`, `FiltersPassed/Failed/NotApplied`, `FilterCode`, `hasFilterCode`, `filterCodeValue`, `declaredByFilter` | — |
+| Local-allele membership | `LocalAlleleMembership`, `localAllele`, `localIndex` | — |
+| Parsed FORMAT keys | `FormatKey`, `hasFormatKey`, `fieldIndex` | `keyPattern` |
+| Parsed record IDs | `RecordIdentifier`, `hasIdentifier`, `identifierValue`, `componentIndex` | `aliasOf` — which identifier aliases which is not in the file |
+| Mixed phasing | `MixedPhasing`, `phaseIndicator` | `allelePhaseSet` |
+
+Five families remain entirely unemitted:
 
 | Family | Terms | What it would add |
 | --- | --- | --- |
-| Parsed FILTER | `filterStatus`, `FiltersPassed/Failed/NotApplied`, `FilterCode`, `hasFilterCode`, `declaredByFilter` | FILTER as resources joined to their `##FILTER` declarations, instead of only the raw string |
 | Padding semantics | `PaddingInterpretation`, `paddingRule`, `paddingSide`, `paddingAnchorPosition`, `paddingBaseCount` and their individuals | Which base of REF/ALT is the VCF padding base, and why |
-| Parsed FORMAT keys | `FormatKey`, `hasFormatKey`, `fieldIndex`, `keyPattern` | The FORMAT key list as ordered resources, not only `formatRaw` |
-| Parsed record IDs | `RecordIdentifier`, `hasIdentifier`, `identifierValue`, `aliasOf` | The semicolon-separated ID column split into individual identifiers |
 | Repeat units | `RepeatUnit`, `hasRepeatUnit`, `repeatUnitBases`, `rucConfidenceInterval`, `rbConfidenceInterval` | `RUB`-level detail below a repeat sequence |
 | Breakend mates | `mateBreakend`, `partnerBreakend`, `insertedSequence`, `isTelomereBreakend` | Resolving a breakend to the record describing its mate |
-| Local-allele membership | `LocalAlleleMembership`, `localAllele`, `localIndex` | LAA membership with its own index, beside the current `LocalAlleleSet` |
-| Mixed phasing | `MixedPhasing`, `phaseIndicator`, `allelePhaseSet` | Per-position phase indicators rather than one status per genotype |
 | Reference blocks | `hasReferenceBlock`, `blockAllele` | A record-level link to its gVCF block |
 | Raw/decoded values | `rawValue`, `decodedValue`, `percentEncodingPolicy`, `sampleFieldsRaw` | Percent-decoded companions beside the lossless source values |
 
@@ -274,7 +295,7 @@ five version overlays — with **zero violations**, in both representation
 profiles, checked with pySHACL using the bundled ontology plus every
 `ontology/versions/*.ttl` and RDFS inference, which is the configuration the
 vocabulary's own `tests/validate_shacl.py` uses. See
-[`validation-migration-notes.md`](validation-migration-notes.md#how-this-was-verified)
+[`validation-migration-notes.md`](validation-migration-notes.md#how-conformance-was-verified)
 for exactly what was covered.
 
 The only results reported are `sh:Warning`s where an input VCF omits the

@@ -80,7 +80,10 @@ declared assembly is recorded but not used for anything.
 target to the VCF Core vocabulary closed three gaps that used to be listed here:
 symbolic ALTs, breakends and `*` are now classified and parsed; `Number=A/R/G/P`
 values are decomposed into per-allele `vcfc:FieldValueItem` resources; and `GT`
-is parsed into ordered allele calls with an explicit phasing status. See
+is parsed into ordered allele calls with an explicit phasing status. The `ID`,
+`FILTER` and `FORMAT` columns followed: each is now decomposed into ordered
+resources beside its raw literal, and a genotype whose positions disagree about
+phasing is `vcfc:MixedPhasing` rather than forced to a single verdict. See
 [`conversion.md`](conversion.md#4-stage-three--the-wrappers-own-emitters).
 
 What remains true:

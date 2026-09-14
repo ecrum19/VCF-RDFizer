@@ -347,9 +347,12 @@ preserves the per-sample vocabulary model:
 - every represented FORMAT slot is a `vcfc:FormatFieldValue`, linked to its
   declaration with `vcfc:declaredBy`;
 - `GT` is parsed into a `vcfc:Genotype` with an explicit `vcfc:phasingStatus`
-  and one `vcfc:GenotypeAlleleCall` per position, and `FT`, `PS`/`PSL`, `LAA`,
-  the copy-number and haplotype keys, and the `M`/`DPM`/`ADM` base-modification
-  families get their own resources;
+  — `vcfc:MixedPhasing` when its positions disagree — and one
+  `vcfc:GenotypeAlleleCall` per position carrying its own `vcfc:phaseIndicator`,
+  and `FT`, `PS`/`PSL`, `LAA` (with per-sample `vcfc:LocalAlleleMembership`
+  ordinals), the copy-number and haplotype keys, and the `M`/`DPM`/`ADM`
+  base-modification families in both their numeric and aliased spellings get
+  their own resources;
 - the VCF file declares `vcfc:representationProfile vcfc:ExpandedRepresentation`.
 
 With the default rules, these triples are appended directly from `records.tsv`;
@@ -1080,7 +1083,7 @@ Safe termination:
 
 If you use VCF-RDFizer in a publication, please cite:
 
-VCF-RDFizer maintainers. (2026). *VCF-RDFizer* (Version 3.0.2) [Computer software]. GitHub. https://github.com/ecrum19/VCF-RDFizer
+VCF-RDFizer maintainers. (2026). *VCF-RDFizer* (Version 3.0.3) [Computer software]. GitHub. https://github.com/ecrum19/VCF-RDFizer
 
 BibTeX:
 
@@ -1089,7 +1092,7 @@ BibTeX:
   author  = {{VCF-RDFizer maintainers}},
   title   = {VCF-RDFizer},
   year    = {2026},
-  version = {3.0.2},
+  version = {3.0.3},
   url     = {https://github.com/ecrum19/VCF-RDFizer},
   note    = {Computer software}
 }
