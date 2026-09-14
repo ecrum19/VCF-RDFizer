@@ -2254,27 +2254,72 @@ class ComunicaHttpEndpointMixin:
             f"{self.bind_timeout}s: {last_error}"
         )
 
+    @staticmethod
+    def _is_connection_level_error(error: BaseException) -> bool:
+        """Is this the socket never opening, rather than the server answering?
+
+        An HTTPError means the endpoint replied, so whatever it said is a real
+        result and must not be retried. Everything else at this layer -- a
+        refused, reset or aborted connection, or a socket that timed out -- is
+        about reaching the process, not about what it thinks of the query.
+        """
+        import urllib.error
+
+        if isinstance(error, urllib.error.HTTPError):
+            return False
+        if isinstance(error, urllib.error.URLError):
+            return isinstance(error.reason, (OSError, TimeoutError))
+        return isinstance(error, (ConnectionError, TimeoutError))
+
     def _await_warm(self, server_log: Path) -> None:
         """Prove the endpoint can actually read the source, before the suite runs.
 
         Charged to setup rather than to the first query, so one query is not
         billed for readiness that every later query got for free.
+
+        A refused connection is retried rather than fatal. ``_await_bind``
+        returns as soon as the port answers one probe, but comunica hands the
+        socket to its worker after that reply, so the next connection can be
+        refused for a moment while the process is perfectly healthy. Treating
+        that as failure made the whole engine unusable on a timing accident --
+        and reported it as a timeout that never happened, because a refused
+        connection comes back from the kernel at once rather than after the
+        warm-up budget. Only the server exiting, an answer from the endpoint,
+        or the budget genuinely running out ends this wait.
         """
         assert self.endpoint is not None
         started = time.monotonic()
-        try:
-            self._post(
-                self.endpoint, "SELECT * WHERE { ?s ?p ?o } LIMIT 1",
-                timeout=self.warmup_timeout,
-            )
-        except Exception as error:  # noqa: BLE001 - surfaced as engine failure
+        deadline = started + self.warmup_timeout
+        last_error: BaseException | None = None
+        while True:
             self._assert_alive(server_log)
-            raise RuntimeError(
-                f"{self.name} could not read {self._endpoint_source_argument()} "
-                f"within {self.warmup_timeout}s (raise --comunica-warmup-timeout, "
-                f"or use --engine qlever): {error}"
-            ) from error
-        self.warmup_seconds = time.monotonic() - started
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                self._post(
+                    self.endpoint, "SELECT * WHERE { ?s ?p ?o } LIMIT 1",
+                    timeout=remaining,
+                )
+            except Exception as error:  # noqa: BLE001 - surfaced as engine failure
+                self._assert_alive(server_log)
+                if not self._is_connection_level_error(error):
+                    raise RuntimeError(
+                        f"{self.name} could not read "
+                        f"{self._endpoint_source_argument()}: {error}"
+                    ) from error
+                last_error = error
+                time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+            else:
+                self.warmup_seconds = time.monotonic() - started
+                return
+        self._assert_alive(server_log)
+        raise RuntimeError(
+            f"{self.name} could not read {self._endpoint_source_argument()} "
+            f"within {time.monotonic() - started:.0f}s "
+            f"(raise --comunica-warmup-timeout, or use --engine qlever): "
+            f"{last_error or 'the endpoint never accepted a connection'}"
+        )
 
     def _assert_alive(self, server_log: Path) -> None:
         if self.server is not None and self.server.poll() is not None:

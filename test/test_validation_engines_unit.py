@@ -438,6 +438,141 @@ class EngineTests(VerboseTestCase):
                     engine.start()
             self.assertIn("index not found", str(caught.exception))
 
+    def _comunica_engine_awaiting_warm(self, tmp_path, *, warmup_timeout):
+        """A started comunica engine, parked just before the warm-up probe."""
+        source = tmp_path / "cohort.nt"
+        source.write_bytes(TRIPLES)
+        engine = V.build_engine(
+            "comunica", source, raw_dir=tmp_path, scratch=tmp_path,
+            options={"comunica_warmup_timeout": warmup_timeout},
+        )
+        engine.endpoint = f"http://127.0.0.1:{engine.port}/sparql"
+        engine.server = mock.MagicMock()
+        engine.server.poll.return_value = None
+        return engine
+
+    def test_a_refused_connection_during_warmup_is_retried(self):
+        """The bind probe is not a promise that the next connection is accepted.
+
+        comunica answers the bind probe and then hands the socket to its
+        worker, so a connection a moment later can be refused while the process
+        is perfectly healthy. That briefly-closed port used to fail the whole
+        engine - and the run it gated - on a timing accident.
+        """
+        import urllib.error
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            engine = self._comunica_engine_awaiting_warm(tmp_path, warmup_timeout=30)
+            attempts = []
+
+            def flaky_post(endpoint, query, *, timeout):
+                attempts.append(timeout)
+                if len(attempts) < 3:
+                    raise urllib.error.URLError(ConnectionRefusedError(111, "refused"))
+                return b'{"results": {"bindings": []}}'
+
+            with mock.patch.object(engine, "_post", flaky_post), \
+                    mock.patch.object(V.time, "sleep"):
+                engine._await_warm(tmp_path / "server.log")
+
+            self.assertEqual(len(attempts), 3)
+            self.assertIsNotNone(engine.warmup_seconds)
+            # Each attempt is given what is left of the budget, never the whole
+            # of it again, so retrying cannot outlive --comunica-warmup-timeout.
+            self.assertLessEqual(attempts[-1], attempts[0])
+
+    def test_a_server_that_dies_during_warmup_fails_at_once(self):
+        """Retrying a refused port must not paper over a dead engine."""
+        import urllib.error
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            server_log = tmp_path / "server.log"
+            server_log.write_text("comunica: out of memory\n", encoding="utf-8")
+            engine = self._comunica_engine_awaiting_warm(tmp_path, warmup_timeout=3600)
+            engine.server.poll.return_value = 137
+            engine.server.returncode = 137
+
+            def refused(endpoint, query, *, timeout):
+                raise urllib.error.URLError(ConnectionRefusedError(111, "refused"))
+
+            started = time.monotonic()
+            with mock.patch.object(engine, "_post", refused):
+                with self.assertRaises(RuntimeError) as caught:
+                    engine._await_warm(server_log)
+
+            # Fails on the dead process, not after the 3600s budget.
+            self.assertLess(time.monotonic() - started, 30)
+            self.assertIn("137", str(caught.exception))
+            self.assertIn("out of memory", str(caught.exception))
+
+    def test_an_answered_error_is_not_retried(self):
+        """An HTTP reply is the endpoint's verdict, not a connection problem.
+
+        A source comunica cannot parse answers every probe the same way, so
+        retrying it would spin for the whole warm-up budget before reporting
+        what it already knew on the first attempt.
+        """
+        import urllib.error
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            engine = self._comunica_engine_awaiting_warm(tmp_path, warmup_timeout=3600)
+            attempts = []
+
+            def http_error(endpoint, query, *, timeout):
+                attempts.append(timeout)
+                raise urllib.error.HTTPError(
+                    endpoint, 500, "Parse error", {}, None
+                )
+
+            with mock.patch.object(engine, "_post", http_error):
+                with self.assertRaises(RuntimeError) as caught:
+                    engine._await_warm(tmp_path / "server.log")
+
+            self.assertEqual(len(attempts), 1)
+            message = str(caught.exception)
+            self.assertIn("could not read", message)
+            # The old message claimed a timeout it had never waited for.
+            self.assertNotIn("3600s", message)
+
+    def test_an_exhausted_warmup_budget_reports_the_time_it_waited(self):
+        """The duration in the message must be measured, not the flag's value.
+
+        The original reported the configured budget whatever had happened, so a
+        connection refused in milliseconds was announced as an hour-long
+        timeout - pointing every reader at the wrong thing entirely.
+        """
+        import itertools
+        import urllib.error
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            engine = self._comunica_engine_awaiting_warm(tmp_path, warmup_timeout=30)
+            attempts = []
+
+            def refused(endpoint, query, *, timeout):
+                attempts.append(timeout)
+                raise urllib.error.URLError(ConnectionRefusedError(111, "refused"))
+
+            # A clock that runs 10s per reading, so the budget expires after one
+            # attempt without the test waiting for any of it.
+            clock = itertools.count(0, 10)
+            with mock.patch.object(V.time, "monotonic", lambda: next(clock)), \
+                    mock.patch.object(V.time, "sleep"), \
+                    mock.patch.object(engine, "_post", refused):
+                with self.assertRaises(RuntimeError) as caught:
+                    engine._await_warm(tmp_path / "server.log")
+
+            self.assertEqual(len(attempts), 1)
+            message = str(caught.exception)
+            # 40s elapsed against a 30s budget: the figure is measured, and is
+            # not simply the flag read back out.
+            self.assertIn("within 40s", message)
+            self.assertIn("refused", message)
+            self.assertIn("--comunica-warmup-timeout", message)
+
     def test_qlever_command_lines_are_overridable(self):
         """QLever's CLI varies by release, so both argv are user-overridable."""
         with tempfile.TemporaryDirectory() as td:

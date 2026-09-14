@@ -7,7 +7,7 @@ and follows each input's declared VCF version. The validation suite has been
 migrated with it. This file records what changed, what it found, and what is
 still open.
 
-**Status: the suite passes.** 703 tests, no failures. The mutation score is
+**Status: the suite passes.** 707 tests, no failures. The mutation score is
 96/113 (85%) across 60 mutations, each listed with its expected detector.
 
 ---
