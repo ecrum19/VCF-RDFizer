@@ -1206,6 +1206,12 @@ def attach_census_expectations(
         else "_condensedFormatValueDigest"
     )
     parser["q13_format_value_digest"] = parser.get(key, [])
+    # The INFO value digest hashes the decomposed value items, which only the
+    # structured representation emits. Under raw INFO the column stays one
+    # opaque literal, so the query matches nothing and the expectation is
+    # empty -- not the digest of values the graph was never asked to produce.
+    if info_representation != "structured":
+        parser["q12_info_value_digest"] = []
     return parser
 
 

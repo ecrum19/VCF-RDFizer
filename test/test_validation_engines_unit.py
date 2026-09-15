@@ -797,6 +797,26 @@ class WrapperValidationTargetTests(VerboseTestCase):
         self.assertEqual(args.info_representation, "raw")
         self.assertEqual(args.header_representation, "basic")
 
+    def test_raw_info_expects_no_value_digest(self):
+        """q12 hashes decomposed INFO value items, which raw mode never emits.
+
+        Regression: with the representation threaded through, q09/q10 came back
+        clean but q12 still reported all 256 buckets missing, because the digest
+        is computed from the VCF in parse_vcf and was never gated on how the
+        INFO column was actually emitted.
+        """
+        from test import validation_fixtures as fixtures
+        structured = V.attach_census_expectations(
+            fixtures.parser_summary("expanded"), "expanded",
+            info_representation="structured", header_representation="structured",
+        )
+        self.assertNotEqual(structured["q12_info_value_digest"], [])
+        raw = V.attach_census_expectations(
+            fixtures.parser_summary("expanded"), "expanded",
+            info_representation="raw", header_representation="structured",
+        )
+        self.assertEqual(raw["q12_info_value_digest"], [])
+
     def test_census_expectations_refuse_to_guess(self):
         """No silent default: a caller that forgets must fail, not mis-expect."""
         with self.assertRaises(TypeError):
