@@ -760,8 +760,8 @@ def _count_definitions(predicates: dict[str, int], numbers: list[str]) -> None:
 
 
 def expected_census(
-    parser: dict[str, Any], representation: str, *, info_representation: str = "structured",
-    header_representation: str = "structured",
+    parser: dict[str, Any], representation: str, *, info_representation: str,
+    header_representation: str,
 ) -> dict[str, list[dict[str, Any]]]:
     """Predicate and class counts the graph must contain, and nothing else."""
     records = parser["totalRecords"]
@@ -1188,8 +1188,8 @@ def parse_header_metadata(raw_header: str) -> dict[str, Any]:
 
 
 def attach_census_expectations(
-    parser: dict[str, Any], representation: str, *, info_representation: str = "structured",
-    header_representation: str = "structured",
+    parser: dict[str, Any], representation: str, *, info_representation: str,
+    header_representation: str,
 ) -> dict[str, Any]:
     """Add the expected predicate/class inventory to a parser summary.
 
@@ -3469,7 +3469,12 @@ def run_validation(args: argparse.Namespace) -> int:
             )
             parse_seconds = time.monotonic() - oracle_started
             census_started = time.monotonic()
-            parser = attach_census_expectations(parser, args.representation)
+            parser = attach_census_expectations(
+                parser,
+                args.representation,
+                info_representation=args.info_representation,
+                header_representation=args.header_representation,
+            )
             oracle_phases["censusSeconds"] = time.monotonic() - census_started
             oracle_seconds = {
                 "parse": parse_seconds,
@@ -3774,6 +3779,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Override artifact format detection (default: infer from the filename)",
     )
     parser.add_argument("--representation", choices=("expanded", "condensed"), required=True)
+    # The oracle's expectation depends on these exactly as much as it does on
+    # --representation: the allele layer, value items, SV carriers and parsed
+    # genotype layer are only emitted for structured INFO, and the '##' line
+    # detail only for structured headers. Without them the oracle expected a
+    # structured graph for every run and any --info-representation raw
+    # conversion failed validation with the whole structured layer reported
+    # missing.
+    parser.add_argument(
+        "--info-representation",
+        choices=("raw", "structured"),
+        default="structured",
+        help=(
+            "How the INFO column was emitted in the graph under test. Must match "
+            "the conversion; the wrapper passes it automatically."
+        ),
+    )
+    parser.add_argument(
+        "--header-representation",
+        choices=("basic", "structured"),
+        default="structured",
+        help=(
+            "How the '##' meta-information lines were emitted in the graph under "
+            "test. Must match the conversion; the wrapper passes it automatically."
+        ),
+    )
     parser.add_argument("--results-dir", type=Path, required=True)
     parser.add_argument("--dataset-id", required=True)
     parser.add_argument("--filter-oracle", choices=("auto", "bcftools", "cyvcf2"), default="auto")
