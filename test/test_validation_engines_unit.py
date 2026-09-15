@@ -726,6 +726,8 @@ class WrapperValidationTargetTests(VerboseTestCase):
                     vcf_path=vcf_path,
                     rdf_path=hdt_path,
                     representation="condensed",
+                    info_representation="structured",
+                    header_representation="structured",
                     validation_id="cohort",
                     results_dir=tmp_path / "results",
                     metrics_dir=tmp_path / "metrics",
@@ -744,6 +746,82 @@ class WrapperValidationTargetTests(VerboseTestCase):
             self.assertEqual(command[command.index("--qlever-memory-gb") + 1], "12")
             self.assertIn("--qlever-index-arg", command)
 
+    def test_representation_flags_reach_the_validation_runner(self):
+        """The oracle's expectation depends on these; the wrapper must forward them.
+
+        Regression: the runner defaulted info/header representation to
+        "structured" and the wrapper never passed either, so every
+        --info-representation raw conversion validated against a structured
+        oracle and failed with the whole structured layer reported missing
+        (allele layer, value items, InfoFieldValue, the INFO digest). The oracle
+        itself was already correct and unit-tested for raw -- only the wiring
+        between wrapper and runner was missing, which no test covered.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            vcf_path = tmp_path / "cohort.vcf"
+            vcf_path.write_text("##fileformat=VCFv4.2\n#CHROM\tPOS\n", encoding="utf-8")
+            nt_path = tmp_path / "cohort.nt"
+            nt_path.write_text("", encoding="utf-8")
+            commands = []
+
+            with mock.patch.object(
+                vcf_rdfizer, "run", side_effect=lambda cmd, **kw: commands.append(cmd) or 0
+            ):
+                vcf_rdfizer.run_validation_mode(
+                    vcf_path=vcf_path,
+                    rdf_path=nt_path,
+                    representation="expanded",
+                    info_representation="raw",
+                    header_representation="basic",
+                    validation_id="cohort",
+                    results_dir=tmp_path / "results",
+                    metrics_dir=tmp_path / "metrics",
+                    run_id="RID",
+                    timestamp="TS",
+                    image_ref="example/vcf-rdfizer:latest",
+                    filter_oracle="auto",
+                    wrapper_log_path=tmp_path / "wrapper.log",
+                )
+            command = commands[0]
+            self.assertEqual(command[command.index("--info-representation") + 1], "raw")
+            self.assertEqual(command[command.index("--header-representation") + 1], "basic")
+
+    def test_the_runner_cli_accepts_what_the_wrapper_sends(self):
+        """Both ends of the container boundary must agree on the flag names."""
+        args = V.build_arg_parser().parse_args([
+            "--vcf", "a.vcf", "--rdf", "a.nt", "--representation", "expanded",
+            "--info-representation", "raw", "--header-representation", "basic",
+            "--results-dir", "r", "--dataset-id", "d",
+        ])
+        self.assertEqual(args.info_representation, "raw")
+        self.assertEqual(args.header_representation, "basic")
+
+    def test_raw_info_expects_no_value_digest(self):
+        """q12 hashes decomposed INFO value items, which raw mode never emits.
+
+        Regression: with the representation threaded through, q09/q10 came back
+        clean but q12 still reported all 256 buckets missing, because the digest
+        is computed from the VCF in parse_vcf and was never gated on how the
+        INFO column was actually emitted.
+        """
+        from test import validation_fixtures as fixtures
+        structured = V.attach_census_expectations(
+            fixtures.parser_summary("expanded"), "expanded",
+            info_representation="structured", header_representation="structured",
+        )
+        self.assertNotEqual(structured["q12_info_value_digest"], [])
+        raw = V.attach_census_expectations(
+            fixtures.parser_summary("expanded"), "expanded",
+            info_representation="raw", header_representation="structured",
+        )
+        self.assertEqual(raw["q12_info_value_digest"], [])
+
+    def test_census_expectations_refuse_to_guess(self):
+        """No silent default: a caller that forgets must fail, not mis-expect."""
+        with self.assertRaises(TypeError):
+            V.attach_census_expectations({}, "expanded")
+
     def test_unsupported_artifact_is_rejected_by_the_wrapper(self):
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
@@ -756,6 +834,8 @@ class WrapperValidationTargetTests(VerboseTestCase):
                     vcf_path=vcf_path,
                     rdf_path=bogus,
                     representation="expanded",
+                    info_representation="structured",
+                    header_representation="structured",
                     validation_id="cohort",
                     results_dir=tmp_path / "results",
                     metrics_dir=tmp_path / "metrics",

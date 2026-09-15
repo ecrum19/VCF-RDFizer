@@ -13,6 +13,24 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Pin pip instead of taking whatever released most recently. Every job used to
+  # run `pip install --upgrade pip`, so each run resolved dependencies with a
+  # different, unannounced resolver: CI was non-reproducible by construction,
+  # and a pip release could break the build with no change in this repository.
+  #
+  # This does NOT prevent transient index failures, and should not be mistaken
+  # for a fix for one. A case is on record: the pull_request run for PR #14
+  # failed with `no matching distributions available for your environment:
+  # mdurl` while the identical commit had passed 15 minutes earlier on push,
+  # passed on two other platforms in that same run, and passed again on re-run
+  # with no code change. mdurl is a pure-Python py3-none-any wheel, so nothing
+  # about the environment made it uninstallable -- that was the index, not the
+  # resolver. The right response there is a re-run. The right response to an
+  # unpinned toolchain is this pin.
+  #
+  # Bump deliberately, as its own commit, so a resolver change lands where it
+  # can be attributed instead of appearing inside an unrelated PR.
+  PIP_VERSION: "26.2.1"
 
 jobs:
   build:
@@ -36,7 +54,7 @@ jobs:
 
       - name: Build package
         run: |
-          python -m pip install --upgrade pip build twine
+          python -m pip install "pip==${{ env.PIP_VERSION }}" build twine
           rm -rf dist build *.egg-info
           python -m build
           python -m twine check dist/*
