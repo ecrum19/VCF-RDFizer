@@ -788,3 +788,165 @@ class RecordDecompositionCountTests(VerboseTestCase):
 
     def test_a_truncated_record_is_treated_as_missing_rather_than_crashing(self):
         self.assertEqual(V.record_decomposition_counts(["chr1", "1"], set()), (0, 0, 0))
+
+
+class FormatValueItemCensusTests(VerboseTestCase):
+    """The oracle must count FORMAT value items, not only INFO ones.
+
+    Regression: _emit_value_items is called from two places -- the INFO pass and
+    append_expanded_sample_rdf -- but emitted_record_counters only walked the
+    INFO entries. format_numbers was even passed in and never read. Any file with
+    a positional FORMAT key (AD, ADALL, PL -- most real VCFs) then validated with
+    the whole item layer reported as unexpected extra rows: 401,606 of them on a
+    100k-record GIAB file, which failed 3/3 replicates of 13_query_cost.
+    """
+
+    def _counters(self, rows, samples=("S1",), format_numbers=None, info_numbers=None):
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        import vcf_rdfizer_vocab as vocab
+        version, _ = vocab.resolve_vcf_version("4.2")
+        return V.emitted_record_counters(
+            [list(r) for r in rows],
+            list(samples),
+            version=version,
+            contig_ids={"chr1"},
+            alt_declaration_ids=set(),
+            info_numbers=info_numbers or {"DP": "1"},
+            format_numbers=format_numbers or {"AD": "R", "GT": "1"},
+        )
+
+    ROW = ["chr1", "100", ".", "A", "G", "50", "PASS", "DP=10", "GT:AD", "0/1:5,7"]
+
+    def test_positional_format_cell_is_counted(self):
+        out = self._counters([self.ROW])
+        self.assertEqual(out["emittedFormatItemClasses"].get("FieldValueItem"), 2)
+        for name in ("hasValueItem", "valueIndex", "itemValue"):
+            self.assertEqual(out["emittedFormatItemPredicates"].get(name), 2, name)
+        # Number=R indexes ref then each ALT, so both items name an allele.
+        self.assertEqual(out["emittedFormatItemPredicates"].get("forAllele"), 2)
+
+    def test_format_items_are_kept_apart_from_info_items(self):
+        """They merge under different profiles, so they cannot share a counter."""
+        out = self._counters([self.ROW])
+        self.assertEqual(out["valueItemCount"], 0)
+        self.assertEqual(out["formatValueItemCount"], 2)
+
+    def test_non_positional_format_key_contributes_nothing(self):
+        out = self._counters([self.ROW], format_numbers={"AD": "1", "GT": "1"})
+        self.assertFalse(out["emittedFormatItemClasses"])
+
+    def test_missing_cell_contributes_nothing(self):
+        row = list(self.ROW); row[9] = "0/1:."
+        self.assertFalse(self._counters([row])["emittedFormatItemClasses"])
+
+    def test_no_alt_contributes_nothing(self):
+        """The emitter requires at least one ALT before it decomposes."""
+        row = ["chr1", "100", ".", "A", ".", "50", "PASS", "DP=10", "GT:AD", "0/0:5"]
+        self.assertFalse(self._counters([row])["emittedFormatItemClasses"])
+
+    def test_the_layer_is_expanded_only(self):
+        """append_expanded_sample_rdf emits it; the condensed profile does not."""
+        parser = self._counters([self.ROW])
+        self.assertTrue(parser["emittedFormatItemClasses"])
+
+
+class EmittedTermCensusCoverageTests(VerboseTestCase):
+    """Every vocab term the emitter produces must be counted, or waived here.
+
+    This is the guard for a whole class of bug: the emitter grows a predicate or
+    class, the oracle never learns to expect it, and every file using that
+    feature fails validation with extra rows. It has happened twice -- the INFO
+    value items under raw INFO, and the FORMAT value items.
+
+    A term in KNOWN_UNMODELLED is a deliberate, documented gap. Shrinking the set
+    is progress. Growing it needs a reason in the commit message, because each
+    entry is a file shape that cannot pass validation today.
+    """
+
+    # Grouped by the feature that produces them.
+    KNOWN_UNMODELLED = {
+        # VCF 4.5 local alleles (LA/LR/LG)
+        "LocalAlleleSet", "LocalAlleleMembership", "hasLocalAlleleSet",
+        "hasLocalAlleleMembership", "hasLocalAllele", "localAllele", "localIndex",
+        # phase sets (PS/PSL/PSO/PSQ)
+        "PhaseSet", "inPhaseSet", "phaseSetId", "phaseSetName", "phaseSetOrdinal",
+        "phaseSetQuality",
+        # structural variants and confidence intervals
+        "VariantEvent", "inEvent", "eventType", "svClaim",
+        "ConfidenceInterval", "ciLower", "ciUpper", "endPosition",
+        # gVCF reference blocks
+        "ReferenceBlock", "isReferenceBlockStart", "referenceBlockLength",
+        # tandem repeats
+        "TandemRepeatAllele", "RepeatSequence", "hasRepeatSequence",
+        "repeatSequenceCount", "repeatSequenceIndex",
+        # Number=M base modifications
+        "BaseModification", "forBaseModification", "modifiedBaseOffset",
+        "modifiedResidue",
+        # raw carriers, deliberately not part of the census
+        "sampleDataRaw", "sampleFilter",
+    }
+
+    @staticmethod
+    def _emitted_terms(source: str):
+        """Classify each _vocab(X) use by its position in the triple."""
+        import re
+        calls, buf, depth = [], [], 0
+        for line in source.split("\n"):
+            if "emit(" in line and depth == 0:
+                buf, depth = [line], line.count("(") - line.count(")")
+                if depth <= 0:
+                    calls.append(" ".join(buf)); buf, depth = [], 0
+            elif depth > 0:
+                buf.append(line); depth += line.count("(") - line.count(")")
+                if depth <= 0:
+                    calls.append(" ".join(buf)); buf, depth = [], 0
+        terms = set()
+        for call in calls:
+            raw = re.findall(
+                r"(RDF_TYPE_URI)|_vocab\(['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]\)", call
+            )
+            seq = [("TYPE", None) if a else ("V", b) for a, b in raw]
+            for i, (kind, name) in enumerate(seq):
+                if kind != "V":
+                    continue
+                # A term preceded by another term is a vocabulary OBJECT (a
+                # value, like vcfc:ExpandedRepresentation), not a census term.
+                if i > 0 and seq[i - 1][0] == "V":
+                    continue
+                terms.add(name)
+        return terms
+
+    def test_no_emitted_term_is_silently_unmodelled(self):
+        import re
+        root = Path(__file__).resolve().parents[1]
+        emitter = (root / "vcf_rdfizer.py").read_text(encoding="utf-8")
+        oracle = (root / "src" / "validation" / "validation_runner.py").read_text(
+            encoding="utf-8"
+        )
+        counted = set(re.findall(r"\{VCFC\}([A-Za-z_][A-Za-z0-9_]*)", oracle))
+        counted |= set(re.findall(r"['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]", oracle))
+        unmodelled = {t for t in self._emitted_terms(emitter) if t not in counted}
+        new = sorted(unmodelled - self.KNOWN_UNMODELLED)
+        self.assertEqual(
+            new, [],
+            "the emitter produces vocab terms the oracle never counts, so any file "
+            "using them fails validation with extra rows. Count them in "
+            "expected_census, or add them to KNOWN_UNMODELLED with a reason: %s" % new,
+        )
+
+    def test_the_waiver_list_does_not_rot(self):
+        """A waived term that is now counted should leave the list."""
+        import re
+        root = Path(__file__).resolve().parents[1]
+        oracle = (root / "src" / "validation" / "validation_runner.py").read_text(
+            encoding="utf-8"
+        )
+        counted = set(re.findall(r"\{VCFC\}([A-Za-z_][A-Za-z0-9_]*)", oracle))
+        counted |= set(re.findall(r"['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]", oracle))
+        stale = sorted(t for t in self.KNOWN_UNMODELLED if t in counted)
+        self.assertEqual(
+            stale, [],
+            "these are now counted by the oracle and should be removed from "
+            "KNOWN_UNMODELLED: %s" % stale,
+        )

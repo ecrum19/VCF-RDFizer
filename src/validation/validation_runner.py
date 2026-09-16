@@ -583,6 +583,11 @@ def emitted_record_counters(
     assembly_contig_ids: set[str] = set()
     reference_alleles = alt_alleles = 0
     value_items = value_item_alleles = tuple_items = 0
+    # FORMAT value items are counted separately: the emitter decomposes them
+    # only in the expanded per-sample representation, so expected_census merges
+    # them for that profile alone, exactly as it does the genotype layer.
+    format_items = format_item_alleles = format_tuple_items = 0
+    format_item_predicates: Counter[str] = Counter()
     genotypes = genotype_calls = called_alleles = 0
 
     for row in rows:
@@ -650,6 +655,43 @@ def emitted_record_counters(
         if samples:
             format_keys = (row[8].split(":") if len(row) > 8 and row[8] else [])
             payloads = row[9 : 9 + len(samples)]
+            # A positional FORMAT cell is decomposed into vcfc:FieldValueItems
+            # exactly as a positional INFO one is -- _emit_value_items is called
+            # for both, from append_expanded_sample_rdf and from the INFO pass.
+            # Counting only the INFO side made every file with a positional
+            # FORMAT key (AD, ADALL, PL -- i.e. most real VCFs) fail validation
+            # with the whole item layer reported as unexpected extra rows.
+            #
+            # The emitter requires at least one ALT before it decomposes, and
+            # split_value_items returns nothing for a missing cell, so both
+            # conditions are mirrored rather than re-derived.
+            if alt_count and format_keys:
+                for payload in payloads:
+                    fields = payload.split(":") if payload else []
+                    for key_index, key in enumerate(format_keys):
+                        cell = fields[key_index] if key_index < len(fields) else ""
+                        if not cell:
+                            continue
+                        number = format_numbers.get(key, ".")
+                        if not version.is_positional(key, number):
+                            continue
+                        items = vocab.split_value_items(cell)
+                        if not items:
+                            continue
+                        format_items += len(items)
+                        if version.tuple_arity(key) is not None:
+                            format_tuple_items += len(items)
+                        for index in range(len(items)):
+                            link = version.value_item_link(key, number, index)
+                            if (
+                                link.allele_index is not None
+                                and link.allele_index in allele_uris
+                            ):
+                                format_item_alleles += 1
+                            elif link.genotype_index is not None:
+                                format_item_predicates["forGenotypeIndex"] += 1
+                            elif link.gt_allele_index is not None:
+                                format_item_predicates["forGTAlleleIndex"] += 1
             if "GT" in format_keys:
                 gt_index = format_keys.index("GT")
                 for payload in payloads:
@@ -696,11 +738,22 @@ def emitted_record_counters(
             genotype_predicates[name] += genotype_calls
         genotype_predicates["calledAllele"] += called_alleles
 
+    format_item_classes: Counter[str] = Counter()
+    if format_items:
+        format_item_classes["FieldValueItem"] += format_items
+        for name in ("hasValueItem", "valueIndex", "itemValue"):
+            format_item_predicates[name] += format_items
+        format_item_predicates["forAllele"] += format_item_alleles
+        format_item_predicates["tupleArity"] += format_tuple_items
+
     return {
         "emittedRecordClasses": dict(classes),
         "emittedRecordPredicates": dict(predicates),
         "emittedGenotypeClasses": dict(genotype_classes),
         "emittedGenotypePredicates": dict(genotype_predicates),
+        "emittedFormatItemClasses": dict(format_item_classes),
+        "emittedFormatItemPredicates": dict(format_item_predicates),
+        "formatValueItemCount": format_items,
         "alleleCount": total_alleles,
         "valueItemCount": value_items,
         "genotypeCount": genotypes,
@@ -869,6 +922,12 @@ def expected_census(
             for class_name, count in parser.get("emittedGenotypeClasses", {}).items():
                 classes[f"{VCFC}{class_name}"] = classes.get(f"{VCFC}{class_name}", 0) + count
             for name, count in parser.get("emittedGenotypePredicates", {}).items():
+                predicates[f"{VCFC}{name}"] = predicates.get(f"{VCFC}{name}", 0) + count
+            # The FORMAT item layer is emitted by append_expanded_sample_rdf, so
+            # it exists only here -- the condensed profile never materializes it.
+            for class_name, count in parser.get("emittedFormatItemClasses", {}).items():
+                classes[f"{VCFC}{class_name}"] = classes.get(f"{VCFC}{class_name}", 0) + count
+            for name, count in parser.get("emittedFormatItemPredicates", {}).items():
                 predicates[f"{VCFC}{name}"] = predicates.get(f"{VCFC}{name}", 0) + count
             classes[f"{VCFC}SampleCall"] = records * samples
             classes[f"{VCFC}FormatFieldValue"] = parser["formatValueSlots"]
