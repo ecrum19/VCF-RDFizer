@@ -228,7 +228,12 @@ class NativeArtifactEngineTests(VerboseTestCase):
         self.assertIn("--engine comunica", str(raised.exception))
 
     def test_a_failing_cottas_query_is_reported_not_raised(self):
-        """One bad query must not abort the other engines in a benchmark run."""
+        """One bad query must not abort the other engines in a benchmark run.
+
+        The query now runs in its own process so a hung one can be killed, so
+        the failure arrives as a non-zero exit with the child's stderr rather
+        than as an exception from an in-process rdflib call.
+        """
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             raw_dir = tmp_path / "raw"
@@ -236,9 +241,19 @@ class NativeArtifactEngineTests(VerboseTestCase):
             query = tmp_path / "q.rq"
             query.write_text("SELECT * WHERE { ?s ?p ?o }", encoding="utf-8")
             engine = self._engine("cottas", tmp_path)
-            engine.graph = mock.Mock()
-            engine.graph.query.side_effect = RuntimeError("parquet is unreadable")
-            envelope = engine.execute("q01", query)
+            engine.artifact = tmp_path / "missing.cottas"
+            with mock.patch.object(
+                V, "run_query_process",
+                return_value=(1, None),
+            ) as runner:
+                # The engine must surface whatever the child wrote, so put
+                # something there the way a real failure would.
+                def _fail(command, *, stdout_path, stderr_path, timeout):
+                    stderr_path.write_text("parquet is unreadable", encoding="utf-8")
+                    stdout_path.write_bytes(b"")
+                    return 1, None
+                runner.side_effect = _fail
+                envelope = engine.execute("q01", query)
 
             self.assertEqual(envelope["status"], "EXECUTION_FAILED")
             self.assertIn("parquet is unreadable", envelope["error"])
@@ -247,6 +262,23 @@ class NativeArtifactEngineTests(VerboseTestCase):
                 "parquet is unreadable",
                 Path(envelope["stderr"]).read_text(encoding="utf-8"),
             )
+
+    def test_a_timed_out_cottas_query_is_reported_as_a_timeout(self):
+        """Exit 124 is what the query loop keys on to skip the rest."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            (tmp_path / "raw").mkdir()
+            query = tmp_path / "q.rq"
+            query.write_text("SELECT * WHERE { ?s ?p ?o }", encoding="utf-8")
+            engine = self._engine("cottas", tmp_path)
+            engine.artifact = tmp_path / "a.cottas"
+            with mock.patch.object(
+                V, "run_query_process",
+                return_value=(124, "query exceeded 1800s"),
+            ):
+                envelope = engine.execute("q05", query)
+            self.assertEqual(envelope["exitCode"], 124)
+            self.assertIn("exceeded", envelope["error"])
 
     def test_an_unknown_engine_name_names_the_supported_ones(self):
         with tempfile.TemporaryDirectory() as td:
