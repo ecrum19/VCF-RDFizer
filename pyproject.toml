@@ -52,3 +52,11 @@ include-package-data = true
 [tool.setuptools.package-data]
 "vcf_rdfizer_data.rules" = ["default_rules.ttl"]
 "vcf_rdfizer_data.linkers" = ["*/linker.ttl", "*/resolver.py", "*/genes.gff3", "*/README.md"]
+# Vendored from the published vocabulary so SHACL validation works from an
+# installed package with no separate checkout. Digests are pinned in
+# vcf_rdfizer_data/VOCABULARY_PROVENANCE.json.
+"vcf_rdfizer_data" = [
+  "VOCABULARY_PROVENANCE.json",
+  "shacl/*.shacl.ttl",
+  "ontology/*.ttl",
+]

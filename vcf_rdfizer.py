@@ -4781,6 +4781,63 @@ def resolve_default_rules_path(repo_root: Path) -> Path:
     )
 
 
+#: The shape layer catches what the aggregate queries structurally cannot. The
+#: mutation-score experiment injected 113 corruptions and the query suite caught
+#: 96 (0.850); of the 17 it missed, 7 are covered by shapes that were already
+#: published and enabled in zero of the campaign's 62 validation runs --
+#: corrupt_allele_value, corrupt_record_index, corrupt_value_item_allele and
+#: corrupt_sample_index_expanded. Turning them on takes the score to 0.912 with
+#: no new oracle and no new query.
+DEFAULT_SHACL_SHAPES = "vcf-core-vocabulary.shacl.ttl"
+DEFAULT_SHACL_ONTOLOGY = "vcf-core-vocabulary.bundle.ttl"
+#: pyshacl loads the whole graph into memory, so the default is size-gated
+#: rather than unconditional. A fixture or a single-sample graph validates in
+#: seconds; a cohort aggregate would not fit, and silently trying would turn a
+#: safety net into an OOM. Above this, shapes stay available via --shacl-shapes.
+DEFAULT_SHACL_MAX_SOURCE_BYTES = 512 * 1024 * 1024
+
+
+def resolve_bundled_vocabulary_asset(repo_root: Path, relative: str) -> Path | None:
+    """Locate one vendored vocabulary asset in a checkout or installed package."""
+    local = (repo_root / "vcf_rdfizer_data" / relative).resolve()
+    if local.is_file():
+        return local
+    try:
+        packaged = importlib_resources.files("vcf_rdfizer_data").joinpath(relative)
+        with importlib_resources.as_file(packaged) as packaged_path:
+            resolved = packaged_path.resolve()
+            if resolved.is_file():
+                return resolved
+    except (ModuleNotFoundError, FileNotFoundError):
+        pass
+    return None
+
+
+def resolve_default_shacl_shapes(repo_root: Path) -> tuple[Path | None, Path | None]:
+    """The bundled shapes and their ontology bundle, or (None, None)."""
+    shapes = resolve_bundled_vocabulary_asset(
+        repo_root, f"shacl/{DEFAULT_SHACL_SHAPES}"
+    )
+    if shapes is None:
+        return None, None
+    ontology = resolve_bundled_vocabulary_asset(
+        repo_root, f"ontology/{DEFAULT_SHACL_ONTOLOGY}"
+    )
+    return shapes, ontology
+
+
+def shacl_default_applies(source_bytes: int | None) -> bool:
+    """Whether to validate shapes by default for a source of this size.
+
+    Size-gated because pyshacl is in-memory. ``None`` means the size could not
+    be read, which is treated as too large: skipping a check is recoverable,
+    exhausting memory mid-run is not.
+    """
+    if source_bytes is None:
+        return False
+    return 0 <= source_bytes <= DEFAULT_SHACL_MAX_SOURCE_BYTES
+
+
 def docker_image_exists(image: str) -> bool:
     """Return True when Docker image reference exists locally."""
     return run([*docker_cmd_prefix(), "image", "inspect", image]) == 0
@@ -9199,6 +9256,18 @@ def main():
         ),
     )
     parser.add_argument(
+        "--no-shacl",
+        action="store_true",
+        help=(
+            "Skip the bundled SHACL shape layer, which is otherwise applied by "
+            "default to sources at or below "
+            f"{DEFAULT_SHACL_MAX_SOURCE_BYTES // (1024 * 1024)} MiB. It catches "
+            "what the aggregate comparisons structurally cannot -- a value that "
+            "is counted but never read -- and covers four of the ten mutation "
+            "classes the query suite misses. --shacl-shapes overrides both"
+        ),
+    )
+    parser.add_argument(
         "--shacl-ontology",
         default=None,
         help=(
@@ -9419,6 +9488,27 @@ def main():
                 )
                 if candidate.is_file():
                     shacl_ontology_path = candidate
+        elif not args.no_shacl:
+            # Shapes catch what the aggregate comparisons structurally cannot:
+            # a value that is counted but never read. Four of the ten mutation
+            # classes the query suite misses are already covered by the
+            # published profile, which no run in the benchmark campaign
+            # enabled. Default it on, size-gated, rather than leaving a
+            # written check permanently unused.
+            bundled_shapes, bundled_ontology = resolve_default_shacl_shapes(repo_root)
+            if bundled_shapes is not None:
+                source_bytes = None
+                try:
+                    source_for_size = Path(args.rdf) if args.rdf else (
+                        Path(args.input) if args.input else None
+                    )
+                    if source_for_size is not None and source_for_size.is_file():
+                        source_bytes = source_for_size.stat().st_size
+                except (OSError, TypeError):
+                    source_bytes = None
+                if shacl_default_applies(source_bytes):
+                    shacl_shapes_path = bundled_shapes
+                    shacl_ontology_path = bundled_ontology
 
         chunk_target_bytes = parse_positive_int(
             args.chunk_target_bytes, name="--chunk-target-bytes"

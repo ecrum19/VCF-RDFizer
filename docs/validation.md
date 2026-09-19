@@ -544,9 +544,19 @@ and a conforming graph is reported as violations. In a vocabulary checkout the
 bundle sits one level up from the shapes, in `ontology/`, and is found
 automatically; `--shacl-ontology PATH` names it explicitly anywhere else.
 
-It is **off by default**: `pyshacl` loads the whole graph into memory, so it is
-suitable for a single-sample graph or a sample of a cohort, not for a
-cohort-scale aggregate. The report records the conformance verdict, the exact
+It is **on by default for sources at or below 512 MiB**, using shapes vendored
+with the package -- no vocabulary checkout needed. `--no-shacl` turns it off;
+`--shacl-shapes` overrides both the bundled shapes and the size gate. Above the
+gate it is skipped, because `pyshacl` loads the whole graph into memory and a
+cohort-scale aggregate would not fit.
+
+It defaults on because the queries cannot see what it sees. The mutation-score
+experiment injected 113 corruptions; the query suite caught 96 (0.850), and 7 of
+the 17 it missed fall into four classes this profile already covers --
+`corrupt_allele_value`, `corrupt_record_index`, `corrupt_value_item_allele` and
+`corrupt_sample_index_expanded`. That is 0.850 to 0.912 for a check that was
+already written and was enabled in none of the 62 validation runs in the
+benchmark campaign. The report records the conformance verdict, the exact
 violation count, the distinct property paths involved, and the first 50
 violations; the full text is written alongside it.
 
