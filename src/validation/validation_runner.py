@@ -2118,6 +2118,25 @@ def run_query_process(
             return 124, f"query exceeded {timeout}s"
 
 
+def is_timeout_error(error: BaseException) -> bool:
+    """Whether an exception from an HTTP query is a timeout rather than a fault.
+
+    urlopen(timeout=...) surfaces a timeout either directly or wrapped in a
+    URLError, and the two are not interchangeable at the call site. Telling them
+    apart is what lets a timeout be reported as exit 124 instead of as a generic
+    execution failure -- which is the difference between "this query is too slow
+    for this engine" and "this engine is broken".
+    """
+    import socket
+    import urllib.error
+
+    if isinstance(error, (TimeoutError, socket.timeout)):
+        return True
+    if isinstance(error, urllib.error.URLError):
+        return isinstance(error.reason, (TimeoutError, socket.timeout))
+    return False
+
+
 def _terminate_process_group(process: subprocess.Popen) -> None:
     """Signal a process group, escalating to SIGKILL, and reap the leader."""
     for signal_number, grace in ((signal.SIGTERM, 10), (signal.SIGKILL, 5)):
@@ -2385,12 +2404,19 @@ class ComunicaHttpEndpointMixin:
                 self.endpoint, query_path.read_text(encoding="utf-8"),
                 timeout=self.query_timeout,
             )
-        except Exception as error:  # noqa: BLE001 - reported as EXECUTION_FAILED
+        except Exception as error:  # noqa: BLE001 - reported below
             stderr_path.write_text(str(error), encoding="utf-8")
             raw_path.write_bytes(b"")
+            # 124 is the timeout convention the query loop keys on; anything
+            # else here really is an execution failure.
+            timed_out = is_timeout_error(error)
+            message = (
+                f"query exceeded {self.query_timeout}s" if timed_out else str(error)
+            )
             return self._envelope(
-                query_id, query_path, returncode=1, started=started,
-                raw_path=raw_path, stderr_path=stderr_path, error=str(error),
+                query_id, query_path, returncode=124 if timed_out else 1,
+                started=started, raw_path=raw_path, stderr_path=stderr_path,
+                error=message,
             )
         raw_path.write_bytes(payload)
         stderr_path.write_bytes(b"")
@@ -2618,12 +2644,17 @@ class QleverEngine(QueryEngine):
             payload = self._post(
                 query_path.read_text(encoding="utf-8"), timeout=self.query_timeout
             )
-        except Exception as error:  # noqa: BLE001 - reported as EXECUTION_FAILED
+        except Exception as error:  # noqa: BLE001 - reported below
             stderr_path.write_text(str(error), encoding="utf-8")
             raw_path.write_bytes(b"")
+            timed_out = is_timeout_error(error)
+            message = (
+                f"query exceeded {self.query_timeout}s" if timed_out else str(error)
+            )
             return self._envelope(
-                query_id, query_path, returncode=1, started=started,
-                raw_path=raw_path, stderr_path=stderr_path, error=str(error),
+                query_id, query_path, returncode=124 if timed_out else 1,
+                started=started, raw_path=raw_path, stderr_path=stderr_path,
+                error=message,
             )
         raw_path.write_bytes(payload)
         stderr_path.write_bytes(b"")
@@ -2754,12 +2785,39 @@ class HdtEngine(ComunicaHttpEndpointMixin, NativeArtifactEngine):
         }
 
 
+#: Run one COTTAS query and write SPARQL Results JSON to stdout.
+#:
+#: This is a separate process on purpose. rdflib evaluates SPARQL over a custom
+#: Store by pulling triples through the Store API in Python, so a query that
+#: looks trivial can run for hours: measured on a 39 MB artifact, opening the
+#: store takes 3-15 ms but `SELECT ?s WHERE { ?s ?p ?o } LIMIT 1` takes 12.7 s
+#: and `COUNT(*)` does not finish in two minutes. In-process, none of that is
+#: interruptible -- the call sits inside pycottas and no timeout can reach it.
+#: Out of process, it is killable.
+#:
+#: Re-opening per query costs nothing, so this does not undo the load-once
+#: property the other engines need: for COTTAS the artifact *is* the index.
+COTTAS_QUERY_RUNNER = """
+import sys
+
+import pycottas
+import rdflib
+
+artifact, query_path = sys.argv[1], sys.argv[2]
+graph = rdflib.Graph(store=pycottas.COTTASStore(artifact))
+with open(query_path, encoding="utf-8") as handle:
+    query = handle.read()
+sys.stdout.buffer.write(graph.query(query).serialize(format="json"))
+"""
+
+
 class CottasEngine(NativeArtifactEngine):
     """Query a .cottas artifact in place through pycottas's rdflib store.
 
     pycottas exposes ``COTTASStore``, an rdflib Store backed by the Parquet
-    artifact, so this runs in-process rather than shelling out. The validator
-    already runs under the interpreter that owns pycottas.
+    artifact. Each query runs in its own process rather than in this one, so
+    ``--validation-query-timeout`` can actually stop it -- see
+    COTTAS_QUERY_RUNNER for why that matters here and nowhere else.
     """
 
     name = "cottas"
@@ -2780,37 +2838,32 @@ class CottasEngine(NativeArtifactEngine):
             ) from error
         super().start()
 
-        import pycottas
-        import rdflib
-
-        self.graph = rdflib.Graph(store=pycottas.COTTASStore(str(self.artifact)))
-
     def execute(self, query_id: str, query_path: Path) -> dict[str, Any]:
         raw_path = self.raw_dir / f"{query_id}.sparql.json"
         stderr_path = self.raw_dir / f"{query_id}.stderr.txt"
         started = time.monotonic()
-        try:
-            result = self.graph.query(query_path.read_text(encoding="utf-8"))
-            raw_path.write_bytes(result.serialize(format="json"))
-            stderr_path.write_bytes(b"")
-            returncode, error = 0, None
-        except Exception as failure:  # noqa: BLE001 - reported as EXECUTION_FAILED
+        returncode, error = run_query_process(
+            [sys.executable, "-c", COTTAS_QUERY_RUNNER,
+             str(self.artifact), str(query_path)],
+            stdout_path=raw_path,
+            stderr_path=stderr_path,
+            timeout=self.query_timeout,
+        )
+        if returncode != 0:
+            # Whatever reached stdout is a truncated serialization, not a
+            # result; leave valid JSON so a reader fails on the status rather
+            # than on a parse error.
             raw_path.write_text("{}", encoding="utf-8")
-            stderr_path.write_text(str(failure), encoding="utf-8")
-            returncode, error = 1, str(failure)
+            if error is None:
+                error = stderr_path.read_text(encoding="utf-8")[-2000:] or None
         return self._envelope(
             query_id, query_path, returncode=returncode, started=started,
             raw_path=raw_path, stderr_path=stderr_path, error=error,
         )
 
     def stop(self) -> None:
-        graph = getattr(self, "graph", None)
-        if graph is not None:
-            try:
-                graph.close()
-            except Exception:  # noqa: BLE001 - teardown must not mask a result
-                pass
-            self.graph = None
+        # Nothing to close: each query owned its own process and has exited.
+        return None
 
 
 ENGINE_CLASSES = {
