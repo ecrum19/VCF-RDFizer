@@ -226,5 +226,87 @@ class SeverityTests(VerboseTestCase):
         self.assertIn('"status": "PASS" if not violations else "FAIL"', source)
 
 
+
+
+class ReportParsingTests(VerboseTestCase):
+    """pyshacl's real output format, captured from a run on bench-1.
+
+    The module looked for lines starting "Constraint Violation". pyshacl 0.30.1
+    writes "Validation Result in <Component>" with an indented "Severity:"
+    line, so that matcher never fired: violationCount was always 0 and the
+    verdict fell through to pyshacl's `conforms`, which is False for a warning
+    as readily as for a violation. The layer was therefore broken in both
+    directions -- unable to report a real violation, and failing any graph that
+    merely carried a recommendation.
+
+    test/fixtures/shacl-report-warnings-only.txt is the verbatim report from
+    that run: six sh:Warning results for vcfc:fieldSource and
+    vcfc:fieldVersion, zero violations.
+    """
+
+    FIXTURE = Path(__file__).resolve().parent / "fixtures" / "shacl-report-warnings-only.txt"
+
+    def _module(self):
+        import importlib.util
+
+        path = (
+            Path(vcf_rdfizer.__file__).resolve().parent
+            / "src" / "validation" / "validation_runner.py"
+        )
+        spec = importlib.util.spec_from_file_location("vr_parse", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_the_real_report_parses_to_six_warnings_and_no_violations(self):
+        results = self._module().parse_shacl_results(self.FIXTURE.read_text(encoding="utf-8"))
+        self.assertEqual(len(results), 6)
+        self.assertEqual({r["severity"] for r in results}, {"Warning"})
+
+    def test_a_violation_block_is_classified_as_blocking(self):
+        text = (
+            "Conforms: False\nResults (1):\n"
+            "Validation Result in DatatypeConstraintComponent (...):\n"
+            "\tSeverity: sh:Violation\n"
+            "\tResult Path: vcfc:pos\n"
+        )
+        results = self._module().parse_shacl_results(text)
+        self.assertEqual([r["severity"] for r in results], ["Violation"])
+
+    def test_mixed_severities_are_separated(self):
+        text = (
+            "Conforms: False\nResults (2):\n"
+            "Validation Result in MinCountConstraintComponent (...):\n"
+            "\tSeverity: sh:Warning\n\tResult Path: vcfc:fieldSource\n"
+            "Validation Result in DatatypeConstraintComponent (...):\n"
+            "\tSeverity: sh:Violation\n\tResult Path: vcfc:pos\n"
+        )
+        results = self._module().parse_shacl_results(text)
+        self.assertEqual([r["severity"] for r in results], ["Warning", "Violation"])
+
+    def test_a_clean_report_parses_to_nothing(self):
+        self.assertEqual(self._module().parse_shacl_results("Conforms: True\n"), [])
+
+    def test_a_block_with_no_severity_line_is_unknown_and_blocks(self):
+        """An unclassifiable result is a parser bug; it must not read as clean."""
+        text = "Validation Result in SomeComponent (...):\n\tResult Path: vcfc:pos\n"
+        results = self._module().parse_shacl_results(text)
+        self.assertEqual([r["severity"] for r in results], ["Unknown"])
+        source = (
+            Path(vcf_rdfizer.__file__).resolve().parent
+            / "src" / "validation" / "validation_runner.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('in ("Violation", "Unknown")', source)
+
+    def test_the_older_pyshacl_spelling_still_parses(self):
+        """A downgrade must not silently stop reporting violations again."""
+        text = (
+            "Constraint Violation in DatatypeConstraintComponent (...):\n"
+            "\tResult Path: vcfc:pos\n"
+        )
+        results = self._module().parse_shacl_results(text)
+        self.assertEqual([r["severity"] for r in results], ["Violation"])
+
+
 if __name__ == "__main__":
     unittest.main()

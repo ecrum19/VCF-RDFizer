@@ -1817,6 +1817,69 @@ def materialize_ntriples(
 SHACL_SAMPLE_LIMIT = 50
 
 
+#: pyshacl writes each result as a "Validation Result in <Component>" block with
+#: an indented "Severity: sh:Violation|sh:Warning|sh:Info" line. It does NOT
+#: write "Constraint Violation", which is what this module looked for -- so the
+#: violation count was always zero and the verdict fell through to pyshacl's
+#: `conforms`, which is False for a warning as readily as for a violation.
+#:
+#: That made the shape layer unusable in both directions at once: it could never
+#: report a real violation, and it failed any graph carrying a recommendation.
+#: The published profile warns whenever an INFO declaration omits Source or
+#: Version, which VCF 4.5 recommends rather than requires, so that is most real
+#: VCFs.
+_SHACL_RESULT_START = "Validation Result in "
+_SHACL_SEVERITY_PREFIX = "Severity:"
+#: Older pyshacl releases used this spelling; kept so a downgrade still parses.
+_SHACL_LEGACY_PREFIXES = {
+    "Constraint Violation": "Violation",
+    "Constraint Warning": "Warning",
+    "Constraint Info": "Info",
+}
+
+
+def parse_shacl_results(text: str) -> list[dict[str, str]]:
+    """Split a pyshacl text report into results tagged by severity.
+
+    Returns one entry per result, each ``{"severity": ..., "text": ...}`` with
+    severity one of ``Violation``, ``Warning``, ``Info`` (or ``Unknown`` when a
+    block carries no severity line, which is treated as a violation by the
+    caller -- an unparseable result must not silently pass).
+    """
+    results: list[dict[str, str]] = []
+    block: list[str] | None = None
+
+    def flush(lines: list[str] | None) -> None:
+        if not lines:
+            return
+        severity = "Unknown"
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith(_SHACL_SEVERITY_PREFIX):
+                token = stripped.split(":", 1)[1].strip()
+                severity = token.rsplit(":", 1)[-1] or "Unknown"
+                break
+        results.append({"severity": severity, "text": "\n".join(lines).strip()})
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        legacy = next(
+            (value for key, value in _SHACL_LEGACY_PREFIXES.items()
+             if stripped.startswith(key)),
+            None,
+        )
+        if stripped.startswith(_SHACL_RESULT_START) or legacy is not None:
+            flush(block)
+            block = [line]
+            if legacy is not None:
+                block.append(f"    Severity: sh:{legacy}")
+            continue
+        if block is not None:
+            block.append(line)
+    flush(block)
+    return results
+
+
 def validate_shacl(
     source: Path,
     shapes: Path,
@@ -1874,25 +1937,19 @@ def validate_shacl(
         write_json(report_path, result)
         return result
 
+    results = parse_shacl_results(text)
+    # Unknown counts as blocking: a result this parser could not classify is a
+    # parser bug, and the safe reading of a parser bug is not "conformant".
     violations = [
-        line.strip() for line in text.splitlines()
-        if line.strip().startswith("Constraint Violation")
+        entry["text"] for entry in results
+        if entry["severity"] in ("Violation", "Unknown")
     ]
-    # pyshacl reports conforms=False for ANY result, including sh:Warning and
-    # sh:Info. The published profile uses warnings for genuine recommendations
-    # -- InfoHeaderLineRecommendedShape warns when an INFO declaration omits
-    # Source or Version, which VCF 4.5 recommends and does not require -- so
-    # conforms alone would fail almost every real VCF. Only sh:Violation blocks
-    # a run; advisory results are reported and carried, not enforced.
-    advisories = sorted({
-        line.strip().split(":", 1)[0].strip()
-        for line in text.splitlines()
-        if line.strip().startswith(("Constraint Warning", "Constraint Info"))
-    })
-    advisory_count = sum(
-        1 for line in text.splitlines()
-        if line.strip().startswith(("Constraint Warning", "Constraint Info"))
-    )
+    advisories = [
+        entry for entry in results
+        if entry["severity"] not in ("Violation", "Unknown")
+    ]
+    advisory_kinds = sorted({entry["severity"] for entry in advisories})
+    advisory_count = len(advisories)
     paths = sorted({
         line.split("Result Path:", 1)[1].strip()
         for line in text.splitlines() if "Result Path:" in line
@@ -1910,7 +1967,8 @@ def validate_shacl(
         "violationCount": len(violations),
         "violationPaths": paths,
         "advisoryCount": advisory_count,
-        "advisoryKinds": advisories,
+        "advisoryKinds": advisory_kinds,
+        "advisorySample": [entry["text"] for entry in advisories][:SHACL_SAMPLE_LIMIT],
         "report": str(log_path),
         "wallSeconds": time.monotonic() - started,
         "sampleLimitedTo": SHACL_SAMPLE_LIMIT,
