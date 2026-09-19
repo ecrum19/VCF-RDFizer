@@ -59,10 +59,31 @@ bigger heap.
 
 | Graph size | Recommended |
 | --- | --- |
-| Fixtures, small VCFs | `--validation-engine comunica` (default; no index build) |
-| Anything above a few GiB of N-Triples | `--validation-engine qlever`, or validate the indexed artifact with `--validate-artifacts hdt` |
+| Anything | `--validation-engine qlever` (default; builds an on-disk index) |
+| Fixtures, where an index build is not worth its setup | `--validation-engine comunica` |
 
 Above 4 GiB the runner warns before it starts and names the alternatives.
+
+### The engine is the performance decision; the artifact is not
+
+This is the most consequential thing to know before configuring a run, and it
+is the opposite of what the interface suggests. Measured on one machine, same
+thirteen questions, same graph:
+
+| What changes | Spread |
+| --- | --- |
+| The **engine**, on a 0.96M-triple graph | QLever 1.09 s, Comunica 23.30 s, HDT-backed 44.83 s, native pycottas 1402.37 s |
+| The **artifact**, under QLever on a 17.1M-triple graph | N-Triples 17.11 s, HDT 17.16 s, COTTAS 16.97 s |
+
+Three orders of magnitude against under 5%. Each engine materializes what it
+needs, so which compressed form the triples were stored in is nearly invisible
+to query time. Choose the representation for size and build cost -- COTTAS is
+0.37--0.55x the stored N-Triples where HDT is 1.36--1.82x, and HDT builds
+1.5--2.8x faster -- and choose the engine for speed.
+
+`qlever` is the default for that reason. It was not, until the benchmark
+campaign had to pass `--validation-engine qlever` by hand on every cell large
+enough for the difference to matter.
 
 ### If validation seems to hang
 
@@ -246,10 +267,10 @@ produced it.
 
 | Engine | Queries | Setup | Use it when |
 |---|---|---|---|
-| `comunica` (default) | The N-Triples file directly | none | The graph fits comfortably in RAM |
-| `qlever` | An on-disk [QLever](https://github.com/ad-freiburg/qlever) index, served on a container-local port | index build | The graph no longer fits in memory, or the aggregate queries are too slow |
+| `qlever` (default) | An on-disk [QLever](https://github.com/ad-freiburg/qlever) index, served on a container-local port | index build | Almost always: fastest by a wide margin at every size measured |
+| `comunica` | The N-Triples file directly | none | A fixture small enough that an index build is not worth its setup |
 | `hdt` | A `.hdt` artifact **in place**, through Comunica's HDT engine | reuses the run's HDT, or builds one | Checking that the compressed artifact is queryable, not just decodable |
-| `cottas` | A `.cottas` artifact **in place**, through `pycottas`'s rdflib store | reuses the run's COTTAS, or builds one | Same, for COTTAS |
+| `cottas` | A `.cottas` artifact **in place**, through `pycottas`'s rdflib store | reuses the run's COTTAS, or builds one | Same, for COTTAS. A conformance path, not a query path: 1286x slower than QLever on identical work, and it does not terminate at all on the condensed encoding (see [limitations](limitations.md)) |
 
 ### Validating a compressed artifact without decoding it
 

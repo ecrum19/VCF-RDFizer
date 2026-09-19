@@ -363,7 +363,16 @@ VALIDATION_RDF_SUFFIXES = (
     (".hdt", "hdt"),
 )
 VALIDATION_ENGINE_CHOICES = ("comunica", "qlever", "hdt", "cottas")
-DEFAULT_VALIDATION_ENGINE = "comunica"
+#: The representation is a storage decision; the engine is the performance one.
+#: Measured on one graph, one machine, the same thirteen questions: QLever 1.09 s,
+#: Comunica 23.30 s, the HDT-backed engine 44.83 s, native pycottas 1402.37 s.
+#: Against the SAME engine, the artifact queried barely matters -- on a
+#: 17.1M-triple graph QLever took 17.11 s over N-Triples, 17.16 s over HDT and
+#: 16.97 s over COTTAS, under 5% apart, because each engine materializes what it
+#: needs. So the default that matters is this one, and it was the slow choice:
+#: the benchmark campaign had to pass --validation-engine qlever by hand on
+#: every cell large enough for it to matter.
+DEFAULT_VALIDATION_ENGINE = "qlever"
 
 
 def parse_validation_engines(raw: str) -> list[str]:
@@ -9033,9 +9042,13 @@ def main():
         default=DEFAULT_VALIDATION_ENGINE,
         help=(
             "SPARQL engine(s) for validation, comma-separated, or 'all'. "
-            "comunica queries the graph in memory; qlever builds an on-disk "
-            "index and serves it; hdt and cottas query those compressed "
-            "artifacts natively without decoding them. Requesting several runs "
+            "This is the choice that decides query time: the artifact barely "
+            "matters (under 5%% between N-Triples, HDT and COTTAS for one "
+            "engine), while engines span three orders of magnitude on identical "
+            "work. qlever builds an on-disk index and serves it; comunica "
+            "queries the graph in memory; hdt and cottas query those compressed "
+            "artifacts natively without decoding them, which is a conformance "
+            "path rather than a fast one. Requesting several runs "
             "the whole query set on each, cross-checks their answers, and "
             "records comparable timings for benchmarking "
             f"(choices: {', '.join(VALIDATION_ENGINE_CHOICES)}; "
