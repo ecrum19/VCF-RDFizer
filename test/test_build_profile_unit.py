@@ -14,6 +14,7 @@ These tests pin the breakdown that makes the difference visible.
 """
 
 import importlib.util
+import pathlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -46,8 +47,13 @@ class FakeRunner:
         return P.StageRunner.peak_workspace_bytes(self)
 
 
-def stage(name, wall, *, rss=None, free_before=None, free_after=None, total=None):
+def stage(name, wall, *, rss=None, free_before=None, free_after=None, total=None,
+          tree_before=None, tree_after=None):
     record = {"name": name, "wall_seconds": wall}
+    if tree_before is not None:
+        record["workspace_tree_bytes_before"] = tree_before
+    if tree_after is not None:
+        record["workspace_tree_bytes_after"] = tree_after
     if rss is not None:
         record["max_rss_kb"] = rss
     if free_before is not None:
@@ -188,17 +194,55 @@ class BuildProfileTests(VerboseTestCase):
 
 
 class VolumeWorkspaceTests(VerboseTestCase):
-    def test_peak_volume_usage_is_derived_from_the_free_space_samples(self):
-        """The host trace cannot see the Docker volume; this is the only source."""
+    """Measure the scratch tree, not the device it happens to sit on.
+
+    The first VM run reported peak_volume_workspace_bytes of
+    126,956,531,712 -- 127 GB, the host disk's used bytes -- for a build whose
+    scratch was a single 11.9 MB chunk. shutil.disk_usage on /work describes
+    the backing device; free-space deltas are no better, because anything else
+    on the host moves them.
+    """
+
+    def test_peak_is_the_largest_scratch_tree_seen(self):
         runner = FakeRunner([
-            stage("hdt-build-00000", 1.0, free_before=90, free_after=70, total=100),
-            stage("hdt-build-00001", 1.0, free_before=70, free_after=25, total=100),
+            stage("hdt-build-00000", 1.0, tree_before=10, tree_after=40),
+            stage("hdt-build-00001", 1.0, tree_before=40, tree_after=25),
         ])
-        self.assertEqual(P.build_profile(runner, {})["peak_volume_workspace_bytes"], 75)
+        self.assertEqual(P.build_profile(runner, {})["peak_volume_workspace_bytes"], 40)
+
+    def test_device_level_numbers_are_not_used_as_the_peak(self):
+        """A 100-byte device with 25 free must not read as 75 bytes of scratch."""
+        runner = FakeRunner([
+            stage("hdt-build-00000", 1.0, free_before=90, free_after=25, total=100),
+        ])
+        self.assertIsNone(P.build_profile(runner, {})["peak_volume_workspace_bytes"])
 
     def test_stages_without_workspace_samples_report_none(self):
         runner = FakeRunner([stage("hdt-build-00000", 1.0)])
         self.assertIsNone(P.build_profile(runner, {})["peak_volume_workspace_bytes"])
+
+    def test_the_tree_walk_sums_file_sizes_and_ignores_symlinks(self):
+        import os
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "a.nt").write_bytes(b"x" * 100)
+            (root / "sub").mkdir()
+            (root / "sub" / "b.nt").write_bytes(b"y" * 50)
+            outside = root.parent / "outside.bin"
+            try:
+                outside.write_bytes(b"z" * 10_000)
+                os.symlink(outside, root / "link.nt")
+            except OSError:
+                outside = None
+            self.assertEqual(P.directory_tree_bytes(root), 150)
+            if outside is not None:
+                outside.unlink(missing_ok=True)
+
+    def test_an_unreadable_root_reports_none(self):
+        self.assertIsNone(
+            P.directory_tree_bytes(pathlib.Path("/nonexistent-workspace-xyz"))
+        )
 
 
 class ChildRssFallbackTests(VerboseTestCase):

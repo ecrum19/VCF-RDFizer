@@ -455,6 +455,30 @@ def parse_time_log(path: Path) -> dict:
     }
 
 
+def directory_tree_bytes(root: Path) -> int | None:
+    """Total size of the files under ``root``, or None if it cannot be read.
+
+    Symlinks are not followed and their targets are not counted, so a link into
+    a mounted output tree cannot inflate the scratch figure.
+    """
+    # rglob on a missing directory yields nothing and raises nothing, so an
+    # absent workspace would otherwise report a confident 0.
+    if not root.is_dir():
+        return None
+    total = 0
+    try:
+        for path in root.rglob("*"):
+            try:
+                if path.is_symlink() or not path.is_file():
+                    continue
+                total += path.stat().st_size
+            except OSError:
+                continue
+    except OSError:
+        return None
+    return total
+
+
 def children_peak_rss_kb() -> int | None:
     """Peak RSS of every child process reaped so far, in KB.
 
@@ -489,17 +513,23 @@ class StageRunner:
         self.stages: list[dict] = []
 
     def peak_workspace_bytes(self) -> int | None:
-        """Highest container-volume usage seen across every stage so far.
+        """Highest workspace-tree size seen across every stage so far.
 
-        The host-side workspace trace cannot see this: the chunk scratch lives
-        in a Docker volume, and the two numbers must never be added. Recording
-        it here is what makes the volume half of peak disk measurable at all.
+        Measures the tree, not the filesystem. ``shutil.disk_usage`` on /work
+        reports the whole backing device: on bench-1 that read 126,956,531,712
+        bytes -- 127 GB of host disk in use -- for a build whose scratch was a
+        single 11.9 MB chunk. Free-space deltas are equally unusable, because
+        anything else on the host moves them.
+
+        The host-side out-tree trace cannot see this directory, and the two
+        numbers must never be added: one is the published artifact tree, this
+        is the container's scratch.
         """
         peaks = [
-            stage["workspace_total_bytes"] - stage[key]
+            stage[key]
             for stage in self.stages
-            for key in ("workspace_free_bytes_before", "workspace_free_bytes_after")
-            if stage.get("workspace_total_bytes") is not None and stage.get(key) is not None
+            for key in ("workspace_tree_bytes_before", "workspace_tree_bytes_after")
+            if stage.get(key) is not None
         ]
         return max(peaks) if peaks else None
 
@@ -528,6 +558,7 @@ class StageRunner:
         started = time.perf_counter()
         workspace_free_before = None
         workspace_total = None
+        workspace_tree_before = directory_tree_bytes(self.work_dir)
         try:
             workspace_usage = shutil.disk_usage(self.work_dir)
             workspace_free_before = workspace_usage.free
@@ -598,6 +629,13 @@ class StageRunner:
             if output_path is not None and output_path.is_file()
             else 0,
         }
+        workspace_tree_after = directory_tree_bytes(self.work_dir)
+        if workspace_tree_before is not None:
+            result["workspace_tree_bytes_before"] = workspace_tree_before
+        if workspace_tree_after is not None:
+            result["workspace_tree_bytes_after"] = workspace_tree_after
+        # Device-level figures are kept because a build that fills the volume
+        # needs them to say so -- but they describe the HOST, not this build.
         try:
             workspace_usage = shutil.disk_usage(self.work_dir)
             result["workspace_free_bytes_after"] = workspace_usage.free
