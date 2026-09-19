@@ -2942,6 +2942,103 @@ def normalize(query_id: str, path: Path) -> Any:
     return rows
 
 
+def derive_anomaly_count_execution(
+    sample_execution: dict[str, Any],
+    sample_query_id: str,
+    raw_dir: Path,
+) -> dict[str, Any] | None:
+    """Synthesize a ``*_count`` result from a sample that did not hit its limit.
+
+    An anomaly preflight is ``SELECT ... LIMIT ANOMALY_SAMPLE_LIMIT``. When it
+    returns fewer rows than that limit it enumerated *every* match, so the exact
+    anomaly total is the number of rows returned and the companion aggregate can
+    only re-derive a number we already hold. Skipping it is not an approximation.
+
+    That matters because the companion is not cheap. Both queries scan the whole
+    graph -- the LIMIT bounds what is returned, not what is examined -- so on a
+    17.1M-triple graph ``preflight_empty_values`` cost 97.0 s and
+    ``preflight_empty_values_count`` a further 94.6 s to report the same zero.
+    Three such scans were 294.1 s of the 298.1 s that all fourteen preflights
+    cost, against 17.1 s for the thirteen semantic queries they precede.
+
+    Returns ``None`` when the sample is truncated or unreadable, in which case
+    the real aggregate must run: the count is then genuinely unknown.
+    """
+    if sample_execution.get("status") != "PASS":
+        return None
+    try:
+        rows = bindings(Path(sample_execution["rawResult"]))
+    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+        return None
+    if len(rows) >= ANOMALY_SAMPLE_LIMIT:
+        return None
+
+    # Write the derived answer in SPARQL Results JSON so every downstream
+    # consumer -- anomaly_count, benchmark.csv, the raw result tree -- reads it
+    # exactly as it reads an executed one.
+    raw_path = raw_dir / f"{sample_query_id}_count.json"
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(
+        raw_path,
+        {
+            "head": {"vars": ["anomalyCount"]},
+            "results": {
+                "bindings": [
+                    {
+                        "anomalyCount": {
+                            "type": "literal",
+                            "datatype": "http://www.w3.org/2001/XMLSchema#integer",
+                            "value": str(len(rows)),
+                        }
+                    }
+                ]
+            },
+        },
+    )
+    return {
+        "status": "PASS",
+        "engine": sample_execution.get("engine"),
+        "exitCode": 0,
+        "wallSeconds": 0.0,
+        "query": None,
+        "rawResult": str(raw_path),
+        "stderr": None,
+        "resourceMetrics": None,
+        # The record says plainly that this was not executed, so a reader never
+        # mistakes a 0.0 s row in benchmark.csv for an impossibly fast scan.
+        "derived": True,
+        "derivedFrom": sample_query_id,
+        "derivedReason": (
+            f"{sample_query_id} returned {len(rows)} of at most "
+            f"{ANOMALY_SAMPLE_LIMIT} rows, so it enumerated every match and the "
+            f"exact count is known without a second full-graph scan"
+        ),
+    }
+
+
+def derived_count_for(
+    query_id: str,
+    executions: dict[str, dict[str, Any]],
+    raw_dir: Path,
+) -> dict[str, Any] | None:
+    """The derived execution for ``query_id``, or None if it must really run.
+
+    Answers one question for the query loop: is this a ``*_count`` companion
+    whose sample already enumerated every match? Anything else -- a semantic
+    query, a preflight that is not part of an anomaly pair, a sample that was
+    truncated or failed -- returns None and is executed normally.
+    """
+    if not query_id.endswith("_count"):
+        return None
+    sample_query_id = query_id[: -len("_count")]
+    if sample_query_id not in ANOMALY_PREFLIGHT_QUERIES:
+        return None
+    sample = executions.get(sample_query_id)
+    if sample is None:
+        return None
+    return derive_anomaly_count_execution(sample, sample_query_id, raw_dir)
+
+
 def anomaly_count(executions: dict[str, dict[str, Any]], query_id: str) -> Any:
     """Exact anomaly total from the companion aggregate, or None if unavailable.
 
@@ -3259,6 +3356,9 @@ BENCHMARK_CSV_HEADER = [
     "oracle_wall_seconds",
     "engine_setup_seconds",
     "artifact_origin",
+    # 1 when the row was derived from a sibling query instead of executed.
+    # Exclude these before summing wall_seconds as measured query cost.
+    "derived",
 ]
 
 
@@ -3309,6 +3409,9 @@ def build_benchmark(
             query_id: {
                 "status": execution.get("status"),
                 "wallSeconds": execution.get("wallSeconds"),
+                # True when the answer was derived from a sibling query rather
+                # than executed, so a 0.0 s row is never read as a measurement.
+                "derived": bool(execution.get("derived")),
             }
             for query_id, execution in executions.items()
         }
@@ -3388,6 +3491,7 @@ def write_benchmark_csv(path: Path, benchmark: dict[str, Any]) -> Path:
                     "oracle_wall_seconds": oracle_total,
                     "engine_setup_seconds": engine["setupSeconds"],
                     "artifact_origin": engine["artifactOrigin"] or "",
+                    "derived": 1 if entry.get("derived") else 0,
                 })
     return path
 
@@ -3641,13 +3745,27 @@ def run_validation(args: argparse.Namespace) -> int:
                                 f" ({engine_name})",
                                 flush=True,
                             )
-                        executions[query_id] = engine.execute(
-                            query_id, query_path(query_dir, query_id)
+                        # An anomaly preflight's ``*_count`` companion re-scans
+                        # the whole graph to total what the sample already
+                        # enumerated, whenever the sample came back under its
+                        # LIMIT. Derive it instead: same number, no second scan.
+                        derived = derived_count_for(
+                            query_id, executions, engine_raw_dir
                         )
-                        progress.emit(
-                            "progress", completed=completed, query_id=query_id,
-                            detail=f"{engine_name}: completed {query_id}",
-                        )
+                        if derived is not None:
+                            executions[query_id] = derived
+                            progress.emit(
+                                "progress", completed=completed, query_id=query_id,
+                                detail=f"{engine_name}: derived {query_id}",
+                            )
+                        else:
+                            executions[query_id] = engine.execute(
+                                query_id, query_path(query_dir, query_id)
+                            )
+                            progress.emit(
+                                "progress", completed=completed, query_id=query_id,
+                                detail=f"{engine_name}: completed {query_id}",
+                            )
 
                         # A query that fails, times out, or returns the wrong
                         # answer never stops the suite: its verdict is recorded
