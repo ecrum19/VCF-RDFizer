@@ -3235,14 +3235,25 @@ def preflight(
             report[query_id] = {"status": "FAIL", "error": f"Expected one aggregate row, got {len(returned)}"}
         elif representation == "expanded":
             actual = {field: binding_int(returned[0], field) for field in ("sampleCallCount", "sampleIdCount", "gtValueNodeCount")}
+            # sampleIdCount counts vcfc:sampleId, which lives on SampleCall --
+            # one per sample PER RECORD. A header-only VCF declares samples and
+            # has no records, so there are no calls to carry the literal and the
+            # count is structurally zero. Expecting sampleCount there fails a
+            # correct graph. The file-scoped sample set is a separate thing and
+            # is checked by the census queries.
             expected = {
                 "sampleCallCount": parser["sampleCount"] * parser["totalRecords"],
-                "sampleIdCount": parser["sampleCount"],
+                "sampleIdCount": (
+                    parser["sampleCount"] if parser["totalRecords"] else 0
+                ),
                 "gtValueNodeCount": parser["sampleCount"] * parser["gtRecordCount"],
             }
             report[query_id] = {"status": "PASS" if actual == expected else "FAIL", "expected": expected, "actual": actual}
         else:
             actual = {field: binding_int(returned[0], field) for field in ("sampleCount", "sampleIdCount", "gtVectorCount")}
+            # The condensed profile's sample set and its sampleId literals are
+            # file-scoped, so both survive a zero-record file; only the
+            # per-record vectors go to zero, which gtRecordCount already says.
             expected = {"sampleCount": parser["sampleCount"], "sampleIdCount": parser["sampleCount"], "gtVectorCount": parser["gtRecordCount"]}
             report[query_id] = {"status": "PASS" if actual == expected else "FAIL", "expected": expected, "actual": actual}
     return report

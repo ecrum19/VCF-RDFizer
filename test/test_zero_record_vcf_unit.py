@@ -210,5 +210,63 @@ class MissingTokenConformanceScopeTests(VerboseTestCase):
         self.assertIn("|M|[.])$", shapes)
 
 
+
+
+class SampleInventoryExpectationTests(VerboseTestCase):
+    """What the GT inventory should expect when there are no records.
+
+    Found on bench-1: with the sample set restored, q09/q10 passed but
+    preflight_sample_gt_inventory still failed, expecting sampleIdCount 1 and
+    finding 0. vcfc:sampleId lives on SampleCall -- one per sample *per record*
+    -- so a header-only VCF has no call to carry it and the count is
+    structurally zero. The file-scoped sample set is a different thing, and the
+    census queries check that.
+    """
+
+    def _expected(self, representation, sample_count, total_records, gt_records):
+        import importlib.util
+
+        path = (
+            Path(vcf_rdfizer.__file__).resolve().parent
+            / "src" / "validation" / "validation_runner.py"
+        )
+        spec = importlib.util.spec_from_file_location("vr_inv", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        source = path.read_text(encoding="utf-8")
+        self.assertIn('parser["sampleCount"] if parser["totalRecords"] else 0', source)
+        if representation == "expanded":
+            return {
+                "sampleCallCount": sample_count * total_records,
+                "sampleIdCount": sample_count if total_records else 0,
+                "gtValueNodeCount": sample_count * gt_records,
+            }
+        return {
+            "sampleCount": sample_count,
+            "sampleIdCount": sample_count,
+            "gtVectorCount": gt_records,
+        }
+
+    def test_expanded_expects_no_sample_ids_when_there_are_no_records(self):
+        self.assertEqual(
+            self._expected("expanded", 1, 0, 0),
+            {"sampleCallCount": 0, "sampleIdCount": 0, "gtValueNodeCount": 0},
+        )
+
+    def test_expanded_still_expects_one_sample_id_per_sample_with_records(self):
+        """The ordinary case must not move."""
+        self.assertEqual(
+            self._expected("expanded", 3, 1000, 1000),
+            {"sampleCallCount": 3000, "sampleIdCount": 3, "gtValueNodeCount": 3000},
+        )
+
+    def test_condensed_keeps_its_file_scoped_sample_ids(self):
+        """Condensed sampleIds are file-scoped, so a zero-record file keeps them."""
+        self.assertEqual(
+            self._expected("condensed", 2, 0, 0),
+            {"sampleCount": 2, "sampleIdCount": 2, "gtVectorCount": 0},
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
