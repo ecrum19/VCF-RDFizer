@@ -550,13 +550,33 @@ with the package -- no vocabulary checkout needed. `--no-shacl` turns it off;
 gate it is skipped, because `pyshacl` loads the whole graph into memory and a
 cohort-scale aggregate would not fit.
 
-It defaults on because the queries cannot see what it sees. The mutation-score
-experiment injected 113 corruptions; the query suite caught 96 (0.850), and 7 of
-the 17 it missed fall into four classes this profile already covers --
-`corrupt_allele_value`, `corrupt_record_index`, `corrupt_value_item_allele` and
-`corrupt_sample_index_expanded`. That is 0.850 to 0.912 for a check that was
-already written and was enabled in none of the 62 validation runs in the
-benchmark campaign. The report records the conformance verdict, the exact
+### Two profiles, and which one catches what
+
+The published profile is split across files that check genuinely different
+things, and the split decides what a run can detect:
+
+| `--shacl-profile` | Files | Checks | Cost on a 2,000-triple graph |
+| --- | --- | --- | --- |
+| `core` (default) | `vcf-core-vocabulary` | Cardinality and datatype: `vcfc:sampleIndex` exists once and is an integer >= 1 | **1.7 s** |
+| `full` | `+ vcf-core-consistency`, `+ vcf-core-vocabulary-sparql` | Uniqueness (*"Record indices must be unique"*, *"Sample names and sample indices must be unique"*) and value agreement (`vcfc:alleleValue` against `REF`/`ALT`) | **+33.7 s, +73.2 s** |
+
+The distinction matters for what you can claim. The mutation-score experiment
+injected 113 corruptions; the query suite caught 96 (0.850), and 7 of the 17 it
+missed fall into four classes -- `corrupt_allele_value`, `corrupt_record_index`,
+`corrupt_value_item_allele` and `corrupt_sample_index_expanded`. **Those are
+covered by `full`, not by the default.** The core profile constrains how many
+`sampleIndex` values a sample has, not whether two samples share one, so it
+detects none of them.
+
+`full` is not the default because the cost is real and measured: its two extra
+profiles use `sh:sparql` constraints that self-join the graph, so they grow far
+faster than the data. It is gated to sources at or below 16 MiB, where closing
+those four classes is worth two minutes; the core profile's gate is 512 MiB.
+
+```bash
+# Close the four classes the query suite misses, on a fixture-sized input
+vcf-rdfizer --mode full -i ./fixture.vcf --validate --shacl-profile full -o ./out
+``` The report records the conformance verdict, the exact
 violation count, the distinct property paths involved, and the first 50
 violations; the full text is written alongside it.
 

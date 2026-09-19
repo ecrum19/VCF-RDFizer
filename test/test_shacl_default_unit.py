@@ -9,8 +9,16 @@ enabled in zero of the 62 validation runs in the benchmark campaign, because it
 required a vocabulary checkout and an explicit flag.
 
 So the shapes are vendored and applied by default, size-gated because pyshacl
-loads the whole graph into memory. Closing those four classes takes the score
-from 0.850 to 0.912 with no new oracle and no new query.
+loads the whole graph into memory.
+
+One correction, forced by measurement on bench-1: those four classes are NOT
+covered by the default profile. ``vcf-core-vocabulary.shacl.ttl`` constrains
+cardinality and datatype only; the uniqueness rules are in the SPARQL profile
+and the value-agreement rules in the consistency profile. Those two cost 33.7 s
+and 73.2 s on a 2,000-triple graph against 1.7 s for the core one, and their
+sh:sparql constraints self-join the graph. So the default is the cheap profile,
+``--shacl-profile full`` opts into the rest on a fixture-sized graph, and the
+0.850 -> 0.912 figure belongs to full, not to the default.
 """
 
 import hashlib
@@ -32,10 +40,76 @@ class BundledAssetTests(VerboseTestCase):
         """Requiring a separate checkout is why this was never switched on."""
         shapes, ontology = vcf_rdfizer.resolve_default_shacl_shapes(REPO_ROOT)
         self.assertIsNotNone(shapes)
-        self.assertTrue(shapes.is_file())
-        self.assertEqual(shapes.name, vcf_rdfizer.DEFAULT_SHACL_SHAPES)
+        self.assertEqual(
+            [path.name for path in shapes], list(vcf_rdfizer.DEFAULT_SHACL_SHAPES)
+        )
+        for path in shapes:
+            self.assertTrue(path.is_file(), path)
         self.assertIsNotNone(ontology, "sh:class needs the class hierarchy")
         self.assertTrue(ontology.is_file())
+
+    def test_the_default_profile_is_the_cheap_one_and_says_so(self):
+        """Measured on bench-1: core 1.7 s, consistency 33.7 s, SPARQL 73.2 s
+        on a 2,000-triple graph. The two that catch a corrupted value cost
+        63x the one that does not, and their sh:sparql constraints self-join
+        the graph, so the gap widens with size. core is what a run can absorb.
+        """
+        self.assertEqual(
+            vcf_rdfizer.DEFAULT_SHACL_SHAPES, ("vcf-core-vocabulary.shacl.ttl",)
+        )
+
+    def test_the_full_profile_adds_the_two_that_catch_a_corrupted_value(self):
+        """vcfc:sampleIndex in the core profile is minCount 1, maxCount 1,
+        integer >= 1 -- nothing about two samples sharing one. Uniqueness is in
+        the SPARQL profile, value agreement in the consistency profile.
+        """
+        self.assertIn("vcf-core-consistency.shacl.ttl", vcf_rdfizer.FULL_SHACL_SHAPES)
+        self.assertIn(
+            "vcf-core-vocabulary-sparql.shacl.ttl", vcf_rdfizer.FULL_SHACL_SHAPES
+        )
+        for name in vcf_rdfizer.DEFAULT_SHACL_SHAPES:
+            self.assertIn(name, vcf_rdfizer.FULL_SHACL_SHAPES)
+
+    def test_the_full_profile_resolves_all_three_files(self):
+        shapes, ontology = vcf_rdfizer.resolve_default_shacl_shapes(REPO_ROOT, "full")
+        self.assertEqual(
+            [path.name for path in shapes], list(vcf_rdfizer.FULL_SHACL_SHAPES)
+        )
+        self.assertIsNotNone(ontology)
+
+    def test_the_full_profile_has_a_much_smaller_size_gate(self):
+        """It is quadratic-ish in graph size; the core gate would be unusable."""
+        self.assertLess(
+            vcf_rdfizer.FULL_SHACL_MAX_SOURCE_BYTES,
+            vcf_rdfizer.DEFAULT_SHACL_MAX_SOURCE_BYTES,
+        )
+        big = vcf_rdfizer.FULL_SHACL_MAX_SOURCE_BYTES + 1
+        self.assertFalse(vcf_rdfizer.shacl_default_applies(big, "full"))
+        self.assertTrue(vcf_rdfizer.shacl_default_applies(big, "core"))
+
+    def test_the_uniqueness_rules_really_live_outside_the_core_profile(self):
+        """Pin the claim against the vendored files, not against memory."""
+        shacl = DATA_ROOT / "shacl"
+        core = (shacl / "vcf-core-vocabulary.shacl.ttl").read_text(encoding="utf-8")
+        sparql = (shacl / "vcf-core-vocabulary-sparql.shacl.ttl").read_text(encoding="utf-8")
+        consistency = (shacl / "vcf-core-consistency.shacl.ttl").read_text(encoding="utf-8")
+        self.assertNotIn("must be unique", core)
+        self.assertIn("Record indices must be unique", sparql)
+        self.assertIn("Sample names and sample indices must be unique", sparql)
+        self.assertIn("vcfc:alleleValue", consistency)
+
+    def test_a_partial_profile_set_resolves_to_nothing(self):
+        """Half a profile set silently drops whole classes of check."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "vcf_rdfizer_data" / "shacl").mkdir(parents=True)
+            (root / "vcf_rdfizer_data" / "shacl"
+             / vcf_rdfizer.DEFAULT_SHACL_SHAPES[0]).write_text("", encoding="utf-8")
+            shapes, ontology = vcf_rdfizer.resolve_default_shacl_shapes(root)
+            if shapes is not None:
+                self.skipTest("installed package shadows the temporary root")
+            self.assertIsNone(shapes)
+            self.assertIsNone(ontology)
 
     def test_the_version_overlays_are_bundled_too(self):
         """4.1-4.5 each have their own overlay; shipping only the core is half."""

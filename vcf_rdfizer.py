@@ -4830,7 +4830,30 @@ def resolve_default_rules_path(repo_root: Path) -> Path:
 #: corrupt_allele_value, corrupt_record_index, corrupt_value_item_allele and
 #: corrupt_sample_index_expanded. Turning them on takes the score to 0.912 with
 #: no new oracle and no new query.
-DEFAULT_SHACL_SHAPES = "vcf-core-vocabulary.shacl.ttl"
+#: The cheap, always-affordable profile. It constrains cardinality and datatype
+#: -- vcfc:sampleIndex must exist once and be an integer >= 1 -- and says
+#: nothing about whether two samples share one. Measured on bench-1 at 1.7 s for
+#: a 2,000-triple graph and 34 s for a 95,000-triple one, which is a default a
+#: run can absorb.
+DEFAULT_SHACL_SHAPES = ("vcf-core-vocabulary.shacl.ttl",)
+#: The profiles that catch a *corrupted* value rather than a missing one:
+#: uniqueness ("Record indices must be unique within a VCF file", "Sample names
+#: and sample indices must be unique") lives in the SPARQL profile, and value
+#: agreement (vcfc:alleleValue against vcfc:ref/vcfc:alt) in the consistency
+#: profile. These are the four mutation classes the query suite misses.
+#:
+#: They are NOT default, and the reason is measured rather than assumed: on a
+#: 2,000-triple graph the consistency profile took 33.7 s and the SPARQL
+#: profile 73.2 s, against 1.7 s for the core one. Their sh:sparql constraints
+#: self-join the graph, so the cost grows far faster than the data. Opt in with
+#: --shacl-profile full on a fixture-sized graph, where closing those classes
+#: is worth two minutes.
+FULL_SHACL_SHAPES = (
+    "vcf-core-vocabulary.shacl.ttl",
+    "vcf-core-consistency.shacl.ttl",
+    "vcf-core-vocabulary-sparql.shacl.ttl",
+)
+SHACL_PROFILE_CHOICES = ("core", "full")
 DEFAULT_SHACL_ONTOLOGY = "vcf-core-vocabulary.bundle.ttl"
 #: pyshacl loads the whole graph into memory, so the default is size-gated
 #: rather than unconditional. A fixture or a single-sample graph validates in
@@ -4855,12 +4878,21 @@ def resolve_bundled_vocabulary_asset(repo_root: Path, relative: str) -> Path | N
     return None
 
 
-def resolve_default_shacl_shapes(repo_root: Path) -> tuple[Path | None, Path | None]:
-    """The bundled shapes and their ontology bundle, or (None, None)."""
-    shapes = resolve_bundled_vocabulary_asset(
-        repo_root, f"shacl/{DEFAULT_SHACL_SHAPES}"
-    )
-    if shapes is None:
+def resolve_default_shacl_shapes(
+    repo_root: Path,
+    profile: str = "core",
+) -> tuple[list[Path] | None, Path | None]:
+    """The bundled shape profiles and their ontology bundle, or (None, None).
+
+    All profiles in the chosen set must resolve: a partial set silently drops
+    whole classes of check, which is exactly the failure this exists to end.
+    """
+    names = FULL_SHACL_SHAPES if profile == "full" else DEFAULT_SHACL_SHAPES
+    shapes = [
+        resolve_bundled_vocabulary_asset(repo_root, f"shacl/{name}")
+        for name in names
+    ]
+    if any(path is None for path in shapes):
         return None, None
     ontology = resolve_bundled_vocabulary_asset(
         repo_root, f"ontology/{DEFAULT_SHACL_ONTOLOGY}"
@@ -4868,7 +4900,21 @@ def resolve_default_shacl_shapes(repo_root: Path) -> tuple[Path | None, Path | N
     return shapes, ontology
 
 
-def shacl_default_applies(source_bytes: int | None) -> bool:
+#: The full profile set is quadratic-ish in graph size, so its gate is not the
+#: core one. 16 MiB of VCF is a fixture or a small single-sample file, which is
+#: where a two-minute structural check is a reasonable trade.
+FULL_SHACL_MAX_SOURCE_BYTES = 16 * 1024 * 1024
+
+
+def shacl_max_source_bytes(profile: str) -> int:
+    """The size gate for one profile set."""
+    return (
+        FULL_SHACL_MAX_SOURCE_BYTES if profile == "full"
+        else DEFAULT_SHACL_MAX_SOURCE_BYTES
+    )
+
+
+def shacl_default_applies(source_bytes: int | None, profile: str = "core") -> bool:
     """Whether to validate shapes by default for a source of this size.
 
     Size-gated because pyshacl is in-memory. ``None`` means the size could not
@@ -4877,7 +4923,7 @@ def shacl_default_applies(source_bytes: int | None) -> bool:
     """
     if source_bytes is None:
         return False
-    return 0 <= source_bytes <= DEFAULT_SHACL_MAX_SOURCE_BYTES
+    return 0 <= source_bytes <= shacl_max_source_bytes(profile)
 
 
 def docker_image_exists(image: str) -> bool:
@@ -7250,7 +7296,7 @@ def run_full_mode(
     validation_engine: str | list[str] = DEFAULT_VALIDATION_ENGINE,
     validation_engine_options: dict | None = None,
     validation_strict_conformance: bool = False,
-    validation_shacl_shapes: Path | None = None,
+    validation_shacl_shapes: Path | list[Path] | None = None,
     validation_shacl_ontology: Path | None = None,
     filter_oracle: str = "auto",
     rdf_storage_mode: str,
@@ -8818,7 +8864,7 @@ def run_validation_mode(
     engine_options: dict | None = None,
     rdf_format: str | None = None,
     strict_conformance: bool = False,
-    shacl_shapes: Path | None = None,
+    shacl_shapes: Path | list[Path] | None = None,
     shacl_ontology: Path | None = None,
     run_tracker: RunTracker | None = None,
     stage_result: dict | None = None,
@@ -8884,10 +8930,23 @@ def run_validation_mode(
         engine_args.append("--strict-conformance")
     shacl_mount: list[str] = []
     if shacl_shapes is not None:
-        # Mounted read-only in its own directory so the shapes file can live
-        # anywhere on the host without exposing its parent tree for writing.
-        shacl_mount = ["-v", f"{shacl_shapes.parent.resolve()}:/data/shacl:ro"]
-        engine_args.extend(["--shacl-shapes", f"/data/shacl/{shacl_shapes.name}"])
+        # One or several profiles. They ship in one directory, so a single
+        # read-only mount covers them all; a caller pointing at files in
+        # different directories is refused rather than silently half-mounted.
+        shapes_paths = (
+            [shacl_shapes] if isinstance(shacl_shapes, Path) else list(shacl_shapes)
+        )
+        parents = {path.parent.resolve() for path in shapes_paths}
+        if len(parents) != 1:
+            raise ValueError(
+                "--shacl-shapes files must live in one directory; got "
+                + ", ".join(sorted(str(parent) for parent in parents))
+            )
+        shacl_mount = ["-v", f"{parents.pop()}:/data/shacl:ro"]
+        engine_args.extend([
+            "--shacl-shapes",
+            ",".join(f"/data/shacl/{path.name}" for path in shapes_paths),
+        ])
         if shacl_ontology is not None:
             # The ontology is a sibling directory in a vocabulary checkout, so
             # it needs its own mount rather than the shapes' one.
@@ -9389,15 +9448,31 @@ def main():
         ),
     )
     parser.add_argument(
+        "--shacl-profile",
+        choices=SHACL_PROFILE_CHOICES,
+        default="core",
+        help=(
+            "Which bundled shape profiles to apply. core (default) constrains "
+            "cardinality and datatype and is cheap. full adds the consistency "
+            "and SPARQL profiles, which are the ones that catch a corrupted "
+            "value -- duplicate record or sample indices, an alleleValue that "
+            "disagrees with ALT -- and are the four mutation classes the query "
+            "suite misses. full is measurably expensive: on a 2,000-triple "
+            "graph its profiles took 33.7 s and 73.2 s against 1.7 s for core, "
+            "so it is gated to sources at or below "
+            f"{FULL_SHACL_MAX_SOURCE_BYTES // (1024 * 1024)} MiB"
+        ),
+    )
+    parser.add_argument(
         "--no-shacl",
         action="store_true",
         help=(
             "Skip the bundled SHACL shape layer, which is otherwise applied by "
             "default to sources at or below "
-            f"{DEFAULT_SHACL_MAX_SOURCE_BYTES // (1024 * 1024)} MiB. It catches "
-            "what the aggregate comparisons structurally cannot -- a value that "
-            "is counted but never read -- and covers four of the ten mutation "
-            "classes the query suite misses. --shacl-shapes overrides both"
+            f"{DEFAULT_SHACL_MAX_SOURCE_BYTES // (1024 * 1024)} MiB. The "
+            "default (core) profile checks structure the aggregate comparisons "
+            "do not; --shacl-profile full adds the profiles that catch a "
+            "corrupted value. --shacl-shapes overrides both"
         ),
     )
     parser.add_argument(
@@ -9560,7 +9635,7 @@ def main():
     validation_artifacts: list[str] = []
     validation_engines: list[str] = [DEFAULT_VALIDATION_ENGINE]
     validation_engine_options: dict = {}
-    shacl_shapes_path: Path | None = None
+    shacl_shapes_path: list[Path] | None = None
     shacl_ontology_path: Path | None = None
     linking_manifests = []
     try:
@@ -9613,9 +9688,18 @@ def main():
         if cottas_warning is not None:
             eprint(f"Warning: {cottas_warning}")
         if args.shacl_shapes is not None:
-            shacl_shapes_path = Path(args.shacl_shapes).expanduser().resolve()
-            if not shacl_shapes_path.is_file():
-                raise ValueError(f"SHACL shapes file not found: {shacl_shapes_path}")
+            # Comma-separated: the published profile is split across files and
+            # only some of them catch a corrupted value.
+            shacl_shapes_path = [
+                Path(token.strip()).expanduser().resolve()
+                for token in str(args.shacl_shapes).split(",")
+                if token.strip()
+            ]
+            for path in shacl_shapes_path:
+                if not path.is_file():
+                    raise ValueError(f"SHACL shapes file not found: {path}")
+            if not shacl_shapes_path:
+                raise ValueError("--shacl-shapes needs at least one file")
             if args.shacl_ontology is not None:
                 shacl_ontology_path = Path(args.shacl_ontology).expanduser().resolve()
                 if not shacl_ontology_path.is_file():
@@ -9627,7 +9711,7 @@ def main():
                 # shapes, in ontology/. Use it when it is there, so the
                 # documented command needs no second flag.
                 candidate = (
-                    shacl_shapes_path.parent.parent
+                    shacl_shapes_path[0].parent.parent
                     / "ontology"
                     / "vcf-core-vocabulary.bundle.ttl"
                 )
@@ -9640,7 +9724,9 @@ def main():
             # published profile, which no run in the benchmark campaign
             # enabled. Default it on, size-gated, rather than leaving a
             # written check permanently unused.
-            bundled_shapes, bundled_ontology = resolve_default_shacl_shapes(repo_root)
+            bundled_shapes, bundled_ontology = resolve_default_shacl_shapes(
+                repo_root, args.shacl_profile
+            )
             if bundled_shapes is not None:
                 source_bytes = None
                 try:
@@ -9651,7 +9737,7 @@ def main():
                         source_bytes = source_for_size.stat().st_size
                 except (OSError, TypeError):
                     source_bytes = None
-                if shacl_default_applies(source_bytes):
+                if shacl_default_applies(source_bytes, args.shacl_profile):
                     shacl_shapes_path = bundled_shapes
                     shacl_ontology_path = bundled_ontology
 

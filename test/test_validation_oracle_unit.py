@@ -746,8 +746,24 @@ class ResolvedArgumentTests(VerboseTestCase):
         args = self.resolve(self.base(**{
             "--shacl-shapes": str(shapes), "--progress-path": str(self.root / "progress.json"),
         }))
-        self.assertTrue(args.shacl_shapes.is_absolute())
+        # A list now: the published profile is split across files and only some
+        # of them catch a corrupted value, so the default names three.
+        self.assertEqual(len(args.shacl_shapes), 1)
+        self.assertTrue(args.shacl_shapes[0].is_absolute())
         self.assertTrue(args.progress_path.is_absolute())
+
+    def test_several_shapes_files_are_accepted_and_all_resolved(self):
+        """Loading only the core profile detects none of the four classes."""
+        first, second = self.root / "a.ttl", self.root / "b.ttl"
+        for path in (first, second):
+            path.write_text("", encoding="utf-8")
+        args = self.resolve(self.base(**{
+            "--shacl-shapes": f"{first},{second}",
+        }))
+        self.assertEqual(
+            [path.name for path in args.shacl_shapes], ["a.ttl", "b.ttl"]
+        )
+        self.assertTrue(all(path.is_absolute() for path in args.shacl_shapes))
 
     def test_no_progress_path_stays_none(self):
         """Progress reporting is opt-in and must not be invented."""

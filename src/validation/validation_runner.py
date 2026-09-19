@@ -1880,9 +1880,28 @@ def parse_shacl_results(text: str) -> list[dict[str, str]]:
     return results
 
 
+def merge_shapes_graph(shapes: list[Path]):
+    """Parse several shapes files into one graph.
+
+    The published profile is split across files that check different things,
+    and the split matters: the core profile constrains cardinality and datatype
+    (``sh:minCount`` on vcfc:sampleIndex, and so on), while the *uniqueness and
+    agreement* rules -- the ones that catch a corrupted value rather than a
+    missing one -- live in the consistency and SPARQL profiles. Loading only
+    the core profile detects none of the mutation classes the shape layer is
+    supposed to cover.
+    """
+    from rdflib import Graph
+
+    graph = Graph()
+    for path in shapes:
+        graph.parse(str(path), format="turtle")
+    return graph
+
+
 def validate_shacl(
     source: Path,
-    shapes: Path,
+    shapes: Path | list[Path],
     results_dir: Path,
     ontology: Path | None = None,
 ) -> dict[str, Any]:
@@ -1911,19 +1930,25 @@ def validate_shacl(
         result = {
             "status": "EXECUTION_FAILED",
             "error": f"pyshacl is not installed in this image: {error}",
-            "shapes": str(shapes),
+            "shapes": [str(path) for path in (
+                [shapes] if isinstance(shapes, Path) else list(shapes))],
         }
         write_json(report_path, result)
         return result
 
     started = time.monotonic()
     try:
+        shapes_list = [shapes] if isinstance(shapes, Path) else list(shapes)
+        shacl_graph = (
+            str(shapes_list[0]) if len(shapes_list) == 1
+            else merge_shapes_graph(shapes_list)
+        )
         conforms, _graph, text = pyshacl_validate(
             str(source),
-            shacl_graph=str(shapes),
+            shacl_graph=shacl_graph,
             ont_graph=str(ontology) if ontology is not None else None,
             data_graph_format="nt",
-            shacl_graph_format="turtle",
+            **({"shacl_graph_format": "turtle"} if isinstance(shacl_graph, str) else {}),
             ont_graph_format="turtle" if ontology is not None else None,
             inference="rdfs" if ontology is not None else "none",
             advanced=True,
@@ -1932,7 +1957,8 @@ def validate_shacl(
         result = {
             "status": "EXECUTION_FAILED",
             "error": f"SHACL validation could not run: {error}",
-            "shapes": str(shapes),
+            "shapes": [str(path) for path in (
+                [shapes] if isinstance(shapes, Path) else list(shapes))],
         }
         write_json(report_path, result)
         return result
@@ -1962,7 +1988,7 @@ def validate_shacl(
         # this run acts on. A graph with warnings only is conforms=False here
         # and status=PASS, which is the distinction the severities encode.
         "conforms": bool(conforms),
-        "shapes": str(shapes),
+        "shapes": [str(path) for path in shapes_list],
         "ontology": str(ontology) if ontology is not None else None,
         "violationCount": len(violations),
         "violationPaths": paths,
@@ -4185,12 +4211,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--shacl-shapes",
-        type=Path,
         default=None,
         help=(
-            "Validate the graph against a SHACL shapes file as an independent "
-            "structural layer. Off by default: pyshacl loads the whole graph "
-            "into memory, so it does not scale to a cohort-sized aggregate"
+            "Validate the graph against SHACL shapes as an independent "
+            "structural layer. Comma-separated: the published profile splits "
+            "cardinality/datatype rules from the uniqueness and agreement "
+            "rules, and only the latter catch a corrupted value"
         ),
     )
     parser.add_argument(
@@ -4337,9 +4363,17 @@ def resolve_args(parser: argparse.ArgumentParser, argv: list[str] | None = None)
     if len({args.comunica_port, args.qlever_port, args.hdt_port}) != 3:
         parser.error("--comunica-port, --qlever-port and --hdt-port must all differ")
     if args.shacl_shapes is not None:
-        args.shacl_shapes = args.shacl_shapes.resolve()
-        if not args.shacl_shapes.is_file():
-            parser.error(f"SHACL shapes file does not exist: {args.shacl_shapes}")
+        # Comma-separated, because the published profile is split across files
+        # and the uniqueness/agreement rules live outside the core one.
+        paths = [
+            Path(token.strip()).resolve()
+            for token in str(args.shacl_shapes).split(",")
+            if token.strip()
+        ]
+        for path in paths:
+            if not path.is_file():
+                parser.error(f"SHACL shapes file does not exist: {path}")
+        args.shacl_shapes = paths
     if args.shacl_ontology is not None:
         args.shacl_ontology = args.shacl_ontology.resolve()
         if not args.shacl_ontology.is_file():
