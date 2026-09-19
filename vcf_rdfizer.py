@@ -5705,6 +5705,8 @@ def write_raw_compression_metrics_artifact(
     method_results: dict[str, dict],
     index_warnings: list[dict] | None = None,
     auxiliary_stages: dict[str, dict] | None = None,
+    build_profile: dict | None = None,
+    build_stages: list[dict] | None = None,
 ):
     """Persist the operation-level compression detail for one RDF source."""
     safe_output = safe_metrics_name(output_name)
@@ -5721,6 +5723,12 @@ def write_raw_compression_metrics_artifact(
         "compression_methods": ",".join(selected_methods) if selected_methods else "none",
         "index_warnings": list(index_warnings or []),
         "auxiliary_stages": dict(auxiliary_stages or {}),
+        # Where the build's time, memory and container-volume disk went. The
+        # container collected per-stage detail all along; it was dropped here,
+        # which is why 90% of end-to-end wall time was attributable no further
+        # than "compression".
+        "build_profile": dict(build_profile or {}),
+        "build_stages": list(build_stages or []),
         "methods": {},
     }
 
@@ -6937,6 +6945,8 @@ def run_containerized_partitioned_representation_methods(
                 selected_methods=methods,
                 method_results=method_results,
                 index_warnings=index_warnings,
+                build_profile=(payload or {}).get("build_profile"),
+                build_stages=(payload or {}).get("stages"),
             )
         return True, method_results
     finally:
