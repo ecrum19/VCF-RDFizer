@@ -2232,6 +2232,27 @@ class ParsedSampleRecord:
     filter_value: str = ""
 
 
+def source_file_from_header_lines(header_lines_tsv: Path) -> str:
+    """The SOURCE_FILE of a header-lines TSV, for a VCF with no data records.
+
+    ``SampleRecordStream`` learns the source file from the first data row, so a
+    header-only VCF leaves it empty -- and the emitters, which key their file
+    IRI on it, then emit nothing at all. The sample columns are declared on the
+    ``#CHROM`` line, not by the data, so a zero-record file still has a sample
+    set to represent. Reading the name from the header table restores it.
+    """
+    try:
+        with header_lines_tsv.open(newline="", encoding="utf-8") as handle:
+            reader = csv.reader(handle, delimiter="\t")
+            next(reader, None)  # column header
+            for row in reader:
+                if row and row[0]:
+                    return row[0]
+    except (OSError, csv.Error):
+        return ""
+    return ""
+
+
 class SampleRecordStream:
     """Read a records.tsv sample block once and expose a stable sample schema."""
 
@@ -2819,11 +2840,18 @@ def append_expanded_sample_rdf(
     )
 
     with SampleRecordStream(records_tsv) as record_stream:
-        if not record_stream.source_file:
+        # A header-only VCF has no data row to learn the source file from, but
+        # its #CHROM line still declares sample columns and its header still
+        # declares fields. Falling back to the header table keeps those
+        # declarations representable instead of emitting an empty graph.
+        source_file = record_stream.source_file or source_file_from_header_lines(
+            header_lines_tsv
+        )
+        if not source_file:
             return stats
 
         def produce(emit):
-            source_component = _rml_uri_component(record_stream.source_file)
+            source_component = _rml_uri_component(source_file)
             file_uri = f"file://{source_component}"
             # The profile is declared even for a sites-only VCF.
             # vcfc:RepresentationProfileShape requires exactly one on every
@@ -4154,11 +4182,18 @@ def append_record_detail_rdf(
     }
 
     with SampleRecordStream(records_tsv) as record_stream:
-        if not record_stream.source_file:
+        # A header-only VCF has no data row to learn the source file from, but
+        # its #CHROM line still declares sample columns and its header still
+        # declares fields. Falling back to the header table keeps those
+        # declarations representable instead of emitting an empty graph.
+        source_file = record_stream.source_file or source_file_from_header_lines(
+            header_lines_tsv
+        )
+        if not source_file:
             return stats
 
         def produce(emit):
-            source_component = _rml_uri_component(record_stream.source_file)
+            source_component = _rml_uri_component(source_file)
             file_uri = f"file://{source_component}"
             emitted_definitions: set[str] = set()
             emitted_assembly_contigs: set[str] = set()
@@ -4436,11 +4471,18 @@ def append_condensed_sample_rdf(
 
     definitions = _load_format_definitions(header_lines_tsv)
     with SampleRecordStream(records_tsv) as record_stream:
-        if not record_stream.source_file:
+        # A header-only VCF has no data row to learn the source file from, but
+        # its #CHROM line still declares sample columns and its header still
+        # declares fields. Falling back to the header table keeps those
+        # declarations representable instead of emitting an empty graph.
+        source_file = record_stream.source_file or source_file_from_header_lines(
+            header_lines_tsv
+        )
+        if not source_file:
             return stats
 
         def produce(emit):
-            source_component = _rml_uri_component(record_stream.source_file)
+            source_component = _rml_uri_component(source_file)
             file_uri = f"file://{source_component}"
             emitted_definitions: set[str] = set()
             # FORMAT keys repeat on every record; encode each distinct key once.

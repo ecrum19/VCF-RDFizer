@@ -1,9 +1,26 @@
 PREFIX vcfc: <https://w3id.org/vcf-core/vocab#>
 
+# Plain "." literals, which should have been typed vcfc:Null.
+#
+# Two predicates are excluded because "." is a CONFORMANT value there, not a
+# missing one, and the published shapes say so:
+#
+#   vcfc:fieldNumber    pattern ^([0-9]+|A|R|G|LA|LR|LG|P|M|[.])$  -- "." is
+#                       VCF's variable-cardinality token (Number=.), which is a
+#                       declared arity, not an absent value.
+#   vcfc:genotypeString pattern ^[|/]?([0-9]+|[.])([|/]([0-9]+|[.]))*$ -- a
+#                       fully-missing haploid call is literally "./." or ".",
+#                       and it carries vcfc:GenotypeString, not vcfc:Null.
+#
+# Without these exclusions the check reports every Number=. declaration in a
+# header as a conformance failure. On the 100,000-record HG005 benchmark cell
+# it returned 20 such rows, and all of them were declarations the vocabulary
+# requires to look exactly that way.
 SELECT ?s ?p ?o (DATATYPE(?o) AS ?datatype)
 WHERE {
   ?s ?p ?o .
   FILTER(ISLITERAL(?o) && STR(?o) = ".")
   FILTER(DATATYPE(?o) != vcfc:Null)
+  FILTER(?p NOT IN (vcfc:fieldNumber, vcfc:genotypeString))
 }
 LIMIT 100
