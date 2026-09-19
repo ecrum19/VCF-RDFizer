@@ -152,5 +152,79 @@ class MutationCoverageTests(VerboseTestCase):
             self.assertIn(mutation_id, source, mutation_id)
 
 
+
+
+class SeverityTests(VerboseTestCase):
+    """Only sh:Violation blocks a run; warnings are recommendations.
+
+    Caught on the VM, not here: the first real pipeline run with the new
+    default failed on test-1k with violationCount 0 and violationPaths
+    [vcfc:fieldSource, vcfc:fieldVersion]. Those come from
+    InfoHeaderLineRecommendedShape, which carries sh:severity sh:Warning
+    because VCF 4.5 *recommends* Source and Version on INFO declarations and
+    does not require them. pyshacl reports conforms=False for any result at any
+    severity, so keying the verdict on conforms alone failed a conformant graph
+    -- and would have failed almost every real VCF.
+    """
+
+    def _verdict(self, report_text):
+        import importlib.util
+
+        runner_path = (
+            Path(vcf_rdfizer.__file__).resolve().parent
+            / "src" / "validation" / "validation_runner.py"
+        )
+        spec = importlib.util.spec_from_file_location("vr_shacl", runner_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        violations = [
+            line.strip() for line in report_text.splitlines()
+            if line.strip().startswith("Constraint Violation")
+        ]
+        return "PASS" if not violations else "FAIL"
+
+    def test_warnings_alone_do_not_fail_a_run(self):
+        report = (
+            "Validation Report\nConforms: False\nResults (2):\n"
+            "Constraint Warning in MinCountConstraintComponent\n"
+            "\tResult Path: vcfc:fieldSource\n"
+            "Constraint Warning in MinCountConstraintComponent\n"
+            "\tResult Path: vcfc:fieldVersion\n"
+        )
+        self.assertEqual(self._verdict(report), "PASS")
+
+    def test_a_real_violation_still_fails(self):
+        report = (
+            "Validation Report\nConforms: False\nResults (1):\n"
+            "Constraint Violation in DatatypeConstraintComponent\n"
+            "\tResult Path: vcfc:pos\n"
+        )
+        self.assertEqual(self._verdict(report), "FAIL")
+
+    def test_a_clean_report_passes(self):
+        self.assertEqual(self._verdict("Validation Report\nConforms: True\n"), "PASS")
+
+    def test_the_recommended_shape_really_is_a_warning(self):
+        """Pin the assumption against the vendored shapes themselves."""
+        shapes = (
+            Path(vcf_rdfizer.__file__).resolve().parent
+            / "vcf_rdfizer_data" / "shacl" / "vcf-core-vocabulary.shacl.ttl"
+        ).read_text(encoding="utf-8")
+        block = shapes[shapes.index("InfoHeaderLineRecommendedShape"):]
+        block = block[:block.index(" .\n")]
+        self.assertIn("vcfc:fieldSource", block)
+        self.assertIn("vcfc:fieldVersion", block)
+        self.assertEqual(block.count("sh:severity sh:Warning"), 2)
+
+    def test_the_report_records_advisories_separately_from_violations(self):
+        source = (
+            Path(vcf_rdfizer.__file__).resolve().parent
+            / "src" / "validation" / "validation_runner.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('"advisoryCount"', source)
+        self.assertIn('"advisoryKinds"', source)
+        self.assertIn('"status": "PASS" if not violations else "FAIL"', source)
+
+
 if __name__ == "__main__":
     unittest.main()

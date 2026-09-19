@@ -1878,6 +1878,21 @@ def validate_shacl(
         line.strip() for line in text.splitlines()
         if line.strip().startswith("Constraint Violation")
     ]
+    # pyshacl reports conforms=False for ANY result, including sh:Warning and
+    # sh:Info. The published profile uses warnings for genuine recommendations
+    # -- InfoHeaderLineRecommendedShape warns when an INFO declaration omits
+    # Source or Version, which VCF 4.5 recommends and does not require -- so
+    # conforms alone would fail almost every real VCF. Only sh:Violation blocks
+    # a run; advisory results are reported and carried, not enforced.
+    advisories = sorted({
+        line.strip().split(":", 1)[0].strip()
+        for line in text.splitlines()
+        if line.strip().startswith(("Constraint Warning", "Constraint Info"))
+    })
+    advisory_count = sum(
+        1 for line in text.splitlines()
+        if line.strip().startswith(("Constraint Warning", "Constraint Info"))
+    )
     paths = sorted({
         line.split("Result Path:", 1)[1].strip()
         for line in text.splitlines() if "Result Path:" in line
@@ -1885,12 +1900,17 @@ def validate_shacl(
     log_path = results_dir / "shacl-report.txt"
     log_path.write_text(text, encoding="utf-8")
     result = {
-        "status": "PASS" if conforms else "FAIL",
+        "status": "PASS" if not violations else "FAIL",
+        # Kept verbatim: it is pyshacl's own verdict, and it is NOT the verdict
+        # this run acts on. A graph with warnings only is conforms=False here
+        # and status=PASS, which is the distinction the severities encode.
         "conforms": bool(conforms),
         "shapes": str(shapes),
         "ontology": str(ontology) if ontology is not None else None,
         "violationCount": len(violations),
         "violationPaths": paths,
+        "advisoryCount": advisory_count,
+        "advisoryKinds": advisories,
         "report": str(log_path),
         "wallSeconds": time.monotonic() - started,
         "sampleLimitedTo": SHACL_SAMPLE_LIMIT,
