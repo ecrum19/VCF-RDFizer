@@ -7007,6 +7007,39 @@ def run_partitioned_representation_methods_for_rdf_files(
     )
 
 
+def remove_tsv_triplet(
+    triplet: dict,
+    *,
+    tsv_dir: Path,
+    image_ref: str,
+    wrapper_log_path: Path,
+) -> tuple[bool, Path | None]:
+    """Remove one input's TSV intermediates. Returns (ok, first_failed_path).
+
+    Idempotent: a path that is already gone is a success, so this can be called
+    at the point the TSVs stop being read AND again as an end-of-iteration
+    sweep without the second call reporting a failure.
+    """
+    for tsv_path in (
+        triplet.get("records"),
+        triplet.get("headers"),
+        triplet.get("metadata"),
+        triplet.get("sample_calls"),
+        triplet.get("sample_format_values"),
+    ):
+        if tsv_path is None or not tsv_path.exists():
+            continue
+        if not remove_file_with_docker_fallback(
+            path=tsv_path,
+            mount_root=tsv_dir,
+            mount_point="/data/tsv",
+            image_ref=image_ref,
+            wrapper_log_path=wrapper_log_path,
+        ):
+            return False, tsv_path
+    return True, None
+
+
 def run_full_mode(
     *,
     input_mount_dir: Path,
@@ -7567,6 +7600,28 @@ def run_full_mode(
             for raw_rdf_path in raw_rdf_files:
                 run_tracker.track_raw_rdf(raw_rdf_path)
 
+        # Every TSV reader has now run: RMLStreamer, the sample emitter, the
+        # header emitter and the record-detail emitter. Free them here rather
+        # than at the end of the iteration, because what comes next is the
+        # representation build -- 90% of end-to-end wall time, and the reason a
+        # 2.63 GB TSV set was sitting on disk for 14.8 hours after being read
+        # in the first three minutes. Measured on the whole-file HG005 cell,
+        # this alone takes peak workspace from 16.23 GB to about 13.6 GB.
+        if not keep_tsv:
+            tsv_removed, failed_path = remove_tsv_triplet(
+                triplet,
+                tsv_dir=tsv_dir,
+                image_ref=image_ref,
+                wrapper_log_path=wrapper_log_path,
+            )
+            if not tsv_removed:
+                fail_current(
+                    "tsv-cleanup",
+                    f"failed to remove intermediate TSV '{failed_path.name}'. "
+                    f"See log: {wrapper_log_path}",
+                )
+                continue
+
         method_results_by_file: dict[str, dict[str, dict]] = {}
         partitioned_representation_results: dict[str, dict] = {}
         if selected_methods:
@@ -7952,32 +8007,21 @@ def run_full_mode(
             print(f"      - Final RDF size (no compression): {format_bytes(raw_total_size)}")
 
         if not keep_tsv:
-            # Cleanup only the triplet generated for this input iteration.
-            tsv_cleanup_failed = False
-            for tsv_path in (
-                triplet["records"],
-                triplet["headers"],
-                triplet["metadata"],
-                triplet.get("sample_calls"),
-                triplet.get("sample_format_values"),
-            ):
-                if tsv_path is None:
-                    continue
-                if tsv_path.exists():
-                    if not remove_file_with_docker_fallback(
-                        path=tsv_path,
-                        mount_root=tsv_dir,
-                        mount_point="/data/tsv",
-                        image_ref=image_ref,
-                        wrapper_log_path=wrapper_log_path,
-                    ):
-                        fail_current(
-                            "tsv-cleanup",
-                            f"failed to remove intermediate TSV '{tsv_path.name}'. See log: {wrapper_log_path}",
-                        )
-                        tsv_cleanup_failed = True
-                        break
-            if tsv_cleanup_failed:
+            # Safety net. The triplet is normally freed before the
+            # representation build above; this catches a path that only
+            # appeared later, and is a no-op in the ordinary case.
+            tsv_removed, failed_path = remove_tsv_triplet(
+                triplet,
+                tsv_dir=tsv_dir,
+                image_ref=image_ref,
+                wrapper_log_path=wrapper_log_path,
+            )
+            if not tsv_removed:
+                fail_current(
+                    "tsv-cleanup",
+                    f"failed to remove intermediate TSV '{failed_path.name}'. "
+                    f"See log: {wrapper_log_path}",
+                )
                 continue
 
         if run_tracker is not None:
