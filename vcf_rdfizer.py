@@ -345,6 +345,103 @@ SAMPLE_RDF_BUFFER_BYTES = 8 * 1024 * 1024
 # line starting with one of these bytes and ending in " ." is a statement.
 _NTRIPLES_SUBJECT_STARTS = (b"<", b"_")
 SAMPLE_REPRESENTATION_CHOICES = {"expanded", "condensed"}
+
+#: How many triples the expanded representation adds per (record x sample).
+#: Fitted from the sample ladder in 03_sample_representation, which re-emitted
+#: the same 10,000 variant records against 1, 4, 16, 64, 256, 1024 and 2504
+#: sample columns: the expanded-minus-condensed difference divided by
+#: records x samples converges to 24.997 by 2504 samples (25.0 at 1024, 24.97
+#: at 256). The condensed arm over that same ladder moved 0.9% in total, which
+#: is why only the expanded side needs an estimate at all.
+EXPANDED_TRIPLES_PER_SAMPLE_CALL = 25
+#: Peak workspace bytes per emitted triple, measured rather than assumed: the
+#: s2504 expanded cell peaked at 11,481,042,944 bytes for 627,372,018 triples,
+#: i.e. 18.3. Rounded up, because a guard that under-estimates is no guard.
+EXPANDED_PEAK_BYTES_PER_TRIPLE = 20
+#: Refuse when the estimate needs more than this share of the free space that
+#: remains. Leaving a quarter of the volume is not generosity: the estimate is
+#: a fit, and filling a disk takes down everything else running on the host.
+COHORT_GUARD_FREE_SPACE_SHARE = 0.75
+
+
+def estimate_expanded_workspace_bytes(record_count: int, sample_count: int) -> int:
+    """Peak bytes the expanded representation will need for this shape.
+
+    Expanded emits per sample per record, so cost is records x samples and the
+    file size on disk says almost nothing about it: 1000G_phase3_chr20 is 327 MB
+    gzipped and, at 1,812,841 records x 2,504 samples, needs roughly 2 TB.
+    """
+    return int(
+        max(0, record_count)
+        * max(0, sample_count)
+        * EXPANDED_TRIPLES_PER_SAMPLE_CALL
+        * EXPANDED_PEAK_BYTES_PER_TRIPLE
+    )
+
+
+def count_records_tsv_rows(records_tsv: Path) -> int:
+    """Data rows in a records TSV, read once in binary without parsing fields."""
+    total = 0
+    with records_tsv.open("rb") as handle:
+        while chunk := handle.read(8 * 1024 * 1024):
+            total += chunk.count(b"\n")
+    # The header line is not a record. A file whose final row has no trailing
+    # newline loses one here, which errs toward a smaller estimate by one row.
+    return max(0, total - 1)
+
+
+def read_records_tsv_sample_count(records_tsv: Path) -> int:
+    """Sample columns declared by a records TSV, or 0 when it has none."""
+    try:
+        with SampleRecordStream(records_tsv) as stream:
+            return len(stream.columns)
+    except (OSError, csv.Error, StopIteration):
+        return 0
+
+
+def cohort_scale_refusal(
+    *,
+    records_tsv: Path,
+    sample_representation: str,
+    out_dir: Path,
+    allow: bool,
+) -> str | None:
+    """Refuse an expanded run that cannot fit, naming the condensed alternative.
+
+    Only ``expanded`` is affected. Condensed is ~S + (V x F) and stays tractable
+    at cohort scale -- across a 1-to-2504 sample ladder it grew 0.9% in total --
+    so the cohort file still converts, in the representation that can hold it.
+
+    Returns the refusal message, or None when the run may proceed.
+    """
+    if allow or sample_representation != "expanded":
+        return None
+    sample_count = read_records_tsv_sample_count(records_tsv)
+    if sample_count <= 1:
+        return None
+    try:
+        record_count = count_records_tsv_rows(records_tsv)
+        free_bytes = shutil.disk_usage(out_dir).free
+    except OSError:
+        # An unreadable TSV or volume is the pipeline's problem to report, not
+        # this guard's to guess at. Let the run proceed and fail where it means.
+        return None
+    needed = estimate_expanded_workspace_bytes(record_count, sample_count)
+    budget = int(free_bytes * COHORT_GUARD_FREE_SPACE_SHARE)
+    if needed <= budget:
+        return None
+    return (
+        f"--sample-representation expanded needs an estimated "
+        f"{needed / 1e9:,.1f} GB of workspace for {record_count:,} records x "
+        f"{sample_count:,} samples ({record_count * sample_count:,} sample "
+        f"calls), and only {free_bytes / 1e9:,.1f} GB is free on "
+        f"{out_dir}. Expanded emits per sample per record, so its cost is "
+        f"records x samples and is not visible in the input file size.\n"
+        f"  Use --sample-representation condensed, which encodes the same "
+        f"genotypes as S + (V x F) and stays flat in sample count, or pass "
+        f"--allow-cohort-expansion to proceed anyway and accept the risk of "
+        f"filling this volume."
+    )
 # How the INFO column is represented. "raw" is the historical behaviour (an
 # opaque vcfc:infoRaw string). "structured" additionally emits one
 # vcfc:InfoFieldValue per record and key, plus the allele layer and the
@@ -6949,6 +7046,7 @@ def run_full_mode(
     run_tracker: RunTracker | None = None,
     linking_manifests: list | None = None,
     linking_options: dict | None = None,
+    allow_cohort_expansion: bool = False,
 ):
     """Execute full pipeline: per-input TSV -> RDF -> compression -> validation."""
     linking_options = dict(linking_options or {})
@@ -7108,6 +7206,21 @@ def run_full_mode(
 
         triplet = triplets_by_prefix[expected_prefix]
         prefix = triplet["prefix"]
+
+        # Refuse a cohort-scale expanded run before spending anything on it.
+        # This sits ahead of the helper TSVs deliberately: building those is
+        # already records x samples work, so a guard after them has let the
+        # failure mode start.
+        refusal = cohort_scale_refusal(
+            records_tsv=triplet["records"],
+            sample_representation=sample_workflow.representation,
+            out_dir=out_dir,
+            allow=allow_cohort_expansion,
+        )
+        if refusal is not None:
+            fail_current("cohort-scale-guard", refusal)
+            continue
+
         sample_calls_tsv = tsv_dir / f"{prefix}.sample_calls.tsv"
         sample_format_tsv = tsv_dir / f"{prefix}.sample_format_values.tsv"
         try:
@@ -8820,6 +8933,18 @@ def main():
         ),
     )
     parser.add_argument(
+        "--allow-cohort-expansion",
+        action="store_true",
+        help=(
+            "Proceed with --sample-representation expanded even when the "
+            "estimated workspace exceeds the free space on the output volume. "
+            "Expanded emits per sample per record, so cost is records x samples "
+            "and is invisible in the input file size: a 327 MB gzipped "
+            "2,504-sample cohort needs roughly 2 TB. Off by default, because "
+            "filling the volume takes down whatever else is running on the host"
+        ),
+    )
+    parser.add_argument(
         "--header-representation",
         choices=HEADER_REPRESENTATION_CHOICES,
         default=DEFAULT_HEADER_REPRESENTATION,
@@ -9759,6 +9884,7 @@ def main():
                 image_ref=image_ref,
                 out_name=args.out_name,
                 sample_workflow=sample_workflow,
+                allow_cohort_expansion=args.allow_cohort_expansion,
                 info_representation=args.info_representation,
                 header_representation=args.header_representation,
                 vcf_version=args.vcf_version,
