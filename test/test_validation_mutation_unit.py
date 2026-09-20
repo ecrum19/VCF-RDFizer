@@ -75,9 +75,37 @@ class RdflibEngine:
                     "rawResult": str(raw_path), "engine": "rdflib", "error": str(error)}
 
 
+def shacl_profile_paths() -> list[Path] | None:
+    """The bundled shape profiles named by VCF_RDFIZER_MUTATION_SHACL, or None.
+
+    The query layer and the shape layer catch different things, and until now
+    this harness measured only the first: every score it has ever reported is a
+    query-only score. Setting the variable to `full` or `core` folds the shape
+    verdict in, which is what makes the shape layer's contribution measurable
+    instead of predicted.
+    """
+    profile = os.environ.get("VCF_RDFIZER_MUTATION_SHACL", "").strip().lower()
+    if profile not in {"core", "full"}:
+        return None
+    import vcf_rdfizer
+
+    repo_root = Path(vcf_rdfizer.__file__).resolve().parent
+    shapes, _ontology = vcf_rdfizer.resolve_default_shacl_shapes(repo_root, profile)
+    return shapes
+
+
+def shacl_ontology_path() -> Path | None:
+    import vcf_rdfizer
+
+    repo_root = Path(vcf_rdfizer.__file__).resolve().parent
+    _shapes, ontology = vcf_rdfizer.resolve_default_shacl_shapes(repo_root, "core")
+    return ontology
+
+
 def validate_graph(
     graph_text: str, representation: str, *, strict_conformance: bool = False,
     include_qual: bool = True, mapping_policy: str = "strict",
+    shacl_shapes: list[Path] | None = None,
 ) -> dict:
     """Run the whole validation decision over one graph."""
     parser = fixtures.parser_summary(representation, include_qual=include_qual)
@@ -95,10 +123,24 @@ def validate_graph(
         # statement count itself. For well-formed N-Triples that is exactly the
         # number of non-empty lines, which is what rapper would report.
         parsed = sum(1 for line in graph_text.splitlines() if line.strip())
-        return V.evaluate_validation(
+        verdict = V.evaluate_validation(
             executions, parser, representation, strict_conformance=strict_conformance,
             mapping_policy=mapping_policy, parsed_triple_count=parsed,
         )
+        if shacl_shapes:
+            graph_path = Path(td) / "graph.nt"
+            graph_path.write_text(graph_text, encoding="utf-8")
+            shacl = V.validate_shacl(
+                graph_path, shacl_shapes, Path(td), shacl_ontology_path()
+            )
+            verdict = dict(verdict)
+            verdict["shacl"] = shacl
+            # A shape violation is a detection in its own right. An execution
+            # failure is NOT: pyshacl being absent or erroring would otherwise
+            # inflate the score with detections nothing actually made.
+            if shacl.get("status") == "FAIL" and verdict["status"] == "PASS":
+                verdict["status"] = "SHACL_VIOLATION"
+        return verdict
 
 
 @unittest.skipIf(rdflib is None, "rdflib is required for the host mutation harness")
@@ -143,14 +185,27 @@ class MutationDetectionTests(VerboseTestCase):
             cls.graphs[key] = fixtures.build_graph(representation, **dict(options))
         return cls.graphs[key]
 
+    #: Resolved once. None unless VCF_RDFIZER_MUTATION_SHACL names a profile,
+    #: so the default run stays exactly the query-only measurement it has
+    #: always been and every archived score remains comparable.
+    shacl_shapes = shacl_profile_paths()
+
     @classmethod
     def tearDownClass(cls):
         detected = [r for r in cls.results if r["detected"]]
+        by_shacl = [r for r in cls.results if r.get("detectedByShacl")]
         report = {
             "total": len(cls.results),
             "detected": len(detected),
             "score": round(len(detected) / len(cls.results), 4) if cls.results else 0.0,
             "knownUndetected": [r["id"] for r in cls.results if not r["detected"]],
+            # Which layer did the detecting. Without this the score is one
+            # number that cannot be attributed, and the shape layer's
+            # contribution stays a claim rather than a measurement.
+            "shaclProfile": os.environ.get("VCF_RDFIZER_MUTATION_SHACL") or None,
+            "detectedByShacl": len(by_shacl),
+            "detectedByShaclIds": sorted({r["id"] for r in by_shacl}),
+            "detectedByQueriesOnly": len(detected) - len(by_shacl),
             "mutations": cls.results,
         }
         destination = os.environ.get("VCF_RDFIZER_MUTATION_REPORT")
@@ -172,19 +227,28 @@ class MutationDetectionTests(VerboseTestCase):
             mutated, representation, strict_conformance=strict,
             include_qual=options.get("include_qual", True),
             mapping_policy=mutation.mapping_policy,
+            shacl_shapes=self.shacl_shapes,
         )
         detected = verdict["status"] != "PASS"
+        detected_by_shacl = verdict["status"] == "SHACL_VIOLATION"
         self.results.append({
             "id": mutation.id,
             "representation": representation,
             "vcfElement": mutation.vcf_element,
             "expectedDetectedBy": mutation.expected_detected_by,
             "detected": detected,
+            "detectedByShacl": detected_by_shacl,
             "status": verdict["status"],
             "knownUndetected": mutation.known_undetected,
             "graphOptions": dict(mutation.graph_options),
         })
         if mutation.known_undetected:
+            if self.shacl_shapes and detected_by_shacl:
+                # Closing one of these is the entire point of enabling the
+                # shape layer, so it is recorded rather than failed. The
+                # catalogue still describes the QUERY layer's coverage, which
+                # is what an unqualified run measures.
+                return
             self.assertFalse(
                 detected,
                 f"{mutation.id} is now DETECTED. This gap has been closed - remove "
