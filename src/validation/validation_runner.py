@@ -1971,6 +1971,7 @@ DEFAULT_COMUNICA_WARMUP_TIMEOUT = 3600
 #: The HDT endpoint runs alongside the N-Triples one within a single run, so
 #: they must not contend for a port.
 DEFAULT_HDT_ENDPOINT_PORT = 7021
+DEFAULT_COTTAS_ENDPOINT_PORT = 7022
 
 
 QLEVER_STATUS_FILE = Path("/opt/vcf-rdfizer/qlever-status.txt")
@@ -2785,85 +2786,67 @@ class HdtEngine(ComunicaHttpEndpointMixin, NativeArtifactEngine):
         }
 
 
-#: Run one COTTAS query and write SPARQL Results JSON to stdout.
-#:
-#: This is a separate process on purpose. rdflib evaluates SPARQL over a custom
-#: Store by pulling triples through the Store API in Python, so a query that
-#: looks trivial can run for hours: measured on a 39 MB artifact, opening the
-#: store takes 3-15 ms but `SELECT ?s WHERE { ?s ?p ?o } LIMIT 1` takes 12.7 s
-#: and `COUNT(*)` does not finish in two minutes. In-process, none of that is
-#: interruptible -- the call sits inside pycottas and no timeout can reach it.
-#: Out of process, it is killable.
-#:
-#: Re-opening per query costs nothing, so this does not undo the load-once
-#: property the other engines need: for COTTAS the artifact *is* the index.
-COTTAS_QUERY_RUNNER = """
-import sys
+class CottasEngine(ComunicaHttpEndpointMixin, NativeArtifactEngine):
+    """Query a .cottas artifact in place, from one load, over Comunica's endpoint.
 
-import pycottas
-import rdflib
+    This used to go through pycottas's rdflib Store in-process. rdflib evaluates
+    SPARQL over a custom Store by pulling triples through the Store API in
+    Python, which is why that path was unusable rather than merely slow:
+    measured on a 39 MB artifact, opening the store took 3-15 ms but
+    `SELECT ?s ?p ?o LIMIT 1` took 12.7 s and COUNT(*) did not finish in two
+    minutes. 06_equivalence hung on one genotype query for 41 hours, and again
+    for 10 hours once bounded, because a bound stops a query without making the
+    engine able to answer it.
 
-artifact, query_path = sys.argv[1], sys.argv[2]
-graph = rdflib.Graph(store=pycottas.COTTASStore(artifact))
-with open(query_path, encoding="utf-8") as handle:
-    query = handle.read()
-sys.stdout.buffer.write(graph.query(query).serialize(format="json"))
-"""
+    @elias.crum/query-sparql-cottas answers the same artifact through DuckDB
+    over the Parquet, behind the same long-lived endpoint the comunica and HDT
+    engines already use -- so the graph is opened once and every query is
+    charged only for itself.
 
-
-class CottasEngine(NativeArtifactEngine):
-    """Query a .cottas artifact in place through pycottas's rdflib store.
-
-    pycottas exposes ``COTTASStore``, an rdflib Store backed by the Parquet
-    artifact. Each query runs in its own process rather than in this one, so
-    ``--validation-query-timeout`` can actually stop it -- see
-    COTTAS_QUERY_RUNNER for why that matters here and nowhere else.
+    Building the artifact still goes through pycottas: this replaces querying,
+    not rdf2cottas.
     """
 
     name = "cottas"
     artifact_format = "cottas"
+    endpoint_binary = "comunica-sparql-cottas-http"
+    endpoint_port_option = "cottas_port"
+    default_endpoint_port = DEFAULT_COTTAS_ENDPOINT_PORT
+    endpoint_missing_hint = (
+        "so COTTAS cannot be queried natively. Rebuild the image, or validate "
+        "the COTTAS artifact by decoding it (--rdf file.cottas --engine comunica)"
+    )
+
+    def __init__(self, source: Path, *, raw_dir: Path, scratch: Path, options: dict[str, Any]):
+        super().__init__(source, raw_dir=raw_dir, scratch=scratch, options=options)
+        self._init_endpoint(options)
 
     def build_artifact(self, target: Path) -> None:
         import pycottas
 
         pycottas.rdf2cottas(str(self.source), str(target))
 
+    def _endpoint_source_argument(self) -> str:
+        # Comunica needs the source type declared, exactly as for HDT: a bare
+        # path is treated as a link to dereference. The engine takes one local
+        # file -- no URLs, directories or globs.
+        return f"cottas@{self.artifact}"
+
     def start(self) -> None:
-        try:
-            import pycottas  # noqa: F401
-            import rdflib  # noqa: F401
-        except ImportError as error:
-            raise RuntimeError(
-                f"pycottas and rdflib are required to query COTTAS natively: {error}"
-            ) from error
-        super().start()
+        # Check the binary before building the artifact: rdf2cottas is the
+        # expensive step and there is no point paying it for an engine that
+        # cannot run.
+        self._require_endpoint_binary()
+        NativeArtifactEngine.start(self)
+        self._start_endpoint()
 
-    def execute(self, query_id: str, query_path: Path) -> dict[str, Any]:
-        raw_path = self.raw_dir / f"{query_id}.sparql.json"
-        stderr_path = self.raw_dir / f"{query_id}.stderr.txt"
-        started = time.monotonic()
-        returncode, error = run_query_process(
-            [sys.executable, "-c", COTTAS_QUERY_RUNNER,
-             str(self.artifact), str(query_path)],
-            stdout_path=raw_path,
-            stderr_path=stderr_path,
-            timeout=self.query_timeout,
-        )
-        if returncode != 0:
-            # Whatever reached stdout is a truncated serialization, not a
-            # result; leave valid JSON so a reader fails on the status rather
-            # than on a parse error.
-            raw_path.write_text("{}", encoding="utf-8")
-            if error is None:
-                error = stderr_path.read_text(encoding="utf-8")[-2000:] or None
-        return self._envelope(
-            query_id, query_path, returncode=returncode, started=started,
-            raw_path=raw_path, stderr_path=stderr_path, error=error,
-        )
-
-    def stop(self) -> None:
-        # Nothing to close: each query owned its own process and has exited.
-        return None
+    def describe(self) -> dict[str, Any]:
+        return {
+            **NativeArtifactEngine.describe(self),
+            **self.endpoint_describe(),
+            "mode": "native cottas query over DuckDB, no decode",
+            "index_orders": "spo only (sibling .posg/.ospg files are not built)",
+        }
 
 
 ENGINE_CLASSES = {

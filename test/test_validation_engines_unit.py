@@ -921,12 +921,17 @@ class QueryTimeoutEnforcementTests(VerboseTestCase):
                 "the forked child outlived the group kill and kept running",
             )
 
-    def test_cottas_runs_each_query_in_its_own_process(self):
-        """In-process querying is what made the hang unkillable."""
+    def test_cottas_is_not_queried_in_process(self):
+        """In-process querying is what made the hang unkillable.
+
+        It is now answered over comunica's endpoint, where the mixin's timeout
+        applies like any other HTTP engine -- so this engine inherits the 124
+        classification rather than needing its own kill path.
+        """
         source = Path(V.__file__).read_text(encoding="utf-8")
         cottas = source[source.index("class CottasEngine"):]
         cottas = cottas[: cottas.index("\nENGINE_CLASSES")]
-        self.assertIn("run_query_process", cottas)
+        self.assertIn("ComunicaHttpEndpointMixin", cottas)
         self.assertNotIn(
             "self.graph.query", cottas,
             "CottasEngine is querying in-process again; a hung query cannot be "
