@@ -4574,28 +4574,53 @@ def append_condensed_sample_rdf(
         return _append_rdf_atomically(rdf_path, stats, produce)
 
 
+def allele_layer_required(info_representation: str, sample_representation: str) -> bool:
+    """Decide whether the record's allele resources have to be minted.
+
+    Two independent layers join to ``<record>/allele/<index>``: the structured
+    INFO value items for Number=A/R/G fields, and the expanded sample layer's
+    ``vcfc:calledAllele`` on every ``vcfc:GenotypeAlleleCall``. Either one alone
+    is enough to require the alleles, so the decision is a disjunction rather
+    than a property of the INFO representation. Tying it to INFO alone left
+    ``--info-representation raw --sample-representation expanded`` emitting
+    ``vcfc:calledAllele`` edges whose targets were never described.
+    """
+    if info_representation not in INFO_REPRESENTATION_CHOICES:
+        raise ValueError(f"unknown INFO representation: {info_representation}")
+    if sample_representation not in SAMPLE_REPRESENTATION_CHOICES:
+        choices = ", ".join(sorted(SAMPLE_REPRESENTATION_CHOICES))
+        raise ValueError(
+            f"unsupported sample representation '{sample_representation}'; "
+            f"choose {choices}"
+        )
+    return info_representation == "structured" or sample_representation == "expanded"
+
+
 def emit_record_detail(
     info_representation: str,
     *,
     records_tsv: Path,
     header_lines_tsv: Path,
     rdf_path: Path,
+    sample_representation: str = "expanded",
     version: "vocab.VCFVersion | None" = None,
 ) -> dict | None:
     """Append the record detail, and when selected the structured INFO form.
 
     ID, ALT, QUAL, FILTER and INFO raw are always emitted: the RML mapping
     cannot type the missing token per row, so this is the only place they can
-    come from. The allele layer travels with the structured INFO representation,
-    because the Number=A/R/G value items are joined to the allele resources it
-    mints.
+    come from. The allele layer is emitted whenever some other layer joins to
+    it -- the structured INFO value items, or the expanded sample layer's
+    per-call ``vcfc:calledAllele`` -- so that no representation combination can
+    reference an allele resource that was never described.
     """
     if info_representation not in INFO_REPRESENTATION_CHOICES:
         raise ValueError(f"unknown INFO representation: {info_representation}")
     structured = info_representation == "structured"
     return append_record_detail_rdf(
         records_tsv, header_lines_tsv, rdf_path,
-        emit_qual=True, emit_info=structured, emit_alleles=structured,
+        emit_qual=True, emit_info=structured,
+        emit_alleles=allele_layer_required(info_representation, sample_representation),
         version=version,
     )
 
@@ -7775,6 +7800,7 @@ def run_full_mode(
                     records_tsv=triplet["records"],
                     header_lines_tsv=triplet["headers"],
                     rdf_path=raw_rdf_files[0],
+                    sample_representation=sample_workflow.representation,
                     version=effective_version,
                 )
             except Exception as exc:
