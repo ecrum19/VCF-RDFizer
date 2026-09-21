@@ -279,7 +279,13 @@ def build_graph(
         vcf_rdfizer.append_record_detail_rdf(
             records_tsv, headers_tsv, graph,
             emit_qual=include_qual, emit_info=include_info,
-            emit_alleles=include_info, version=version,
+            # Same disjunction the wrapper applies: the expanded sample layer
+            # joins to the alleles through vcfc:calledAllele, so raw INFO alone
+            # does not mean the allele layer can be left out.
+            emit_alleles=vcf_rdfizer.allele_layer_required(
+                "structured" if include_info else "raw", representation
+            ),
+            version=version,
             progress_interval_records=0,
         )
         if representation == "expanded":

@@ -579,6 +579,15 @@ def emitted_record_counters(
     """
     classes: Counter[str] = Counter()
     predicates: Counter[str] = Counter()
+    # The allele layer is reported separately for the same reason the genotype
+    # layer is: it is not owned by one representation axis. Structured INFO
+    # needs it for the Number=A/R/G value items, and the expanded sample layer
+    # needs it for vcfc:calledAllele, so expected_census merges it when either
+    # asks. Everything the emitter writes inside its ``emit_alleles`` branch --
+    # the contig and assembly links as well as the allele resources -- belongs
+    # here, or the oracle and the emitter would disagree about raw INFO.
+    allele_classes: Counter[str] = Counter()
+    allele_predicates: Counter[str] = Counter()
 
     assembly_contig_ids: set[str] = set()
     reference_alleles = alt_alleles = 0
@@ -595,15 +604,15 @@ def emitted_record_counters(
         # declared reference sequence; the two are mutually exclusive.
         assembly_id = vocab.parse_bracketed_chrom(chrom)
         if assembly_id is not None:
-            predicates["chromAssemblyContig"] += 1
+            allele_predicates["chromAssemblyContig"] += 1
             if assembly_id not in assembly_contig_ids:
                 assembly_contig_ids.add(assembly_id)
-                classes["AssemblyContig"] += 1
-                predicates["assemblyContigId"] += 1
+                allele_classes["AssemblyContig"] += 1
+                allele_predicates["assemblyContigId"] += 1
                 if has_assembly_line:
-                    predicates["declaredInAssembly"] += 1
+                    allele_predicates["declaredInAssembly"] += 1
         elif chrom in contig_ids:
-            predicates["chromosome"] += 1
+            allele_predicates["chromosome"] += 1
 
         alleles = vocab.parse_alt_alleles(ref, alt)
         allele_uris = {allele.index for allele in alleles}
@@ -614,17 +623,17 @@ def emitted_record_counters(
             else:
                 alt_alleles += 1
             if allele.symbolic_id and allele.symbolic_id in alt_declaration_ids:
-                predicates["declaredByAlt"] += 1
+                allele_predicates["declaredByAlt"] += 1
             if allele.symbolic_type:
-                predicates["svType"] += 1
+                allele_predicates["svType"] += 1
             if allele.breakend is not None:
-                classes["Breakend"] += 1
+                allele_classes["Breakend"] += 1
                 if allele.breakend.orientation is not None:
-                    predicates["breakendOrientation"] += 1
+                    allele_predicates["breakendOrientation"] += 1
                 if allele.breakend.replacement:
-                    predicates["breakendReplacementString"] += 1
+                    allele_predicates["breakendReplacementString"] += 1
                 if allele.breakend.is_single:
-                    predicates["isSingleBreakend"] += 1
+                    allele_predicates["isSingleBreakend"] += 1
 
         entries = parse_info_entries(info)
         for key, value in entries:
@@ -666,14 +675,14 @@ def emitted_record_counters(
                     )
 
     if reference_alleles:
-        classes["ReferenceAllele"] = reference_alleles
-        predicates["hasReferenceAllele"] = reference_alleles
+        allele_classes["ReferenceAllele"] = reference_alleles
+        allele_predicates["hasReferenceAllele"] = reference_alleles
     if alt_alleles:
-        classes["AltAllele"] = alt_alleles
-        predicates["hasAltAllele"] = alt_alleles
+        allele_classes["AltAllele"] = alt_alleles
+        allele_predicates["hasAltAllele"] = alt_alleles
     total_alleles = reference_alleles + alt_alleles
     for name in ("alleleIndex", "alleleValue", "alleleKind"):
-        predicates[name] += total_alleles
+        allele_predicates[name] += total_alleles
 
     if value_items:
         classes["FieldValueItem"] += value_items
@@ -699,6 +708,8 @@ def emitted_record_counters(
     return {
         "emittedRecordClasses": dict(classes),
         "emittedRecordPredicates": dict(predicates),
+        "emittedAlleleClasses": dict(allele_classes),
+        "emittedAllelePredicates": dict(allele_predicates),
         "emittedGenotypeClasses": dict(genotype_classes),
         "emittedGenotypePredicates": dict(genotype_predicates),
         "alleleCount": total_alleles,
@@ -952,11 +963,21 @@ def expected_census(
             predicates.get(f"{VCFC}fieldIndex", 0) + values
         )
 
-        # The allele layer, the value items, the SV carriers and the parsed
-        # genotype layer travel with the structured INFO representation.
+        # The value items and the SV carriers travel with the structured INFO
+        # representation. The allele layer does not -- it is merged below.
         for class_name, count in parser["emittedRecordClasses"].items():
             classes[f"{VCFC}{class_name}"] = classes.get(f"{VCFC}{class_name}", 0) + count
         for name, count in parser["emittedRecordPredicates"].items():
+            predicates[f"{VCFC}{name}"] = predicates.get(f"{VCFC}{name}", 0) + count
+
+    # The allele layer is required by whoever joins to it: the structured INFO
+    # value items (Number=A/R/G) or the expanded sample layer's calledAllele.
+    # This mirrors ``allele_layer_required`` in the wrapper; the two must agree
+    # or every raw-INFO expanded run reports a census mismatch.
+    if info_representation == "structured" or representation == "expanded":
+        for class_name, count in parser.get("emittedAlleleClasses", {}).items():
+            classes[f"{VCFC}{class_name}"] = classes.get(f"{VCFC}{class_name}", 0) + count
+        for name, count in parser.get("emittedAllelePredicates", {}).items():
             predicates[f"{VCFC}{name}"] = predicates.get(f"{VCFC}{name}", 0) + count
 
     classes = _nonzero(classes)

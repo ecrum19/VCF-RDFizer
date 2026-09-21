@@ -177,5 +177,42 @@ class AlleleReferenceIntegrityTest(VerboseTestCase):
         self.assertEqual(self.referenced_alleles(triples), set())
 
 
+class OracleAgreesWithTheEmitterTest(VerboseTestCase):
+    """The census expectation must apply the same rule the emitter does.
+
+    Fixing the emitter alone turned the covering set's three failures from a
+    shape violation into a census MISMATCH: the graph gained 1,972 allele
+    triples the oracle, which still keyed the allele layer on structured INFO,
+    reported as extra rows. Both sides read the disjunction now.
+    """
+
+    def census(self, representation: str, info_representation: str) -> dict:
+        from test import validation_fixtures as vfixtures
+
+        summary = vfixtures.parser_summary(
+            representation, include_info=info_representation == "structured"
+        )
+        return {
+            row["predicate"]: row["tripleCount"]
+            for row in summary["q09_predicate_census"]
+        }
+
+    def test_raw_expanded_expects_the_allele_layer(self):
+        census = self.census("expanded", "raw")
+        for term in ("alleleIndex", "alleleValue", "alleleKind"):
+            self.assertIn(f"{VCFC_NAMESPACE}{term}", census, term)
+        self.assertNotIn(f"{VCFC_NAMESPACE}hasInfoValue", census)
+
+    def test_raw_condensed_expects_no_allele_layer(self):
+        census = self.census("condensed", "raw")
+        self.assertNotIn(f"{VCFC_NAMESPACE}alleleIndex", census)
+
+    def test_structured_expects_the_allele_layer_in_both_representations(self):
+        for representation in ("expanded", "condensed"):
+            with self.subTest(representation=representation):
+                census = self.census(representation, "structured")
+                self.assertIn(f"{VCFC_NAMESPACE}alleleIndex", census)
+
+
 if __name__ == "__main__":
     unittest.main()
