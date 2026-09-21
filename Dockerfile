@@ -195,9 +195,25 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 
 # A DuckDB addon that cannot load is a runtime failure inside a benchmark cell
-# hours later. Prove the binary works while the image is still being built.
-RUN comunica-sparql-cottas --version >/dev/null 2>&1 \
-  || { echo "comunica-sparql-cottas is installed but will not run"; exit 1; }
+# hours later, so prove the whole path here: write a triple, build a .cottas
+# with pycottas, and answer a query over it with the comunica engine.
+#
+# Checking the binary alone is not enough. `--version` prints its table and
+# then exits 1, and the addon is ESM so `require()` cannot probe it either --
+# both look like failures when the engine is fine. Only a real query settles it,
+# and it also covers rdf2cottas, which is the other half of this engine.
+RUN set -eu; \
+    printf '<http://example.org/s> <http://example.org/p> <http://example.org/o> .\n' \
+      > /tmp/cottas-probe.nt; \
+    /opt/pycottas-venv/bin/python -c \
+      "import pycottas; pycottas.rdf2cottas('/tmp/cottas-probe.nt', '/tmp/cottas-probe.cottas')"; \
+    out="$(comunica-sparql-cottas cottas@/tmp/cottas-probe.cottas \
+            'SELECT ?s WHERE { ?s ?p ?o }' 2>&1)"; \
+    printf '%s' "$out" | grep -q 'example.org/s' \
+      || { echo "cottas engine built the artifact but cannot query it:"; \
+           printf '%s\n' "$out"; exit 1; }; \
+    rm -f /tmp/cottas-probe.nt /tmp/cottas-probe.cottas; \
+    echo "cottas engine verified end to end"
 
 RUN mkdir -p /opt/rmlstreamer \
   && curl -fsSL \
