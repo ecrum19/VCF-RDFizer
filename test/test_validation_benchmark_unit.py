@@ -227,58 +227,45 @@ class NativeArtifactEngineTests(VerboseTestCase):
                     engine.start()
         self.assertIn("--engine comunica", str(raised.exception))
 
-    def test_a_failing_cottas_query_is_reported_not_raised(self):
-        """One bad query must not abort the other engines in a benchmark run.
-
-        The query now runs in its own process so a hung one can be killed, so
-        the failure arrives as a non-zero exit with the child's stderr rather
-        than as an exception from an in-process rdflib call.
-        """
-        with tempfile.TemporaryDirectory() as td:
-            tmp_path = Path(td)
-            raw_dir = tmp_path / "raw"
-            raw_dir.mkdir()
-            query = tmp_path / "q.rq"
-            query.write_text("SELECT * WHERE { ?s ?p ?o }", encoding="utf-8")
-            engine = self._engine("cottas", tmp_path)
-            engine.artifact = tmp_path / "missing.cottas"
-            with mock.patch.object(
-                V, "run_query_process",
-                return_value=(1, None),
-            ) as runner:
-                # The engine must surface whatever the child wrote, so put
-                # something there the way a real failure would.
-                def _fail(command, *, stdout_path, stderr_path, timeout):
-                    stderr_path.write_text("parquet is unreadable", encoding="utf-8")
-                    stdout_path.write_bytes(b"")
-                    return 1, None
-                runner.side_effect = _fail
-                envelope = engine.execute("q01", query)
-
-            self.assertEqual(envelope["status"], "EXECUTION_FAILED")
-            self.assertIn("parquet is unreadable", envelope["error"])
-            self.assertEqual(json.loads(Path(envelope["rawResult"]).read_text()), {})
-            self.assertIn(
-                "parquet is unreadable",
-                Path(envelope["stderr"]).read_text(encoding="utf-8"),
-            )
-
-    def test_a_timed_out_cottas_query_is_reported_as_a_timeout(self):
-        """Exit 124 is what the query loop keys on to skip the rest."""
+    def test_cottas_queries_are_addressed_with_comunicas_typed_source_prefix(self):
+        """Same requirement as HDT: a bare path is treated as a link."""
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
             (tmp_path / "raw").mkdir()
-            query = tmp_path / "q.rq"
-            query.write_text("SELECT * WHERE { ?s ?p ?o }", encoding="utf-8")
             engine = self._engine("cottas", tmp_path)
-            engine.artifact = tmp_path / "a.cottas"
-            with mock.patch.object(
-                V, "run_query_process",
-                return_value=(124, "query exceeded 1800s"),
-            ):
-                envelope = engine.execute("q05", query)
-            self.assertEqual(envelope["exitCode"], 124)
-            self.assertIn("exceeded", envelope["error"])
+            engine.artifact = tmp_path / "cohort.cottas"
+            self.assertEqual(
+                engine._endpoint_source_argument(),
+                f"cottas@{tmp_path / 'cohort.cottas'}",
+            )
+
+    def test_cottas_is_queried_over_an_endpoint_not_in_process(self):
+        """The in-process rdflib Store is what made this engine unusable.
+
+        rdflib evaluates SPARQL over a custom Store by pulling triples through
+        the Store API in Python: 12.7 s for LIMIT 1 on a 39 MB artifact, and a
+        genotype query that ran 41 hours without finishing. Querying over the
+        same long-lived endpoint the comunica and HDT engines use is what makes
+        06_equivalence possible at all, so it must not regress to in-process.
+        """
+        source = Path(V.__file__).read_text(encoding="utf-8")
+        cottas = source[source.index("class CottasEngine"):]
+        cottas = cottas[: cottas.index("\nENGINE_CLASSES")]
+        self.assertIn("ComunicaHttpEndpointMixin", cottas)
+        self.assertIn("comunica-sparql-cottas-http", cottas)
+        self.assertNotIn("self.graph.query", cottas)
+        self.assertNotIn("COTTASStore", cottas)
+        # Building the artifact is still pycottas' job; only querying moved.
+        self.assertIn("rdf2cottas", cottas)
+
+    def test_cottas_checks_the_binary_before_building_the_artifact(self):
+        """rdf2cottas is the expensive step; do not pay it for a dead engine."""
+        with tempfile.TemporaryDirectory() as td:
+            engine = self._engine("cottas", Path(td))
+            with mock.patch.object(V.shutil, "which", return_value=None):
+                with self.assertRaises(RuntimeError) as raised:
+                    engine.start()
+        self.assertIn("--engine comunica", str(raised.exception))
 
     def test_an_unknown_engine_name_names_the_supported_ones(self):
         with tempfile.TemporaryDirectory() as td:
