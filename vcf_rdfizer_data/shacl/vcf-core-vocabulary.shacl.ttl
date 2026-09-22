@@ -1,0 +1,460 @@
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix sh:    <http://www.w3.org/ns/shacl#> .
+@prefix vcfc:  <https://w3id.org/vcf-core/vocab#> .
+@prefix rdf:   <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix xsd:   <http://www.w3.org/2001/XMLSchema#> .
+@prefix prov:  <http://www.w3.org/ns/prov#> .
+@prefix dcat:  <http://www.w3.org/ns/dcat#> .
+@prefix so:    <http://purl.obolibrary.org/obo/SO_> .
+@prefix faldo: <http://biohackathon.org/resource/faldo#> .
+
+#################################################################
+# VCFFile shape
+#################################################################
+
+vcfc:VCFFileShape a sh:NodeShape ;
+  sh:targetClass vcfc:VCFFile ;
+
+  sh:property [
+    sh:path vcfc:hasHeader ;
+    sh:minCount 1 ;
+    sh:maxCount 1 ;
+    sh:class vcfc:VCFHeader ;
+  ] ;
+
+  sh:property [
+    sh:path vcfc:fileFormat ;
+    sh:minCount 1 ; sh:maxCount 1 ;
+    sh:datatype xsd:string ; sh:pattern "^VCFv4\\.[0-5]$" ;
+  ] ;
+
+  sh:property [
+    sh:path vcfc:referenceGenome ;
+    sh:minCount 0 ;
+    sh:datatype xsd:string ;
+  ] ;
+
+  sh:property [
+    sh:path vcfc:fileDate ;
+    sh:minCount 0 ;
+    sh:datatype xsd:date ;
+  ] ;
+
+  sh:property [
+    sh:path vcfc:representationProfile ;
+    sh:minCount 1 ;
+    sh:maxCount 1 ;
+    sh:class vcfc:RepresentationProfile ;
+  ] ;
+
+  sh:property [
+    sh:path vcfc:hasSampleSet ;
+    sh:minCount 0 ;
+    sh:maxCount 1 ;
+    sh:class vcfc:SampleSet ;
+  ] ;
+
+  sh:property [
+    sh:path vcfc:hasRecord ;
+    sh:minCount 0 ;
+    sh:class vcfc:VCFRecord ;
+  ] .
+
+# Apply the VCF 4.5 version gate only when a producer explicitly opts into
+# this profile.  Generic vcfc:VCFFile resources can represent other VCF
+# versions without being rejected by the VCF 4.5 vocabulary.
+vcfc:VCF45ConformanceShape a sh:NodeShape ;
+  sh:targetClass vcfc:VCF45File ;
+  sh:property [
+    sh:path vcfc:fileFormat ;
+    sh:minCount 1 ;
+    sh:maxCount 1 ;
+    sh:hasValue "VCFv4.5" ;
+    sh:message "VCF 4.5 conformance requires fileFormat VCFv4.5."@en
+  ] .
+
+#################################################################
+# Header shape
+#################################################################
+
+vcfc:VCFHeaderShape a sh:NodeShape ;
+  sh:targetClass vcfc:VCFHeader ;
+  sh:property [ sh:path vcfc:hasColumnHeader ; sh:minCount 1 ; sh:maxCount 1 ; sh:class vcfc:ColumnHeaderLine ] ;
+  sh:property [ sh:path vcfc:hasHeaderLine ; sh:qualifiedValueShape [ sh:class vcfc:FileFormatHeaderLine ] ; sh:qualifiedMinCount 1 ; sh:qualifiedMaxCount 1 ] ;
+
+  sh:property [
+    sh:path vcfc:hasHeaderLine ;
+    sh:minCount 1 ;
+    sh:class vcfc:HeaderLine ;
+  ] .
+
+#################################################################
+# INFO/FORMAT definition shapes (coverage of key attributes)
+#################################################################
+
+vcfc:InfoFieldDefinitionShape a sh:NodeShape ;
+  sh:targetClass vcfc:InfoFieldDefinition ;
+
+  sh:property [ sh:path vcfc:fieldId ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ; sh:pattern "^([A-Za-z_][0-9A-Za-z_.]*|1000G)$" ] ;
+  sh:property [ sh:path vcfc:fieldNumber ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ; sh:pattern "^([0-9]+|A|R|G|LA|LR|LG|P|M|[.])$" ] ;
+  sh:property [ sh:path vcfc:fieldArity ; sh:minCount 0 ; sh:in (vcfc:ArityPerAlt vcfc:ArityPerAllele vcfc:ArityPerGenotype vcfc:ArityVariable vcfc:ArityPerLocalAlt vcfc:ArityPerLocalAllele vcfc:ArityPerLocalGenotype vcfc:ArityPerGTAllele vcfc:ArityPerBaseModification) ] ;
+  sh:property [ sh:path vcfc:fieldType ; sh:minCount 1 ; sh:maxCount 1 ; sh:in (vcfc:IntegerType vcfc:FloatType vcfc:FlagType vcfc:CharacterType vcfc:StringType) ] ;
+  sh:property [ sh:path vcfc:fieldDescription ; sh:minCount 1 ; sh:datatype xsd:string ] ;
+  sh:or (
+    [ sh:property [ sh:path vcfc:fieldType ; sh:not [ sh:hasValue vcfc:FlagType ] ] ]
+    [ sh:property [ sh:path vcfc:fieldType ; sh:hasValue vcfc:FlagType ] ; sh:property [ sh:path vcfc:fieldNumber ; sh:hasValue "0" ] ]
+  ) .
+
+# Source and Version are recommendations for a concrete INFO declaration, not
+# for every reusable registry definition.
+vcfc:InfoHeaderLineRecommendedShape a sh:NodeShape ;
+  sh:targetClass vcfc:INFOHeaderLine ;
+  sh:property [ sh:path vcfc:fieldSource ; sh:minCount 1 ; sh:datatype xsd:string ; sh:severity sh:Warning ; sh:message "VCF 4.5 recommends Source on INFO declarations."@en ] ;
+  sh:property [ sh:path vcfc:fieldVersion ; sh:minCount 1 ; sh:datatype xsd:string ; sh:severity sh:Warning ; sh:message "VCF 4.5 recommends Version on INFO declarations."@en ] .
+
+vcfc:FormatFieldDefinitionShape a sh:NodeShape ;
+  sh:targetClass vcfc:FormatFieldDefinition ;
+
+  # VCF 4.5's M, DPM, and ADM field families are pattern-defined registry
+  # rows, rather than a single concrete field ID.
+  sh:or (
+    [ sh:property [ sh:path vcfc:fieldId ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ; sh:pattern "^[A-Za-z_][0-9A-Za-z_.]*$" ] ]
+    [ sh:property [ sh:path vcfc:keyPattern ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ; sh:pattern "^(M|DPM|ADM)\\[0-9\\]\\+\\[ACGTUN\\]$" ] ]
+  ) ;
+  sh:property [ sh:path vcfc:fieldNumber ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ; sh:pattern "^([0-9]+|A|R|G|LA|LR|LG|P|M|[.])$" ] ;
+  sh:property [ sh:path vcfc:fieldArity ; sh:minCount 0 ; sh:in (vcfc:ArityPerAlt vcfc:ArityPerAllele vcfc:ArityPerGenotype vcfc:ArityVariable vcfc:ArityPerLocalAlt vcfc:ArityPerLocalAllele vcfc:ArityPerLocalGenotype vcfc:ArityPerGTAllele vcfc:ArityPerBaseModification) ] ;
+  sh:property [ sh:path vcfc:fieldType ; sh:minCount 1 ; sh:maxCount 1 ; sh:in (vcfc:IntegerType vcfc:FloatType vcfc:CharacterType vcfc:StringType) ; sh:not [ sh:hasValue vcfc:FlagType ] ] ;
+  sh:property [ sh:path vcfc:fieldDescription ; sh:minCount 1 ; sh:datatype xsd:string ] .
+
+#################################################################
+# VCFRecord + VariantCall shapes
+#################################################################
+
+vcfc:VCFRecordShape a sh:NodeShape ;
+  sh:targetClass vcfc:VCFRecord ;
+
+  sh:property [ sh:path vcfc:chrom ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ] ;
+  sh:property [ sh:path vcfc:pos ; sh:minCount 1 ; sh:maxCount 1 ; sh:minInclusive 0 ; sh:node vcfc:IntegerLiteralShape ] ;
+  sh:property [ sh:path vcfc:ref ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ; sh:pattern "^[ACGTNacgtn]+$" ] ;
+  # VCF 4.5 fixed field 5: "If there are no alternative alleles, then the
+  # MISSING value must be used." Such a record carries "."^^vcfc:Null, so the
+  # datatype must be a disjunction -- requiring xsd:string here rejected every
+  # REF-only and gVCF-style record.
+  sh:property [
+    sh:path vcfc:alt ;
+    sh:minCount 1 ;
+    sh:or (
+      [ sh:datatype xsd:string ]
+      [ sh:datatype vcfc:Null ]
+    ) ;
+  ] ;
+
+  sh:property [
+    sh:path vcfc:hasCall ;
+    sh:minCount 0 ;
+    sh:class vcfc:VariantCall ;
+  ] ;
+
+  sh:property [
+    sh:path vcfc:asSequenceAlteration ;
+    sh:minCount 0 ;
+    sh:class so:0001059 ;
+  ] .
+
+vcfc:VariantCallShape a sh:NodeShape ;
+  sh:targetClass vcfc:VariantCall ;
+
+  # VCF 4.5 data types: a Float matches ^[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?$
+  # or ^[-+]?(INF|INFINITY|NAN)$ case-insensitively. xsd:double covers the
+  # numeric forms plus INF/-INF/NaN; the final branch covers the INFINITY and
+  # case-variant spellings that no XSD numeric datatype accepts.
+  #
+  # Because several datatypes conform, two correct producers can serialize the
+  # same QUAL differently -- vcf-core's own materializer writes vcfc:VCFFloat,
+  # VCF-RDFizer writes xsd:decimal, and both pass this shape. Producers SHOULD
+  # write vcfc:VCFFloat, the only branch that also carries INF/INFINITY/NAN.
+  # Consumers MUST NOT branch on DATATYPE(?qual): compare the lexical value, or
+  # accept the alternatives explicitly. Kept here rather than as an
+  # rdfs:comment because assess.py hashes ontology/*.ttl, so editing a comment
+  # there would invalidate every recorded review acceptance.
+  sh:property [
+    sh:path vcfc:qual ;
+    sh:minCount 0 ; sh:maxCount 1 ;
+    sh:or (
+      [ sh:datatype vcfc:VCFFloat ; sh:pattern "^([-+]?[0-9]*[.]?[0-9]+([eE][-+]?[0-9]+)?|[-+]?(INF|INFINITY|NAN))$" ; sh:flags "i" ]
+      [ sh:datatype xsd:decimal ]
+      [ sh:datatype xsd:double ]
+      [ sh:datatype xsd:float ]
+      [ sh:datatype vcfc:Null ]
+      [ sh:datatype xsd:string ; sh:pattern "^[-+]?(INF|INFINITY|NAN)$" ; sh:flags "i" ]
+    ) ;
+  ] ;
+
+  sh:property [
+    sh:path vcfc:filter ;
+    sh:minCount 0 ;
+    sh:or (
+      [ sh:datatype xsd:string ]
+      [ sh:datatype vcfc:Null ]
+    ) ;
+  ] ;
+
+  sh:property [
+    sh:path vcfc:hasInfoValue ;
+    sh:minCount 0 ;
+    sh:class vcfc:InfoFieldValue ;
+  ] ;
+
+  sh:property [
+    sh:path vcfc:hasSampleCall ;
+    sh:minCount 0 ;
+    sh:class vcfc:SampleCall ;
+  ] ;
+
+  sh:property [
+    sh:path vcfc:hasCallMatrix ;
+    sh:minCount 0 ;
+    sh:class vcfc:CohortCallMatrix ;
+  ] .
+
+#################################################################
+# SampleCall shape
+#################################################################
+
+vcfc:SampleCallShape a sh:NodeShape ;
+  sh:targetClass vcfc:SampleCall ;
+
+  sh:property [ sh:path vcfc:sampleId ; sh:minCount 1 ; sh:datatype xsd:string ] ;
+  sh:property [ sh:path vcfc:forSample ; sh:minCount 0 ; sh:maxCount 1 ; sh:class vcfc:VCFSample ] ;
+  sh:property [ sh:path vcfc:hasFormatValue ; sh:minCount 0 ; sh:class vcfc:FormatFieldValue ] .
+
+#################################################################
+# Expanded / condensed cohort representation shapes
+#################################################################
+
+vcfc:VCFSampleShape a sh:NodeShape ;
+  sh:targetClass vcfc:VCFSample ;
+
+  sh:property [ sh:path vcfc:sampleName ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ] ;
+  sh:property [ sh:path vcfc:sampleIndex ; sh:minCount 1 ; sh:maxCount 1 ; sh:node vcfc:IntegerLiteralShape ; sh:minInclusive 1 ] .
+
+vcfc:SampleSetShape a sh:NodeShape ;
+  sh:targetClass vcfc:SampleSet ;
+
+  sh:property [ sh:path vcfc:hasSample ; sh:minCount 1 ; sh:class vcfc:VCFSample ] .
+
+vcfc:CohortCallMatrixShape a sh:NodeShape ;
+  sh:targetClass vcfc:CohortCallMatrix ;
+
+  sh:property [ sh:path vcfc:appliesToSampleSet ; sh:minCount 1 ; sh:maxCount 1 ; sh:class vcfc:SampleSet ] ;
+  sh:property [ sh:path vcfc:hasFormatValueVector ; sh:minCount 1 ; sh:class vcfc:FormatValueVector ] ;
+  sh:property [ sh:path vcfc:sampleDataRaw ; sh:minCount 0 ; sh:datatype xsd:string ] .
+
+vcfc:FormatValueVectorShape a sh:NodeShape ;
+  sh:targetClass vcfc:FormatValueVector ;
+
+  sh:property [ sh:path vcfc:declaredBy ; sh:minCount 1 ; sh:maxCount 1 ; sh:class vcfc:FormatFieldDefinition ] ;
+  sh:property [ sh:path vcfc:valueEncoding ; sh:minCount 1 ; sh:maxCount 1 ; sh:class vcfc:VectorEncoding ] ;
+  sh:property [ sh:path vcfc:encodedValues ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ] .
+
+#################################################################
+# INFO/FORMAT value shapes
+#################################################################
+
+vcfc:InfoFieldValueShape a sh:NodeShape ;
+  sh:targetClass vcfc:InfoFieldValue ;
+
+  sh:property [
+    sh:path vcfc:fieldValue ;
+    sh:minCount 0 ;
+    sh:or (
+      [ sh:datatype xsd:string ]
+      [ sh:datatype vcfc:Null ]
+    ) ;
+  ] ;
+  sh:property [ sh:path vcfc:declaredBy ; sh:minCount 0 ; sh:class vcfc:InfoFieldDefinition ] .
+
+vcfc:FormatFieldValueShape a sh:NodeShape ;
+  sh:targetClass vcfc:FormatFieldValue ;
+
+  sh:property [
+    sh:path vcfc:fieldValue ;
+    sh:minCount 0 ;
+    sh:or (
+      [ sh:datatype xsd:string ]
+      [ sh:datatype vcfc:Null ]
+    ) ;
+  ] ;
+  sh:property [ sh:path vcfc:declaredBy ; sh:minCount 0 ; sh:class vcfc:FormatFieldDefinition ] .
+
+#################################################################
+# Header, lexical, allele, genotype, and SV shapes
+#################################################################
+
+vcfc:HeaderLineShape a sh:NodeShape ;
+  sh:targetClass vcfc:HeaderLine ;
+  sh:property [ sh:path vcfc:headerKey ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ] ;
+  sh:property [ sh:path vcfc:lineIndex ; sh:minCount 1 ; sh:maxCount 1 ; sh:node vcfc:IntegerLiteralShape ; sh:minInclusive 1 ] .
+
+vcfc:StructuredHeaderLineShape a sh:NodeShape ;
+  sh:targetClass vcfc:StructuredHeaderLine ;
+  sh:property [ sh:path vcfc:hasAttribute ; sh:minCount 1 ; sh:class vcfc:HeaderAttribute ] .
+
+vcfc:UnstructuredHeaderLineShape a sh:NodeShape ;
+  sh:targetClass vcfc:UnstructuredHeaderLine ;
+  sh:property [ sh:path vcfc:headerValue ; sh:minCount 1 ; sh:datatype xsd:string ; sh:pattern "^[^<].*$" ] .
+
+vcfc:HeaderAttributeShape a sh:NodeShape ;
+  sh:targetClass vcfc:HeaderAttribute ;
+  sh:property [ sh:path vcfc:attributeKey ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ] ;
+  sh:property [ sh:path vcfc:attributeValue ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ] ;
+  sh:property [ sh:path vcfc:attributeIndex ; sh:minCount 1 ; sh:maxCount 1 ; sh:node vcfc:IntegerLiteralShape ; sh:minInclusive 1 ] .
+
+vcfc:ColumnHeaderLineShape a sh:NodeShape ;
+  sh:targetClass vcfc:ColumnHeaderLine ;
+  sh:property [ sh:path vcfc:hasGenotypeColumns ; sh:minCount 0 ; sh:class vcfc:VCFSample ] .
+
+vcfc:FileFormatHeaderLineShape a sh:NodeShape ;
+  sh:targetClass vcfc:FileFormatHeaderLine ;
+  sh:property [ sh:path vcfc:headerKey ; sh:hasValue "fileformat" ] ;
+  sh:property [ sh:path vcfc:headerValue ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ] .
+
+vcfc:ContigHeaderLineShape a sh:NodeShape ;
+  sh:targetClass vcfc:ContigHeaderLine ;
+  sh:property [ sh:path vcfc:contigId ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ; sh:pattern "^[0-9A-Za-z!#$%&+./:;?@^_|~-][0-9A-Za-z!#$%&*+./:;=?@^_|~-]*$" ] ;
+  sh:property [ sh:path vcfc:contigUrl ; sh:minCount 0 ; sh:maxCount 1 ; sh:datatype xsd:anyURI ] .
+
+vcfc:FilterDefinitionShape a sh:NodeShape ;
+  sh:targetClass vcfc:FilterDefinition ;
+  sh:property [ sh:path vcfc:filterId ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ; sh:not [ sh:hasValue "0" ] ] ;
+  sh:property [ sh:path vcfc:fieldDescription ; sh:minCount 1 ; sh:datatype xsd:string ] .
+
+vcfc:AltDefinitionShape a sh:NodeShape ;
+  sh:targetClass vcfc:AltDefinition ;
+  sh:property [ sh:path vcfc:altId ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ] ;
+  sh:property [ sh:path vcfc:fieldDescription ; sh:minCount 1 ; sh:datatype xsd:string ] .
+
+vcfc:MetaDefinitionShape a sh:NodeShape ;
+  sh:targetClass vcfc:MetaDefinition ;
+  sh:property [ sh:path vcfc:fieldId ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ] ;
+  sh:property [ sh:path vcfc:fieldNumber ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ; sh:pattern "^([0-9]+|A|R|G|LA|LR|LG|P|M|[.])$" ] ;
+  sh:property [ sh:path vcfc:fieldType ; sh:minCount 1 ; sh:maxCount 1 ; sh:in (vcfc:IntegerType vcfc:FloatType vcfc:CharacterType vcfc:StringType) ] .
+
+vcfc:SampleHeaderLineShape a sh:NodeShape ;
+  sh:targetClass vcfc:SampleHeaderLine ;
+  sh:property [ sh:path vcfc:declaresSample ; sh:minCount 0 ; sh:maxCount 1 ; sh:class vcfc:SampleDeclaration ] .
+
+vcfc:PedigreeHeaderLineShape a sh:NodeShape ;
+  sh:targetClass vcfc:PedigreeHeaderLine ;
+  sh:property [ sh:path vcfc:pedigreeAncestor ; sh:minCount 0 ; sh:class vcfc:SampleDeclaration ] .
+
+vcfc:VCFRecordOrderShape a sh:NodeShape ;
+  sh:targetClass vcfc:VCFRecord ;
+  sh:property [ sh:path vcfc:recordIndex ; sh:minCount 1 ; sh:maxCount 1 ; sh:node vcfc:IntegerLiteralShape ; sh:minInclusive 1 ] .
+
+vcfc:AlleleShape a sh:NodeShape ;
+  sh:targetClass vcfc:Allele ;
+  sh:property [ sh:path vcfc:alleleIndex ; sh:minCount 1 ; sh:maxCount 1 ; sh:node vcfc:IntegerLiteralShape ; sh:minInclusive 0 ] ;
+  sh:property [ sh:path vcfc:alleleValue ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path vcfc:alleleKind ; sh:minCount 1 ; sh:maxCount 1 ; sh:in (vcfc:BaseSequenceAllele vcfc:OverlappingDeletionAllele vcfc:MissingAllele vcfc:SymbolicAllele vcfc:UnspecifiedAllele vcfc:BreakendAllele) ] .
+
+vcfc:ReferenceAlleleShape a sh:NodeShape ;
+  sh:targetClass vcfc:ReferenceAllele ;
+  sh:property [ sh:path vcfc:alleleIndex ; sh:minInclusive 0 ; sh:maxInclusive 0 ] .
+
+vcfc:AltAlleleShape a sh:NodeShape ;
+  sh:targetClass vcfc:AltAllele ;
+  sh:property [ sh:path vcfc:alleleIndex ; sh:minInclusive 1 ] .
+
+vcfc:FieldValueItemShape a sh:NodeShape ;
+  sh:targetClass vcfc:FieldValueItem ;
+  sh:property [ sh:path vcfc:valueIndex ; sh:minCount 1 ; sh:maxCount 1 ; sh:node vcfc:IntegerLiteralShape ; sh:minInclusive 0 ] ;
+  sh:property [ sh:path vcfc:itemValue ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path vcfc:tupleArity ; sh:minCount 0 ; sh:maxCount 1 ; sh:node vcfc:IntegerLiteralShape ; sh:minInclusive 1 ] .
+
+vcfc:GenotypeShape a sh:NodeShape ;
+  sh:targetClass vcfc:Genotype ;
+  sh:property [ sh:path vcfc:genotypeString ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype vcfc:GenotypeString ; sh:pattern "^[|/]?([0-9]+|[.])([|/]([0-9]+|[.]))*$" ] ;
+  sh:property [ sh:path vcfc:ploidy ; sh:minCount 1 ; sh:maxCount 1 ; sh:node vcfc:IntegerLiteralShape ; sh:minInclusive 1 ] ;
+  sh:property [ sh:path vcfc:hasAlleleCall ; sh:minCount 1 ; sh:class vcfc:GenotypeAlleleCall ] .
+
+vcfc:GenotypeAlleleCallShape a sh:NodeShape ;
+  sh:targetClass vcfc:GenotypeAlleleCall ;
+  sh:property [ sh:path vcfc:callIndex ; sh:minCount 1 ; sh:maxCount 1 ; sh:node vcfc:IntegerLiteralShape ; sh:minInclusive 0 ] ;
+  sh:property [ sh:path vcfc:isNoCall ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:boolean ] ;
+  sh:property [ sh:path vcfc:calledAllele ; sh:minCount 0 ; sh:maxCount 1 ; sh:class vcfc:Allele ] .
+
+vcfc:PhaseSetShape a sh:NodeShape ;
+  sh:targetClass vcfc:PhaseSet ;
+  sh:or (
+    [ sh:property [ sh:path vcfc:phaseSetId ; sh:minCount 1 ; sh:datatype xsd:string ] ]
+    [ sh:property [ sh:path vcfc:phaseSetName ; sh:minCount 1 ; sh:datatype xsd:string ] ]
+  ) .
+
+vcfc:LocalAlleleSetShape a sh:NodeShape ;
+  sh:targetClass vcfc:LocalAlleleSet ;
+  sh:property [ sh:path vcfc:hasLocalAllele ; sh:minCount 0 ; sh:class vcfc:AltAllele ] .
+
+vcfc:SymbolicAlleleTypeShape a sh:NodeShape ;
+  sh:targetClass vcfc:SymbolicAlleleType ;
+  sh:property [ sh:path vcfc:svTypeCode ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ] .
+
+vcfc:BreakendShape a sh:NodeShape ;
+  sh:targetClass vcfc:Breakend ;
+  sh:or ( [ sh:property [ sh:path vcfc:isSingleBreakend ; sh:hasValue true ] ; sh:property [ sh:path vcfc:mateBreakend ; sh:maxCount 0 ] ] [ sh:property [ sh:path vcfc:breakendOrientation ; sh:minCount 1 ; sh:maxCount 1 ; sh:class vcfc:BreakendOrientation ] ] ) .
+
+vcfc:VariantEventShape a sh:NodeShape ;
+  sh:targetClass vcfc:VariantEvent ;
+  sh:property [ sh:path vcfc:eventType ; sh:minCount 0 ; sh:maxCount 1 ; sh:class vcfc:EventType ] .
+
+vcfc:ConfidenceIntervalShape a sh:NodeShape ;
+  sh:targetClass vcfc:ConfidenceInterval ;
+  sh:property [ sh:path vcfc:ciLower ; sh:minCount 1 ; sh:maxCount 1 ; sh:lessThanOrEquals vcfc:ciUpper ; sh:node vcfc:NumericLiteralShape ] ;
+  sh:property [ sh:path vcfc:ciUpper ; sh:minCount 1 ; sh:maxCount 1 ; sh:node vcfc:NumericLiteralShape ] .
+
+vcfc:TandemRepeatAlleleShape a sh:NodeShape ;
+  sh:targetClass vcfc:TandemRepeatAllele ;
+  sh:property [ sh:path vcfc:repeatSequenceCount ; sh:minCount 1 ; sh:maxCount 1 ; sh:node vcfc:IntegerLiteralShape ; sh:minInclusive 0 ] .
+
+vcfc:RepeatSequenceShape a sh:NodeShape ;
+  sh:targetClass vcfc:RepeatSequence ;
+  sh:property [ sh:path vcfc:repeatSequenceIndex ; sh:minCount 1 ; sh:maxCount 1 ; sh:node vcfc:IntegerLiteralShape ; sh:minInclusive 1 ] .
+
+vcfc:ReferenceBlockShape a sh:NodeShape ;
+  sh:targetClass vcfc:ReferenceBlock ;
+  sh:property [ sh:path vcfc:referenceBlockLength ; sh:minCount 1 ; sh:maxCount 1 ; sh:node vcfc:IntegerLiteralShape ; sh:minInclusive 0 ] .
+
+vcfc:BaseModificationShape a sh:NodeShape ;
+  sh:targetClass vcfc:BaseModification ;
+  sh:property [ sh:path vcfc:modifiedResidue ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path vcfc:modifiedBaseOffset ; sh:minCount 1 ; sh:maxCount 1 ; sh:node vcfc:IntegerLiteralShape ; sh:minInclusive 0 ] .
+
+vcfc:RepresentationProfileShape a sh:NodeShape ;
+  sh:targetClass vcfc:VCFFile ;
+  sh:xone (
+    [ sh:property [ sh:path vcfc:representationProfile ; sh:hasValue vcfc:ExpandedRepresentation ; sh:minCount 1 ; sh:maxCount 1 ] ]
+    [ sh:property [ sh:path vcfc:representationProfile ; sh:hasValue vcfc:CondensedRepresentation ; sh:minCount 1 ; sh:maxCount 1 ] ]
+  ) .
+
+# Integer-derived RDF datatypes share their numeric value space.
+vcfc:IntegerLiteralShape a sh:NodeShape ; sh:or ( [ sh:datatype xsd:integer ] [ sh:datatype xsd:nonNegativeInteger ] [ sh:datatype xsd:positiveInteger ] [ sh:datatype xsd:nonPositiveInteger ] [ sh:datatype xsd:negativeInteger ] [ sh:datatype xsd:long ] [ sh:datatype xsd:int ] [ sh:datatype xsd:short ] [ sh:datatype xsd:byte ] [ sh:datatype xsd:unsignedLong ] [ sh:datatype xsd:unsignedInt ] [ sh:datatype xsd:unsignedShort ] [ sh:datatype xsd:unsignedByte ] ) .
+
+vcfc:NumericLiteralShape a sh:NodeShape ;
+  sh:or ( [ sh:node vcfc:IntegerLiteralShape ] [ sh:datatype xsd:decimal ] [ sh:datatype xsd:float ] [ sh:datatype xsd:double ] ) .
+vcfc:NullLiteralShape a sh:NodeShape ;
+  sh:targetObjectsOf vcfc:fieldValue, vcfc:alt, vcfc:qual, vcfc:recordId, vcfc:filter, vcfc:itemValue ;
+  sh:or ( [ sh:not [ sh:datatype vcfc:Null ] ] [ sh:datatype vcfc:Null ; sh:pattern "^[.]$" ] ) .
+vcfc:FixedArityShape a sh:NodeShape ; sh:targetClass vcfc:FieldDefinition ;
+  sh:property [ sh:path vcfc:fieldNumberInteger ; sh:maxCount 1 ; sh:node vcfc:IntegerLiteralShape ; sh:minInclusive 0 ] .
+
+vcfc:RecordIdentifierShape a sh:NodeShape ; sh:targetClass vcfc:RecordIdentifier ;
+  sh:property [ sh:path vcfc:identifierValue ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ; sh:pattern "^[^; \t\r\n]+$" ; sh:not [ sh:in (".") ] ] ;
+  sh:property [ sh:path vcfc:componentIndex ; sh:minCount 1 ; sh:maxCount 1 ; sh:node vcfc:IntegerLiteralShape ; sh:minInclusive 1 ] .
+vcfc:FilterCodeShape a sh:NodeShape ; sh:targetClass vcfc:FilterCode ;
+  sh:property [ sh:path vcfc:filterCodeValue ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ; sh:pattern "^[^; \t\r\n]+$" ; sh:not [ sh:in ("0" "." "PASS") ] ] ;
+  sh:property [ sh:path vcfc:componentIndex ; sh:minCount 1 ; sh:maxCount 1 ; sh:node vcfc:IntegerLiteralShape ; sh:minInclusive 1 ] .
+vcfc:LocalAlleleMembershipShape a sh:NodeShape ; sh:targetClass vcfc:LocalAlleleMembership ;
+  sh:property [ sh:path vcfc:localIndex ; sh:minCount 1 ; sh:maxCount 1 ; sh:node vcfc:IntegerLiteralShape ; sh:minInclusive 1 ] ;
+  sh:property [ sh:path vcfc:localAllele ; sh:minCount 1 ; sh:maxCount 1 ; sh:class vcfc:AltAllele ] .
+vcfc:AllelePhaseIndicatorShape a sh:NodeShape ; sh:targetClass vcfc:GenotypeAlleleCall ;
+  sh:property [ sh:path vcfc:phaseIndicator ; sh:maxCount 1 ; sh:in ("/" "|") ] .

@@ -1,0 +1,2459 @@
+@prefix vcfc: <https://w3id.org/vcf-core/vocab#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix dct: <http://purl.org/dc/terms/> .
+@prefix dcat: <http://www.w3.org/ns/dcat#> .
+@prefix prov: <http://www.w3.org/ns/prov#> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+@prefix so: <http://purl.obolibrary.org/obo/SO_> .
+@prefix faldo: <http://biohackathon.org/resource/faldo#> .
+@prefix geno: <http://purl.obolibrary.org/obo/GENO_> .
+@prefix sio: <http://semanticscience.org/resource/SIO_> .
+@prefix hero: <https://w3id.org/hereditary/ontology/genomics/schema/> .
+@prefix vrs: <https://w3id.org/ga4gh/schema/vrs/2.0/json/> .
+@prefix ican: <https://ican.fr/> .
+@prefix chebi: <http://purl.obolibrary.org/obo/CHEBI_> .
+
+#################################################################
+# Generated companion-site bundle. Do not edit by hand.
+# Source modules remain normative and are listed below.
+#################################################################
+
+# Source: ontology/vcf-core-vocabulary.ttl
+# SB/gvar uses https://ican.fr/ as its schema URI; keep prefix for convenience.
+
+#################################################################
+# Ontology header
+#################################################################
+
+vcfc: a owl:Ontology ;
+  rdfs:label "VCF Core Vocabulary"@en ;
+  dct:description "Vocabulary for representing the logical VCF 4.5 model in RDF: files, headers, records, alleles, values, genotype data, and VCF-specific structural-variant syntax. It supports both expanded per-sample and condensed, sample-ordered representations, and delegates broader variation semantics through FALDO, VRS, SO, GENO, and ChEBI alignments. BCF 2.2 byte layout is out of scope."@en ;
+  dct:license <https://creativecommons.org/licenses/by/4.0/> ;
+  dct:creator "Elias Crum" ;
+  owl:versionIRI <https://w3id.org/vcf-core/vocab/2.1.2> ;
+  owl:versionInfo "2.1.2" ;
+  dct:modified "2026-09-08"^^xsd:date ;
+  owl:priorVersion <https://w3id.org/vcf-core/vocab/2.0.0> ;
+  dct:replaces <https://w3id.org/vcf-rdfizer/vocab> ;
+  owl:imports <https://w3id.org/vcf-core/alleles>,
+              <https://w3id.org/vcf-core/genotypes>,
+              <https://w3id.org/vcf-core/sv>,
+              <https://w3id.org/vcf-core/reserved-keys> ;
+  rdfs:seeAlso <https://samtools.github.io/hts-specs/VCFv4.5.pdf> ;
+  rdfs:seeAlso <http://biohackathon.org/resource/faldo> ;
+  rdfs:seeAlso <https://w3id.org/ga4gh/schema/vrs/2.0/json/> ;
+  rdfs:seeAlso <https://swat4hcls-2025-genomic-variation.github.io/genomic-variant-schema/> ;
+  rdfs:seeAlso <https://hereditary.dei.unipd.it/ontology/genomics/> .
+
+#################################################################
+# Core classes
+#################################################################
+
+vcfc:VCFFile a owl:Class ;
+  rdfs:label "VCF file"@en ;
+  rdfs:comment "A Variant Call Format (VCF) file artifact represented as a dataset distribution. In VCF 4.5, the artifact contains meta-information lines, one column-header line, and zero or more tab-delimited data records."@en ;
+  vcfc:iriTemplate "file://{vcfFilePath}" ;
+  skos:exactMatch hero:VCFFile ;
+  rdfs:seeAlso hero:VCFFile ;
+  rdfs:subClassOf dcat:Distribution, prov:Entity .
+
+vcfc:VCFHeader a owl:Class ;
+  rdfs:label "VCF header"@en ;
+  rdfs:comment "A resource that groups the VCF file's meta-information header lines. VCF 4.5 meta-information lines begin with '##' and occur before the mandatory '#CHROM' column-header line and all data records."@en ;
+  vcfc:iriTemplate "file://{vcfFilePath}#header" .
+
+vcfc:HeaderLine a owl:Class ;
+  rdfs:label "VCF header line"@en ;
+  rdfs:comment "A representation of one VCF meta-information line, such as '##fileformat=VCFv4.5' or '##INFO=<...>'. A line may have an unstructured value or a structured, angle-bracketed list of key-value pairs."@en ;
+  vcfc:iriTemplate "file://{vcfFilePath}#header/line/{lineId}" .
+
+vcfc:FileFormatHeaderLine a owl:Class ; rdfs:subClassOf vcfc:UnstructuredHeaderLine ;
+  rdfs:label "fileformat header line"@en ;
+  rdfs:comment "The required, first VCF meta-information line. Its value declares the VCF version, for example 'VCFv4.5'."@en .
+
+vcfc:FileDateHeaderLine a owl:Class ; rdfs:subClassOf vcfc:UnstructuredHeaderLine ;
+  rdfs:label "fileDate header line"@en ;
+  rdfs:comment "An optional producer-supplied '##fileDate' meta-information line. It is a commonly used unstructured header convention, rather than a required VCF 4.5 line."@en .
+
+vcfc:SourceHeaderLine a owl:Class ; rdfs:subClassOf vcfc:UnstructuredHeaderLine ;
+  rdfs:label "source header line"@en ;
+  rdfs:comment "An optional producer-supplied '##source' meta-information line, typically identifying the program, pipeline, or source that generated the VCF."@en .
+
+vcfc:ReferenceHeaderLine a owl:Class ; rdfs:subClassOf vcfc:UnstructuredHeaderLine ;
+  rdfs:label "reference header line"@en ;
+  rdfs:comment "An optional '##reference' meta-information line that identifies the reference genome or sequence resource used to interpret the records. Including reference and contig metadata is recommended by VCF 4.5."@en .
+
+vcfc:ContigHeaderLine a owl:Class ; rdfs:subClassOf vcfc:StructuredHeaderLine ;
+  rdfs:label "contig header line"@en ;
+  rdfs:comment "A structured '##contig=<...>' declaration for a reference sequence used by records in the file. VCF 4.5 requires its ID and reserves optional attributes such as length, md5, and URL; contig declarations are recommended in VCF and required in BCF."@en ;
+  # 2.0.0: was skos:relatedMatch faldo:Reference, which does not exist -- FALDO
+  # declares the object property faldo:reference and no Reference class.
+  skos:relatedMatch vrs:SequenceReference ;
+  rdfs:seeAlso faldo:reference, vrs:SequenceReference .
+
+vcfc:INFOHeaderLine a owl:Class ; rdfs:subClassOf vcfc:StructuredHeaderLine, vcfc:InfoFieldDefinition ;
+  rdfs:label "INFO header line"@en ;
+  rdfs:comment "A structured '##INFO=<...>' declaration that defines the identifier, cardinality, type, and meaning of an annotation that may occur in the INFO column. ID, Number, Type, and Description are required by VCF 4.5."@en .
+
+vcfc:FORMATHeaderLine a owl:Class ; rdfs:subClassOf vcfc:StructuredHeaderLine, vcfc:FormatFieldDefinition ;
+  rdfs:label "FORMAT header line"@en ;
+  rdfs:comment "A structured '##FORMAT=<...>' declaration that defines the identifier, cardinality, type, and meaning of a field in a per-sample column. ID, Number, Type, and Description are required by VCF 4.5."@en .
+
+vcfc:FILTERHeaderLine a owl:Class ; rdfs:subClassOf vcfc:StructuredHeaderLine, vcfc:FilterDefinition ;
+  rdfs:label "FILTER header line"@en ;
+  rdfs:comment "A structured '##FILTER=<...>' declaration that defines a code which may appear in the FILTER column when a record does not pass that filter. ID and Description are required by VCF 4.5."@en .
+
+vcfc:ALTHeaderLine a owl:Class ; rdfs:subClassOf vcfc:StructuredHeaderLine, vcfc:AltDefinition ;
+  rdfs:label "ALT header line"@en ;
+  rdfs:comment "A structured '##ALT=<...>' declaration that defines the meaning of a symbolic alternate-allele identifier. The identifier is used in the ALT column inside angle brackets, for example '<DEL>'."@en .
+
+vcfc:VCFRecord a owl:Class ;
+  rdfs:label "VCF record"@en ;
+  rdfs:comment "One tab-delimited VCF data line. It contains the eight mandatory fixed fields CHROM, POS, ID, REF, ALT, QUAL, FILTER, and INFO; it may additionally contain a FORMAT field and one value block per sample. This is a VCF-centric representation that can link to a sequence-alteration model via vcfc:asSequenceAlteration."@en ;
+  vcfc:iriTemplate "file://{vcfFilePath}#record/{recordKey}" ;
+  skos:exactMatch hero:VCFRecord ;
+  skos:relatedMatch faldo:Region, vrs:SequenceLocation, vrs:Allele ;
+  rdfs:seeAlso hero:VCFRecord, faldo:Region, vrs:SequenceLocation, vrs:Allele ;
+  rdfs:subClassOf prov:Entity .
+
+vcfc:VariantCall a owl:Class ;
+  rdfs:label "variant call"@en ;
+  rdfs:comment "A vocabulary-level resource that groups the call assessment carried by a VCF record: QUAL, FILTER, INFO, the FORMAT declaration, and sample genotype data. It is an RDF convenience for the contents of a record, not a separate line type in VCF syntax. Since version 1.1.0, genotype data can be represented either as expanded per-sample calls or through one condensed cohort call matrix."@en ;
+  vcfc:iriTemplate "file://{vcfFilePath}#call/{recordKey}" ;
+  skos:closeMatch hero:GenomicVariation, so:0001060, vrs:Allele ;
+  rdfs:seeAlso hero:GenomicVariation, so:0001060, vrs:Allele ;
+  rdfs:subClassOf prov:Entity .
+
+vcfc:SampleCall a owl:Class ;
+  rdfs:label "sample call"@en ;
+  rdfs:comment "The colon-delimited value block for one sample in a genotype-bearing VCF record, represented as structured FORMAT field values. Its field order and meanings are supplied by that record's FORMAT column and corresponding FORMAT declarations. This is the expanded representation retained for single-sample and low-sample VCF files; it MUST NOT be used to represent a vector of values for multiple samples."@en ;
+  vcfc:iriTemplate "file://{vcfFilePath}#sample/{recordKey}/{sampleId}" ;
+  skos:closeMatch hero:Genotype ;
+  skos:relatedMatch hero:Zygosity ;
+  rdfs:seeAlso hero:Genotype, hero:Zygosity ;
+  rdfs:subClassOf prov:Entity .
+
+vcfc:FieldDefinition a owl:Class ;
+  rdfs:label "field definition"@en ;
+  rdfs:comment "A reusable specification- or file-level definition of an INFO, FORMAT, FILTER, ALT, or META key. It is not itself a VCF header line: a concrete file declaration uses the corresponding *HeaderLine subclass."@en .
+
+vcfc:InfoFieldDefinition a owl:Class ; rdfs:subClassOf vcfc:FieldDefinition ;
+  rdfs:label "INFO field definition"@en ;
+  rdfs:comment "The definition of one INFO key, including its ID, Number, Type, and human-readable Description. It specifies how that key's site-level annotation values must be interpreted."@en .
+
+vcfc:FormatFieldDefinition a owl:Class ; rdfs:subClassOf vcfc:FieldDefinition ;
+  rdfs:label "FORMAT field definition"@en ;
+  rdfs:comment "The definition of one FORMAT key, including its ID, Number, Type, and human-readable Description. It specifies how the corresponding per-sample values must be interpreted. Since version 1.1.0, it can also declare a condensed vcfc:FormatValueVector through vcfc:declaredBy."@en .
+
+vcfc:FilterDefinition a owl:Class ; rdfs:subClassOf vcfc:FieldDefinition ;
+  rdfs:label "FILTER definition"@en ;
+  rdfs:comment "The definition of one FILTER failure code. A VCF record that fails this criterion cites the code in its semicolon-separated FILTER value."@en .
+
+vcfc:AltDefinition a owl:Class ; rdfs:subClassOf vcfc:FieldDefinition ;
+  rdfs:label "ALT definition"@en ;
+  rdfs:comment "The definition of one symbolic ALT identifier. It provides the meaning of an angle-bracketed alternate allele such as '<DEL>' without asserting a particular variation model."@en .
+
+vcfc:InfoFieldValue a owl:Class ;
+  rdfs:label "INFO field value"@en ;
+  rdfs:comment "A structured representation of one key and its optional value(s) from the INFO column of a VCF record. INFO entries are separated by semicolons, and an entry without an equals sign represents a Flag-style presence assertion."@en ;
+  vcfc:iriTemplate "file://{vcfFilePath}#call/{recordKey}/info/{fieldKey}" ;
+  skos:relatedMatch hero:VariantLevelData ;
+  rdfs:seeAlso hero:VariantLevelData .
+
+vcfc:FormatFieldValue a owl:Class ;
+  rdfs:label "FORMAT field value"@en ;
+  rdfs:comment "A structured representation of one value from one sample's colon-delimited data block, interpreted at the corresponding position in the record's FORMAT key list. This is an expanded, per-sample resource; version 1.1.0 added vcfc:FormatValueVector for a condensed multi-sample representation and the two classes MUST NOT be substituted for one another."@en ;
+  vcfc:iriTemplate "file://{vcfFilePath}#sample/{recordKey}/{sampleId}/fmt/{fieldKey}" ;
+  skos:relatedMatch hero:Genotype ;
+  rdfs:seeAlso hero:Genotype .
+
+# Cohort-oriented representation additions (version 1.1.0)
+vcfc:VCFSample a owl:Class ;
+  rdfs:label "VCF sample"@en ;
+  rdfs:comment "Added in version 1.1.0. A reusable representation of one named sample column in one VCF file. It identifies a VCF column, not necessarily a biological individual; external subject or biosample resources may be linked separately."@en ;
+  vcfc:iriTemplate "file://{vcfFilePath}#samples/{sampleId}" ;
+  rdfs:subClassOf prov:Entity .
+
+vcfc:SampleSet a owl:Class ;
+  rdfs:label "VCF sample set"@en ;
+  rdfs:comment "Added in version 1.1.0. The ordered set of sample columns declared by one VCF file. The vcfc:sampleIndex of each member is one-based and determines how values in a condensed representation are associated with samples."@en ;
+  vcfc:iriTemplate "file://{vcfFilePath}#samples" ;
+  rdfs:subClassOf prov:Entity .
+
+vcfc:CohortCallMatrix a owl:Class ;
+  rdfs:label "cohort call matrix"@en ;
+  rdfs:comment "Added in version 1.1.0. A condensed representation of all sample genotype data for one VariantCall. It applies to exactly one ordered SampleSet and groups one FormatValueVector for each represented FORMAT key. A matrix does not itself assert an individual RDF statement for every sample value."@en ;
+  vcfc:iriTemplate "file://{vcfFilePath}#call/{recordKey}/matrix" ;
+  rdfs:subClassOf prov:Entity .
+
+vcfc:FormatValueVector a owl:Class ;
+  rdfs:label "FORMAT value vector"@en ;
+  rdfs:comment "Added in version 1.1.0. The values of one FORMAT key across the ordered members of a CohortCallMatrix's SampleSet. It MUST be linked to the corresponding FormatFieldDefinition with vcfc:declaredBy and its encoded values MUST contain one position for each sample, including explicit missing values. It is a compact container, not a collection of individual vcfc:FormatFieldValue assertions."@en ;
+  vcfc:iriTemplate "file://{vcfFilePath}#call/{recordKey}/matrix/fmt/{fieldKey}" ;
+  rdfs:subClassOf prov:Entity .
+
+vcfc:RepresentationProfile a owl:Class ;
+  rdfs:label "VCF RDF representation profile"@en ;
+  rdfs:comment "Added in version 1.1.0. A declared profile that tells consumers whether genotype data are emitted as individual expanded statements or as condensed, sample-ordered vectors."@en .
+
+vcfc:VectorEncoding a owl:Class ;
+  rdfs:label "FORMAT value vector encoding"@en ;
+  rdfs:comment "Added in version 1.1.0. A named encoding for the lexical payload of a FormatValueVector. The encoding is required to interpret vcfc:encodedValues."@en .
+
+vcfc:ExpandedRepresentation a owl:NamedIndividual, vcfc:RepresentationProfile ;
+  rdfs:label "expanded representation"@en ;
+  skos:altLabel "dense representation"@en ;
+  rdfs:comment "Added in version 1.1.0 as vcfr:DenseRepresentation and renamed in version 2.0.0 to match the terminology used throughout the documentation. The representation profile that expresses genotype data as a vcfc:SampleCall for each sample and a vcfc:FormatFieldValue for each populated sample/FORMAT position. It is intended for single-sample or low-sample VCF files and for use cases requiring direct RDF statements about individual calls."@en .
+
+vcfc:CondensedRepresentation a owl:NamedIndividual, vcfc:RepresentationProfile ;
+  rdfs:label "condensed representation"@en ;
+  rdfs:comment "Added in version 1.1.0. The representation profile that expresses a VariantCall's multi-sample genotype data through a CohortCallMatrix, a shared SampleSet, and FORMAT value vectors. It is intended for large multi-sample VCF files. Individual genotype values remain recoverable by decoding the vectors, but are not independently asserted as RDF triples."@en .
+
+vcfc:VCFTextVector a owl:NamedIndividual, vcfc:VectorEncoding ;
+  rdfs:label "VCF text vector encoding"@en ;
+  rdfs:comment "Added in version 1.1.0. A tab-separated sequence of raw VCF values, ordered by the matrix SampleSet. There is exactly one item per sample; a missing item is represented by the VCF token '.'. Commas within an item remain part of that FORMAT value and MUST NOT be treated as vector separators."@en .
+
+#################################################################
+# Controlled vocab / enums (lightweight)
+#################################################################
+
+vcfc:VCFValueType a owl:Class ;
+  rdfs:label "VCF value type"@en ;
+  rdfs:comment "The declared VCF data type of an INFO or FORMAT field. INFO definitions may use Integer, Float, Flag, Character, or String; FORMAT definitions may use all of these except Flag."@en .
+
+vcfc:IntegerType a owl:NamedIndividual, vcfc:VCFValueType ;
+  rdfs:label "Integer"@en ;
+  rdfs:comment "The VCF Integer type: a signed 32-bit integer value."@en .
+
+vcfc:FloatType a owl:NamedIndividual, vcfc:VCFValueType ;
+  rdfs:label "Float"@en ;
+  rdfs:comment "The VCF Float type: a 32-bit IEEE-754 floating-point value, whose textual form may also express INF, INFINITY, or NAN."@en .
+
+vcfc:FlagType a owl:NamedIndividual, vcfc:VCFValueType ;
+  rdfs:label "Flag"@en ;
+  rdfs:comment "The VCF presence-only type for an INFO key. A Flag has no value in the INFO column and its Number is 0; it is not permitted for FORMAT fields."@en .
+
+vcfc:CharacterType a owl:NamedIndividual, vcfc:VCFValueType ;
+  rdfs:label "Character"@en ;
+  rdfs:comment "The VCF Character type, used when a field value is a single character."@en .
+
+vcfc:StringType a owl:NamedIndividual, vcfc:VCFValueType ;
+  rdfs:label "String"@en ;
+  rdfs:comment "The VCF String type, used for a textual value whose permitted content is further constrained by the field in which it occurs."@en .
+
+vcfc:VCFNumberArity a owl:Class ;
+  rdfs:label "VCF Number arity"@en ;
+  rdfs:comment "The cardinality declaration used in a structured INFO or FORMAT definition. Besides a non-negative integer, VCF 4.5 defines A (one value per ALT allele), R (one per allele including REF), G (one per genotype), and '.' (variable, unknown, or unbounded); FORMAT additionally defines LA, LR, LG, P, and M."@en .
+
+vcfc:Null a rdfs:Datatype ;
+  rdfs:label "null literal datatype"@en ;
+  rdfs:comment "Datatype for the explicit VCF missing-value token '.'. VCF 4.5 uses this token whenever a field or allele value is missing; represent it as '.'^^vcfc:Null rather than as a plain string or a fabricated numeric value."@en .
+
+#################################################################
+# Object properties
+#################################################################
+
+vcfc:hasHeader a owl:ObjectProperty ;
+  rdfs:label "has header"@en ;
+  rdfs:comment "Associates a VCF file artifact with the resource that groups its meta-information header lines."@en ;
+  rdfs:domain vcfc:VCFFile ;
+  rdfs:range vcfc:VCFHeader .
+
+vcfc:hasHeaderLine a owl:ObjectProperty ;
+  rdfs:label "has header line"@en ;
+  rdfs:comment "Associates a VCF header with one of its meta-information lines. This preserves the individual declaration even when its structured attributes are also represented separately."@en ;
+  rdfs:domain vcfc:VCFHeader ;
+  rdfs:range vcfc:HeaderLine .
+
+vcfc:hasRecord a owl:ObjectProperty ;
+  rdfs:label "has record"@en ;
+  rdfs:comment "Associates a VCF file with one of its tab-delimited data records."@en ;
+  rdfs:domain vcfc:VCFFile ;
+  rdfs:range vcfc:VCFRecord .
+
+vcfc:hasCall a owl:ObjectProperty ;
+  rdfs:label "has call"@en ;
+  rdfs:comment "Associates a VCF record with its vocabulary-level call resource, which groups QUAL, FILTER, INFO, FORMAT, and per-sample call data."@en ;
+  rdfs:domain vcfc:VCFRecord ;
+  rdfs:range vcfc:VariantCall .
+
+vcfc:hasSampleCall a owl:ObjectProperty ;
+  rdfs:label "has sample call"@en ;
+  rdfs:comment "Associates a record-level call with the values for one sample. It is used only when the VCF record includes genotype columns. This property is the expanded-profile alternative to vcfc:hasCallMatrix, not a link to a condensed vector."@en ;
+  rdfs:domain vcfc:VariantCall ;
+  rdfs:range vcfc:SampleCall .
+
+vcfc:hasSampleSet a owl:ObjectProperty ;
+  rdfs:label "has sample set"@en ;
+  rdfs:comment "Added in version 1.1.0. Associates a VCF file with its ordered set of sample columns. The set provides the sample order used by every condensed cohort call matrix in that file."@en ;
+  rdfs:domain vcfc:VCFFile ;
+  rdfs:range vcfc:SampleSet .
+
+vcfc:hasSample a owl:ObjectProperty ;
+  rdfs:label "has sample"@en ;
+  rdfs:comment "Added in version 1.1.0. Associates a SampleSet with a reusable VCF sample-column resource. The member's vcfc:sampleIndex supplies the set order."@en ;
+  rdfs:domain vcfc:SampleSet ;
+  rdfs:range vcfc:VCFSample .
+
+vcfc:forSample a owl:ObjectProperty ;
+  rdfs:label "for sample"@en ;
+  rdfs:comment "Added in version 1.1.0. Optionally links an expanded SampleCall to the reusable VCFSample representing its column. This avoids treating repeated vcfc:sampleId literals as the only sample identity."@en ;
+  rdfs:domain vcfc:SampleCall ;
+  rdfs:range vcfc:VCFSample .
+
+vcfc:hasCallMatrix a owl:ObjectProperty ;
+  rdfs:label "has cohort call matrix"@en ;
+  rdfs:comment "Added in version 1.1.0. Associates a VariantCall with its condensed multi-sample genotype representation. It is the condensed-profile alternative to emitting one vcfc:hasSampleCall assertion per sample."@en ;
+  rdfs:domain vcfc:VariantCall ;
+  rdfs:range vcfc:CohortCallMatrix .
+
+vcfc:hasFormatValueVector a owl:ObjectProperty ;
+  rdfs:label "has FORMAT value vector"@en ;
+  rdfs:comment "Added in version 1.1.0. Associates a CohortCallMatrix with the ordered values for one FORMAT key across its SampleSet."@en ;
+  rdfs:domain vcfc:CohortCallMatrix ;
+  rdfs:range vcfc:FormatValueVector .
+
+vcfc:appliesToSampleSet a owl:ObjectProperty ;
+  rdfs:label "applies to sample set"@en ;
+  rdfs:comment "Added in version 1.1.0. Identifies the ordered SampleSet used to interpret a CohortCallMatrix and all of its FORMAT value vectors."@en ;
+  rdfs:domain vcfc:CohortCallMatrix ;
+  rdfs:range vcfc:SampleSet .
+
+vcfc:hasInfoValue a owl:ObjectProperty ;
+  rdfs:label "has INFO value"@en ;
+  rdfs:comment "Associates a record-level call with one structured annotation parsed from its INFO column."@en ;
+  rdfs:domain vcfc:VariantCall ;
+  rdfs:range vcfc:InfoFieldValue .
+
+vcfc:hasFormatValue a owl:ObjectProperty ;
+  rdfs:label "has FORMAT value"@en ;
+  rdfs:comment "Associates a sample call with one structured value parsed from that sample's FORMAT-ordered data block."@en ;
+  rdfs:domain vcfc:SampleCall ;
+  rdfs:range vcfc:FormatFieldValue .
+
+vcfc:declaredBy a owl:ObjectProperty ;
+  rdfs:label "declared by"@en ;
+  rdfs:comment "Links an INFO, FORMAT, FILTER, or ALT value/usage to its header definition line. Since version 1.1.0, a FormatValueVector uses this property to identify the FORMAT key that defines every position in the vector."@en ;
+  rdfs:range vcfc:FieldDefinition .
+
+vcfc:declaredOnLine a owl:ObjectProperty ;
+  rdfs:label "declared on header line"@en ;
+  rdfs:comment "Links a reusable field definition to the concrete HeaderLine that declares it in one VCF file. This keeps specification-level registry definitions distinct from file-local header-line occurrences."@en ;
+  rdfs:domain vcfc:FieldDefinition ; rdfs:range vcfc:HeaderLine .
+
+vcfc:chromosome a owl:ObjectProperty ;
+  rdfs:label "chromosome / contig reference"@en ;
+  rdfs:comment "Links a record to the declared contig corresponding to its CHROM value. The CHROM column identifies a reference sequence (or, for breakpoint assemblies, an angle-bracketed assembly contig ID); a resolvable external reference may also be aligned to FALDO."@en ;
+  rdfs:seeAlso vrs:SequenceLocation ;
+  rdfs:domain vcfc:VCFRecord ;
+  rdfs:range vcfc:ContigHeaderLine .
+
+vcfc:asSequenceAlteration a owl:ObjectProperty ;
+  rdfs:label "as sequence alteration"@en ;
+  rdfs:comment "Links the VCF-centric record or call to an independently modelled sequence alteration, such as an SB/gvar SequenceAlteration. This relation supports semantic alignment without changing the source VCF representation."@en ;
+  rdfs:seeAlso vrs:Allele ;
+  rdfs:range so:0001059 .
+
+vcfc:representationProfile a owl:ObjectProperty ;
+  rdfs:label "representation profile"@en ;
+  rdfs:comment "Added in version 1.1.0. Declares the genotype-data representation used by a VCF RDF graph. A converter MUST use vcfc:ExpandedRepresentation when emitting per-sample call resources and vcfc:CondensedRepresentation when emitting cohort call matrices."@en ;
+  rdfs:domain vcfc:VCFFile ;
+  rdfs:range vcfc:RepresentationProfile .
+
+vcfc:valueEncoding a owl:ObjectProperty ;
+  rdfs:label "value encoding"@en ;
+  rdfs:comment "Added in version 1.1.0. Names the lexical encoding used for a FormatValueVector's vcfc:encodedValues payload."@en ;
+  rdfs:domain vcfc:FormatValueVector ;
+  rdfs:range vcfc:VectorEncoding .
+
+vcfc:missingValuePolicy a owl:AnnotationProperty ;
+  rdfs:label "missing value policy"@en ;
+  rdfs:comment "Documents how the VCF missing-value token '.' is represented when source values are transformed to RDF."@en .
+
+vcfc:iriTemplate a owl:AnnotationProperty ;
+  rdfs:label "IRI template"@en ;
+  rdfs:comment "Provides a recommended IRI-minting pattern, using RFC 6570-style placeholders, for instances of a vocabulary class."@en .
+
+vcfc: vcfc:missingValuePolicy "VCF missing token '.' SHOULD be serialized as literal '.'^^vcfc:Null (do not serialize plain '.'^^xsd:string)."@en .
+vcfc: vcfc:iriTemplate "file://{vcfFilePath}" .
+
+#################################################################
+# Datatype properties (VCF metadata + record fields)
+#################################################################
+
+# Header common
+vcfc:headerKey a owl:DatatypeProperty ;
+  rdfs:label "header key"@en ;
+  rdfs:comment "The meta-information key to the left of '=' in a header line, without the leading '##'; for example, 'fileformat', 'INFO', or 'contig'."@en ;
+  rdfs:domain vcfc:HeaderLine ;
+  rdfs:range xsd:string .
+
+vcfc:headerValue a owl:DatatypeProperty ;
+  rdfs:label "header value"@en ;
+  rdfs:comment "The source value to the right of '=' in a VCF meta-information line. For a structured line, this may preserve the angle-bracketed key-value list in addition to its separately represented attributes."@en ;
+  rdfs:domain vcfc:HeaderLine ;
+  rdfs:range xsd:string .
+
+# File-level metadata (common headers)
+vcfc:fileFormat a owl:DatatypeProperty ;
+  rdfs:label "file format"@en ;
+  rdfs:comment "The VCF version string declared by the required '##fileformat' line, for example 'VCFv4.5'. That line must be the first line of a conforming VCF file."@en ;
+  rdfs:domain vcfc:VCFFile ;
+  rdfs:range xsd:string .
+
+vcfc:fileDate a owl:DatatypeProperty ;
+  rdfs:label "file date"@en ;
+  rdfs:comment "A producer-supplied file date, typically derived from an optional '##fileDate' header line. It records file metadata and is not one of VCF 4.5's required fixed fields."@en ;
+  rdfs:domain vcfc:VCFFile ;
+  rdfs:range xsd:date .
+
+vcfc:sourceSoftware a owl:DatatypeProperty ;
+  rdfs:label "source software"@en ;
+  rdfs:comment "The program, pipeline, or other source named by an optional '##source' header line."@en ;
+  rdfs:domain vcfc:VCFFile ;
+  rdfs:range xsd:string .
+
+vcfc:referenceGenome a owl:DatatypeProperty ;
+  rdfs:label "reference genome"@en ;
+  rdfs:comment "The reference genome or sequence resource identified by optional reference metadata, commonly a '##reference' header value. VCF 4.5 recommends recording reference and contig metadata to make the records interpretable."@en ;
+  rdfs:domain vcfc:VCFFile ;
+  rdfs:range xsd:string .
+
+vcfc:contigCount a owl:DatatypeProperty ;
+  rdfs:label "contig count"@en ;
+  rdfs:comment "The number of contig declarations associated with the file. This is a derived RDF convenience, not a separate VCF header field."@en ;
+  rdfs:domain vcfc:VCFFile ;
+  rdfs:range xsd:integer .
+
+# Contig header details
+vcfc:contigId a owl:DatatypeProperty ;
+  rdfs:label "contig ID"@en ;
+  rdfs:comment "The required ID attribute of a '##contig=<...>' declaration. It names the reference sequence that may be cited in CHROM and must not be a reserved symbolic-allele name."@en ;
+  rdfs:domain vcfc:ContigHeaderLine ;
+  rdfs:range xsd:string .
+
+vcfc:contigLength a owl:DatatypeProperty ;
+  rdfs:label "contig length"@en ;
+  rdfs:comment "The optional 'length' attribute of a contig declaration: the length of the reference sequence in bases."@en ;
+  rdfs:domain vcfc:ContigHeaderLine ;
+  rdfs:range xsd:integer .
+
+vcfc:contigAssembly a owl:DatatypeProperty ;
+  rdfs:label "contig assembly"@en ;
+  rdfs:comment "An optional assembly identifier supplied in a contig declaration. It identifies the reference assembly context for the named contig."@en ;
+  rdfs:domain vcfc:ContigHeaderLine ;
+  rdfs:range xsd:string .
+
+vcfc:contigMd5 a owl:DatatypeProperty ;
+  rdfs:label "contig MD5"@en ;
+  rdfs:comment "The optional 'md5' attribute of a contig declaration: the lowercase hexadecimal MD5 checksum of the normalized reference sequence, as defined by the SAM specification and referenced by VCF 4.5."@en ;
+  rdfs:domain vcfc:ContigHeaderLine ;
+  rdfs:range xsd:string .
+
+# INFO/FORMAT definition fields
+vcfc:fieldId a owl:DatatypeProperty ;
+  rdfs:label "field ID"@en ;
+  rdfs:comment "The ID attribute of an INFO or FORMAT field declaration. It is the key used to identify a value in the INFO column or FORMAT-ordered sample data and is unique within its header-line type."@en ;
+  rdfs:domain vcfc:FieldDefinition ;
+  rdfs:range xsd:string .
+
+vcfc:fieldNumber a owl:DatatypeProperty ;
+  rdfs:label "field Number"@en ;
+  rdfs:comment "The Number attribute from an INFO or FORMAT definition, retained as a string because VCF permits both integers and symbolic arities. A, R, and G follow REF/ALT or genotype order; '.' means variable, unknown, or unbounded; FORMAT also permits LA, LR, LG, P, and M."@en ;
+  rdfs:domain vcfc:FieldDefinition ;
+  rdfs:range xsd:string .
+
+vcfc:fieldType a owl:ObjectProperty ;
+  rdfs:label "field Type"@en ;
+  rdfs:comment "Links an INFO or FORMAT field declaration to its VCF Type. INFO supports Integer, Float, Flag, Character, and String; FORMAT supports all of those except Flag."@en ;
+  rdfs:domain vcfc:FieldDefinition ;
+  rdfs:range vcfc:VCFValueType .
+
+vcfc:fieldDescription a owl:DatatypeProperty ;
+  rdfs:label "field Description"@en ;
+  rdfs:comment "The human-readable Description attribute from a structured INFO, FORMAT, FILTER, or ALT header declaration. VCF requires this attribute to be quoted in the source header."@en ;
+  rdfs:domain vcfc:FieldDefinition ;
+  rdfs:range xsd:string .
+
+# FILTER definition
+vcfc:filterId a owl:DatatypeProperty ;
+  rdfs:label "FILTER ID"@en ;
+  rdfs:comment "The ID of a FILTER declaration: the failure code that can occur in the semicolon-separated FILTER column when the corresponding criterion is not passed."@en ;
+  rdfs:domain vcfc:FilterDefinition ;
+  rdfs:range xsd:string .
+
+# ALT definition
+vcfc:altId a owl:DatatypeProperty ;
+  rdfs:label "ALT ID"@en ;
+  rdfs:comment "The ID of a symbolic ALT declaration, stored without the angle brackets used when the identifier occurs in the ALT column."@en ;
+  rdfs:domain vcfc:AltDefinition ;
+  rdfs:range xsd:string .
+
+# Record core columns
+vcfc:chrom a owl:DatatypeProperty ;
+  rdfs:label "CHROM"@en ;
+  rdfs:comment "The required CHROM fixed-field value: an identifier for the reference sequence on which the record is located, or an angle-bracketed assembly-contig ID for a breakpoint assembly. Records for one CHROM occur in a contiguous block."@en ;
+  rdfs:domain vcfc:VCFRecord ;
+  rdfs:range xsd:string .
+
+vcfc:pos a owl:DatatypeProperty ;
+  rdfs:label "POS"@en ;
+  rdfs:comment "The required 1-based reference position of the record. It denotes the first base of REF, is numerically ordered within CHROM, and may be 0 or N+1 to indicate a telomere for a contig of length N."@en ;
+  rdfs:seeAlso vrs:SequenceLocation ;
+  rdfs:domain vcfc:VCFRecord ;
+  rdfs:range xsd:integer .
+
+vcfc:recordId a owl:DatatypeProperty ;
+  rdfs:label "ID"@en ;
+  rdfs:comment "The ID fixed-field value: a semicolon-separated list of unique record identifiers, such as dbSNP rs identifiers. When no identifier is available, VCF uses '.', represented here as '.'^^vcfc:Null."@en ;
+  rdfs:domain vcfc:VCFRecord ;
+  rdfs:range rdfs:Literal .
+
+vcfc:ref a owl:DatatypeProperty ;
+  rdfs:label "REF"@en ;
+  rdfs:comment "The required reference allele string. It contains one or more A, C, G, T, or N bases and begins at POS. For simple insertions, deletions, and symbolic alleles, VCF uses an adjacent padding base to avoid an empty allele."@en ;
+  rdfs:seeAlso vrs:LiteralSequenceExpression ;
+  rdfs:domain vcfc:VCFRecord ;
+  rdfs:range xsd:string .
+
+vcfc:alt a owl:DatatypeProperty ;
+  rdfs:label "ALT"@en ;
+  rdfs:comment "A lossless raw ALT lexical value. The VCF source serializes ALT as an ordered comma-separated list whose items may be base strings, '*', '.', symbolic IDs, '<*>', or breakend expressions. Repeated vcfc:alt assertions are unsuitable for per-allele annotation or preserving ALT order; use hasAltAllele and alleleIndex for the structural form."@en ;
+  rdfs:seeAlso vrs:LiteralSequenceExpression ;
+  rdfs:domain vcfc:VCFRecord ;
+  rdfs:range xsd:string .
+
+# Call-level columns
+vcfc:qual a owl:DatatypeProperty ;
+  rdfs:label "QUAL"@en ;
+  rdfs:comment "The QUAL fixed-field value: the Phred-scaled quality score for the assertion made in ALT. When ALT is '.', it is -10 log10 P(variant); otherwise it is -10 log10 P(no variant). An unknown score is represented by '.'^^vcfc:Null."@en ;
+  rdfs:domain vcfc:VariantCall ;
+  rdfs:range rdfs:Literal .
+
+vcfc:filter a owl:DatatypeProperty ;
+  rdfs:label "FILTER"@en ;
+  rdfs:comment "The FILTER fixed-field value. 'PASS' means the position passed all filters; otherwise it is a semicolon-separated list of declared filter codes that failed. '.'^^vcfc:Null means filters have not been applied."@en ;
+  rdfs:domain vcfc:VariantCall ;
+  rdfs:range rdfs:Literal .
+
+vcfc:infoRaw a owl:DatatypeProperty ;
+  rdfs:label "INFO raw"@en ;
+  rdfs:comment "An optional lossless copy of the INFO fixed-field string. In VCF it is '.' when no annotations are present, or a semicolon-separated series of key[=value[,value...]] entries. Use structured vcfc:InfoFieldValue resources for machine interpretation."@en ;
+  rdfs:domain vcfc:VariantCall ;
+  rdfs:range rdfs:Literal .
+
+vcfc:FormatKey a owl:Class ;
+  rdfs:label "declared FORMAT key"@en ;
+  rdfs:comment "One key of one record's FORMAT column, in column order. VCF 4.5 lets a sample drop trailing fields, so the keys a record declares and the values a sample supplies are different sets. Without this resource the declared list exists only inside the vcfc:formatRaw string, and a consumer could not tell an omitted field from an undeclared one without parsing it."@en ;
+  vcfc:iriTemplate "file://{vcfFilePath}#call/{recordKey}/formatKey/{fieldIndex}" .
+
+vcfc:hasFormatKey a owl:ObjectProperty ;
+  rdfs:label "has declared FORMAT key"@en ;
+  rdfs:comment "Associates a record-level call with one key declared in its FORMAT column. The key's position comes from vcfc:fieldIndex and its meaning from vcfc:declaredBy, so the declared order is queryable without reading vcfc:formatRaw."@en ;
+  rdfs:domain vcfc:VariantCall ; rdfs:range vcfc:FormatKey .
+
+vcfc:formatRaw a owl:DatatypeProperty ;
+  rdfs:label "FORMAT raw"@en ;
+  rdfs:comment "An optional lossless copy of the FORMAT column: the colon-separated, ordered list of keys that determines the meaning of every sample data block in the record. If GT is included, it is the first key; the same field order applies to all samples in the record. Since version 1.1.0, this order also determines how a condensed CohortCallMatrix's FORMAT value vectors are combined for a sample."@en ;
+  rdfs:domain vcfc:VariantCall ;
+  rdfs:range xsd:string .
+
+# Structured INFO/FORMAT values
+vcfc:fieldValue a owl:DatatypeProperty ;
+  rdfs:label "field value"@en ;
+  rdfs:comment "The literal value copied from one structured INFO or FORMAT entry. It may preserve a comma-separated VCF value list; when a source value is missing, use '.'^^vcfc:Null. The typed value properties may additionally be used where the source type and transformation support them. In the version 1.1.0 condensed profile, use vcfc:encodedValues on a FormatValueVector instead of creating one vcfc:fieldValue assertion per sample."@en ;
+  rdfs:range rdfs:Literal .
+
+vcfc:fieldValueInteger a owl:DatatypeProperty ;
+  rdfs:label "field value (integer)"@en ;
+  rdfs:comment "An RDF integer representation of a parsed VCF Integer field value. Use vcfc:fieldValue for the original lexical form, lists, or missing values."@en ;
+  rdfs:range xsd:integer .
+
+vcfc:fieldValueDecimal a owl:DatatypeProperty ;
+  rdfs:label "field value (decimal)"@en ;
+  rdfs:comment "An RDF decimal representation of a parsed finite VCF Float field value. VCF Float may also use INF, INFINITY, or NAN; preserve such lexical values with vcfc:fieldValue rather than coercing them to xsd:decimal."@en ;
+  rdfs:range xsd:decimal .
+
+vcfc:fieldValueBoolean a owl:DatatypeProperty ;
+  rdfs:label "field value (boolean)"@en ;
+  rdfs:comment "An RDF boolean representation that may be used for the presence semantics of a VCF INFO Flag. In VCF source syntax, a Flag is indicated by a key without an explicit value and has Number=0."@en ;
+  rdfs:range xsd:boolean .
+
+# Reusable VCF sample-column identity (version 1.1.0)
+vcfc:sampleName a owl:DatatypeProperty ;
+  rdfs:label "sample name"@en ;
+  rdfs:comment "Added in version 1.1.0. The exact sample-column identifier from the '#CHROM' header line, attached to a reusable VCFSample. It is distinct from vcfc:sampleId, which remains the identifier literal on an expanded SampleCall."@en ;
+  rdfs:domain vcfc:VCFSample ;
+  rdfs:range xsd:string .
+
+vcfc:sampleIndex a owl:DatatypeProperty ;
+  rdfs:label "sample index"@en ;
+  rdfs:comment "Added in version 1.1.0. The one-based position of a VCFSample in its file's '#CHROM' sample-column order. A condensed FormatValueVector position i corresponds to the SampleSet member whose sample index is i."@en ;
+  rdfs:domain vcfc:VCFSample ;
+  rdfs:range xsd:positiveInteger .
+
+# Expanded SampleCall identity
+vcfc:sampleId a owl:DatatypeProperty ;
+  rdfs:label "sample ID"@en ;
+  rdfs:comment "The sample identifier from the column-header line on an expanded SampleCall. When genotype data is present, VCF places FORMAT after the eight fixed columns and then one uniquely named column per sample. Since version 1.1.0, converters should additionally use vcfc:forSample and VCFSample when reusable sample identity is needed."@en ;
+  rdfs:domain vcfc:SampleCall ;
+  rdfs:range xsd:string .
+
+# Condensed cohort payloads (version 1.1.0)
+vcfc:encodedValues a owl:DatatypeProperty ;
+  rdfs:label "encoded values"@en ;
+  rdfs:comment "Added in version 1.1.0. The lexical payload of a FormatValueVector. Interpret it only according to vcfc:valueEncoding, the vector's vcfc:declaredBy FORMAT definition, and the SampleSet of its CohortCallMatrix; it is not a sequence of independently asserted RDF values."@en ;
+  rdfs:domain vcfc:FormatValueVector ;
+  rdfs:range xsd:string .
+
+vcfc:sampleDataRaw a owl:DatatypeProperty ;
+  rdfs:label "sample data raw"@en ;
+  rdfs:comment "Added in version 1.1.0. An optional lossless textual copy of a record's genotype columns, with individual sample blocks separated by tabs in SampleSet order. It preserves source serialization for a CohortCallMatrix but does not replace its FORMAT value vectors for semantic interpretation."@en ;
+  rdfs:domain vcfc:CohortCallMatrix ;
+  rdfs:range xsd:string .
+
+#################################################################
+# Recommended alignments to SB/gvar (non-assertive hints)
+#################################################################
+
+# SB/gvar models sequence alteration as so:0001059 and uses FALDO/GENO/SIO slots. :contentReference[oaicite:2]{index=2}
+vcfc:recommendedSequenceAlterationClass a owl:AnnotationProperty ;
+  rdfs:label "recommended sequence alteration class"@en ;
+  rdfs:comment "Documents a sequence-alteration class recommended as a target when a VCF-centric record or call is linked to a variation model. It is guidance for alignment and does not reclassify the VCF resource."@en .
+
+vcfc:recommendedSequenceAlterationClass vcfc:recommendedSequenceAlterationClass so:0001059 .
+
+#################################################################
+# VCF 4.5 additive core layer
+#################################################################
+
+vcfc:StructuredHeaderLine a owl:Class ; rdfs:subClassOf vcfc:HeaderLine ;
+  rdfs:label "structured header line"@en ;
+  rdfs:comment "A VCF meta-information line whose value is an angle-bracketed, comma-separated list of key-value attributes. Implementations must not rely on the source attribute order, but may preserve it with vcfc:attributeIndex."@en .
+
+vcfc:UnstructuredHeaderLine a owl:Class ; rdfs:subClassOf vcfc:HeaderLine ;
+  rdfs:label "unstructured header line"@en ;
+  rdfs:comment "A VCF meta-information line whose non-empty value is not an angle-bracketed attribute list."@en .
+
+vcfc:HeaderAttribute a owl:Class ;
+  rdfs:label "header attribute"@en ;
+  rdfs:comment "One key-value attribute from a structured VCF header line. It makes required, optional, and implementation-defined attributes queryable while headerValue retains the source form."@en ;
+  vcfc:iriTemplate "file://{vcfFilePath}#header/line/{lineId}/attribute/{attributeIndex}" .
+
+vcfc:ColumnHeaderLine a owl:Class ;
+  rdfs:label "column header line"@en ;
+  rdfs:comment "The mandatory tab-delimited #CHROM line. It declares the eight fixed VCF columns and, where genotype data occur, FORMAT followed by ordered sample columns. It is distinct from a ## meta-information HeaderLine."@en ;
+  vcfc:iriTemplate "file://{vcfFilePath}#header/columns" .
+
+vcfc:AssemblyHeaderLine a owl:Class ; rdfs:subClassOf vcfc:UnstructuredHeaderLine ;
+  rdfs:label "assembly header line"@en ;
+  rdfs:comment "The optional ##assembly line that locates a FASTA file containing breakpoint assemblies referenced by BKPTID."@en .
+
+vcfc:MetaHeaderLine a owl:Class ; rdfs:subClassOf vcfc:StructuredHeaderLine, vcfc:MetaDefinition ;
+  rdfs:label "META header line"@en ;
+  rdfs:comment "A structured ##META declaration that defines an implementation- or file-specific sample attribute key and optional allowed values."@en .
+
+vcfc:MetaDefinition a owl:Class ; rdfs:subClassOf vcfc:FieldDefinition ;
+  rdfs:label "META definition"@en ;
+  rdfs:comment "A ##META declaration represented as a reusable field definition. Its fieldId, fieldArity, and fieldType describe attributes used on ##SAMPLE lines."@en .
+
+vcfc:SampleHeaderLine a owl:Class ; rdfs:subClassOf vcfc:StructuredHeaderLine ;
+  rdfs:label "SAMPLE header line"@en ;
+  rdfs:comment "A structured ##SAMPLE declaration describing a sample or genome mapping through standard or META-declared attributes."@en .
+
+vcfc:SampleDeclaration a owl:Class ; rdfs:subClassOf prov:Entity ;
+  rdfs:label "sample declaration"@en ;
+  rdfs:comment "The declared subject of one ##SAMPLE header line. This is a header-level declaration and is distinct from a VCFSample, which identifies a #CHROM sample column."@en .
+
+vcfc:PedigreeHeaderLine a owl:Class ; rdfs:subClassOf vcfc:StructuredHeaderLine, vcfc:PedigreeRelation ;
+  rdfs:label "PEDIGREE header line"@en ;
+  rdfs:comment "A structured ##PEDIGREE declaration. Its HeaderAttribute resources retain arbitrary ancestor-role attributes; pedigreeMother and pedigreeFather provide direct links when those roles are represented as resources."@en .
+
+vcfc:PedigreeRelation a owl:Class ;
+  rdfs:label "pedigree relation"@en ;
+  rdfs:comment "A parent, ancestor, or clonal-origin relationship declared in VCF pedigree metadata."@en .
+
+vcfc:PedigreeDBHeaderLine a owl:Class ; rdfs:subClassOf vcfc:UnstructuredHeaderLine ;
+  rdfs:label "pedigreeDB header line"@en ;
+  rdfs:comment "The optional ##pedigreeDB line that identifies an external pedigree database."@en .
+
+vcfc:VCFFloat a rdfs:Datatype ;
+  rdfs:label "VCF Float"@en ;
+  rdfs:comment "A VCF Float lexical value: a finite decimal/scientific value or, case-insensitively, INF, INFINITY, or NAN. SHACL supplies the portable lexical check."@en .
+
+vcfc:VCFInteger a rdfs:Datatype ;
+  rdfs:label "VCF Integer"@en ;
+  rdfs:comment "A signed 32-bit VCF Integer excluding -2147483648 through -2147483641, which VCF 4.5 reserves because BCF cannot encode them."@en .
+
+vcfc:GenotypeString a rdfs:Datatype ;
+  rdfs:label "genotype string"@en ;
+  rdfs:comment "A VCF GT lexical value: allele indices or missing calls separated by phased (|) or unphased (/) indicators, optionally with a leading indicator for partial phasing."@en .
+
+vcfc:BreakendString a rdfs:Datatype ;
+  rdfs:label "breakend string"@en ;
+  rdfs:comment "A VCF breakend ALT lexical value. Use a Breakend resource for the queryable structural components while retaining this datatype for the lossless source expression."@en .
+
+vcfc:ArityPerAlt a owl:NamedIndividual, vcfc:VCFNumberArity ;
+  rdfs:label "one value per alternate allele (A)"@en ; vcfc:arityCode "A" .
+vcfc:ArityPerAllele a owl:NamedIndividual, vcfc:VCFNumberArity ;
+  rdfs:label "one value per allele (R)"@en ; vcfc:arityCode "R" .
+vcfc:ArityPerGenotype a owl:NamedIndividual, vcfc:VCFNumberArity ;
+  rdfs:label "one value per genotype (G)"@en ; vcfc:arityCode "G" .
+vcfc:ArityVariable a owl:NamedIndividual, vcfc:VCFNumberArity ;
+  rdfs:label "variable arity (.)"@en ; vcfc:arityCode "." .
+vcfc:ArityPerLocalAlt a owl:NamedIndividual, vcfc:VCFNumberArity ;
+  rdfs:label "one value per local alternate allele (LA)"@en ; vcfc:arityCode "LA" .
+vcfc:ArityPerLocalAllele a owl:NamedIndividual, vcfc:VCFNumberArity ;
+  rdfs:label "one value per local allele (LR)"@en ; vcfc:arityCode "LR" .
+vcfc:ArityPerLocalGenotype a owl:NamedIndividual, vcfc:VCFNumberArity ;
+  rdfs:label "one value per local genotype (LG)"@en ; vcfc:arityCode "LG" .
+vcfc:ArityPerGTAllele a owl:NamedIndividual, vcfc:VCFNumberArity ;
+  rdfs:label "one value per GT allele (P)"@en ; vcfc:arityCode "P" .
+vcfc:ArityPerBaseModification a owl:NamedIndividual, vcfc:VCFNumberArity ;
+  rdfs:label "one value per base modification (M)"@en ; vcfc:arityCode "M" .
+
+vcfc:fieldArity a owl:ObjectProperty ;
+  rdfs:label "field arity"@en ;
+  rdfs:comment "Links a field definition with a symbolic VCF Number arity. For a fixed count, use fieldNumberInteger; fieldNumber always preserves the exact source token."@en ;
+  rdfs:domain vcfc:FieldDefinition ; rdfs:range vcfc:VCFNumberArity .
+
+vcfc:hasAttribute a owl:ObjectProperty ;
+  rdfs:label "has attribute"@en ; rdfs:domain vcfc:StructuredHeaderLine ; rdfs:range vcfc:HeaderAttribute .
+vcfc:hasColumnHeader a owl:ObjectProperty ;
+  rdfs:label "has column header"@en ; rdfs:domain vcfc:VCFHeader ; rdfs:range vcfc:ColumnHeaderLine .
+vcfc:hasGenotypeColumns a owl:ObjectProperty ;
+  rdfs:label "has genotype columns"@en ; rdfs:domain vcfc:ColumnHeaderLine ; rdfs:range vcfc:VCFSample .
+vcfc:declaresSample a owl:ObjectProperty ;
+  rdfs:label "declares sample"@en ; rdfs:domain vcfc:SampleHeaderLine ; rdfs:range vcfc:SampleDeclaration .
+vcfc:pedigreeAncestor a owl:ObjectProperty ;
+  rdfs:label "pedigree ancestor"@en ; rdfs:domain vcfc:PedigreeRelation ; rdfs:range vcfc:SampleDeclaration .
+vcfc:pedigreeMother a owl:ObjectProperty ; rdfs:subPropertyOf vcfc:pedigreeAncestor ;
+  rdfs:label "pedigree mother"@en ; rdfs:domain vcfc:PedigreeRelation ; rdfs:range vcfc:SampleDeclaration .
+vcfc:pedigreeFather a owl:ObjectProperty ; rdfs:subPropertyOf vcfc:pedigreeAncestor ;
+  rdfs:label "pedigree father"@en ; rdfs:domain vcfc:PedigreeRelation ; rdfs:range vcfc:SampleDeclaration .
+vcfc:pedigreeOriginal a owl:ObjectProperty ; rdfs:subPropertyOf vcfc:pedigreeAncestor, prov:wasDerivedFrom ;
+  rdfs:label "pedigree original"@en ;
+  rdfs:comment "The clonal Original= relation in a ##PEDIGREE line. It is explicitly a PROV derivation relation; parent and generic ancestor links are not globally forced to that interpretation."@en ;
+  rdfs:domain vcfc:PedigreeRelation ; rdfs:range vcfc:SampleDeclaration .
+
+vcfc:arityCode a owl:DatatypeProperty ;
+  rdfs:label "arity code"@en ; rdfs:domain vcfc:VCFNumberArity ; rdfs:range xsd:string .
+vcfc:fieldNumberInteger a owl:DatatypeProperty ;
+  rdfs:label "field Number integer"@en ; rdfs:domain vcfc:FieldDefinition ; rdfs:range xsd:nonNegativeInteger .
+vcfc:lineIndex a owl:DatatypeProperty ;
+  rdfs:label "line index"@en ; rdfs:domain vcfc:HeaderLine ; rdfs:range xsd:positiveInteger .
+vcfc:recordIndex a owl:DatatypeProperty ;
+  rdfs:label "record index"@en ; rdfs:domain vcfc:VCFRecord ; rdfs:range xsd:positiveInteger .
+vcfc:attributeKey a owl:DatatypeProperty ;
+  rdfs:label "attribute key"@en ; rdfs:domain vcfc:HeaderAttribute ; rdfs:range xsd:string .
+vcfc:attributeValue a owl:DatatypeProperty ;
+  rdfs:label "attribute value"@en ; rdfs:domain vcfc:HeaderAttribute ; rdfs:range xsd:string .
+vcfc:attributeIndex a owl:DatatypeProperty ;
+  rdfs:label "attribute index"@en ; rdfs:domain vcfc:HeaderAttribute ; rdfs:range xsd:positiveInteger .
+vcfc:assemblyUrl a owl:DatatypeProperty ;
+  rdfs:label "assembly URL"@en ; rdfs:domain vcfc:AssemblyHeaderLine ; rdfs:range xsd:anyURI .
+
+vcfc:AssemblyContig a owl:Class ;
+  rdfs:label "breakpoint-assembly contig"@en ;
+  rdfs:comment "A contig held in the external breakpoint-assembly file named by a '##assembly' line, referenced from CHROM as an angle-bracketed ID such as '<asm1>'. VCF 4.5 fixed field 1 admits this form as an alternative to a reference-sequence name. It is deliberately not a vcfc:ContigHeaderLine: no '##contig' declaration exists for it, and modelling it as one would assert a reference-sequence declaration the file does not make."@en ;
+  vcfc:iriTemplate "file://{vcfFilePath}#assembly/contig/{assemblyContigId}" .
+
+vcfc:assemblyContigId a owl:DatatypeProperty ;
+  rdfs:label "assembly contig ID"@en ;
+  rdfs:comment "The identifier of a breakpoint-assembly contig with the angle brackets removed, so that '<asm1>' in CHROM yields 'asm1'. The bracketed source token stays available on vcfc:chrom."@en ;
+  rdfs:domain vcfc:AssemblyContig ; rdfs:range xsd:string .
+
+vcfc:chromAssemblyContig a owl:ObjectProperty ;
+  rdfs:label "CHROM assembly contig"@en ;
+  rdfs:comment "Associates a record whose CHROM is an angle-bracketed assembly-contig ID with that contig. It is the structured counterpart of vcfc:chromosome, which links a record to a declared reference contig; a record uses one or the other, never both."@en ;
+  rdfs:domain vcfc:VCFRecord ; rdfs:range vcfc:AssemblyContig .
+
+vcfc:declaredInAssembly a owl:ObjectProperty ;
+  rdfs:label "declared in assembly file"@en ;
+  rdfs:comment "Links a breakpoint-assembly contig to the '##assembly' header line whose URL names the file that holds its sequence. This is the contig's sequence source; the vocabulary does not fetch or model the sequence itself."@en ;
+  rdfs:domain vcfc:AssemblyContig ; rdfs:range vcfc:AssemblyHeaderLine .
+vcfc:pedigreeDbUrl a owl:DatatypeProperty ;
+  rdfs:label "pedigree database URL"@en ; rdfs:domain vcfc:PedigreeDBHeaderLine ; rdfs:range xsd:anyURI .
+vcfc:metaAllowedValue a owl:DatatypeProperty ;
+  rdfs:label "META allowed value"@en ; rdfs:domain vcfc:MetaDefinition ; rdfs:range xsd:string .
+vcfc:ancestorRole a owl:DatatypeProperty ;
+  rdfs:label "ancestor role"@en ; rdfs:domain vcfc:PedigreeRelation ; rdfs:range xsd:string .
+vcfc:contigUrl a owl:DatatypeProperty ;
+  rdfs:label "contig URL"@en ; rdfs:domain vcfc:ContigHeaderLine ; rdfs:range xsd:anyURI .
+vcfc:fieldSource a owl:DatatypeProperty ;
+  rdfs:label "field source"@en ; rdfs:domain vcfc:INFOHeaderLine ; rdfs:range xsd:string .
+vcfc:fieldVersion a owl:DatatypeProperty ;
+  rdfs:label "field version"@en ; rdfs:domain vcfc:INFOHeaderLine ; rdfs:range xsd:string .
+vcfc:percentEncodingPolicy a owl:DatatypeProperty ;
+  rdfs:label "percent-encoding policy"@en ; rdfs:domain vcfc:VCFFile ; rdfs:range xsd:string .
+vcfc:rawValue a owl:DatatypeProperty ;
+  rdfs:label "raw value"@en ; rdfs:comment "The lossless source lexical value before optional percent decoding."@en ; rdfs:range rdfs:Literal .
+vcfc:decodedValue a owl:DatatypeProperty ;
+  rdfs:label "decoded value"@en ; rdfs:comment "A consumer-oriented value after applying the file's percent-encoding policy; rawValue remains authoritative for round-tripping."@en ; rdfs:range rdfs:Literal .
+
+# Parsed components retain their source order without changing raw columns.
+vcfc:RecordIdentifier a owl:Class ; rdfs:label "record identifier"@en ;
+  rdfs:comment "One component of the semicolon-separated ID column. The missing dot is represented by no identifier components."@en .
+vcfc:hasIdentifier a owl:ObjectProperty ; rdfs:label "has identifier"@en ;
+  rdfs:domain vcfc:VCFRecord ; rdfs:range vcfc:RecordIdentifier .
+vcfc:identifierValue a owl:DatatypeProperty ; rdfs:label "identifier value"@en ;
+  rdfs:domain vcfc:RecordIdentifier ; rdfs:range xsd:string .
+vcfc:componentIndex a owl:DatatypeProperty ; rdfs:label "component index"@en ;
+  rdfs:comment "One-based position of an ID or FILTER component in its source column."@en ; rdfs:range xsd:positiveInteger .
+vcfc:FilterCode a owl:Class ; rdfs:label "filter failure code"@en ;
+  rdfs:comment "One failed FILTER or FT code. PASS and missing are statuses, not failure codes."@en .
+vcfc:hasFilterCode a owl:ObjectProperty ; rdfs:label "has filter failure code"@en ; rdfs:range vcfc:FilterCode .
+vcfc:filterCodeValue a owl:DatatypeProperty ; rdfs:label "filter code value"@en ; rdfs:domain vcfc:FilterCode ; rdfs:range xsd:string .
+vcfc:declaredByFilter a owl:ObjectProperty ; rdfs:label "declared by filter"@en ; rdfs:domain vcfc:FilterCode ; rdfs:range vcfc:FilterDefinition .
+vcfc:FilterStatus a owl:Class ; rdfs:label "filter status"@en .
+vcfc:FiltersPassed a owl:NamedIndividual, vcfc:FilterStatus ; rdfs:label "filters passed"@en .
+vcfc:FiltersFailed a owl:NamedIndividual, vcfc:FilterStatus ; rdfs:label "filters failed"@en .
+vcfc:FiltersNotApplied a owl:NamedIndividual, vcfc:FilterStatus ; rdfs:label "filters not applied"@en .
+vcfc:filterStatus a owl:ObjectProperty ; rdfs:label "filter status"@en ;
+  rdfs:comment "Status of FILTER on a VariantCall or FT on a SampleCall."@en ; rdfs:range vcfc:FilterStatus .
+vcfc:fieldIndex a owl:DatatypeProperty ; rdfs:label "field index"@en ;
+  rdfs:comment "One-based source order of an INFO entry or FORMAT field value within its parent."@en ; rdfs:range xsd:positiveInteger .
+vcfc:sampleFieldsRaw a owl:DatatypeProperty ; rdfs:label "raw sample fields"@en ;
+  rdfs:comment "One expanded sample's original colon-separated fields, retaining omitted trailing fields and empty list tokens."@en ;
+  rdfs:domain vcfc:SampleCall ; rdfs:range xsd:string .
+
+#################################################################
+# Version-scoped file classes, derived from ontology/versions/registry.json
+# by scripts/build-shacl-profiles.py. Edit the registry, not this block.
+#################################################################
+
+# BEGIN GENERATED VERSION CLASSES
+vcfc:VCF41File a owl:Class ; rdfs:subClassOf vcfc:VCFFile ; rdfs:label "VCF 4.1 file"@en ; rdfs:comment "An optional explicit VCF 4.1 file type. Use it when the VCF 4.1 SHACL version gate is wanted; VCFFile itself remains version-neutral, and the matching overlay also scopes its rules by fileFormat."@en .
+
+vcfc:VCF42File a owl:Class ; rdfs:subClassOf vcfc:VCFFile ; rdfs:label "VCF 4.2 file"@en ; rdfs:comment "An optional explicit VCF 4.2 file type. Use it when the VCF 4.2 SHACL version gate is wanted; VCFFile itself remains version-neutral, and the matching overlay also scopes its rules by fileFormat."@en .
+
+vcfc:VCF43File a owl:Class ; rdfs:subClassOf vcfc:VCFFile ; rdfs:label "VCF 4.3 file"@en ; rdfs:comment "An optional explicit VCF 4.3 file type. Use it when the VCF 4.3 SHACL version gate is wanted; VCFFile itself remains version-neutral, and the matching overlay also scopes its rules by fileFormat."@en .
+
+vcfc:VCF44File a owl:Class ; rdfs:subClassOf vcfc:VCFFile ; rdfs:label "VCF 4.4 file"@en ; rdfs:comment "An optional explicit VCF 4.4 file type. Use it when the VCF 4.4 SHACL version gate is wanted; VCFFile itself remains version-neutral, and the matching overlay also scopes its rules by fileFormat."@en .
+
+vcfc:VCF45File a owl:Class ; rdfs:subClassOf vcfc:VCFFile ; rdfs:label "VCF 4.5 file"@en ; rdfs:comment "An optional explicit VCF 4.5 file type. Use it when the VCF 4.5 SHACL version gate is wanted; VCFFile itself remains version-neutral, and the matching overlay also scopes its rules by fileFormat."@en .
+# END GENERATED VERSION CLASSES
+
+# Source: ontology/vcf-core-alleles.ttl
+#################################################################
+# Alleles and VCF Number-indexed values
+#################################################################
+
+<https://w3id.org/vcf-core/alleles> a owl:Ontology ;
+  rdfs:label "VCF Core allele and value-indexing module"@en ;
+  dct:description "VCF-specific allele carriers and indexed values for Number=A/R/G/LA/LR/LG/P/M fields."@en ;
+  owl:imports <https://w3id.org/vcf-core/vocab> ;
+  owl:versionInfo "2.1.2" .
+
+vcfc:Allele a owl:Class ;
+  rdfs:label "VCF allele"@en ;
+  rdfs:comment "An ordered allele participating in one VCF record. alleleIndex is 0 for REF and one-based for ALT, making VCF Number=A and Number=R values directly joinable without parsing the ALT string."@en ;
+  skos:closeMatch vrs:Allele ;
+  rdfs:seeAlso vrs:Allele, faldo:location ;
+  vcfc:iriTemplate "file://{vcfFilePath}#record/{recordKey}/allele/{alleleIndex}" .
+
+vcfc:ReferenceAllele a owl:Class ; rdfs:subClassOf vcfc:Allele ;
+  rdfs:label "reference allele"@en ;
+  rdfs:comment "The record's REF allele, identified by alleleIndex 0."@en .
+
+vcfc:AltAllele a owl:Class ; rdfs:subClassOf vcfc:Allele ;
+  rdfs:label "alternate allele"@en ;
+  rdfs:comment "One ordered ALT allele, identified by a positive alleleIndex in source ALT order."@en .
+
+vcfc:AlleleKind a owl:Class ;
+  rdfs:label "VCF allele kind"@en ;
+  rdfs:comment "A controlled syntactic category for an allele lexical form."@en .
+
+vcfc:BaseSequenceAllele a owl:NamedIndividual, vcfc:AlleleKind ;
+  rdfs:label "base-sequence allele"@en ;
+  rdfs:comment "A literal base sequence in an ALT field."@en .
+vcfc:OverlappingDeletionAllele a owl:NamedIndividual, vcfc:AlleleKind ;
+  rdfs:label "overlapping-deletion allele (*)"@en ;
+  rdfs:comment "The star ALT allele, marking an allele deleted by an overlapping upstream record."@en .
+vcfc:MissingAllele a owl:NamedIndividual, vcfc:AlleleKind ;
+  rdfs:label "missing allele (.)"@en ;
+  rdfs:comment "The VCF missing ALT token."@en .
+vcfc:SymbolicAllele a owl:NamedIndividual, vcfc:AlleleKind ;
+  rdfs:label "symbolic allele"@en ;
+  rdfs:comment "An angle-bracketed symbolic ALT identifier such as <DEL>."@en .
+vcfc:UnspecifiedAllele a owl:NamedIndividual, vcfc:AlleleKind ;
+  rdfs:label "unspecified allele"@en ;
+  rdfs:comment "The <*> or <NON_REF> ALT form used to indicate an unspecified alternate allele."@en .
+vcfc:BreakendAllele a owl:NamedIndividual, vcfc:AlleleKind ;
+  rdfs:label "breakend allele"@en ;
+  rdfs:comment "A bracketed VCF ALT expression describing a breakend."@en .
+
+vcfc:FieldValueItem a owl:Class ;
+  rdfs:label "field value item"@en ;
+  rdfs:comment "One ordered, parsed item from the comma-separated payload of an INFO or FORMAT field. The parent field value retains the original lexical payload for round-tripping."@en ;
+  vcfc:iriTemplate "file://{vcfFilePath}#call/{recordKey}/field/{fieldKey}/value/{valueIndex}" .
+
+vcfc:hasAltAllele a owl:ObjectProperty ;
+  rdfs:label "has alternate allele"@en ; rdfs:domain vcfc:VCFRecord ; rdfs:range vcfc:AltAllele .
+vcfc:hasReferenceAllele a owl:ObjectProperty ;
+  rdfs:label "has reference allele"@en ; rdfs:domain vcfc:VCFRecord ; rdfs:range vcfc:ReferenceAllele .
+vcfc:alleleKind a owl:ObjectProperty ;
+  rdfs:label "allele kind"@en ; rdfs:domain vcfc:Allele ; rdfs:range vcfc:AlleleKind .
+vcfc:declaredByAlt a owl:ObjectProperty ;
+  rdfs:label "declared by ALT definition"@en ; rdfs:domain vcfc:AltAllele ; rdfs:range vcfc:AltDefinition .
+vcfc:hasValueItem a owl:ObjectProperty ;
+  rdfs:label "has value item"@en ; rdfs:range vcfc:FieldValueItem .
+vcfc:forAllele a owl:ObjectProperty ;
+  rdfs:label "for allele"@en ; rdfs:domain vcfc:FieldValueItem ; rdfs:range vcfc:Allele .
+vcfc:forBaseModification a owl:ObjectProperty ;
+  rdfs:label "for base modification"@en ; rdfs:domain vcfc:FieldValueItem ;
+  rdfs:comment "Links a Number=M value item to the applicable BaseModification resource when that layer is used."@en .
+
+vcfc:alleleIndex a owl:DatatypeProperty ;
+  rdfs:label "allele index"@en ; rdfs:domain vcfc:Allele ; rdfs:range xsd:nonNegativeInteger .
+vcfc:alleleValue a owl:DatatypeProperty ;
+  rdfs:label "allele value"@en ; rdfs:domain vcfc:Allele ; rdfs:range rdfs:Literal .
+vcfc:valueIndex a owl:DatatypeProperty ;
+  rdfs:label "value index"@en ; rdfs:domain vcfc:FieldValueItem ; rdfs:range xsd:nonNegativeInteger .
+vcfc:itemValue a owl:DatatypeProperty ;
+  rdfs:label "item value"@en ; rdfs:domain vcfc:FieldValueItem ; rdfs:range rdfs:Literal .
+vcfc:forGenotypeIndex a owl:DatatypeProperty ;
+  rdfs:label "for genotype index"@en ; rdfs:domain vcfc:FieldValueItem ; rdfs:range xsd:nonNegativeInteger .
+vcfc:forGTAlleleIndex a owl:DatatypeProperty ;
+  rdfs:label "for GT allele index"@en ; rdfs:domain vcfc:FieldValueItem ; rdfs:range xsd:nonNegativeInteger .
+vcfc:tupleArity a owl:DatatypeProperty ;
+  rdfs:label "tuple arity"@en ;
+  rdfs:comment "The fixed grouping width for flattened VCF value lists, such as 2 for confidence intervals and 4 for MEINFO or METRANS."@en ;
+  rdfs:domain vcfc:FieldValueItem ; rdfs:range xsd:positiveInteger .
+
+#################################################################
+# REF padding-base interpretation (VCF 4.5 fixed field 4)
+#################################################################
+
+# VCF requires a padding base whenever an allele would otherwise be empty, and
+# for symbolic alleles. Which base plays that role is an interpretation layered
+# on top of REF and ALT, not part of them, so it is carried by a separate
+# resource and only asserted where the specification determines it. A shared
+# first base is NOT by itself evidence of padding: complex substitutions may
+# share a prefix while the specification leaves padding optional, and trimming
+# such a prefix would silently assert a claim about the alteration.
+
+vcfc:PaddingInterpretation a owl:Class ;
+  rdfs:label "padding-base interpretation"@en ;
+  rdfs:comment "A derived statement about which base of a record's alleles serves as the VCF padding base, together with the specification rule that determined it. It never replaces or trims vcfc:ref and vcfc:alleleValue, which keep the source strings; a consumer that ignores this resource still sees the record exactly as written."@en ;
+  vcfc:iriTemplate "file://{vcfFilePath}#record/{recordKey}/padding" .
+
+vcfc:hasPaddingInterpretation a owl:ObjectProperty ;
+  rdfs:label "has padding interpretation"@en ;
+  rdfs:comment "Associates a record with the padding interpretation derived for its alleles. At most one interpretation is asserted per record."@en ;
+  rdfs:domain vcfc:VCFRecord ; rdfs:range vcfc:PaddingInterpretation .
+
+vcfc:PaddingRule a owl:Class ;
+  rdfs:label "padding rule"@en ;
+  rdfs:comment "The VCF 4.5 provision under which a padding interpretation was derived. Naming the rule keeps the interpretation auditable and makes the undetermined case explicit rather than silent."@en .
+
+vcfc:SimpleIndelPadding a owl:NamedIndividual, vcfc:PaddingRule ;
+  rdfs:label "simple insertion or deletion"@en ;
+  rdfs:comment "One allele is a strict prefix of the other, so without a padding base one allele would be empty. VCF 4.5 requires the base before the variant, and POS denotes that base."@en .
+
+vcfc:SymbolicAllelePadding a owl:NamedIndividual, vcfc:PaddingRule ;
+  rdfs:label "symbolic alternate allele"@en ;
+  rdfs:comment "An ALT allele is an angle-bracketed symbolic ID other than '<*>'. VCF 4.5 requires the padding base and POS denotes the coordinate of the base preceding the polymorphism."@en .
+
+vcfc:PositionOnePadding a owl:NamedIndividual, vcfc:PaddingRule ;
+  rdfs:label "contig position one exception"@en ;
+  rdfs:comment "The variant occurs at position 1 of the contig, where VCF 4.5 requires the base after the variant instead of the base before it."@en .
+
+vcfc:UnspecifiedAlleleNoPadding a owl:NamedIndividual, vcfc:PaddingRule ;
+  rdfs:label "unspecified allele, no padding"@en ;
+  rdfs:comment "The only alternate allele is the unspecified allele '<*>', which VCF 4.5 exempts from the padding requirement: its reference call interval includes the POS base. The padding base count is therefore zero."@en .
+
+vcfc:PaddingNotDetermined a owl:NamedIndividual, vcfc:PaddingRule ;
+  rdfs:label "not determined by the specification"@en ;
+  rdfs:comment "Every allele already has at least one base of its own, so VCF 4.5 permits but does not require a padding base and does not say which base plays that role. No padding claim is made; the shared prefix of a complex substitution falls here."@en .
+
+vcfc:paddingRule a owl:ObjectProperty ;
+  rdfs:label "padding rule"@en ;
+  rdfs:comment "The specification provision that produced this padding interpretation."@en ;
+  rdfs:domain vcfc:PaddingInterpretation ; rdfs:range vcfc:PaddingRule .
+
+vcfc:PaddingSide a owl:Class ;
+  rdfs:label "padding side"@en ;
+  rdfs:comment "Whether the padding base precedes or follows the variant bases."@en .
+
+vcfc:PaddingBefore a owl:NamedIndividual, vcfc:PaddingSide ;
+  rdfs:label "padding before the variant"@en ;
+  rdfs:comment "The ordinary case: the padding base is the first base of REF and POS denotes it."@en .
+
+vcfc:PaddingAfter a owl:NamedIndividual, vcfc:PaddingSide ;
+  rdfs:label "padding after the variant"@en ;
+  rdfs:comment "The position-one exception: the padding base follows the variant bases."@en .
+
+vcfc:paddingSide a owl:ObjectProperty ;
+  rdfs:label "padding side"@en ;
+  rdfs:comment "Which side of the variant bases the padding base occupies. Asserted only when a padding rule determines it."@en ;
+  rdfs:domain vcfc:PaddingInterpretation ; rdfs:range vcfc:PaddingSide .
+
+vcfc:paddingBaseCount a owl:DatatypeProperty ;
+  rdfs:label "padding base count"@en ;
+  rdfs:comment "How many bases of the record's alleles serve as padding under the stated rule: one for a required padding base, zero when the rule determines that none is present or when the specification leaves it undetermined."@en ;
+  rdfs:domain vcfc:PaddingInterpretation ; rdfs:range xsd:nonNegativeInteger .
+
+vcfc:paddingAnchorPosition a owl:DatatypeProperty ;
+  rdfs:label "padding anchor position"@en ;
+  rdfs:comment "The 1-based reference coordinate of the padding base. For vcfc:PaddingBefore this equals the record's POS; for vcfc:PaddingAfter it is the coordinate following the variant bases. Absent when no padding base is asserted."@en ;
+  rdfs:domain vcfc:PaddingInterpretation ; rdfs:range xsd:integer .
+
+# Source: ontology/vcf-core-genotypes.ttl
+#################################################################
+# Genotype, phasing, and local alleles
+#################################################################
+
+<https://w3id.org/vcf-core/genotypes> a owl:Ontology ;
+  rdfs:label "VCF Core genotype module"@en ;
+  dct:description "Parsed GT, phasing, phase-set, local-allele, and sample-filter carriers for VCF 4.5."@en ;
+  owl:imports <https://w3id.org/vcf-core/vocab>, <https://w3id.org/vcf-core/alleles> ;
+  owl:versionInfo "2.1.2" .
+
+vcfc:Genotype a owl:Class ;
+  rdfs:label "VCF genotype"@en ;
+  rdfs:comment "The parsed GT field for one SampleCall. It preserves genotypeString and represents its ordered allele calls and phasing independently."@en ;
+  skos:closeMatch geno:0000536 ; rdfs:seeAlso vrs:CisPhasedBlock .
+
+vcfc:GenotypeAlleleCall a owl:Class ;
+  rdfs:label "genotype allele call"@en ;
+  rdfs:comment "One allele position in a parsed GT value. callIndex preserves genotype order; isNoCall represents a dot call without inventing an allele."@en .
+
+vcfc:PhasingStatus a owl:Class ;
+  rdfs:label "phasing status"@en ;
+  rdfs:comment "The separator semantics between genotype allele calls."@en .
+
+vcfc:PhaseSet a owl:Class ;
+  rdfs:label "phase set"@en ;
+  rdfs:comment "A parsed phase-set identifier or list carried by PS or PSL, optionally with PSO and PSQ information."@en ;
+  skos:closeMatch geno:0000886, vrs:CisPhasedBlock .
+
+vcfc:LocalAlleleSet a owl:Class ;
+  rdfs:label "local allele set"@en ;
+  rdfs:comment "The subset of ALT alleles declared as locally relevant to a sample by LAA. Its members keep their record-global alleleIndex values."@en .
+
+vcfc:Phased a owl:NamedIndividual, vcfc:PhasingStatus ;
+  rdfs:label "phased"@en ; rdfs:seeAlso geno:0000131 .
+vcfc:Unphased a owl:NamedIndividual, vcfc:PhasingStatus ;
+  rdfs:label "unphased"@en .
+
+vcfc:hasGenotype a owl:ObjectProperty ;
+  rdfs:label "has genotype"@en ; rdfs:domain vcfc:SampleCall ; rdfs:range vcfc:Genotype .
+vcfc:hasAlleleCall a owl:ObjectProperty ;
+  rdfs:label "has allele call"@en ; rdfs:domain vcfc:Genotype ; rdfs:range vcfc:GenotypeAlleleCall .
+vcfc:calledAllele a owl:ObjectProperty ;
+  rdfs:label "called allele"@en ; rdfs:domain vcfc:GenotypeAlleleCall ; rdfs:range vcfc:Allele .
+vcfc:phasingStatus a owl:ObjectProperty ;
+  rdfs:label "phasing status"@en ; rdfs:domain vcfc:Genotype ; rdfs:range vcfc:PhasingStatus .
+vcfc:inPhaseSet a owl:ObjectProperty ;
+  rdfs:label "in phase set"@en ; rdfs:domain vcfc:Genotype ; rdfs:range vcfc:PhaseSet .
+vcfc:hasLocalAlleleSet a owl:ObjectProperty ;
+  rdfs:label "has local allele set"@en ; rdfs:domain vcfc:Genotype ; rdfs:range vcfc:LocalAlleleSet .
+vcfc:hasLocalAllele a owl:ObjectProperty ;
+  rdfs:label "has local allele"@en ; rdfs:domain vcfc:LocalAlleleSet ; rdfs:range vcfc:AltAllele .
+
+vcfc:genotypeString a owl:DatatypeProperty ;
+  rdfs:label "genotype string"@en ; rdfs:domain vcfc:Genotype ; rdfs:range vcfc:GenotypeString .
+vcfc:ploidy a owl:DatatypeProperty ;
+  rdfs:label "ploidy"@en ; rdfs:domain vcfc:Genotype ; rdfs:range xsd:nonNegativeInteger .
+vcfc:callIndex a owl:DatatypeProperty ;
+  rdfs:label "allele-call index"@en ; rdfs:domain vcfc:GenotypeAlleleCall ; rdfs:range xsd:nonNegativeInteger .
+vcfc:isNoCall a owl:DatatypeProperty ;
+  rdfs:label "is no-call"@en ; rdfs:domain vcfc:GenotypeAlleleCall ; rdfs:range xsd:boolean .
+vcfc:phaseSetId a owl:DatatypeProperty ;
+  rdfs:label "phase-set ID"@en ; rdfs:domain vcfc:PhaseSet ; rdfs:range xsd:string .
+vcfc:phaseSetName a owl:DatatypeProperty ;
+  rdfs:label "phase-set name"@en ; rdfs:domain vcfc:PhaseSet ; rdfs:range xsd:string .
+vcfc:phaseSetOrdinal a owl:DatatypeProperty ;
+  rdfs:label "phase-set ordinal"@en ; rdfs:domain vcfc:PhaseSet ; rdfs:range xsd:integer .
+vcfc:phaseSetQuality a owl:DatatypeProperty ;
+  rdfs:label "phase-set quality"@en ; rdfs:domain vcfc:PhaseSet ; rdfs:range rdfs:Literal .
+vcfc:localAlleleIndex a owl:DatatypeProperty ;
+  rdfs:label "local allele index"@en ;
+  rdfs:comment "The one-based ALT index written in LAA for a member of a LocalAlleleSet."@en ;
+  rdfs:domain vcfc:AltAllele ; rdfs:range xsd:positiveInteger .
+vcfc:genotypeIndex a owl:DatatypeProperty ;
+  rdfs:label "genotype index"@en ;
+  rdfs:comment "The VCF Number=G index for genotype alleles k₁…k_P: Index(k₁…k_P) = Σ C(k_m + m − 1, m)."@en ;
+  rdfs:range xsd:nonNegativeInteger .
+vcfc:sampleFilter a owl:DatatypeProperty ;
+  rdfs:label "sample filter"@en ;
+  rdfs:comment "The FT value on one SampleCall, preserving PASS, one or more failure codes, or the VCF missing token."@en ;
+  rdfs:domain vcfc:SampleCall ; rdfs:range rdfs:Literal .
+
+vcfc:phaseIndicator a owl:DatatypeProperty ; rdfs:label "preceding phase indicator"@en ;
+  rdfs:comment "The / or | indicator preceding this GT allele call, including the effective first indicator when omitted in the source. genotypeString preserves whether it was explicit."@en ;
+  rdfs:domain vcfc:GenotypeAlleleCall ; rdfs:range xsd:string .
+vcfc:MixedPhasing a owl:NamedIndividual, vcfc:PhasingStatus ; rdfs:label "mixed phasing"@en ;
+  rdfs:comment "Both phased and unphased allele indicators occur; phaseIndicator on each allele call supplies the precise semantics."@en .
+vcfc:LocalAlleleMembership a owl:Class ; rdfs:label "local allele membership"@en ;
+  rdfs:comment "An ordered membership in one sample's LocalAlleleSet. The membership, rather than the shared ALT allele, carries the local index."@en .
+vcfc:hasLocalAlleleMembership a owl:ObjectProperty ; rdfs:label "has local allele membership"@en ;
+  rdfs:domain vcfc:LocalAlleleSet ; rdfs:range vcfc:LocalAlleleMembership .
+vcfc:localAllele a owl:ObjectProperty ; rdfs:label "local allele"@en ;
+  rdfs:domain vcfc:LocalAlleleMembership ; rdfs:range vcfc:AltAllele .
+vcfc:localIndex a owl:DatatypeProperty ; rdfs:label "local index"@en ;
+  rdfs:domain vcfc:LocalAlleleMembership ; rdfs:range xsd:positiveInteger .
+vcfc:localAlleleIndex owl:deprecated true ;
+  rdfs:comment "Use localIndex on LocalAlleleMembership for sample-specific ordering. alleleIndex remains the record-global ALT index written in LAA."@en .
+
+vcfc:allelePhaseSet a owl:ObjectProperty ; rdfs:label "allele phase set"@en ;
+  rdfs:domain vcfc:GenotypeAlleleCall ; rdfs:range vcfc:PhaseSet ;
+  rdfs:comment "The PSL entry for this GT allele call; missing entries have no link."@en .
+
+# Source: ontology/vcf-core-sv.ttl
+#################################################################
+# Structural variation, repeats, gVCF, and base modifications
+#################################################################
+
+<https://w3id.org/vcf-core/sv> a owl:Ontology ;
+  rdfs:label "VCF Core structural-variation module"@en ;
+  dct:description "VCF-specific structural-variant syntax carriers, tandem repeats, copy-number fields, reference blocks, and base modifications."@en ;
+  owl:imports <https://w3id.org/vcf-core/vocab>,
+              <https://w3id.org/vcf-core/alleles>,
+              <https://w3id.org/vcf-core/genotypes> ;
+  owl:versionInfo "2.1.2" .
+
+vcfc:SymbolicAlleleType a owl:Class ;
+  rdfs:label "symbolic allele type"@en ;
+  rdfs:comment "A reserved first-level symbolic ALT type or recommended subtype. It represents VCF syntax and points outward to SO rather than reclassifying an allele as an SO entity."@en .
+
+vcfc:SVClaim a owl:Class ;
+  rdfs:label "structural-variant claim"@en ;
+  rdfs:comment "The per-ALT SVCLAIM code indicating an abundance claim, adjacency claim, or both."@en .
+
+vcfc:Breakend a owl:Class ; rdfs:subClassOf vcfc:AltAllele ;
+  rdfs:label "breakend"@en ;
+  rdfs:comment "A parsed bracketed VCF ALT allele representing a novel adjacency or terminus. The source expression remains in alleleValue."@en ;
+  skos:relatedMatch so:0001021 ; rdfs:seeAlso vrs:Adjacency, vrs:Terminus .
+
+vcfc:BreakendOrientation a owl:Class ;
+  rdfs:label "breakend orientation"@en ;
+  rdfs:comment "One of the four bracket placements permitted by VCF breakend notation."@en .
+
+vcfc:VariantEvent a owl:Class ;
+  rdfs:label "variant event"@en ;
+  rdfs:comment "A named EVENT grouping records that jointly describe a complex rearrangement or another related variation event."@en .
+
+vcfc:EventType a owl:Class ;
+  rdfs:label "event type"@en ;
+  rdfs:comment "A reserved VCF EVENTTYPE code."@en .
+
+vcfc:ConfidenceInterval a owl:Class ;
+  rdfs:label "confidence interval"@en ;
+  rdfs:comment "A lower and upper VCF interval for CILEN, CICN, CIRUC, or CIRB. CILEN contains length bounds, not POS offsets. CIPOS and CIEND instead use FALDO InRangePosition."@en .
+
+vcfc:TandemRepeatAllele a owl:Class ; rdfs:subClassOf vcfc:AltAllele ;
+  rdfs:label "tandem-repeat allele"@en ;
+  rdfs:comment "A <CNV:TR> alternate allele whose repeat sequences and units are represented through the VCF tandem-repeat fields."@en .
+
+vcfc:RepeatSequence a owl:Class ;
+  rdfs:label "repeat sequence"@en ;
+  rdfs:comment "One repeat sequence within a tandem-repeat allele, indexed in VCF RN/RUS/RUL/RUC/RB order."@en .
+
+vcfc:RepeatUnit a owl:Class ;
+  rdfs:label "repeat unit"@en ;
+  rdfs:comment "One individually sized repeat unit used only when RUB distinguishes varying unit lengths."@en .
+
+vcfc:ReferenceBlock a owl:Class ;
+  rdfs:label "reference block"@en ;
+  rdfs:comment "A reference interval for one sample, linked to its unspecified ALT allele with blockAllele. Different samples may have different FORMAT LEN extents for the same record."@en .
+
+vcfc:BaseModification a owl:Class ;
+  rdfs:label "base modification"@en ;
+  rdfs:comment "A parsed base-modification carrier for VCF Number=M FORMAT fields. modifiedResidue links directly to the corresponding ChEBI resource; FALDO ForwardStrandPosition, ReverseStrandPosition, and BothStrandsPosition express the VCF strandedness convention without new VCF terms."@en .
+
+vcfc:SymbolicDeletion a owl:NamedIndividual, vcfc:SymbolicAlleleType ;
+  rdfs:label "DEL symbolic allele type"@en ; vcfc:svTypeCode "DEL" ; skos:exactMatch so:0000159 .
+vcfc:SymbolicInsertion a owl:NamedIndividual, vcfc:SymbolicAlleleType ;
+  rdfs:label "INS symbolic allele type"@en ; vcfc:svTypeCode "INS" ; skos:exactMatch so:0000667 .
+vcfc:SymbolicDuplication a owl:NamedIndividual, vcfc:SymbolicAlleleType ;
+  rdfs:label "DUP symbolic allele type"@en ; vcfc:svTypeCode "DUP" ; skos:exactMatch so:1000035 .
+vcfc:SymbolicInversion a owl:NamedIndividual, vcfc:SymbolicAlleleType ;
+  rdfs:label "INV symbolic allele type"@en ; vcfc:svTypeCode "INV" ; skos:exactMatch so:1000036 .
+vcfc:SymbolicCopyNumberVariation a owl:NamedIndividual, vcfc:SymbolicAlleleType ;
+  rdfs:label "CNV symbolic allele type"@en ; vcfc:svTypeCode "CNV" ; skos:exactMatch so:0001019 .
+vcfc:SymbolicTandemRepeat a owl:NamedIndividual, vcfc:SymbolicAlleleType ;
+  rdfs:label "CNV:TR symbolic allele subtype"@en ; vcfc:svTypeCode "CNV:TR" ;
+  vcfc:svSubtypeOf vcfc:SymbolicCopyNumberVariation ; skos:closeMatch so:0000705 ; skos:relatedMatch so:0002096 .
+vcfc:SymbolicTandemDuplication a owl:NamedIndividual, vcfc:SymbolicAlleleType ;
+  rdfs:label "DUP:TANDEM symbolic allele subtype"@en ; vcfc:svTypeCode "DUP:TANDEM" ;
+  vcfc:svSubtypeOf vcfc:SymbolicDuplication ; skos:exactMatch so:1000173 .
+vcfc:SymbolicMobileElementDeletion a owl:NamedIndividual, vcfc:SymbolicAlleleType ;
+  rdfs:label "DEL:ME symbolic allele subtype"@en ; vcfc:svTypeCode "DEL:ME" ;
+  vcfc:svSubtypeOf vcfc:SymbolicDeletion ; skos:exactMatch so:0002066 .
+vcfc:SymbolicMobileElementInsertion a owl:NamedIndividual, vcfc:SymbolicAlleleType ;
+  rdfs:label "INS:ME symbolic allele subtype"@en ; vcfc:svTypeCode "INS:ME" ;
+  vcfc:svSubtypeOf vcfc:SymbolicInsertion ; skos:exactMatch so:0001837 .
+
+vcfc:AbundanceClaim a owl:NamedIndividual, vcfc:SVClaim ;
+  rdfs:label "abundance claim (D)"@en ; vcfc:svClaimCode "D" .
+vcfc:AdjacencyClaim a owl:NamedIndividual, vcfc:SVClaim ;
+  rdfs:label "adjacency claim (J)"@en ; vcfc:svClaimCode "J" .
+vcfc:AbundanceAndAdjacencyClaim a owl:NamedIndividual, vcfc:SVClaim ;
+  rdfs:label "abundance and adjacency claim (DJ)"@en ; vcfc:svClaimCode "DJ" .
+
+vcfc:SequenceBeforeLeftBracket a owl:NamedIndividual, vcfc:BreakendOrientation ;
+  rdfs:label "sequence before left bracket"@en ; rdfs:comment "The t[p[ breakend form."@en .
+vcfc:SequenceBeforeRightBracket a owl:NamedIndividual, vcfc:BreakendOrientation ;
+  rdfs:label "sequence before right bracket"@en ; rdfs:comment "The t]p] breakend form."@en .
+vcfc:SequenceAfterLeftBracket a owl:NamedIndividual, vcfc:BreakendOrientation ;
+  rdfs:label "sequence after left bracket"@en ; rdfs:comment "The [p[t breakend form."@en .
+vcfc:SequenceAfterRightBracket a owl:NamedIndividual, vcfc:BreakendOrientation ;
+  rdfs:label "sequence after right bracket"@en ; rdfs:comment "The ]p]t breakend form."@en .
+
+vcfc:EventDeletion a owl:NamedIndividual, vcfc:EventType ; rdfs:label "DEL event type"@en ; vcfc:eventTypeCode "DEL" ; skos:exactMatch so:0000159 .
+vcfc:EventMobileElementDeletion a owl:NamedIndividual, vcfc:EventType ; rdfs:label "DEL:ME event type"@en ; vcfc:eventTypeCode "DEL:ME" ; skos:exactMatch so:0002066 .
+vcfc:EventInsertion a owl:NamedIndividual, vcfc:EventType ; rdfs:label "INS event type"@en ; vcfc:eventTypeCode "INS" ; skos:exactMatch so:0000667 .
+vcfc:EventMobileElementInsertion a owl:NamedIndividual, vcfc:EventType ; rdfs:label "INS:ME event type"@en ; vcfc:eventTypeCode "INS:ME" ; skos:exactMatch so:0001837 .
+vcfc:EventDuplication a owl:NamedIndividual, vcfc:EventType ; rdfs:label "DUP event type"@en ; vcfc:eventTypeCode "DUP" ; skos:exactMatch so:1000035 .
+vcfc:EventTandemDuplication a owl:NamedIndividual, vcfc:EventType ; rdfs:label "DUP:TANDEM event type"@en ; vcfc:eventTypeCode "DUP:TANDEM" ; skos:exactMatch so:1000173 .
+vcfc:EventDispersedDuplication a owl:NamedIndividual, vcfc:EventType ; rdfs:label "DUP:DISPERSED event type"@en ; vcfc:eventTypeCode "DUP:DISPERSED" .
+vcfc:EventInversion a owl:NamedIndividual, vcfc:EventType ; rdfs:label "INV event type"@en ; vcfc:eventTypeCode "INV" ; skos:exactMatch so:1000036 .
+vcfc:EventTranslocation a owl:NamedIndividual, vcfc:EventType ; rdfs:label "TRA event type"@en ; vcfc:eventTypeCode "TRA" ; skos:exactMatch so:0000199 .
+vcfc:EventBalancedTranslocation a owl:NamedIndividual, vcfc:EventType ; rdfs:label "TRA:BALANCED event type"@en ; vcfc:eventTypeCode "TRA:BALANCED" ; skos:exactMatch so:1000048 .
+vcfc:EventUnbalancedTranslocation a owl:NamedIndividual, vcfc:EventType ; rdfs:label "TRA:UNBALANCED event type"@en ; vcfc:eventTypeCode "TRA:UNBALANCED" .
+vcfc:EventChromothripsis a owl:NamedIndividual, vcfc:EventType ; rdfs:label "CHROMOTHRIPSIS event type"@en ; vcfc:eventTypeCode "CHROMOTHRIPSIS" ; skos:closeMatch so:0002062 .
+vcfc:EventChromoplexy a owl:NamedIndividual, vcfc:EventType ; rdfs:label "CHROMOPLEXY event type"@en ; vcfc:eventTypeCode "CHROMOPLEXY" .
+vcfc:EventBreakageFusionBridge a owl:NamedIndividual, vcfc:EventType ; rdfs:label "BFB event type"@en ; vcfc:eventTypeCode "BFB" .
+vcfc:EventDoubleMinute a owl:NamedIndividual, vcfc:EventType ; rdfs:label "DOUBLEMINUTE event type"@en ; vcfc:eventTypeCode "DOUBLEMINUTE" .
+
+vcfc:svType a owl:ObjectProperty ; rdfs:label "SV type"@en ; rdfs:domain vcfc:AltAllele ; rdfs:range vcfc:SymbolicAlleleType .
+vcfc:svSubtypeOf a owl:ObjectProperty ; rdfs:label "SV subtype of"@en ; rdfs:domain vcfc:SymbolicAlleleType ; rdfs:range vcfc:SymbolicAlleleType .
+vcfc:svClaim a owl:ObjectProperty ; rdfs:label "SV claim"@en ; rdfs:domain vcfc:AltAllele ; rdfs:range vcfc:SVClaim .
+vcfc:mateBreakend a owl:ObjectProperty ; rdfs:label "mate breakend"@en ; rdfs:domain vcfc:Breakend ; rdfs:range vcfc:Breakend .
+vcfc:partnerBreakend a owl:ObjectProperty ; rdfs:label "partner breakend"@en ; rdfs:domain vcfc:Breakend ; rdfs:range vcfc:Breakend .
+vcfc:breakendOrientation a owl:ObjectProperty ; rdfs:label "breakend orientation"@en ; rdfs:domain vcfc:Breakend ; rdfs:range vcfc:BreakendOrientation .
+vcfc:inEvent a owl:ObjectProperty ; rdfs:label "in event"@en ; rdfs:range vcfc:VariantEvent .
+vcfc:eventType a owl:ObjectProperty ; rdfs:label "event type"@en ; rdfs:domain vcfc:VariantEvent ; rdfs:range vcfc:EventType .
+vcfc:posConfidenceInterval a owl:ObjectProperty ;
+  rdfs:label "POS confidence interval"@en ; rdfs:domain vcfc:AltAllele ; rdfs:range faldo:InRangePosition ;
+  rdfs:comment "Represents CIPOS through FALDO InRangePosition rather than a VCF-specific ConfidenceInterval."@en .
+vcfc:endConfidenceInterval a owl:ObjectProperty ;
+  rdfs:label "END confidence interval"@en ; rdfs:domain vcfc:AltAllele ; rdfs:range faldo:InRangePosition ;
+  rdfs:comment "Represents CIEND through FALDO InRangePosition rather than a VCF-specific ConfidenceInterval."@en .
+vcfc:lenConfidenceInterval a owl:ObjectProperty ; rdfs:label "SVLEN confidence interval"@en ; rdfs:domain vcfc:AltAllele ; rdfs:range vcfc:ConfidenceInterval .
+vcfc:copyNumberConfidenceInterval a owl:ObjectProperty ; rdfs:label "copy-number confidence interval"@en ; rdfs:range vcfc:ConfidenceInterval .
+vcfc:rucConfidenceInterval a owl:ObjectProperty ; rdfs:label "RUC confidence interval"@en ; rdfs:domain vcfc:RepeatSequence ; rdfs:range vcfc:ConfidenceInterval .
+vcfc:rbConfidenceInterval a owl:ObjectProperty ; rdfs:label "RB confidence interval"@en ; rdfs:domain vcfc:RepeatSequence ; rdfs:range vcfc:ConfidenceInterval .
+vcfc:hasRepeatSequence a owl:ObjectProperty ; rdfs:label "has repeat sequence"@en ; rdfs:domain vcfc:TandemRepeatAllele ; rdfs:range vcfc:RepeatSequence .
+vcfc:hasRepeatUnit a owl:ObjectProperty ; rdfs:label "has repeat unit"@en ; rdfs:domain vcfc:RepeatSequence ; rdfs:range vcfc:RepeatUnit .
+vcfc:modifiedResidue a owl:ObjectProperty ; rdfs:label "modified residue"@en ; rdfs:domain vcfc:BaseModification ;
+  rdfs:comment "Links directly to the ChEBI class denoting the modified residue."@en .
+
+vcfc:svTypeCode a owl:DatatypeProperty ; rdfs:label "SV type code"@en ; rdfs:domain vcfc:SymbolicAlleleType ; rdfs:range xsd:string .
+vcfc:svClaimCode a owl:DatatypeProperty ; rdfs:label "SV claim code"@en ; rdfs:domain vcfc:SVClaim ; rdfs:range xsd:string .
+vcfc:svLength a owl:DatatypeProperty ; rdfs:label "SV length"@en ; rdfs:domain vcfc:AltAllele ; rdfs:range rdfs:Literal .
+vcfc:isImprecise a owl:DatatypeProperty ; rdfs:label "is imprecise"@en ; rdfs:domain vcfc:AltAllele ; rdfs:range xsd:boolean .
+vcfc:isNovel a owl:DatatypeProperty ; rdfs:label "is novel"@en ; rdfs:domain vcfc:AltAllele ; rdfs:range xsd:boolean .
+vcfc:isSingleBreakend a owl:DatatypeProperty ; rdfs:label "is single breakend"@en ; rdfs:domain vcfc:Breakend ; rdfs:range xsd:boolean .
+vcfc:isTelomereBreakend a owl:DatatypeProperty ; rdfs:label "is telomere breakend"@en ; rdfs:domain vcfc:Breakend ; rdfs:range xsd:boolean .
+vcfc:breakendReplacementString a owl:DatatypeProperty ; rdfs:label "breakend replacement string"@en ; rdfs:domain vcfc:Breakend ; rdfs:range vcfc:BreakendString .
+vcfc:insertedSequence a owl:DatatypeProperty ; rdfs:label "inserted sequence"@en ; rdfs:domain vcfc:Breakend ; rdfs:range xsd:string .
+vcfc:eventTypeCode a owl:DatatypeProperty ; rdfs:label "event type code"@en ; rdfs:domain vcfc:EventType ; rdfs:range xsd:string .
+vcfc:ciLower a owl:DatatypeProperty ; rdfs:label "confidence-interval lower bound"@en ; rdfs:domain vcfc:ConfidenceInterval ; rdfs:range rdfs:Literal .
+vcfc:ciUpper a owl:DatatypeProperty ; rdfs:label "confidence-interval upper bound"@en ; rdfs:domain vcfc:ConfidenceInterval ; rdfs:range rdfs:Literal .
+vcfc:repeatSequenceCount a owl:DatatypeProperty ; rdfs:label "repeat-sequence count"@en ; rdfs:domain vcfc:TandemRepeatAllele ; rdfs:range xsd:nonNegativeInteger .
+vcfc:repeatSequenceIndex a owl:DatatypeProperty ; rdfs:label "repeat-sequence index"@en ; rdfs:domain vcfc:RepeatSequence ; rdfs:range xsd:positiveInteger .
+vcfc:repeatUnitSequence a owl:DatatypeProperty ; rdfs:label "repeat-unit sequence"@en ; rdfs:domain vcfc:RepeatSequence ; rdfs:range rdfs:Literal .
+vcfc:repeatUnitLength a owl:DatatypeProperty ; rdfs:label "repeat-unit length"@en ; rdfs:domain vcfc:RepeatSequence ; rdfs:range rdfs:Literal .
+vcfc:repeatUnitCount a owl:DatatypeProperty ; rdfs:label "repeat-unit count"@en ; rdfs:domain vcfc:RepeatSequence ; rdfs:range rdfs:Literal .
+vcfc:repeatBases a owl:DatatypeProperty ; rdfs:label "repeat bases"@en ; rdfs:domain vcfc:RepeatSequence ; rdfs:range rdfs:Literal .
+vcfc:repeatUnitBases a owl:DatatypeProperty ; rdfs:label "repeat-unit bases"@en ; rdfs:domain vcfc:RepeatUnit ; rdfs:range rdfs:Literal .
+vcfc:copyNumber a owl:DatatypeProperty ; rdfs:label "copy number"@en ; rdfs:range rdfs:Literal .
+vcfc:copyNumberQuality a owl:DatatypeProperty ; rdfs:label "copy-number quality"@en ; rdfs:domain vcfc:SampleCall ; rdfs:range rdfs:Literal .
+vcfc:copyNumberLikelihood a owl:DatatypeProperty ; rdfs:label "copy-number likelihood"@en ; rdfs:domain vcfc:SampleCall ; rdfs:range rdfs:Literal .
+vcfc:copyNumberPosterior a owl:DatatypeProperty ; rdfs:label "copy-number posterior"@en ; rdfs:domain vcfc:SampleCall ; rdfs:range rdfs:Literal .
+vcfc:haplotypeId a owl:DatatypeProperty ; rdfs:label "haplotype ID"@en ; rdfs:domain vcfc:SampleCall ; rdfs:range xsd:integer .
+vcfc:ancestralHaplotypeId a owl:DatatypeProperty ; rdfs:label "ancestral haplotype ID"@en ; rdfs:domain vcfc:SampleCall ; rdfs:range xsd:integer .
+vcfc:referenceBlockLength a owl:DatatypeProperty ; rdfs:label "reference-block length"@en ; rdfs:domain vcfc:ReferenceBlock ; rdfs:range xsd:nonNegativeInteger .
+vcfc:endPosition a owl:DatatypeProperty ; rdfs:label "end position"@en ; rdfs:domain vcfc:ReferenceBlock ; rdfs:range xsd:integer .
+vcfc:isReferenceBlockStart a owl:DatatypeProperty ; rdfs:label "is reference-block start"@en ; rdfs:domain vcfc:ReferenceBlock ; rdfs:range xsd:boolean .
+vcfc:modifiedBaseOffset a owl:DatatypeProperty ; rdfs:label "modified-base offset"@en ; rdfs:domain vcfc:BaseModification ; rdfs:range xsd:nonNegativeInteger .
+vcfc:modificationFraction a owl:DatatypeProperty ; rdfs:label "modification fraction"@en ; rdfs:domain vcfc:BaseModification ; rdfs:range rdfs:Literal .
+vcfc:modificationDepth a owl:DatatypeProperty ; rdfs:label "modification depth"@en ; rdfs:domain vcfc:BaseModification ; rdfs:range rdfs:Literal .
+vcfc:modificationAlleleDepth a owl:DatatypeProperty ; rdfs:label "modification allele depth"@en ; rdfs:domain vcfc:BaseModification ; rdfs:range rdfs:Literal .
+
+vcfc:hasReferenceBlock a owl:ObjectProperty ; rdfs:label "has reference block"@en ; rdfs:range vcfc:ReferenceBlock .
+vcfc:blockAllele a owl:ObjectProperty ; rdfs:label "block allele"@en ; rdfs:domain vcfc:ReferenceBlock ; rdfs:range vcfc:AltAllele .
+
+# Source: ontology/vcf-core-reserved-keys.ttl
+#################################################################
+# VCF 4.5 reserved-key registry
+#
+# Generated by scripts/generate-reserved-keys.mjs from https://raw.githubusercontent.com/samtools/hts-specs/master/VCFv4.5.tex
+# SHA-256: 37f13e0d2e8e741ea8505b0342b6e6034637a1f476eeb3af1b8acc25d70246c5
+# Source rows: 21 general INFO, 31 SV INFO,
+# 63 general FORMAT, 8 SV FORMAT.
+# Do not edit by hand; regenerate from the cited VCF 4.5 source.
+#################################################################
+
+<https://w3id.org/vcf-core/reserved-keys> a owl:Ontology ;
+  rdfs:label "VCF Core reserved-key registry for VCF 4.5"@en ;
+  dct:source <https://raw.githubusercontent.com/samtools/hts-specs/master/VCFv4.5.tex> ;
+  owl:imports <https://w3id.org/vcf-core/vocab> ;
+  owl:versionInfo "2.1.2" ;
+  vcfc:specificationVersion "VCFv4.5" .
+
+vcfc:specificationVersion a owl:AnnotationProperty ;
+  rdfs:label "specification version"@en ;
+  rdfs:comment "The VCF specification version a registry graph describes. It is distinct from owl:versionInfo, which records the release version of this vocabulary."@en .
+
+vcfc:reservedIn a owl:AnnotationProperty ;
+  rdfs:label "reserved in"@en ;
+  rdfs:comment "Records the VCF specification version that reserves a field identifier or identifier pattern."@en .
+
+vcfc:deprecatedInVersion a owl:AnnotationProperty ;
+  rdfs:label "deprecated in version"@en ;
+  rdfs:comment "Records the VCF specification version in which a reserved field is deprecated."@en .
+
+vcfc:keyPattern a owl:AnnotationProperty ;
+  rdfs:label "key pattern"@en ;
+  rdfs:comment "The regular-expression family reserved by a FORMAT field definition rather than one concrete key."@en .
+
+vcfc:aliasOf a owl:AnnotationProperty ;
+  rdfs:label "alias of"@en ;
+  rdfs:comment "The canonical reserved key denoted by a VCF base-modification alias."@en .
+
+vcfc:ReservedInfo_AA a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info AA reserved field definition"@en ;
+  vcfc:fieldId "AA" ;
+  vcfc:fieldNumber "1" ;
+  vcfc:fieldNumberInteger 1 ;
+  vcfc:fieldType vcfc:StringType ;
+  vcfc:fieldDescription "Ancestral allele" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_AC a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info AC reserved field definition"@en ;
+  vcfc:fieldId "AC" ;
+  vcfc:fieldNumber "A" ;
+  vcfc:fieldArity vcfc:ArityPerAlt ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Allele count in genotypes, for each ALT allele, in the same order as listed" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_AD a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info AD reserved field definition"@en ;
+  vcfc:fieldId "AD" ;
+  vcfc:fieldNumber "R" ;
+  vcfc:fieldArity vcfc:ArityPerAllele ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Total read depth for each allele" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_ADF a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info ADF reserved field definition"@en ;
+  vcfc:fieldId "ADF" ;
+  vcfc:fieldNumber "R" ;
+  vcfc:fieldArity vcfc:ArityPerAllele ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Read depth for each allele on the forward strand" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_ADR a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info ADR reserved field definition"@en ;
+  vcfc:fieldId "ADR" ;
+  vcfc:fieldNumber "R" ;
+  vcfc:fieldArity vcfc:ArityPerAllele ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Read depth for each allele on the reverse strand" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_AF a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info AF reserved field definition"@en ;
+  vcfc:fieldId "AF" ;
+  vcfc:fieldNumber "A" ;
+  vcfc:fieldArity vcfc:ArityPerAlt ;
+  vcfc:fieldType vcfc:FloatType ;
+  vcfc:fieldDescription "Allele frequency for each ALT allele in the same order as listed (estimated from primary data, not called genotypes)" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_AN a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info AN reserved field definition"@en ;
+  vcfc:fieldId "AN" ;
+  vcfc:fieldNumber "1" ;
+  vcfc:fieldNumberInteger 1 ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Total number of alleles in called genotypes" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_BQ a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info BQ reserved field definition"@en ;
+  vcfc:fieldId "BQ" ;
+  vcfc:fieldNumber "1" ;
+  vcfc:fieldNumberInteger 1 ;
+  vcfc:fieldType vcfc:FloatType ;
+  vcfc:fieldDescription "RMS base quality" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_CIGAR a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info CIGAR reserved field definition"@en ;
+  vcfc:fieldId "CIGAR" ;
+  vcfc:fieldNumber "A" ;
+  vcfc:fieldArity vcfc:ArityPerAlt ;
+  vcfc:fieldType vcfc:StringType ;
+  vcfc:fieldDescription "Cigar string describing how to align an alternate allele to the reference allele" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_DB a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info DB reserved field definition"@en ;
+  vcfc:fieldId "DB" ;
+  vcfc:fieldNumber "0" ;
+  vcfc:fieldNumberInteger 0 ;
+  vcfc:fieldType vcfc:FlagType ;
+  vcfc:fieldDescription "dbSNP membership" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_DP a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info DP reserved field definition"@en ;
+  vcfc:fieldId "DP" ;
+  vcfc:fieldNumber "1" ;
+  vcfc:fieldNumberInteger 1 ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Combined depth across samples" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_END a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info END reserved field definition"@en ;
+  vcfc:fieldId "END" ;
+  vcfc:fieldNumber "1" ;
+  vcfc:fieldNumberInteger 1 ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Deprecated. Present for backwards compatibility with earlier versions of VCF." ;
+  vcfc:reservedIn "VCFv4.5" ;
+  vcfc:deprecatedInVersion "VCFv4.5" .
+
+vcfc:ReservedInfo_H2 a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info H2 reserved field definition"@en ;
+  vcfc:fieldId "H2" ;
+  vcfc:fieldNumber "0" ;
+  vcfc:fieldNumberInteger 0 ;
+  vcfc:fieldType vcfc:FlagType ;
+  vcfc:fieldDescription "HapMap2 membership" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_H3 a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info H3 reserved field definition"@en ;
+  vcfc:fieldId "H3" ;
+  vcfc:fieldNumber "0" ;
+  vcfc:fieldNumberInteger 0 ;
+  vcfc:fieldType vcfc:FlagType ;
+  vcfc:fieldDescription "HapMap3 membership" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_MQ a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info MQ reserved field definition"@en ;
+  vcfc:fieldId "MQ" ;
+  vcfc:fieldNumber "1" ;
+  vcfc:fieldNumberInteger 1 ;
+  vcfc:fieldType vcfc:FloatType ;
+  vcfc:fieldDescription "RMS mapping quality" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_MQ0 a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info MQ0 reserved field definition"@en ;
+  vcfc:fieldId "MQ0" ;
+  vcfc:fieldNumber "1" ;
+  vcfc:fieldNumberInteger 1 ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Number of MAPQ == 0 reads" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_NS a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info NS reserved field definition"@en ;
+  vcfc:fieldId "NS" ;
+  vcfc:fieldNumber "1" ;
+  vcfc:fieldNumberInteger 1 ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Number of samples with data" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_SB a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info SB reserved field definition"@en ;
+  vcfc:fieldId "SB" ;
+  vcfc:fieldNumber "4" ;
+  vcfc:fieldNumberInteger 4 ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Strand bias" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_SOMATIC a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info SOMATIC reserved field definition"@en ;
+  vcfc:fieldId "SOMATIC" ;
+  vcfc:fieldNumber "0" ;
+  vcfc:fieldNumberInteger 0 ;
+  vcfc:fieldType vcfc:FlagType ;
+  vcfc:fieldDescription "Somatic mutation (for cancer genomics)" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_VALIDATED a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info VALIDATED reserved field definition"@en ;
+  vcfc:fieldId "VALIDATED" ;
+  vcfc:fieldNumber "0" ;
+  vcfc:fieldNumberInteger 0 ;
+  vcfc:fieldType vcfc:FlagType ;
+  vcfc:fieldDescription "Validated by follow-up experiment" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_1000G a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info 1000G reserved field definition"@en ;
+  vcfc:fieldId "1000G" ;
+  vcfc:fieldNumber "0" ;
+  vcfc:fieldNumberInteger 0 ;
+  vcfc:fieldType vcfc:FlagType ;
+  vcfc:fieldDescription "1000 Genomes membership" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_IMPRECISE a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info IMPRECISE reserved field definition"@en ;
+  vcfc:fieldId "IMPRECISE" ;
+  vcfc:fieldNumber "0" ;
+  vcfc:fieldNumberInteger 0 ;
+  vcfc:fieldType vcfc:FlagType ;
+  vcfc:fieldDescription "Imprecise structural variation" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_NOVEL a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info NOVEL reserved field definition"@en ;
+  vcfc:fieldId "NOVEL" ;
+  vcfc:fieldNumber "0" ;
+  vcfc:fieldNumberInteger 0 ;
+  vcfc:fieldType vcfc:FlagType ;
+  vcfc:fieldDescription "Indicates a novel structural variation" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_SVTYPE a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info SVTYPE reserved field definition"@en ;
+  vcfc:fieldId "SVTYPE" ;
+  vcfc:fieldNumber "1" ;
+  vcfc:fieldNumberInteger 1 ;
+  vcfc:fieldType vcfc:StringType ;
+  vcfc:fieldDescription "Type of structural variant" ;
+  vcfc:reservedIn "VCFv4.5" ;
+  vcfc:deprecatedInVersion "VCFv4.4" .
+
+vcfc:ReservedInfo_SVLEN a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info SVLEN reserved field definition"@en ;
+  vcfc:fieldId "SVLEN" ;
+  vcfc:fieldNumber "A" ;
+  vcfc:fieldArity vcfc:ArityPerAlt ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Length of structural variant" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_CIPOS a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info CIPOS reserved field definition"@en ;
+  vcfc:fieldId "CIPOS" ;
+  vcfc:fieldNumber "." ;
+  vcfc:fieldArity vcfc:ArityVariable ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Confidence interval around POS for symbolic structural variants" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_CIEND a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info CIEND reserved field definition"@en ;
+  vcfc:fieldId "CIEND" ;
+  vcfc:fieldNumber "." ;
+  vcfc:fieldArity vcfc:ArityVariable ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Confidence interval around the inferred END for symbolic structural variants" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_HOMLEN a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info HOMLEN reserved field definition"@en ;
+  vcfc:fieldId "HOMLEN" ;
+  vcfc:fieldNumber "A" ;
+  vcfc:fieldArity vcfc:ArityPerAlt ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Length of base pair identical micro-homology at breakpoints" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_HOMSEQ a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info HOMSEQ reserved field definition"@en ;
+  vcfc:fieldId "HOMSEQ" ;
+  vcfc:fieldNumber "A" ;
+  vcfc:fieldArity vcfc:ArityPerAlt ;
+  vcfc:fieldType vcfc:StringType ;
+  vcfc:fieldDescription "Sequence of base pair identical micro-homology at breakpoints" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_BKPTID a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info BKPTID reserved field definition"@en ;
+  vcfc:fieldId "BKPTID" ;
+  vcfc:fieldNumber "A" ;
+  vcfc:fieldArity vcfc:ArityPerAlt ;
+  vcfc:fieldType vcfc:StringType ;
+  vcfc:fieldDescription "ID of the assembled alternate allele in the assembly file" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_MEINFO a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info MEINFO reserved field definition"@en ;
+  vcfc:fieldId "MEINFO" ;
+  vcfc:fieldNumber "." ;
+  vcfc:fieldArity vcfc:ArityVariable ;
+  vcfc:fieldType vcfc:StringType ;
+  vcfc:fieldDescription "Mobile element info of the form NAME,START,END,POLARITY" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_METRANS a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info METRANS reserved field definition"@en ;
+  vcfc:fieldId "METRANS" ;
+  vcfc:fieldNumber "." ;
+  vcfc:fieldArity vcfc:ArityVariable ;
+  vcfc:fieldType vcfc:StringType ;
+  vcfc:fieldDescription "Mobile element transduction info of the form CHR,START,END,POLARITY" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_DGVID a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info DGVID reserved field definition"@en ;
+  vcfc:fieldId "DGVID" ;
+  vcfc:fieldNumber "A" ;
+  vcfc:fieldArity vcfc:ArityPerAlt ;
+  vcfc:fieldType vcfc:StringType ;
+  vcfc:fieldDescription "ID of this element in Database of Genomic Variation" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_DBVARID a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info DBVARID reserved field definition"@en ;
+  vcfc:fieldId "DBVARID" ;
+  vcfc:fieldNumber "A" ;
+  vcfc:fieldArity vcfc:ArityPerAlt ;
+  vcfc:fieldType vcfc:StringType ;
+  vcfc:fieldDescription "ID of this element in DBVAR" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_DBRIPID a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info DBRIPID reserved field definition"@en ;
+  vcfc:fieldId "DBRIPID" ;
+  vcfc:fieldNumber "A" ;
+  vcfc:fieldArity vcfc:ArityPerAlt ;
+  vcfc:fieldType vcfc:StringType ;
+  vcfc:fieldDescription "ID of this element in DBRIP" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_MATEID a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info MATEID reserved field definition"@en ;
+  vcfc:fieldId "MATEID" ;
+  vcfc:fieldNumber "A" ;
+  vcfc:fieldArity vcfc:ArityPerAlt ;
+  vcfc:fieldType vcfc:StringType ;
+  vcfc:fieldDescription "ID of mate breakend" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_PARID a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info PARID reserved field definition"@en ;
+  vcfc:fieldId "PARID" ;
+  vcfc:fieldNumber "A" ;
+  vcfc:fieldArity vcfc:ArityPerAlt ;
+  vcfc:fieldType vcfc:StringType ;
+  vcfc:fieldDescription "ID of partner breakend" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_EVENT a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info EVENT reserved field definition"@en ;
+  vcfc:fieldId "EVENT" ;
+  vcfc:fieldNumber "A" ;
+  vcfc:fieldArity vcfc:ArityPerAlt ;
+  vcfc:fieldType vcfc:StringType ;
+  vcfc:fieldDescription "ID of associated event" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_EVENTTYPE a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info EVENTTYPE reserved field definition"@en ;
+  vcfc:fieldId "EVENTTYPE" ;
+  vcfc:fieldNumber "A" ;
+  vcfc:fieldArity vcfc:ArityPerAlt ;
+  vcfc:fieldType vcfc:StringType ;
+  vcfc:fieldDescription "Type of associated event" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_CILEN a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info CILEN reserved field definition"@en ;
+  vcfc:fieldId "CILEN" ;
+  vcfc:fieldNumber "." ;
+  vcfc:fieldArity vcfc:ArityVariable ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Confidence interval for the SVLEN field" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_CN a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info CN reserved field definition"@en ;
+  vcfc:fieldId "CN" ;
+  vcfc:fieldNumber "A" ;
+  vcfc:fieldArity vcfc:ArityPerAlt ;
+  vcfc:fieldType vcfc:FloatType ;
+  vcfc:fieldDescription "Copy number of CNV/breakpoint" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_CICN a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info CICN reserved field definition"@en ;
+  vcfc:fieldId "CICN" ;
+  vcfc:fieldNumber "." ;
+  vcfc:fieldArity vcfc:ArityVariable ;
+  vcfc:fieldType vcfc:FloatType ;
+  vcfc:fieldDescription "Confidence interval around copy number" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_SVCLAIM a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info SVCLAIM reserved field definition"@en ;
+  vcfc:fieldId "SVCLAIM" ;
+  vcfc:fieldNumber "A" ;
+  vcfc:fieldArity vcfc:ArityPerAlt ;
+  vcfc:fieldType vcfc:StringType ;
+  vcfc:fieldDescription "Claim made by the structural variant call. Valid values are D, J, DJ for abundance, adjacency and both respectively" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_RN a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info RN reserved field definition"@en ;
+  vcfc:fieldId "RN" ;
+  vcfc:fieldNumber "A" ;
+  vcfc:fieldArity vcfc:ArityPerAlt ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Total number of repeat sequences in this allele" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_RUS a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info RUS reserved field definition"@en ;
+  vcfc:fieldId "RUS" ;
+  vcfc:fieldNumber "." ;
+  vcfc:fieldArity vcfc:ArityVariable ;
+  vcfc:fieldType vcfc:StringType ;
+  vcfc:fieldDescription "Repeat unit sequence of the corresponding repeat sequence" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_RUL a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info RUL reserved field definition"@en ;
+  vcfc:fieldId "RUL" ;
+  vcfc:fieldNumber "." ;
+  vcfc:fieldArity vcfc:ArityVariable ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Repeat unit length of the corresponding repeat sequence" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_RUC a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info RUC reserved field definition"@en ;
+  vcfc:fieldId "RUC" ;
+  vcfc:fieldNumber "." ;
+  vcfc:fieldArity vcfc:ArityVariable ;
+  vcfc:fieldType vcfc:FloatType ;
+  vcfc:fieldDescription "Repeat unit count of corresponding repeat sequence" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_RB a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info RB reserved field definition"@en ;
+  vcfc:fieldId "RB" ;
+  vcfc:fieldNumber "." ;
+  vcfc:fieldArity vcfc:ArityVariable ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Total number of bases in the corresponding repeat sequence" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_CIRUC a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info CIRUC reserved field definition"@en ;
+  vcfc:fieldId "CIRUC" ;
+  vcfc:fieldNumber "." ;
+  vcfc:fieldArity vcfc:ArityVariable ;
+  vcfc:fieldType vcfc:FloatType ;
+  vcfc:fieldDescription "Confidence interval around RUC" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_CIRB a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info CIRB reserved field definition"@en ;
+  vcfc:fieldId "CIRB" ;
+  vcfc:fieldNumber "." ;
+  vcfc:fieldArity vcfc:ArityVariable ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Confidence interval around RB" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedInfo_RUB a owl:NamedIndividual, vcfc:InfoFieldDefinition ;
+  rdfs:label "Info RUB reserved field definition"@en ;
+  vcfc:fieldId "RUB" ;
+  vcfc:fieldNumber "." ;
+  vcfc:fieldArity vcfc:ArityVariable ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Number of bases in each individual repeat unit" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_AD a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format AD reserved field definition"@en ;
+  vcfc:fieldId "AD" ;
+  vcfc:fieldNumber "R" ;
+  vcfc:fieldArity vcfc:ArityPerAllele ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Read depth for each allele" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_ADF a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format ADF reserved field definition"@en ;
+  vcfc:fieldId "ADF" ;
+  vcfc:fieldNumber "R" ;
+  vcfc:fieldArity vcfc:ArityPerAllele ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Read depth for each allele on the forward strand" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_ADR a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format ADR reserved field definition"@en ;
+  vcfc:fieldId "ADR" ;
+  vcfc:fieldNumber "R" ;
+  vcfc:fieldArity vcfc:ArityPerAllele ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Read depth for each allele on the reverse strand" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_DP a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format DP reserved field definition"@en ;
+  vcfc:fieldId "DP" ;
+  vcfc:fieldNumber "1" ;
+  vcfc:fieldNumberInteger 1 ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Read depth" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_EC a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format EC reserved field definition"@en ;
+  vcfc:fieldId "EC" ;
+  vcfc:fieldNumber "A" ;
+  vcfc:fieldArity vcfc:ArityPerAlt ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Expected alternate allele counts" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_LEN a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format LEN reserved field definition"@en ;
+  vcfc:fieldId "LEN" ;
+  vcfc:fieldNumber "1" ;
+  vcfc:fieldNumberInteger 1 ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Length of <*> reference block" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_FT a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format FT reserved field definition"@en ;
+  vcfc:fieldId "FT" ;
+  vcfc:fieldNumber "1" ;
+  vcfc:fieldNumberInteger 1 ;
+  vcfc:fieldType vcfc:StringType ;
+  vcfc:fieldDescription "Filter indicating if this genotype was \"called\"" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_GL a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format GL reserved field definition"@en ;
+  vcfc:fieldId "GL" ;
+  vcfc:fieldNumber "G" ;
+  vcfc:fieldArity vcfc:ArityPerGenotype ;
+  vcfc:fieldType vcfc:FloatType ;
+  vcfc:fieldDescription "Genotype likelihoods" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_GP a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format GP reserved field definition"@en ;
+  vcfc:fieldId "GP" ;
+  vcfc:fieldNumber "G" ;
+  vcfc:fieldArity vcfc:ArityPerGenotype ;
+  vcfc:fieldType vcfc:FloatType ;
+  vcfc:fieldDescription "Genotype posterior probabilities" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_GQ a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format GQ reserved field definition"@en ;
+  vcfc:fieldId "GQ" ;
+  vcfc:fieldNumber "1" ;
+  vcfc:fieldNumberInteger 1 ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Conditional genotype quality" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_GT a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format GT reserved field definition"@en ;
+  vcfc:fieldId "GT" ;
+  vcfc:fieldNumber "1" ;
+  vcfc:fieldNumberInteger 1 ;
+  vcfc:fieldType vcfc:StringType ;
+  vcfc:fieldDescription "Genotype" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_HQ a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format HQ reserved field definition"@en ;
+  vcfc:fieldId "HQ" ;
+  vcfc:fieldNumber "2" ;
+  vcfc:fieldNumberInteger 2 ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Haplotype quality" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_LA a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format LA reserved field definition"@en ;
+  vcfc:fieldId "LA" ;
+  vcfc:fieldNumber "." ;
+  vcfc:fieldArity vcfc:ArityVariable ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Reserved" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_LAA a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format LAA reserved field definition"@en ;
+  vcfc:fieldId "LAA" ;
+  vcfc:fieldNumber "." ;
+  vcfc:fieldArity vcfc:ArityVariable ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "1-based indices into ALT, indicating which alleles are relevant (local) for the current sample" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_LAD a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format LAD reserved field definition"@en ;
+  vcfc:fieldId "LAD" ;
+  vcfc:fieldNumber "LR" ;
+  vcfc:fieldArity vcfc:ArityPerLocalAllele ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Local-allele representation of AD" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_LADF a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format LADF reserved field definition"@en ;
+  vcfc:fieldId "LADF" ;
+  vcfc:fieldNumber "LR" ;
+  vcfc:fieldArity vcfc:ArityPerLocalAllele ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Local-allele representation of ADF" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_LADR a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format LADR reserved field definition"@en ;
+  vcfc:fieldId "LADR" ;
+  vcfc:fieldNumber "LR" ;
+  vcfc:fieldArity vcfc:ArityPerLocalAllele ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Local-allele representation of ADR" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_LEC a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format LEC reserved field definition"@en ;
+  vcfc:fieldId "LEC" ;
+  vcfc:fieldNumber "LA" ;
+  vcfc:fieldArity vcfc:ArityPerLocalAlt ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Local-allele representation of EC" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_LGL a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format LGL reserved field definition"@en ;
+  vcfc:fieldId "LGL" ;
+  vcfc:fieldNumber "LG" ;
+  vcfc:fieldArity vcfc:ArityPerLocalGenotype ;
+  vcfc:fieldType vcfc:FloatType ;
+  vcfc:fieldDescription "Local-allele representation of GL" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_LGP a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format LGP reserved field definition"@en ;
+  vcfc:fieldId "LGP" ;
+  vcfc:fieldNumber "LG" ;
+  vcfc:fieldArity vcfc:ArityPerLocalGenotype ;
+  vcfc:fieldType vcfc:FloatType ;
+  vcfc:fieldDescription "Local-allele representation of GP" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_LPL a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format LPL reserved field definition"@en ;
+  vcfc:fieldId "LPL" ;
+  vcfc:fieldNumber "LG" ;
+  vcfc:fieldArity vcfc:ArityPerLocalGenotype ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Local-allele representation of PL" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_LPP a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format LPP reserved field definition"@en ;
+  vcfc:fieldId "LPP" ;
+  vcfc:fieldNumber "LG" ;
+  vcfc:fieldArity vcfc:ArityPerLocalGenotype ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Local-allele representation of PP" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_MChEBI_ACGTUN_ a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format M[0-9]+[ACGTUN] reserved field definition"@en ;
+  vcfc:fieldNumber "M" ;
+  vcfc:fieldArity vcfc:ArityPerBaseModification ;
+  vcfc:fieldType vcfc:FloatType ;
+  vcfc:fieldDescription "Fraction of bases modified with the given ChEBI ID." ;
+  vcfc:reservedIn "VCFv4.5" ;
+  vcfc:keyPattern "M[0-9]+[ACGTUN]" .
+
+vcfc:ReservedFormat_DPMChEBI_ACGTUN_ a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format DPM[0-9]+[ACGTUN] reserved field definition"@en ;
+  vcfc:fieldNumber "M" ;
+  vcfc:fieldArity vcfc:ArityPerBaseModification ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Total read depth for reads able to detect the base modification with the given ChEBI ID." ;
+  vcfc:reservedIn "VCFv4.5" ;
+  vcfc:keyPattern "DPM[0-9]+[ACGTUN]" .
+
+vcfc:ReservedFormat_ADMChEBI_ACGTUN_ a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format ADM[0-9]+[ACGTUN] reserved field definition"@en ;
+  vcfc:fieldNumber "M" ;
+  vcfc:fieldArity vcfc:ArityPerBaseModification ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Read depth for reads with the base modification with the given ChEBI ID." ;
+  vcfc:reservedIn "VCFv4.5" ;
+  vcfc:keyPattern "ADM[0-9]+[ACGTUN]" .
+
+vcfc:ReservedFormat_M5mC a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format M5mC reserved field definition"@en ;
+  vcfc:fieldId "M5mC" ;
+  vcfc:fieldNumber "M" ;
+  vcfc:fieldArity vcfc:ArityPerBaseModification ;
+  vcfc:fieldType vcfc:FloatType ;
+  vcfc:fieldDescription "Alias for M27551C 5-Methylcytosine" ;
+  vcfc:reservedIn "VCFv4.5" ;
+  vcfc:aliasOf "M27551C" ;
+  skos:exactMatch chebi:27551 .
+
+vcfc:ReservedFormat_DPM5mC a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format DPM5mC reserved field definition"@en ;
+  vcfc:fieldId "DPM5mC" ;
+  vcfc:fieldNumber "M" ;
+  vcfc:fieldArity vcfc:ArityPerBaseModification ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Alias for DPM27551C" ;
+  vcfc:reservedIn "VCFv4.5" ;
+  vcfc:aliasOf "DPM27551C" .
+
+vcfc:ReservedFormat_ADM5mC a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format ADM5mC reserved field definition"@en ;
+  vcfc:fieldId "ADM5mC" ;
+  vcfc:fieldNumber "M" ;
+  vcfc:fieldArity vcfc:ArityPerBaseModification ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Alias for ADM27551C" ;
+  vcfc:reservedIn "VCFv4.5" ;
+  vcfc:aliasOf "ADM27551C" .
+
+vcfc:ReservedFormat_M5hmC a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format M5hmC reserved field definition"@en ;
+  vcfc:fieldId "M5hmC" ;
+  vcfc:fieldNumber "M" ;
+  vcfc:fieldArity vcfc:ArityPerBaseModification ;
+  vcfc:fieldType vcfc:FloatType ;
+  vcfc:fieldDescription "Alias for M76792C 5-Hydroxymethylcytosine" ;
+  vcfc:reservedIn "VCFv4.5" ;
+  vcfc:aliasOf "M76792C" ;
+  skos:exactMatch chebi:76792 .
+
+vcfc:ReservedFormat_DPM5hmC a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format DPM5hmC reserved field definition"@en ;
+  vcfc:fieldId "DPM5hmC" ;
+  vcfc:fieldNumber "M" ;
+  vcfc:fieldArity vcfc:ArityPerBaseModification ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Alias for DPM76792C" ;
+  vcfc:reservedIn "VCFv4.5" ;
+  vcfc:aliasOf "DPM76792C" .
+
+vcfc:ReservedFormat_ADM5hmC a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format ADM5hmC reserved field definition"@en ;
+  vcfc:fieldId "ADM5hmC" ;
+  vcfc:fieldNumber "M" ;
+  vcfc:fieldArity vcfc:ArityPerBaseModification ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Alias for ADM76792C" ;
+  vcfc:reservedIn "VCFv4.5" ;
+  vcfc:aliasOf "ADM76792C" .
+
+vcfc:ReservedFormat_M5fC a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format M5fC reserved field definition"@en ;
+  vcfc:fieldId "M5fC" ;
+  vcfc:fieldNumber "M" ;
+  vcfc:fieldArity vcfc:ArityPerBaseModification ;
+  vcfc:fieldType vcfc:FloatType ;
+  vcfc:fieldDescription "Alias for M76794C 5-Formylcytosine" ;
+  vcfc:reservedIn "VCFv4.5" ;
+  vcfc:aliasOf "M76794C" ;
+  skos:exactMatch chebi:76794 .
+
+vcfc:ReservedFormat_DPM5fC a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format DPM5fC reserved field definition"@en ;
+  vcfc:fieldId "DPM5fC" ;
+  vcfc:fieldNumber "M" ;
+  vcfc:fieldArity vcfc:ArityPerBaseModification ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Alias for DPM76794C" ;
+  vcfc:reservedIn "VCFv4.5" ;
+  vcfc:aliasOf "DPM76794C" .
+
+vcfc:ReservedFormat_ADM5fC a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format ADM5fC reserved field definition"@en ;
+  vcfc:fieldId "ADM5fC" ;
+  vcfc:fieldNumber "M" ;
+  vcfc:fieldArity vcfc:ArityPerBaseModification ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Alias for ADM76794C" ;
+  vcfc:reservedIn "VCFv4.5" ;
+  vcfc:aliasOf "ADM76794C" .
+
+vcfc:ReservedFormat_M5caC a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format M5caC reserved field definition"@en ;
+  vcfc:fieldId "M5caC" ;
+  vcfc:fieldNumber "M" ;
+  vcfc:fieldArity vcfc:ArityPerBaseModification ;
+  vcfc:fieldType vcfc:FloatType ;
+  vcfc:fieldDescription "Alias for M76793C 5-Carboxylcytosine" ;
+  vcfc:reservedIn "VCFv4.5" ;
+  vcfc:aliasOf "M76793C" ;
+  skos:exactMatch chebi:76793 .
+
+vcfc:ReservedFormat_DPM5caC a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format DPM5caC reserved field definition"@en ;
+  vcfc:fieldId "DPM5caC" ;
+  vcfc:fieldNumber "M" ;
+  vcfc:fieldArity vcfc:ArityPerBaseModification ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Alias for DPM76793C" ;
+  vcfc:reservedIn "VCFv4.5" ;
+  vcfc:aliasOf "DPM76793C" .
+
+vcfc:ReservedFormat_ADM5caC a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format ADM5caC reserved field definition"@en ;
+  vcfc:fieldId "ADM5caC" ;
+  vcfc:fieldNumber "M" ;
+  vcfc:fieldArity vcfc:ArityPerBaseModification ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Alias for ADM76793C" ;
+  vcfc:reservedIn "VCFv4.5" ;
+  vcfc:aliasOf "ADM76793C" .
+
+vcfc:ReservedFormat_M5hmU a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format M5hmU reserved field definition"@en ;
+  vcfc:fieldId "M5hmU" ;
+  vcfc:fieldNumber "M" ;
+  vcfc:fieldArity vcfc:ArityPerBaseModification ;
+  vcfc:fieldType vcfc:FloatType ;
+  vcfc:fieldDescription "Alias for M16964T 5-Hydroxymethyluracil" ;
+  vcfc:reservedIn "VCFv4.5" ;
+  vcfc:aliasOf "M16964T" ;
+  skos:exactMatch chebi:16964 .
+
+vcfc:ReservedFormat_DPM5hmU a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format DPM5hmU reserved field definition"@en ;
+  vcfc:fieldId "DPM5hmU" ;
+  vcfc:fieldNumber "M" ;
+  vcfc:fieldArity vcfc:ArityPerBaseModification ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Alias for DPM16964T" ;
+  vcfc:reservedIn "VCFv4.5" ;
+  vcfc:aliasOf "DPM16964T" .
+
+vcfc:ReservedFormat_ADM5hmU a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format ADM5hmU reserved field definition"@en ;
+  vcfc:fieldId "ADM5hmU" ;
+  vcfc:fieldNumber "M" ;
+  vcfc:fieldArity vcfc:ArityPerBaseModification ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Alias for ADM16964T" ;
+  vcfc:reservedIn "VCFv4.5" ;
+  vcfc:aliasOf "ADM16964T" .
+
+vcfc:ReservedFormat_M5fU a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format M5fU reserved field definition"@en ;
+  vcfc:fieldId "M5fU" ;
+  vcfc:fieldNumber "M" ;
+  vcfc:fieldArity vcfc:ArityPerBaseModification ;
+  vcfc:fieldType vcfc:FloatType ;
+  vcfc:fieldDescription "Alias for M80961T 5-Formyluracil" ;
+  vcfc:reservedIn "VCFv4.5" ;
+  vcfc:aliasOf "M80961T" ;
+  skos:exactMatch chebi:80961 .
+
+vcfc:ReservedFormat_DPM5fU a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format DPM5fU reserved field definition"@en ;
+  vcfc:fieldId "DPM5fU" ;
+  vcfc:fieldNumber "M" ;
+  vcfc:fieldArity vcfc:ArityPerBaseModification ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Alias for DPM80961T" ;
+  vcfc:reservedIn "VCFv4.5" ;
+  vcfc:aliasOf "DPM80961T" .
+
+vcfc:ReservedFormat_ADM5fU a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format ADM5fU reserved field definition"@en ;
+  vcfc:fieldId "ADM5fU" ;
+  vcfc:fieldNumber "M" ;
+  vcfc:fieldArity vcfc:ArityPerBaseModification ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Alias for ADM80961T" ;
+  vcfc:reservedIn "VCFv4.5" ;
+  vcfc:aliasOf "ADM80961T" .
+
+vcfc:ReservedFormat_M5caU a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format M5caU reserved field definition"@en ;
+  vcfc:fieldId "M5caU" ;
+  vcfc:fieldNumber "M" ;
+  vcfc:fieldArity vcfc:ArityPerBaseModification ;
+  vcfc:fieldType vcfc:FloatType ;
+  vcfc:fieldDescription "Alias for M17477T 5-Carboxyluracil" ;
+  vcfc:reservedIn "VCFv4.5" ;
+  vcfc:aliasOf "M17477T" ;
+  skos:exactMatch chebi:17477 .
+
+vcfc:ReservedFormat_DPM5caU a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format DPM5caU reserved field definition"@en ;
+  vcfc:fieldId "DPM5caU" ;
+  vcfc:fieldNumber "M" ;
+  vcfc:fieldArity vcfc:ArityPerBaseModification ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Alias for DPM17477T" ;
+  vcfc:reservedIn "VCFv4.5" ;
+  vcfc:aliasOf "DPM17477T" .
+
+vcfc:ReservedFormat_ADM5caU a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format ADM5caU reserved field definition"@en ;
+  vcfc:fieldId "ADM5caU" ;
+  vcfc:fieldNumber "M" ;
+  vcfc:fieldArity vcfc:ArityPerBaseModification ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Alias for ADM17477T" ;
+  vcfc:reservedIn "VCFv4.5" ;
+  vcfc:aliasOf "ADM17477T" .
+
+vcfc:ReservedFormat_M6mA a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format M6mA reserved field definition"@en ;
+  vcfc:fieldId "M6mA" ;
+  vcfc:fieldNumber "M" ;
+  vcfc:fieldArity vcfc:ArityPerBaseModification ;
+  vcfc:fieldType vcfc:FloatType ;
+  vcfc:fieldDescription "Alias for M28871A 6-Methyladenine" ;
+  vcfc:reservedIn "VCFv4.5" ;
+  vcfc:aliasOf "M28871A" ;
+  skos:exactMatch chebi:28871 .
+
+vcfc:ReservedFormat_DPM6mA a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format DPM6mA reserved field definition"@en ;
+  vcfc:fieldId "DPM6mA" ;
+  vcfc:fieldNumber "M" ;
+  vcfc:fieldArity vcfc:ArityPerBaseModification ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Alias for DPM28871A" ;
+  vcfc:reservedIn "VCFv4.5" ;
+  vcfc:aliasOf "DPM28871A" .
+
+vcfc:ReservedFormat_ADM6mA a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format ADM6mA reserved field definition"@en ;
+  vcfc:fieldId "ADM6mA" ;
+  vcfc:fieldNumber "M" ;
+  vcfc:fieldArity vcfc:ArityPerBaseModification ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Alias for ADM28871A" ;
+  vcfc:reservedIn "VCFv4.5" ;
+  vcfc:aliasOf "ADM28871A" .
+
+vcfc:ReservedFormat_M8oxoG a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format M8oxoG reserved field definition"@en ;
+  vcfc:fieldId "M8oxoG" ;
+  vcfc:fieldNumber "M" ;
+  vcfc:fieldArity vcfc:ArityPerBaseModification ;
+  vcfc:fieldType vcfc:FloatType ;
+  vcfc:fieldDescription "Alias for M44605G 8-Oxoguanine" ;
+  vcfc:reservedIn "VCFv4.5" ;
+  vcfc:aliasOf "M44605G" ;
+  skos:exactMatch chebi:44605 .
+
+vcfc:ReservedFormat_DPM8oxoG a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format DPM8oxoG reserved field definition"@en ;
+  vcfc:fieldId "DPM8oxoG" ;
+  vcfc:fieldNumber "M" ;
+  vcfc:fieldArity vcfc:ArityPerBaseModification ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Alias for DPM44605G" ;
+  vcfc:reservedIn "VCFv4.5" ;
+  vcfc:aliasOf "DPM44605G" .
+
+vcfc:ReservedFormat_ADM8oxoG a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format ADM8oxoG reserved field definition"@en ;
+  vcfc:fieldId "ADM8oxoG" ;
+  vcfc:fieldNumber "M" ;
+  vcfc:fieldArity vcfc:ArityPerBaseModification ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Alias for ADM44605G" ;
+  vcfc:reservedIn "VCFv4.5" ;
+  vcfc:aliasOf "ADM44605G" .
+
+vcfc:ReservedFormat_MXaoN a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format MXaoN reserved field definition"@en ;
+  vcfc:fieldId "MXaoN" ;
+  vcfc:fieldNumber "M" ;
+  vcfc:fieldArity vcfc:ArityPerBaseModification ;
+  vcfc:fieldType vcfc:FloatType ;
+  vcfc:fieldDescription "Alias for M18107N Xanthosine" ;
+  vcfc:reservedIn "VCFv4.5" ;
+  vcfc:aliasOf "M18107N" ;
+  skos:exactMatch chebi:18107 .
+
+vcfc:ReservedFormat_DPMXaoN a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format DPMXaoN reserved field definition"@en ;
+  vcfc:fieldId "DPMXaoN" ;
+  vcfc:fieldNumber "M" ;
+  vcfc:fieldArity vcfc:ArityPerBaseModification ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Alias for DPM18107N" ;
+  vcfc:reservedIn "VCFv4.5" ;
+  vcfc:aliasOf "DPM18107N" .
+
+vcfc:ReservedFormat_ADMXaoN a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format ADMXaoN reserved field definition"@en ;
+  vcfc:fieldId "ADMXaoN" ;
+  vcfc:fieldNumber "M" ;
+  vcfc:fieldArity vcfc:ArityPerBaseModification ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Alias for ADM18107N" ;
+  vcfc:reservedIn "VCFv4.5" ;
+  vcfc:aliasOf "ADM18107N" .
+
+vcfc:ReservedFormat_MQ a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format MQ reserved field definition"@en ;
+  vcfc:fieldId "MQ" ;
+  vcfc:fieldNumber "1" ;
+  vcfc:fieldNumberInteger 1 ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "RMS mapping quality" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_PL a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format PL reserved field definition"@en ;
+  vcfc:fieldId "PL" ;
+  vcfc:fieldNumber "G" ;
+  vcfc:fieldArity vcfc:ArityPerGenotype ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Phred-scaled genotype likelihoods rounded to the closest integer" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_PP a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format PP reserved field definition"@en ;
+  vcfc:fieldId "PP" ;
+  vcfc:fieldNumber "G" ;
+  vcfc:fieldArity vcfc:ArityPerGenotype ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Phred-scaled genotype posterior probabilities rounded to the closest integer" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_PQ a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format PQ reserved field definition"@en ;
+  vcfc:fieldId "PQ" ;
+  vcfc:fieldNumber "1" ;
+  vcfc:fieldNumberInteger 1 ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Phasing quality" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_PS a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format PS reserved field definition"@en ;
+  vcfc:fieldId "PS" ;
+  vcfc:fieldNumber "1" ;
+  vcfc:fieldNumberInteger 1 ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Phase set" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_PSL a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format PSL reserved field definition"@en ;
+  vcfc:fieldId "PSL" ;
+  vcfc:fieldNumber "P" ;
+  vcfc:fieldArity vcfc:ArityPerGTAllele ;
+  vcfc:fieldType vcfc:StringType ;
+  vcfc:fieldDescription "Phase set list" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_PSO a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format PSO reserved field definition"@en ;
+  vcfc:fieldId "PSO" ;
+  vcfc:fieldNumber "P" ;
+  vcfc:fieldArity vcfc:ArityPerGTAllele ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Phase set list ordinal" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_PSQ a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format PSQ reserved field definition"@en ;
+  vcfc:fieldId "PSQ" ;
+  vcfc:fieldNumber "P" ;
+  vcfc:fieldArity vcfc:ArityPerGTAllele ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Phase set list quality" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_CN a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format CN reserved field definition"@en ;
+  vcfc:fieldId "CN" ;
+  vcfc:fieldNumber "1" ;
+  vcfc:fieldNumberInteger 1 ;
+  vcfc:fieldType vcfc:FloatType ;
+  vcfc:fieldDescription "Copy number" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_CICN a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format CICN reserved field definition"@en ;
+  vcfc:fieldId "CICN" ;
+  vcfc:fieldNumber "2" ;
+  vcfc:fieldNumberInteger 2 ;
+  vcfc:fieldType vcfc:FloatType ;
+  vcfc:fieldDescription "Confidence interval around copy number" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_CNQ a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format CNQ reserved field definition"@en ;
+  vcfc:fieldId "CNQ" ;
+  vcfc:fieldNumber "1" ;
+  vcfc:fieldNumberInteger 1 ;
+  vcfc:fieldType vcfc:FloatType ;
+  vcfc:fieldDescription "Copy number genotype quality" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_CNL a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format CNL reserved field definition"@en ;
+  vcfc:fieldId "CNL" ;
+  vcfc:fieldNumber "G" ;
+  vcfc:fieldArity vcfc:ArityPerGenotype ;
+  vcfc:fieldType vcfc:FloatType ;
+  vcfc:fieldDescription "Copy number genotype likelihood" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_CNP a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format CNP reserved field definition"@en ;
+  vcfc:fieldId "CNP" ;
+  vcfc:fieldNumber "G" ;
+  vcfc:fieldArity vcfc:ArityPerGenotype ;
+  vcfc:fieldType vcfc:FloatType ;
+  vcfc:fieldDescription "Copy number posterior probabilities" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_NQ a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format NQ reserved field definition"@en ;
+  vcfc:fieldId "NQ" ;
+  vcfc:fieldNumber "1" ;
+  vcfc:fieldNumberInteger 1 ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Phred style probability score that the variant is novel" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_HAP a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format HAP reserved field definition"@en ;
+  vcfc:fieldId "HAP" ;
+  vcfc:fieldNumber "1" ;
+  vcfc:fieldNumberInteger 1 ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Unique haplotype identifier" ;
+  vcfc:reservedIn "VCFv4.5" .
+
+vcfc:ReservedFormat_AHAP a owl:NamedIndividual, vcfc:FormatFieldDefinition ;
+  rdfs:label "Format AHAP reserved field definition"@en ;
+  vcfc:fieldId "AHAP" ;
+  vcfc:fieldNumber "1" ;
+  vcfc:fieldNumberInteger 1 ;
+  vcfc:fieldType vcfc:IntegerType ;
+  vcfc:fieldDescription "Unique identifier of ancestral haplotype" ;
+  vcfc:reservedIn "VCFv4.5" .

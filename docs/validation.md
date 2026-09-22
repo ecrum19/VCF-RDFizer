@@ -59,10 +59,31 @@ bigger heap.
 
 | Graph size | Recommended |
 | --- | --- |
-| Fixtures, small VCFs | `--validation-engine comunica` (default; no index build) |
-| Anything above a few GiB of N-Triples | `--validation-engine qlever`, or validate the indexed artifact with `--validate-artifacts hdt` |
+| Anything | `--validation-engine qlever` (default; builds an on-disk index) |
+| Fixtures, where an index build is not worth its setup | `--validation-engine comunica` |
 
 Above 4 GiB the runner warns before it starts and names the alternatives.
+
+### The engine is the performance decision; the artifact is not
+
+This is the most consequential thing to know before configuring a run, and it
+is the opposite of what the interface suggests. Measured on one machine, same
+thirteen questions, same graph:
+
+| What changes | Spread |
+| --- | --- |
+| The **engine**, on a 0.96M-triple graph | QLever 1.09 s, Comunica 23.30 s, HDT-backed 44.83 s, native pycottas 1402.37 s |
+| The **artifact**, under QLever on a 17.1M-triple graph | N-Triples 17.11 s, HDT 17.16 s, COTTAS 16.97 s |
+
+Three orders of magnitude against under 5%. Each engine materializes what it
+needs, so which compressed form the triples were stored in is nearly invisible
+to query time. Choose the representation for size and build cost -- COTTAS is
+0.37--0.55x the stored N-Triples where HDT is 1.36--1.82x, and HDT builds
+1.5--2.8x faster -- and choose the engine for speed.
+
+`qlever` is the default for that reason. It was not, until the benchmark
+campaign had to pass `--validation-engine qlever` by hand on every cell large
+enough for the difference to matter.
 
 ### If validation seems to hang
 
@@ -246,10 +267,10 @@ produced it.
 
 | Engine | Queries | Setup | Use it when |
 |---|---|---|---|
-| `comunica` (default) | The N-Triples file directly | none | The graph fits comfortably in RAM |
-| `qlever` | An on-disk [QLever](https://github.com/ad-freiburg/qlever) index, served on a container-local port | index build | The graph no longer fits in memory, or the aggregate queries are too slow |
+| `qlever` (default) | An on-disk [QLever](https://github.com/ad-freiburg/qlever) index, served on a container-local port | index build | Almost always: fastest by a wide margin at every size measured |
+| `comunica` | The N-Triples file directly | none | A fixture small enough that an index build is not worth its setup |
 | `hdt` | A `.hdt` artifact **in place**, through Comunica's HDT engine | reuses the run's HDT, or builds one | Checking that the compressed artifact is queryable, not just decodable |
-| `cottas` | A `.cottas` artifact **in place**, through `pycottas`'s rdflib store | reuses the run's COTTAS, or builds one | Same, for COTTAS |
+| `cottas` | A `.cottas` artifact **in place**, through `pycottas`'s rdflib store | reuses the run's COTTAS, or builds one | Same, for COTTAS. A conformance path, not a query path: 1286x slower than QLever on identical work, and it does not terminate at all on the condensed encoding (see [limitations](limitations.md)) |
 
 ### Validating a compressed artifact without decoding it
 
@@ -523,9 +544,39 @@ and a conforming graph is reported as violations. In a vocabulary checkout the
 bundle sits one level up from the shapes, in `ontology/`, and is found
 automatically; `--shacl-ontology PATH` names it explicitly anywhere else.
 
-It is **off by default**: `pyshacl` loads the whole graph into memory, so it is
-suitable for a single-sample graph or a sample of a cohort, not for a
-cohort-scale aggregate. The report records the conformance verdict, the exact
+It is **on by default for sources at or below 512 MiB**, using shapes vendored
+with the package -- no vocabulary checkout needed. `--no-shacl` turns it off;
+`--shacl-shapes` overrides both the bundled shapes and the size gate. Above the
+gate it is skipped, because `pyshacl` loads the whole graph into memory and a
+cohort-scale aggregate would not fit.
+
+### Two profiles, and which one catches what
+
+The published profile is split across files that check genuinely different
+things, and the split decides what a run can detect:
+
+| `--shacl-profile` | Files | Checks | Cost on a 2,000-triple graph |
+| --- | --- | --- | --- |
+| `core` (default) | `vcf-core-vocabulary` | Cardinality and datatype: `vcfc:sampleIndex` exists once and is an integer >= 1 | **1.7 s** |
+| `full` | `+ vcf-core-consistency`, `+ vcf-core-vocabulary-sparql` | Uniqueness (*"Record indices must be unique"*, *"Sample names and sample indices must be unique"*) and value agreement (`vcfc:alleleValue` against `REF`/`ALT`) | **+33.7 s, +73.2 s** |
+
+The distinction matters for what you can claim. The mutation-score experiment
+injected 113 corruptions; the query suite caught 96 (0.850), and 7 of the 17 it
+missed fall into four classes -- `corrupt_allele_value`, `corrupt_record_index`,
+`corrupt_value_item_allele` and `corrupt_sample_index_expanded`. **Those are
+covered by `full`, not by the default.** The core profile constrains how many
+`sampleIndex` values a sample has, not whether two samples share one, so it
+detects none of them.
+
+`full` is not the default because the cost is real and measured: its two extra
+profiles use `sh:sparql` constraints that self-join the graph, so they grow far
+faster than the data. It is gated to sources at or below 16 MiB, where closing
+those four classes is worth two minutes; the core profile's gate is 512 MiB.
+
+```bash
+# Close the four classes the query suite misses, on a fixture-sized input
+vcf-rdfizer --mode full -i ./fixture.vcf --validate --shacl-profile full -o ./out
+``` The report records the conformance verdict, the exact
 violation count, the distinct property paths involved, and the first 50
 violations; the full text is written alongside it.
 

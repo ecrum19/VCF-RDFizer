@@ -281,3 +281,32 @@ presented as if it did.
 - [Privacy policy design](privacy-policy-design.md) — the disclosure-control gap, and the proposal to close it
 - [VCF coverage matrix](vcf-coverage.md) — the element-by-element measurement
 - [Validation](validation.md) — the detailed "what is not tested"
+
+## Native COTTAS querying does not terminate on the condensed encoding
+
+`--validation-engine cottas` against a `--sample-representation condensed`
+graph is **refused by default**, and this is a measurement rather than a
+precaution. It was reproduced twice on a 10,000-record fixture: native pycottas
+answered the fourteen preflight queries and Q1-Q4, then failed to complete
+`q05_sample_genotype_counts`, running 41 hours in the first attempt and about
+10 in the second, both at roughly 190% CPU. Both runs are archived whole,
+container logs included.
+
+The scope is narrow, and worth stating precisely rather than as "COTTAS is
+slow":
+
+* QLever answered all thirteen questions on that **same cell**, in about a
+  second each.
+* The sibling **expanded** encoding completed every engine, pycottas included,
+  in 185-194 minutes.
+
+So the defect is native pycottas x the condensed genotype encoding x a
+genotype-level query. The condensed encoding stores genotypes as `S + (V x F)`
+rather than `V x S`, so a per-sample genotype query joins across the sample
+block; the working hypothesis is a missing or unusable index on that join
+column rather than data volume.
+
+Naming `cottas` explicitly is refused. `--validation-engine all` drops it with
+a warning and validates with the other three, because asking for `all` is a
+request for breadth and failing the whole run serves that worse.
+`--allow-cottas-condensed` attempts it anyway.

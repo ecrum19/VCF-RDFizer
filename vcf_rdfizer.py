@@ -345,6 +345,103 @@ SAMPLE_RDF_BUFFER_BYTES = 8 * 1024 * 1024
 # line starting with one of these bytes and ending in " ." is a statement.
 _NTRIPLES_SUBJECT_STARTS = (b"<", b"_")
 SAMPLE_REPRESENTATION_CHOICES = {"expanded", "condensed"}
+
+#: How many triples the expanded representation adds per (record x sample).
+#: Fitted from the sample ladder in 03_sample_representation, which re-emitted
+#: the same 10,000 variant records against 1, 4, 16, 64, 256, 1024 and 2504
+#: sample columns: the expanded-minus-condensed difference divided by
+#: records x samples converges to 24.997 by 2504 samples (25.0 at 1024, 24.97
+#: at 256). The condensed arm over that same ladder moved 0.9% in total, which
+#: is why only the expanded side needs an estimate at all.
+EXPANDED_TRIPLES_PER_SAMPLE_CALL = 25
+#: Peak workspace bytes per emitted triple, measured rather than assumed: the
+#: s2504 expanded cell peaked at 11,481,042,944 bytes for 627,372,018 triples,
+#: i.e. 18.3. Rounded up, because a guard that under-estimates is no guard.
+EXPANDED_PEAK_BYTES_PER_TRIPLE = 20
+#: Refuse when the estimate needs more than this share of the free space that
+#: remains. Leaving a quarter of the volume is not generosity: the estimate is
+#: a fit, and filling a disk takes down everything else running on the host.
+COHORT_GUARD_FREE_SPACE_SHARE = 0.75
+
+
+def estimate_expanded_workspace_bytes(record_count: int, sample_count: int) -> int:
+    """Peak bytes the expanded representation will need for this shape.
+
+    Expanded emits per sample per record, so cost is records x samples and the
+    file size on disk says almost nothing about it: 1000G_phase3_chr20 is 327 MB
+    gzipped and, at 1,812,841 records x 2,504 samples, needs roughly 2 TB.
+    """
+    return int(
+        max(0, record_count)
+        * max(0, sample_count)
+        * EXPANDED_TRIPLES_PER_SAMPLE_CALL
+        * EXPANDED_PEAK_BYTES_PER_TRIPLE
+    )
+
+
+def count_records_tsv_rows(records_tsv: Path) -> int:
+    """Data rows in a records TSV, read once in binary without parsing fields."""
+    total = 0
+    with records_tsv.open("rb") as handle:
+        while chunk := handle.read(8 * 1024 * 1024):
+            total += chunk.count(b"\n")
+    # The header line is not a record. A file whose final row has no trailing
+    # newline loses one here, which errs toward a smaller estimate by one row.
+    return max(0, total - 1)
+
+
+def read_records_tsv_sample_count(records_tsv: Path) -> int:
+    """Sample columns declared by a records TSV, or 0 when it has none."""
+    try:
+        with SampleRecordStream(records_tsv) as stream:
+            return len(stream.columns)
+    except (OSError, csv.Error, StopIteration):
+        return 0
+
+
+def cohort_scale_refusal(
+    *,
+    records_tsv: Path,
+    sample_representation: str,
+    out_dir: Path,
+    allow: bool,
+) -> str | None:
+    """Refuse an expanded run that cannot fit, naming the condensed alternative.
+
+    Only ``expanded`` is affected. Condensed is ~S + (V x F) and stays tractable
+    at cohort scale -- across a 1-to-2504 sample ladder it grew 0.9% in total --
+    so the cohort file still converts, in the representation that can hold it.
+
+    Returns the refusal message, or None when the run may proceed.
+    """
+    if allow or sample_representation != "expanded":
+        return None
+    sample_count = read_records_tsv_sample_count(records_tsv)
+    if sample_count <= 1:
+        return None
+    try:
+        record_count = count_records_tsv_rows(records_tsv)
+        free_bytes = shutil.disk_usage(out_dir).free
+    except OSError:
+        # An unreadable TSV or volume is the pipeline's problem to report, not
+        # this guard's to guess at. Let the run proceed and fail where it means.
+        return None
+    needed = estimate_expanded_workspace_bytes(record_count, sample_count)
+    budget = int(free_bytes * COHORT_GUARD_FREE_SPACE_SHARE)
+    if needed <= budget:
+        return None
+    return (
+        f"--sample-representation expanded needs an estimated "
+        f"{needed / 1e9:,.1f} GB of workspace for {record_count:,} records x "
+        f"{sample_count:,} samples ({record_count * sample_count:,} sample "
+        f"calls), and only {free_bytes / 1e9:,.1f} GB is free on "
+        f"{out_dir}. Expanded emits per sample per record, so its cost is "
+        f"records x samples and is not visible in the input file size.\n"
+        f"  Use --sample-representation condensed, which encodes the same "
+        f"genotypes as S + (V x F) and stays flat in sample count, or pass "
+        f"--allow-cohort-expansion to proceed anyway and accept the risk of "
+        f"filling this volume."
+    )
 # How the INFO column is represented. "raw" is the historical behaviour (an
 # opaque vcfc:infoRaw string). "structured" additionally emits one
 # vcfc:InfoFieldValue per record and key, plus the allele layer and the
@@ -363,7 +460,16 @@ VALIDATION_RDF_SUFFIXES = (
     (".hdt", "hdt"),
 )
 VALIDATION_ENGINE_CHOICES = ("comunica", "qlever", "hdt", "cottas")
-DEFAULT_VALIDATION_ENGINE = "comunica"
+#: The representation is a storage decision; the engine is the performance one.
+#: Measured on one graph, one machine, the same thirteen questions: QLever 1.09 s,
+#: Comunica 23.30 s, the HDT-backed engine 44.83 s, native pycottas 1402.37 s.
+#: Against the SAME engine, the artifact queried barely matters -- on a
+#: 17.1M-triple graph QLever took 17.11 s over N-Triples, 17.16 s over HDT and
+#: 16.97 s over COTTAS, under 5% apart, because each engine materializes what it
+#: needs. So the default that matters is this one, and it was the slow choice:
+#: the benchmark campaign had to pass --validation-engine qlever by hand on
+#: every cell large enough for it to matter.
+DEFAULT_VALIDATION_ENGINE = "qlever"
 
 
 def parse_validation_engines(raw: str) -> list[str]:
@@ -2126,6 +2232,27 @@ class ParsedSampleRecord:
     filter_value: str = ""
 
 
+def source_file_from_header_lines(header_lines_tsv: Path) -> str:
+    """The SOURCE_FILE of a header-lines TSV, for a VCF with no data records.
+
+    ``SampleRecordStream`` learns the source file from the first data row, so a
+    header-only VCF leaves it empty -- and the emitters, which key their file
+    IRI on it, then emit nothing at all. The sample columns are declared on the
+    ``#CHROM`` line, not by the data, so a zero-record file still has a sample
+    set to represent. Reading the name from the header table restores it.
+    """
+    try:
+        with header_lines_tsv.open(newline="", encoding="utf-8") as handle:
+            reader = csv.reader(handle, delimiter="\t")
+            next(reader, None)  # column header
+            for row in reader:
+                if row and row[0]:
+                    return row[0]
+    except (OSError, csv.Error):
+        return ""
+    return ""
+
+
 class SampleRecordStream:
     """Read a records.tsv sample block once and expose a stable sample schema."""
 
@@ -2713,11 +2840,18 @@ def append_expanded_sample_rdf(
     )
 
     with SampleRecordStream(records_tsv) as record_stream:
-        if not record_stream.source_file:
+        # A header-only VCF has no data row to learn the source file from, but
+        # its #CHROM line still declares sample columns and its header still
+        # declares fields. Falling back to the header table keeps those
+        # declarations representable instead of emitting an empty graph.
+        source_file = record_stream.source_file or source_file_from_header_lines(
+            header_lines_tsv
+        )
+        if not source_file:
             return stats
 
         def produce(emit):
-            source_component = _rml_uri_component(record_stream.source_file)
+            source_component = _rml_uri_component(source_file)
             file_uri = f"file://{source_component}"
             # The profile is declared even for a sites-only VCF.
             # vcfc:RepresentationProfileShape requires exactly one on every
@@ -4048,11 +4182,18 @@ def append_record_detail_rdf(
     }
 
     with SampleRecordStream(records_tsv) as record_stream:
-        if not record_stream.source_file:
+        # A header-only VCF has no data row to learn the source file from, but
+        # its #CHROM line still declares sample columns and its header still
+        # declares fields. Falling back to the header table keeps those
+        # declarations representable instead of emitting an empty graph.
+        source_file = record_stream.source_file or source_file_from_header_lines(
+            header_lines_tsv
+        )
+        if not source_file:
             return stats
 
         def produce(emit):
-            source_component = _rml_uri_component(record_stream.source_file)
+            source_component = _rml_uri_component(source_file)
             file_uri = f"file://{source_component}"
             emitted_definitions: set[str] = set()
             emitted_assembly_contigs: set[str] = set()
@@ -4330,11 +4471,18 @@ def append_condensed_sample_rdf(
 
     definitions = _load_format_definitions(header_lines_tsv)
     with SampleRecordStream(records_tsv) as record_stream:
-        if not record_stream.source_file:
+        # A header-only VCF has no data row to learn the source file from, but
+        # its #CHROM line still declares sample columns and its header still
+        # declares fields. Falling back to the header table keeps those
+        # declarations representable instead of emitting an empty graph.
+        source_file = record_stream.source_file or source_file_from_header_lines(
+            header_lines_tsv
+        )
+        if not source_file:
             return stats
 
         def produce(emit):
-            source_component = _rml_uri_component(record_stream.source_file)
+            source_component = _rml_uri_component(source_file)
             file_uri = f"file://{source_component}"
             emitted_definitions: set[str] = set()
             # FORMAT keys repeat on every record; encode each distinct key once.
@@ -4426,28 +4574,53 @@ def append_condensed_sample_rdf(
         return _append_rdf_atomically(rdf_path, stats, produce)
 
 
+def allele_layer_required(info_representation: str, sample_representation: str) -> bool:
+    """Decide whether the record's allele resources have to be minted.
+
+    Two independent layers join to ``<record>/allele/<index>``: the structured
+    INFO value items for Number=A/R/G fields, and the expanded sample layer's
+    ``vcfc:calledAllele`` on every ``vcfc:GenotypeAlleleCall``. Either one alone
+    is enough to require the alleles, so the decision is a disjunction rather
+    than a property of the INFO representation. Tying it to INFO alone left
+    ``--info-representation raw --sample-representation expanded`` emitting
+    ``vcfc:calledAllele`` edges whose targets were never described.
+    """
+    if info_representation not in INFO_REPRESENTATION_CHOICES:
+        raise ValueError(f"unknown INFO representation: {info_representation}")
+    if sample_representation not in SAMPLE_REPRESENTATION_CHOICES:
+        choices = ", ".join(sorted(SAMPLE_REPRESENTATION_CHOICES))
+        raise ValueError(
+            f"unsupported sample representation '{sample_representation}'; "
+            f"choose {choices}"
+        )
+    return info_representation == "structured" or sample_representation == "expanded"
+
+
 def emit_record_detail(
     info_representation: str,
     *,
     records_tsv: Path,
     header_lines_tsv: Path,
     rdf_path: Path,
+    sample_representation: str = "expanded",
     version: "vocab.VCFVersion | None" = None,
 ) -> dict | None:
     """Append the record detail, and when selected the structured INFO form.
 
     ID, ALT, QUAL, FILTER and INFO raw are always emitted: the RML mapping
     cannot type the missing token per row, so this is the only place they can
-    come from. The allele layer travels with the structured INFO representation,
-    because the Number=A/R/G value items are joined to the allele resources it
-    mints.
+    come from. The allele layer is emitted whenever some other layer joins to
+    it -- the structured INFO value items, or the expanded sample layer's
+    per-call ``vcfc:calledAllele`` -- so that no representation combination can
+    reference an allele resource that was never described.
     """
     if info_representation not in INFO_REPRESENTATION_CHOICES:
         raise ValueError(f"unknown INFO representation: {info_representation}")
     structured = info_representation == "structured"
     return append_record_detail_rdf(
         records_tsv, header_lines_tsv, rdf_path,
-        emit_qual=True, emit_info=structured, emit_alleles=structured,
+        emit_qual=True, emit_info=structured,
+        emit_alleles=allele_layer_required(info_representation, sample_representation),
         version=version,
     )
 
@@ -4673,6 +4846,109 @@ def resolve_default_rules_path(repo_root: Path) -> Path:
     raise ValueError(
         "default rules file not found. Provide --rules explicitly or reinstall package."
     )
+
+
+#: The shape layer catches what the aggregate queries structurally cannot. The
+#: mutation-score experiment injected 113 corruptions and the query suite caught
+#: 96 (0.850); of the 17 it missed, 7 are covered by shapes that were already
+#: published and enabled in zero of the campaign's 62 validation runs --
+#: corrupt_allele_value, corrupt_record_index, corrupt_value_item_allele and
+#: corrupt_sample_index_expanded. Turning them on takes the score to 0.912 with
+#: no new oracle and no new query.
+#: The cheap, always-affordable profile. It constrains cardinality and datatype
+#: -- vcfc:sampleIndex must exist once and be an integer >= 1 -- and says
+#: nothing about whether two samples share one. Measured on bench-1 at 1.7 s for
+#: a 2,000-triple graph and 34 s for a 95,000-triple one, which is a default a
+#: run can absorb.
+DEFAULT_SHACL_SHAPES = ("vcf-core-vocabulary.shacl.ttl",)
+#: The profiles that catch a *corrupted* value rather than a missing one:
+#: uniqueness ("Record indices must be unique within a VCF file", "Sample names
+#: and sample indices must be unique") lives in the SPARQL profile, and value
+#: agreement (vcfc:alleleValue against vcfc:ref/vcfc:alt) in the consistency
+#: profile. These are the four mutation classes the query suite misses.
+#:
+#: They are NOT default, and the reason is measured rather than assumed: on a
+#: 2,000-triple graph the consistency profile took 33.7 s and the SPARQL
+#: profile 73.2 s, against 1.7 s for the core one. Their sh:sparql constraints
+#: self-join the graph, so the cost grows far faster than the data. Opt in with
+#: --shacl-profile full on a fixture-sized graph, where closing those classes
+#: is worth two minutes.
+FULL_SHACL_SHAPES = (
+    "vcf-core-vocabulary.shacl.ttl",
+    "vcf-core-consistency.shacl.ttl",
+    "vcf-core-vocabulary-sparql.shacl.ttl",
+)
+SHACL_PROFILE_CHOICES = ("core", "full")
+DEFAULT_SHACL_ONTOLOGY = "vcf-core-vocabulary.bundle.ttl"
+#: pyshacl loads the whole graph into memory, so the default is size-gated
+#: rather than unconditional. A fixture or a single-sample graph validates in
+#: seconds; a cohort aggregate would not fit, and silently trying would turn a
+#: safety net into an OOM. Above this, shapes stay available via --shacl-shapes.
+DEFAULT_SHACL_MAX_SOURCE_BYTES = 512 * 1024 * 1024
+
+
+def resolve_bundled_vocabulary_asset(repo_root: Path, relative: str) -> Path | None:
+    """Locate one vendored vocabulary asset in a checkout or installed package."""
+    local = (repo_root / "vcf_rdfizer_data" / relative).resolve()
+    if local.is_file():
+        return local
+    try:
+        packaged = importlib_resources.files("vcf_rdfizer_data").joinpath(relative)
+        with importlib_resources.as_file(packaged) as packaged_path:
+            resolved = packaged_path.resolve()
+            if resolved.is_file():
+                return resolved
+    except (ModuleNotFoundError, FileNotFoundError):
+        pass
+    return None
+
+
+def resolve_default_shacl_shapes(
+    repo_root: Path,
+    profile: str = "core",
+) -> tuple[list[Path] | None, Path | None]:
+    """The bundled shape profiles and their ontology bundle, or (None, None).
+
+    All profiles in the chosen set must resolve: a partial set silently drops
+    whole classes of check, which is exactly the failure this exists to end.
+    """
+    names = FULL_SHACL_SHAPES if profile == "full" else DEFAULT_SHACL_SHAPES
+    shapes = [
+        resolve_bundled_vocabulary_asset(repo_root, f"shacl/{name}")
+        for name in names
+    ]
+    if any(path is None for path in shapes):
+        return None, None
+    ontology = resolve_bundled_vocabulary_asset(
+        repo_root, f"ontology/{DEFAULT_SHACL_ONTOLOGY}"
+    )
+    return shapes, ontology
+
+
+#: The full profile set is quadratic-ish in graph size, so its gate is not the
+#: core one. 16 MiB of VCF is a fixture or a small single-sample file, which is
+#: where a two-minute structural check is a reasonable trade.
+FULL_SHACL_MAX_SOURCE_BYTES = 16 * 1024 * 1024
+
+
+def shacl_max_source_bytes(profile: str) -> int:
+    """The size gate for one profile set."""
+    return (
+        FULL_SHACL_MAX_SOURCE_BYTES if profile == "full"
+        else DEFAULT_SHACL_MAX_SOURCE_BYTES
+    )
+
+
+def shacl_default_applies(source_bytes: int | None, profile: str = "core") -> bool:
+    """Whether to validate shapes by default for a source of this size.
+
+    Size-gated because pyshacl is in-memory. ``None`` means the size could not
+    be read, which is treated as too large: skipping a check is recoverable,
+    exhausting memory mid-run is not.
+    """
+    if source_bytes is None:
+        return False
+    return 0 <= source_bytes <= shacl_max_source_bytes(profile)
 
 
 def docker_image_exists(image: str) -> bool:
@@ -5599,6 +5875,8 @@ def write_raw_compression_metrics_artifact(
     method_results: dict[str, dict],
     index_warnings: list[dict] | None = None,
     auxiliary_stages: dict[str, dict] | None = None,
+    build_profile: dict | None = None,
+    build_stages: list[dict] | None = None,
 ):
     """Persist the operation-level compression detail for one RDF source."""
     safe_output = safe_metrics_name(output_name)
@@ -5615,6 +5893,12 @@ def write_raw_compression_metrics_artifact(
         "compression_methods": ",".join(selected_methods) if selected_methods else "none",
         "index_warnings": list(index_warnings or []),
         "auxiliary_stages": dict(auxiliary_stages or {}),
+        # Where the build's time, memory and container-volume disk went. The
+        # container collected per-stage detail all along; it was dropped here,
+        # which is why 90% of end-to-end wall time was attributable no further
+        # than "compression".
+        "build_profile": dict(build_profile or {}),
+        "build_stages": list(build_stages or []),
         "methods": {},
     }
 
@@ -6831,6 +7115,8 @@ def run_containerized_partitioned_representation_methods(
                 selected_methods=methods,
                 method_results=method_results,
                 index_warnings=index_warnings,
+                build_profile=(payload or {}).get("build_profile"),
+                build_stages=(payload or {}).get("stages"),
             )
         return True, method_results
     finally:
@@ -6901,6 +7187,39 @@ def run_partitioned_representation_methods_for_rdf_files(
     )
 
 
+def remove_tsv_triplet(
+    triplet: dict,
+    *,
+    tsv_dir: Path,
+    image_ref: str,
+    wrapper_log_path: Path,
+) -> tuple[bool, Path | None]:
+    """Remove one input's TSV intermediates. Returns (ok, first_failed_path).
+
+    Idempotent: a path that is already gone is a success, so this can be called
+    at the point the TSVs stop being read AND again as an end-of-iteration
+    sweep without the second call reporting a failure.
+    """
+    for tsv_path in (
+        triplet.get("records"),
+        triplet.get("headers"),
+        triplet.get("metadata"),
+        triplet.get("sample_calls"),
+        triplet.get("sample_format_values"),
+    ):
+        if tsv_path is None or not tsv_path.exists():
+            continue
+        if not remove_file_with_docker_fallback(
+            path=tsv_path,
+            mount_root=tsv_dir,
+            mount_point="/data/tsv",
+            image_ref=image_ref,
+            wrapper_log_path=wrapper_log_path,
+        ):
+            return False, tsv_path
+    return True, None
+
+
 def run_full_mode(
     *,
     input_mount_dir: Path,
@@ -6921,7 +7240,7 @@ def run_full_mode(
     validation_engine: str | list[str] = DEFAULT_VALIDATION_ENGINE,
     validation_engine_options: dict | None = None,
     validation_strict_conformance: bool = False,
-    validation_shacl_shapes: Path | None = None,
+    validation_shacl_shapes: Path | list[Path] | None = None,
     validation_shacl_ontology: Path | None = None,
     filter_oracle: str = "auto",
     rdf_storage_mode: str,
@@ -6940,6 +7259,7 @@ def run_full_mode(
     run_tracker: RunTracker | None = None,
     linking_manifests: list | None = None,
     linking_options: dict | None = None,
+    allow_cohort_expansion: bool = False,
 ):
     """Execute full pipeline: per-input TSV -> RDF -> compression -> validation."""
     linking_options = dict(linking_options or {})
@@ -7099,6 +7419,21 @@ def run_full_mode(
 
         triplet = triplets_by_prefix[expected_prefix]
         prefix = triplet["prefix"]
+
+        # Refuse a cohort-scale expanded run before spending anything on it.
+        # This sits ahead of the helper TSVs deliberately: building those is
+        # already records x samples work, so a guard after them has let the
+        # failure mode start.
+        refusal = cohort_scale_refusal(
+            records_tsv=triplet["records"],
+            sample_representation=sample_workflow.representation,
+            out_dir=out_dir,
+            allow=allow_cohort_expansion,
+        )
+        if refusal is not None:
+            fail_current("cohort-scale-guard", refusal)
+            continue
+
         sample_calls_tsv = tsv_dir / f"{prefix}.sample_calls.tsv"
         sample_format_tsv = tsv_dir / f"{prefix}.sample_format_values.tsv"
         try:
@@ -7384,6 +7719,7 @@ def run_full_mode(
                     records_tsv=triplet["records"],
                     header_lines_tsv=triplet["headers"],
                     rdf_path=raw_rdf_files[0],
+                    sample_representation=sample_workflow.representation,
                     version=effective_version,
                 )
             except Exception as exc:
@@ -7444,6 +7780,28 @@ def run_full_mode(
         if run_tracker is not None:
             for raw_rdf_path in raw_rdf_files:
                 run_tracker.track_raw_rdf(raw_rdf_path)
+
+        # Every TSV reader has now run: RMLStreamer, the sample emitter, the
+        # header emitter and the record-detail emitter. Free them here rather
+        # than at the end of the iteration, because what comes next is the
+        # representation build -- 90% of end-to-end wall time, and the reason a
+        # 2.63 GB TSV set was sitting on disk for 14.8 hours after being read
+        # in the first three minutes. Measured on the whole-file HG005 cell,
+        # this alone takes peak workspace from 16.23 GB to about 13.6 GB.
+        if not keep_tsv:
+            tsv_removed, failed_path = remove_tsv_triplet(
+                triplet,
+                tsv_dir=tsv_dir,
+                image_ref=image_ref,
+                wrapper_log_path=wrapper_log_path,
+            )
+            if not tsv_removed:
+                fail_current(
+                    "tsv-cleanup",
+                    f"failed to remove intermediate TSV '{failed_path.name}'. "
+                    f"See log: {wrapper_log_path}",
+                )
+                continue
 
         method_results_by_file: dict[str, dict[str, dict]] = {}
         partitioned_representation_results: dict[str, dict] = {}
@@ -7830,32 +8188,21 @@ def run_full_mode(
             print(f"      - Final RDF size (no compression): {format_bytes(raw_total_size)}")
 
         if not keep_tsv:
-            # Cleanup only the triplet generated for this input iteration.
-            tsv_cleanup_failed = False
-            for tsv_path in (
-                triplet["records"],
-                triplet["headers"],
-                triplet["metadata"],
-                triplet.get("sample_calls"),
-                triplet.get("sample_format_values"),
-            ):
-                if tsv_path is None:
-                    continue
-                if tsv_path.exists():
-                    if not remove_file_with_docker_fallback(
-                        path=tsv_path,
-                        mount_root=tsv_dir,
-                        mount_point="/data/tsv",
-                        image_ref=image_ref,
-                        wrapper_log_path=wrapper_log_path,
-                    ):
-                        fail_current(
-                            "tsv-cleanup",
-                            f"failed to remove intermediate TSV '{tsv_path.name}'. See log: {wrapper_log_path}",
-                        )
-                        tsv_cleanup_failed = True
-                        break
-            if tsv_cleanup_failed:
+            # Safety net. The triplet is normally freed before the
+            # representation build above; this catches a path that only
+            # appeared later, and is a no-op in the ordinary case.
+            tsv_removed, failed_path = remove_tsv_triplet(
+                triplet,
+                tsv_dir=tsv_dir,
+                image_ref=image_ref,
+                wrapper_log_path=wrapper_log_path,
+            )
+            if not tsv_removed:
+                fail_current(
+                    "tsv-cleanup",
+                    f"failed to remove intermediate TSV '{failed_path.name}'. "
+                    f"See log: {wrapper_log_path}",
+                )
                 continue
 
         if run_tracker is not None:
@@ -8462,7 +8809,7 @@ def run_validation_mode(
     engine_options: dict | None = None,
     rdf_format: str | None = None,
     strict_conformance: bool = False,
-    shacl_shapes: Path | None = None,
+    shacl_shapes: Path | list[Path] | None = None,
     shacl_ontology: Path | None = None,
     run_tracker: RunTracker | None = None,
     stage_result: dict | None = None,
@@ -8528,10 +8875,23 @@ def run_validation_mode(
         engine_args.append("--strict-conformance")
     shacl_mount: list[str] = []
     if shacl_shapes is not None:
-        # Mounted read-only in its own directory so the shapes file can live
-        # anywhere on the host without exposing its parent tree for writing.
-        shacl_mount = ["-v", f"{shacl_shapes.parent.resolve()}:/data/shacl:ro"]
-        engine_args.extend(["--shacl-shapes", f"/data/shacl/{shacl_shapes.name}"])
+        # One or several profiles. They ship in one directory, so a single
+        # read-only mount covers them all; a caller pointing at files in
+        # different directories is refused rather than silently half-mounted.
+        shapes_paths = (
+            [shacl_shapes] if isinstance(shacl_shapes, Path) else list(shacl_shapes)
+        )
+        parents = {path.parent.resolve() for path in shapes_paths}
+        if len(parents) != 1:
+            raise ValueError(
+                "--shacl-shapes files must live in one directory; got "
+                + ", ".join(sorted(str(parent) for parent in parents))
+            )
+        shacl_mount = ["-v", f"{parents.pop()}:/data/shacl:ro"]
+        engine_args.extend([
+            "--shacl-shapes",
+            ",".join(f"/data/shacl/{path.name}" for path in shapes_paths),
+        ])
         if shacl_ontology is not None:
             # The ontology is a sibling directory in a vocabulary checkout, so
             # it needs its own mount rather than the shapes' one.
@@ -8811,6 +9171,18 @@ def main():
         ),
     )
     parser.add_argument(
+        "--allow-cohort-expansion",
+        action="store_true",
+        help=(
+            "Proceed with --sample-representation expanded even when the "
+            "estimated workspace exceeds the free space on the output volume. "
+            "Expanded emits per sample per record, so cost is records x samples "
+            "and is invisible in the input file size: a 327 MB gzipped "
+            "2,504-sample cohort needs roughly 2 TB. Off by default, because "
+            "filling the volume takes down whatever else is running on the host"
+        ),
+    )
+    parser.add_argument(
         "--header-representation",
         choices=HEADER_REPRESENTATION_CHOICES,
         default=DEFAULT_HEADER_REPRESENTATION,
@@ -9011,6 +9383,34 @@ def main():
         ),
     )
     parser.add_argument(
+        "--shacl-profile",
+        choices=SHACL_PROFILE_CHOICES,
+        default="core",
+        help=(
+            "Which bundled shape profiles to apply. core (default) constrains "
+            "cardinality and datatype and is cheap. full adds the consistency "
+            "and SPARQL profiles, which are the ones that catch a corrupted "
+            "value -- duplicate record or sample indices, an alleleValue that "
+            "disagrees with ALT -- and are the four mutation classes the query "
+            "suite misses. full is measurably expensive: on a 2,000-triple "
+            "graph its profiles took 33.7 s and 73.2 s against 1.7 s for core, "
+            "so it is gated to sources at or below "
+            f"{FULL_SHACL_MAX_SOURCE_BYTES // (1024 * 1024)} MiB"
+        ),
+    )
+    parser.add_argument(
+        "--no-shacl",
+        action="store_true",
+        help=(
+            "Skip the bundled SHACL shape layer, which is otherwise applied by "
+            "default to sources at or below "
+            f"{DEFAULT_SHACL_MAX_SOURCE_BYTES // (1024 * 1024)} MiB. The "
+            "default (core) profile checks structure the aggregate comparisons "
+            "do not; --shacl-profile full adds the profiles that catch a "
+            "corrupted value. --shacl-shapes overrides both"
+        ),
+    )
+    parser.add_argument(
         "--shacl-ontology",
         default=None,
         help=(
@@ -9033,9 +9433,13 @@ def main():
         default=DEFAULT_VALIDATION_ENGINE,
         help=(
             "SPARQL engine(s) for validation, comma-separated, or 'all'. "
-            "comunica queries the graph in memory; qlever builds an on-disk "
-            "index and serves it; hdt and cottas query those compressed "
-            "artifacts natively without decoding them. Requesting several runs "
+            "This is the choice that decides query time: the artifact barely "
+            "matters (under 5%% between N-Triples, HDT and COTTAS for one "
+            "engine), while engines span three orders of magnitude on identical "
+            "work. qlever builds an on-disk index and serves it; comunica "
+            "queries the graph in memory; hdt and cottas query those compressed "
+            "artifacts natively without decoding them, which is a conformance "
+            "path rather than a fast one. Requesting several runs "
             "the whole query set on each, cross-checks their answers, and "
             "records comparable timings for benchmarking "
             f"(choices: {', '.join(VALIDATION_ENGINE_CHOICES)}; "
@@ -9166,7 +9570,7 @@ def main():
     validation_artifacts: list[str] = []
     validation_engines: list[str] = [DEFAULT_VALIDATION_ENGINE]
     validation_engine_options: dict = {}
-    shacl_shapes_path: Path | None = None
+    shacl_shapes_path: list[Path] | None = None
     shacl_ontology_path: Path | None = None
     linking_manifests = []
     try:
@@ -9207,9 +9611,18 @@ def main():
         validation_engines = parse_validation_engines(args.validation_engine)
         validation_artifacts = parse_validation_targets(args.validate_artifacts)
         if args.shacl_shapes is not None:
-            shacl_shapes_path = Path(args.shacl_shapes).expanduser().resolve()
-            if not shacl_shapes_path.is_file():
-                raise ValueError(f"SHACL shapes file not found: {shacl_shapes_path}")
+            # Comma-separated: the published profile is split across files and
+            # only some of them catch a corrupted value.
+            shacl_shapes_path = [
+                Path(token.strip()).expanduser().resolve()
+                for token in str(args.shacl_shapes).split(",")
+                if token.strip()
+            ]
+            for path in shacl_shapes_path:
+                if not path.is_file():
+                    raise ValueError(f"SHACL shapes file not found: {path}")
+            if not shacl_shapes_path:
+                raise ValueError("--shacl-shapes needs at least one file")
             if args.shacl_ontology is not None:
                 shacl_ontology_path = Path(args.shacl_ontology).expanduser().resolve()
                 if not shacl_ontology_path.is_file():
@@ -9221,12 +9634,35 @@ def main():
                 # shapes, in ontology/. Use it when it is there, so the
                 # documented command needs no second flag.
                 candidate = (
-                    shacl_shapes_path.parent.parent
+                    shacl_shapes_path[0].parent.parent
                     / "ontology"
                     / "vcf-core-vocabulary.bundle.ttl"
                 )
                 if candidate.is_file():
                     shacl_ontology_path = candidate
+        elif not args.no_shacl:
+            # Shapes catch what the aggregate comparisons structurally cannot:
+            # a value that is counted but never read. Four of the ten mutation
+            # classes the query suite misses are already covered by the
+            # published profile, which no run in the benchmark campaign
+            # enabled. Default it on, size-gated, rather than leaving a
+            # written check permanently unused.
+            bundled_shapes, bundled_ontology = resolve_default_shacl_shapes(
+                repo_root, args.shacl_profile
+            )
+            if bundled_shapes is not None:
+                source_bytes = None
+                try:
+                    source_for_size = Path(args.rdf) if args.rdf else (
+                        Path(args.input) if args.input else None
+                    )
+                    if source_for_size is not None and source_for_size.is_file():
+                        source_bytes = source_for_size.stat().st_size
+                except (OSError, TypeError):
+                    source_bytes = None
+                if shacl_default_applies(source_bytes, args.shacl_profile):
+                    shacl_shapes_path = bundled_shapes
+                    shacl_ontology_path = bundled_ontology
 
         chunk_target_bytes = parse_positive_int(
             args.chunk_target_bytes, name="--chunk-target-bytes"
@@ -9746,6 +10182,7 @@ def main():
                 image_ref=image_ref,
                 out_name=args.out_name,
                 sample_workflow=sample_workflow,
+                allow_cohort_expansion=args.allow_cohort_expansion,
                 info_representation=args.info_representation,
                 header_representation=args.header_representation,
                 vcf_version=args.vcf_version,

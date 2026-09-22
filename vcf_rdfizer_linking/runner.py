@@ -32,6 +32,24 @@ class LinkRunError(ValueError):
         self.report = report
 
 
+#: What each tier's link actually rests on, recorded alongside every linkset.
+#:
+#: tier 1 rewrites an identifier the VCF already carried. It cannot fail on a
+#:        record that has one and cannot succeed on a record that does not, so
+#:        its hit rate is a property of the input, not of the linker -- and
+#:        nothing checks that the identifier is still correct for this position
+#:        and these alleles. A stale rsID in a re-annotated call set produces a
+#:        confidently wrong vcfl:sameVariantAs.
+#: tier 2 matches coordinates against a digest-pinned reference, so the link is
+#:        verified against something.
+#: tier 3 resolves against a live service, whose response digest is recorded.
+ASSERTION_BASIS = {
+    1: "identifier-rewrite: taken from the source ID column, not position-verified",
+    2: "coordinate-interval: matched against a digest-pinned reference",
+    3: "service-resolution: resolved against a live service, response digest recorded",
+}
+
+
 def keys_for(record, manifest):
     if manifest.strategy == "token":
         value = record.id
@@ -109,6 +127,20 @@ def run_linkers(records, manifests, output: Path | None, *, cache_dir=DEFAULT_CA
                  "assembly": manifest.reference.assembly if manifest.reference else None,
                  "unique_keys": 0, "skipped_records": 0, "links": 0, "requests": 0,
                  "cache_hits": 0, "bytes_transferred": 0, "final_service_status": None,
+                 # "86 links" says nothing without its denominator. Records that
+                 # produced at least one join key are the population a linker
+                 # could possibly link; subjects actually linked are the
+                 # numerator. Their ratio is the coverage a reader needs before
+                 # "86/86" can mean anything.
+                 "eligible_records": 0, "linked_subjects": 0, "coverage": None,
+                 # What the link asserts on. A tier-1 rsID link is a rewrite of
+                 # an identifier the VCF already carried: it cannot fail to
+                 # link a record that has an rsID and cannot link one that does
+                 # not, and nothing checks that the identifier is still correct
+                 # for this position and these alleles. Recording the basis
+                 # keeps a strong predicate from reading as a verified claim.
+                 "assertion_basis": ASSERTION_BASIS.get(manifest.tier, "unspecified"),
+                 "assertion_verified": manifest.tier == 2,
                  "status": "pending", "wall_seconds": 0}
         if manifest.tier == 3:
             stats["resolver_sha256"] = hashlib.sha256((manifest.directory / "resolver.py").read_bytes()).hexdigest()
@@ -140,6 +172,8 @@ def run_linkers(records, manifests, output: Path | None, *, cache_dir=DEFAULT_CA
                         keys = keys_for(record, manifest)
                         if not keys:
                             stats_by_id[manifest.id]["skipped_records"] += 1
+                        else:
+                            stats_by_id[manifest.id]["eligible_records"] += 1
                         subject = record.call if manifest.subject == str(VCFL.VariantCall) else record.record
                         absolute_iri(subject)
                         db.executemany("INSERT OR IGNORE INTO keys VALUES (?,?,?,?)", [
@@ -185,6 +219,12 @@ def run_linkers(records, manifests, output: Path | None, *, cache_dir=DEFAULT_CA
                                 db.execute("INSERT OR IGNORE INTO links SELECT linker,source,subject,?,? FROM keys WHERE linker=? AND key=?",
                                            (manifest.predicate, obj, manifest.id, encoded[link.key]))
                         current["links"] = db.execute("SELECT COUNT(*) FROM links WHERE linker=?", (manifest.id,)).fetchone()[0]
+                        current["linked_subjects"] = db.execute(
+                            "SELECT COUNT(DISTINCT subject) FROM links WHERE linker=?",
+                            (manifest.id,)).fetchone()[0]
+                        if current["eligible_records"]:
+                            current["coverage"] = round(
+                                current["linked_subjects"] / current["eligible_records"], 6)
                         current["status"] = "success"
                     except BaseException:
                         current["status"] = "failed"
@@ -213,6 +253,16 @@ def run_linkers(records, manifests, output: Path | None, *, cache_dir=DEFAULT_CA
                                     emit(triple(node, RDF.type, URIRef(VCFL.Linkset).n3()))
                                     emit(triple(node, VCFL.producedBy, URIRef(f"https://w3id.org/vcf-rdfizer/linker/{manifest.id}/{manifest.version}").n3()))
                                     emit(triple(node, VCFL.linkCount, Literal(count, datatype=XSD.integer).n3()))
+                                    linker_stats = stats_by_id[manifest.id]
+                                    emit(triple(node, VCFL.eligibleRecordCount, Literal(
+                                        linker_stats["eligible_records"], datatype=XSD.integer).n3()))
+                                    emit(triple(node, VCFL.linkedSubjectCount, Literal(
+                                        linker_stats["linked_subjects"], datatype=XSD.integer).n3()))
+                                    # A consumer reading vcfl:sameVariantAs should be
+                                    # able to see what it rests on without leaving
+                                    # the graph.
+                                    emit(triple(node, VCFL.assertionBasis,
+                                                literal(linker_stats["assertion_basis"])))
                                     emit(triple(node, VCFL.source, URIRef(source).n3()))
                                     emit(triple(node, VCFL.manifestDigest, literal("sha256:" + stats_by_id[manifest.id]["manifest_sha256"])))
                                     if manifest.tier == 3:

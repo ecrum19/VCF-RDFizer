@@ -1,0 +1,16 @@
+{
+  "source_repository": "https://github.com/ecrum19/vcf-rdfizer-vocabulary",
+  "source_commit": "5bfd19d3c8fc377cd7eda689f3f8cad0d8d9bf8b",
+  "note": "Vendored so SHACL validation works from an installed package, with no vocabulary checkout. test_shacl_default_unit.py re-checks these digests against a sibling checkout when one is present.",
+  "files": {
+    "ontology/vcf-core-vocabulary.bundle.ttl": "20fd2d8820eb3c8d2796175a6e89212bc5ce04f607ab092addc631e4eff2489c",
+    "shacl/vcf-4.1.shacl.ttl": "5eafc441f2bae5c3b19d80dfc34eff0c2c6cefd61b569eadd38900f4343721f9",
+    "shacl/vcf-4.2.shacl.ttl": "186131c85a483eaec457b545a9e1d310b6eccc2c9fadc95aaa37b34946d7e226",
+    "shacl/vcf-4.3.shacl.ttl": "026105bb56660348239e3ada633e5d00a82f74df28b98798e0db2d1906b63470",
+    "shacl/vcf-4.4.shacl.ttl": "98574513333d95993a401e927bd16ff4dad95b1f52bcf5f039c9e3f57227cafb",
+    "shacl/vcf-4.5.shacl.ttl": "230b21c61a089dd109a05971de80dcde8915400114e3f1591f12ce30a195c448",
+    "shacl/vcf-core-consistency.shacl.ttl": "6513ff0aba6b788afe28d558dc9e7062bfdf937ac3e08380e51e12c72d55276f",
+    "shacl/vcf-core-vocabulary-sparql.shacl.ttl": "c032e1e6bc252cd518dc454373e4b4e20b3ed60b8a843c705b3519149ecb2168",
+    "shacl/vcf-core-vocabulary.shacl.ttl": "a5788121e84e98a9497e88debeb652e33cabca6d4a40df6cd5db28c6af049da9"
+  }
+}

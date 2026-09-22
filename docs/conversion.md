@@ -191,7 +191,14 @@ emitted and the values stay available as ordinary INFO values, rather than
 producing a resource that would fail its SHACL shape.
 
 `--info-representation raw` emits only the opaque `vcfc:infoRaw` string, and
-turns off the allele layer with it (the value items join to the alleles).
+drops the value items with it.
+
+The allele layer is *not* tied to the INFO representation. Two layers join to
+`<record>/allele/<index>`: the structured INFO value items, and the expanded
+sample layer's per-call `vcfc:calledAllele`. Either one alone requires the
+alleles, so the layer is emitted when `--info-representation structured` **or**
+`--sample-representation expanded` is in force, and left out only for
+`raw` + `condensed`, where nothing references it.
 
 ### `append_header_representation_rdf` — structured headers
 

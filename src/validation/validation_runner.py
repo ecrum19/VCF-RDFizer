@@ -579,6 +579,15 @@ def emitted_record_counters(
     """
     classes: Counter[str] = Counter()
     predicates: Counter[str] = Counter()
+    # The allele layer is reported separately for the same reason the genotype
+    # layer is: it is not owned by one representation axis. Structured INFO
+    # needs it for the Number=A/R/G value items, and the expanded sample layer
+    # needs it for vcfc:calledAllele, so expected_census merges it when either
+    # asks. Everything the emitter writes inside its ``emit_alleles`` branch --
+    # the contig and assembly links as well as the allele resources -- belongs
+    # here, or the oracle and the emitter would disagree about raw INFO.
+    allele_classes: Counter[str] = Counter()
+    allele_predicates: Counter[str] = Counter()
 
     assembly_contig_ids: set[str] = set()
     reference_alleles = alt_alleles = 0
@@ -600,15 +609,15 @@ def emitted_record_counters(
         # declared reference sequence; the two are mutually exclusive.
         assembly_id = vocab.parse_bracketed_chrom(chrom)
         if assembly_id is not None:
-            predicates["chromAssemblyContig"] += 1
+            allele_predicates["chromAssemblyContig"] += 1
             if assembly_id not in assembly_contig_ids:
                 assembly_contig_ids.add(assembly_id)
-                classes["AssemblyContig"] += 1
-                predicates["assemblyContigId"] += 1
+                allele_classes["AssemblyContig"] += 1
+                allele_predicates["assemblyContigId"] += 1
                 if has_assembly_line:
-                    predicates["declaredInAssembly"] += 1
+                    allele_predicates["declaredInAssembly"] += 1
         elif chrom in contig_ids:
-            predicates["chromosome"] += 1
+            allele_predicates["chromosome"] += 1
 
         alleles = vocab.parse_alt_alleles(ref, alt)
         allele_uris = {allele.index for allele in alleles}
@@ -619,17 +628,17 @@ def emitted_record_counters(
             else:
                 alt_alleles += 1
             if allele.symbolic_id and allele.symbolic_id in alt_declaration_ids:
-                predicates["declaredByAlt"] += 1
+                allele_predicates["declaredByAlt"] += 1
             if allele.symbolic_type:
-                predicates["svType"] += 1
+                allele_predicates["svType"] += 1
             if allele.breakend is not None:
-                classes["Breakend"] += 1
+                allele_classes["Breakend"] += 1
                 if allele.breakend.orientation is not None:
-                    predicates["breakendOrientation"] += 1
+                    allele_predicates["breakendOrientation"] += 1
                 if allele.breakend.replacement:
-                    predicates["breakendReplacementString"] += 1
+                    allele_predicates["breakendReplacementString"] += 1
                 if allele.breakend.is_single:
-                    predicates["isSingleBreakend"] += 1
+                    allele_predicates["isSingleBreakend"] += 1
 
         entries = parse_info_entries(info)
         for key, value in entries:
@@ -708,14 +717,14 @@ def emitted_record_counters(
                     )
 
     if reference_alleles:
-        classes["ReferenceAllele"] = reference_alleles
-        predicates["hasReferenceAllele"] = reference_alleles
+        allele_classes["ReferenceAllele"] = reference_alleles
+        allele_predicates["hasReferenceAllele"] = reference_alleles
     if alt_alleles:
-        classes["AltAllele"] = alt_alleles
-        predicates["hasAltAllele"] = alt_alleles
+        allele_classes["AltAllele"] = alt_alleles
+        allele_predicates["hasAltAllele"] = alt_alleles
     total_alleles = reference_alleles + alt_alleles
     for name in ("alleleIndex", "alleleValue", "alleleKind"):
-        predicates[name] += total_alleles
+        allele_predicates[name] += total_alleles
 
     if value_items:
         classes["FieldValueItem"] += value_items
@@ -749,6 +758,8 @@ def emitted_record_counters(
     return {
         "emittedRecordClasses": dict(classes),
         "emittedRecordPredicates": dict(predicates),
+        "emittedAlleleClasses": dict(allele_classes),
+        "emittedAllelePredicates": dict(allele_predicates),
         "emittedGenotypeClasses": dict(genotype_classes),
         "emittedGenotypePredicates": dict(genotype_predicates),
         "emittedFormatItemClasses": dict(format_item_classes),
@@ -1011,11 +1022,21 @@ def expected_census(
             predicates.get(f"{VCFC}fieldIndex", 0) + values
         )
 
-        # The allele layer, the value items, the SV carriers and the parsed
-        # genotype layer travel with the structured INFO representation.
+        # The value items and the SV carriers travel with the structured INFO
+        # representation. The allele layer does not -- it is merged below.
         for class_name, count in parser["emittedRecordClasses"].items():
             classes[f"{VCFC}{class_name}"] = classes.get(f"{VCFC}{class_name}", 0) + count
         for name, count in parser["emittedRecordPredicates"].items():
+            predicates[f"{VCFC}{name}"] = predicates.get(f"{VCFC}{name}", 0) + count
+
+    # The allele layer is required by whoever joins to it: the structured INFO
+    # value items (Number=A/R/G) or the expanded sample layer's calledAllele.
+    # This mirrors ``allele_layer_required`` in the wrapper; the two must agree
+    # or every raw-INFO expanded run reports a census mismatch.
+    if info_representation == "structured" or representation == "expanded":
+        for class_name, count in parser.get("emittedAlleleClasses", {}).items():
+            classes[f"{VCFC}{class_name}"] = classes.get(f"{VCFC}{class_name}", 0) + count
+        for name, count in parser.get("emittedAllelePredicates", {}).items():
             predicates[f"{VCFC}{name}"] = predicates.get(f"{VCFC}{name}", 0) + count
 
     classes = _nonzero(classes)
@@ -1876,9 +1897,91 @@ def materialize_ntriples(
 SHACL_SAMPLE_LIMIT = 50
 
 
+#: pyshacl writes each result as a "Validation Result in <Component>" block with
+#: an indented "Severity: sh:Violation|sh:Warning|sh:Info" line. It does NOT
+#: write "Constraint Violation", which is what this module looked for -- so the
+#: violation count was always zero and the verdict fell through to pyshacl's
+#: `conforms`, which is False for a warning as readily as for a violation.
+#:
+#: That made the shape layer unusable in both directions at once: it could never
+#: report a real violation, and it failed any graph carrying a recommendation.
+#: The published profile warns whenever an INFO declaration omits Source or
+#: Version, which VCF 4.5 recommends rather than requires, so that is most real
+#: VCFs.
+_SHACL_RESULT_START = "Validation Result in "
+_SHACL_SEVERITY_PREFIX = "Severity:"
+#: Older pyshacl releases used this spelling; kept so a downgrade still parses.
+_SHACL_LEGACY_PREFIXES = {
+    "Constraint Violation": "Violation",
+    "Constraint Warning": "Warning",
+    "Constraint Info": "Info",
+}
+
+
+def parse_shacl_results(text: str) -> list[dict[str, str]]:
+    """Split a pyshacl text report into results tagged by severity.
+
+    Returns one entry per result, each ``{"severity": ..., "text": ...}`` with
+    severity one of ``Violation``, ``Warning``, ``Info`` (or ``Unknown`` when a
+    block carries no severity line, which is treated as a violation by the
+    caller -- an unparseable result must not silently pass).
+    """
+    results: list[dict[str, str]] = []
+    block: list[str] | None = None
+
+    def flush(lines: list[str] | None) -> None:
+        if not lines:
+            return
+        severity = "Unknown"
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith(_SHACL_SEVERITY_PREFIX):
+                token = stripped.split(":", 1)[1].strip()
+                severity = token.rsplit(":", 1)[-1] or "Unknown"
+                break
+        results.append({"severity": severity, "text": "\n".join(lines).strip()})
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        legacy = next(
+            (value for key, value in _SHACL_LEGACY_PREFIXES.items()
+             if stripped.startswith(key)),
+            None,
+        )
+        if stripped.startswith(_SHACL_RESULT_START) or legacy is not None:
+            flush(block)
+            block = [line]
+            if legacy is not None:
+                block.append(f"    Severity: sh:{legacy}")
+            continue
+        if block is not None:
+            block.append(line)
+    flush(block)
+    return results
+
+
+def merge_shapes_graph(shapes: list[Path]):
+    """Parse several shapes files into one graph.
+
+    The published profile is split across files that check different things,
+    and the split matters: the core profile constrains cardinality and datatype
+    (``sh:minCount`` on vcfc:sampleIndex, and so on), while the *uniqueness and
+    agreement* rules -- the ones that catch a corrupted value rather than a
+    missing one -- live in the consistency and SPARQL profiles. Loading only
+    the core profile detects none of the mutation classes the shape layer is
+    supposed to cover.
+    """
+    from rdflib import Graph
+
+    graph = Graph()
+    for path in shapes:
+        graph.parse(str(path), format="turtle")
+    return graph
+
+
 def validate_shacl(
     source: Path,
-    shapes: Path,
+    shapes: Path | list[Path],
     results_dir: Path,
     ontology: Path | None = None,
 ) -> dict[str, Any]:
@@ -1907,19 +2010,25 @@ def validate_shacl(
         result = {
             "status": "EXECUTION_FAILED",
             "error": f"pyshacl is not installed in this image: {error}",
-            "shapes": str(shapes),
+            "shapes": [str(path) for path in (
+                [shapes] if isinstance(shapes, Path) else list(shapes))],
         }
         write_json(report_path, result)
         return result
 
     started = time.monotonic()
     try:
+        shapes_list = [shapes] if isinstance(shapes, Path) else list(shapes)
+        shacl_graph = (
+            str(shapes_list[0]) if len(shapes_list) == 1
+            else merge_shapes_graph(shapes_list)
+        )
         conforms, _graph, text = pyshacl_validate(
             str(source),
-            shacl_graph=str(shapes),
+            shacl_graph=shacl_graph,
             ont_graph=str(ontology) if ontology is not None else None,
             data_graph_format="nt",
-            shacl_graph_format="turtle",
+            **({"shacl_graph_format": "turtle"} if isinstance(shacl_graph, str) else {}),
             ont_graph_format="turtle" if ontology is not None else None,
             inference="rdfs" if ontology is not None else "none",
             advanced=True,
@@ -1928,15 +2037,25 @@ def validate_shacl(
         result = {
             "status": "EXECUTION_FAILED",
             "error": f"SHACL validation could not run: {error}",
-            "shapes": str(shapes),
+            "shapes": [str(path) for path in (
+                [shapes] if isinstance(shapes, Path) else list(shapes))],
         }
         write_json(report_path, result)
         return result
 
+    results = parse_shacl_results(text)
+    # Unknown counts as blocking: a result this parser could not classify is a
+    # parser bug, and the safe reading of a parser bug is not "conformant".
     violations = [
-        line.strip() for line in text.splitlines()
-        if line.strip().startswith("Constraint Violation")
+        entry["text"] for entry in results
+        if entry["severity"] in ("Violation", "Unknown")
     ]
+    advisories = [
+        entry for entry in results
+        if entry["severity"] not in ("Violation", "Unknown")
+    ]
+    advisory_kinds = sorted({entry["severity"] for entry in advisories})
+    advisory_count = len(advisories)
     paths = sorted({
         line.split("Result Path:", 1)[1].strip()
         for line in text.splitlines() if "Result Path:" in line
@@ -1944,12 +2063,18 @@ def validate_shacl(
     log_path = results_dir / "shacl-report.txt"
     log_path.write_text(text, encoding="utf-8")
     result = {
-        "status": "PASS" if conforms else "FAIL",
+        "status": "PASS" if not violations else "FAIL",
+        # Kept verbatim: it is pyshacl's own verdict, and it is NOT the verdict
+        # this run acts on. A graph with warnings only is conforms=False here
+        # and status=PASS, which is the distinction the severities encode.
         "conforms": bool(conforms),
-        "shapes": str(shapes),
+        "shapes": [str(path) for path in shapes_list],
         "ontology": str(ontology) if ontology is not None else None,
         "violationCount": len(violations),
         "violationPaths": paths,
+        "advisoryCount": advisory_count,
+        "advisoryKinds": advisory_kinds,
+        "advisorySample": [entry["text"] for entry in advisories][:SHACL_SAMPLE_LIMIT],
         "report": str(log_path),
         "wallSeconds": time.monotonic() - started,
         "sampleLimitedTo": SHACL_SAMPLE_LIMIT,
@@ -2984,6 +3109,103 @@ def normalize(query_id: str, path: Path) -> Any:
     return rows
 
 
+def derive_anomaly_count_execution(
+    sample_execution: dict[str, Any],
+    sample_query_id: str,
+    raw_dir: Path,
+) -> dict[str, Any] | None:
+    """Synthesize a ``*_count`` result from a sample that did not hit its limit.
+
+    An anomaly preflight is ``SELECT ... LIMIT ANOMALY_SAMPLE_LIMIT``. When it
+    returns fewer rows than that limit it enumerated *every* match, so the exact
+    anomaly total is the number of rows returned and the companion aggregate can
+    only re-derive a number we already hold. Skipping it is not an approximation.
+
+    That matters because the companion is not cheap. Both queries scan the whole
+    graph -- the LIMIT bounds what is returned, not what is examined -- so on a
+    17.1M-triple graph ``preflight_empty_values`` cost 97.0 s and
+    ``preflight_empty_values_count`` a further 94.6 s to report the same zero.
+    Three such scans were 294.1 s of the 298.1 s that all fourteen preflights
+    cost, against 17.1 s for the thirteen semantic queries they precede.
+
+    Returns ``None`` when the sample is truncated or unreadable, in which case
+    the real aggregate must run: the count is then genuinely unknown.
+    """
+    if sample_execution.get("status") != "PASS":
+        return None
+    try:
+        rows = bindings(Path(sample_execution["rawResult"]))
+    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+        return None
+    if len(rows) >= ANOMALY_SAMPLE_LIMIT:
+        return None
+
+    # Write the derived answer in SPARQL Results JSON so every downstream
+    # consumer -- anomaly_count, benchmark.csv, the raw result tree -- reads it
+    # exactly as it reads an executed one.
+    raw_path = raw_dir / f"{sample_query_id}_count.json"
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(
+        raw_path,
+        {
+            "head": {"vars": ["anomalyCount"]},
+            "results": {
+                "bindings": [
+                    {
+                        "anomalyCount": {
+                            "type": "literal",
+                            "datatype": "http://www.w3.org/2001/XMLSchema#integer",
+                            "value": str(len(rows)),
+                        }
+                    }
+                ]
+            },
+        },
+    )
+    return {
+        "status": "PASS",
+        "engine": sample_execution.get("engine"),
+        "exitCode": 0,
+        "wallSeconds": 0.0,
+        "query": None,
+        "rawResult": str(raw_path),
+        "stderr": None,
+        "resourceMetrics": None,
+        # The record says plainly that this was not executed, so a reader never
+        # mistakes a 0.0 s row in benchmark.csv for an impossibly fast scan.
+        "derived": True,
+        "derivedFrom": sample_query_id,
+        "derivedReason": (
+            f"{sample_query_id} returned {len(rows)} of at most "
+            f"{ANOMALY_SAMPLE_LIMIT} rows, so it enumerated every match and the "
+            f"exact count is known without a second full-graph scan"
+        ),
+    }
+
+
+def derived_count_for(
+    query_id: str,
+    executions: dict[str, dict[str, Any]],
+    raw_dir: Path,
+) -> dict[str, Any] | None:
+    """The derived execution for ``query_id``, or None if it must really run.
+
+    Answers one question for the query loop: is this a ``*_count`` companion
+    whose sample already enumerated every match? Anything else -- a semantic
+    query, a preflight that is not part of an anomaly pair, a sample that was
+    truncated or failed -- returns None and is executed normally.
+    """
+    if not query_id.endswith("_count"):
+        return None
+    sample_query_id = query_id[: -len("_count")]
+    if sample_query_id not in ANOMALY_PREFLIGHT_QUERIES:
+        return None
+    sample = executions.get(sample_query_id)
+    if sample is None:
+        return None
+    return derive_anomaly_count_execution(sample, sample_query_id, raw_dir)
+
+
 def anomaly_count(executions: dict[str, dict[str, Any]], query_id: str) -> Any:
     """Exact anomaly total from the companion aggregate, or None if unavailable.
 
@@ -3102,14 +3324,25 @@ def preflight(
             report[query_id] = {"status": "FAIL", "error": f"Expected one aggregate row, got {len(returned)}"}
         elif representation == "expanded":
             actual = {field: binding_int(returned[0], field) for field in ("sampleCallCount", "sampleIdCount", "gtValueNodeCount")}
+            # sampleIdCount counts vcfc:sampleId, which lives on SampleCall --
+            # one per sample PER RECORD. A header-only VCF declares samples and
+            # has no records, so there are no calls to carry the literal and the
+            # count is structurally zero. Expecting sampleCount there fails a
+            # correct graph. The file-scoped sample set is a separate thing and
+            # is checked by the census queries.
             expected = {
                 "sampleCallCount": parser["sampleCount"] * parser["totalRecords"],
-                "sampleIdCount": parser["sampleCount"],
+                "sampleIdCount": (
+                    parser["sampleCount"] if parser["totalRecords"] else 0
+                ),
                 "gtValueNodeCount": parser["sampleCount"] * parser["gtRecordCount"],
             }
             report[query_id] = {"status": "PASS" if actual == expected else "FAIL", "expected": expected, "actual": actual}
         else:
             actual = {field: binding_int(returned[0], field) for field in ("sampleCount", "sampleIdCount", "gtVectorCount")}
+            # The condensed profile's sample set and its sampleId literals are
+            # file-scoped, so both survive a zero-record file; only the
+            # per-record vectors go to zero, which gtRecordCount already says.
             expected = {"sampleCount": parser["sampleCount"], "sampleIdCount": parser["sampleCount"], "gtVectorCount": parser["gtRecordCount"]}
             report[query_id] = {"status": "PASS" if actual == expected else "FAIL", "expected": expected, "actual": actual}
     return report
@@ -3301,6 +3534,9 @@ BENCHMARK_CSV_HEADER = [
     "oracle_wall_seconds",
     "engine_setup_seconds",
     "artifact_origin",
+    # 1 when the row was derived from a sibling query instead of executed.
+    # Exclude these before summing wall_seconds as measured query cost.
+    "derived",
 ]
 
 
@@ -3351,6 +3587,9 @@ def build_benchmark(
             query_id: {
                 "status": execution.get("status"),
                 "wallSeconds": execution.get("wallSeconds"),
+                # True when the answer was derived from a sibling query rather
+                # than executed, so a 0.0 s row is never read as a measurement.
+                "derived": bool(execution.get("derived")),
             }
             for query_id, execution in executions.items()
         }
@@ -3430,6 +3669,7 @@ def write_benchmark_csv(path: Path, benchmark: dict[str, Any]) -> Path:
                     "oracle_wall_seconds": oracle_total,
                     "engine_setup_seconds": engine["setupSeconds"],
                     "artifact_origin": engine["artifactOrigin"] or "",
+                    "derived": 1 if entry.get("derived") else 0,
                 })
     return path
 
@@ -3683,13 +3923,27 @@ def run_validation(args: argparse.Namespace) -> int:
                                 f" ({engine_name})",
                                 flush=True,
                             )
-                        executions[query_id] = engine.execute(
-                            query_id, query_path(query_dir, query_id)
+                        # An anomaly preflight's ``*_count`` companion re-scans
+                        # the whole graph to total what the sample already
+                        # enumerated, whenever the sample came back under its
+                        # LIMIT. Derive it instead: same number, no second scan.
+                        derived = derived_count_for(
+                            query_id, executions, engine_raw_dir
                         )
-                        progress.emit(
-                            "progress", completed=completed, query_id=query_id,
-                            detail=f"{engine_name}: completed {query_id}",
-                        )
+                        if derived is not None:
+                            executions[query_id] = derived
+                            progress.emit(
+                                "progress", completed=completed, query_id=query_id,
+                                detail=f"{engine_name}: derived {query_id}",
+                            )
+                        else:
+                            executions[query_id] = engine.execute(
+                                query_id, query_path(query_dir, query_id)
+                            )
+                            progress.emit(
+                                "progress", completed=completed, query_id=query_id,
+                                detail=f"{engine_name}: completed {query_id}",
+                            )
 
                         # A query that fails, times out, or returns the wrong
                         # answer never stops the suite: its verdict is recorded
@@ -4020,12 +4274,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--shacl-shapes",
-        type=Path,
         default=None,
         help=(
-            "Validate the graph against a SHACL shapes file as an independent "
-            "structural layer. Off by default: pyshacl loads the whole graph "
-            "into memory, so it does not scale to a cohort-sized aggregate"
+            "Validate the graph against SHACL shapes as an independent "
+            "structural layer. Comma-separated: the published profile splits "
+            "cardinality/datatype rules from the uniqueness and agreement "
+            "rules, and only the latter catch a corrupted value"
         ),
     )
     parser.add_argument(
@@ -4172,9 +4426,17 @@ def resolve_args(parser: argparse.ArgumentParser, argv: list[str] | None = None)
     if len({args.comunica_port, args.qlever_port, args.hdt_port}) != 3:
         parser.error("--comunica-port, --qlever-port and --hdt-port must all differ")
     if args.shacl_shapes is not None:
-        args.shacl_shapes = args.shacl_shapes.resolve()
-        if not args.shacl_shapes.is_file():
-            parser.error(f"SHACL shapes file does not exist: {args.shacl_shapes}")
+        # Comma-separated, because the published profile is split across files
+        # and the uniqueness/agreement rules live outside the core one.
+        paths = [
+            Path(token.strip()).resolve()
+            for token in str(args.shacl_shapes).split(",")
+            if token.strip()
+        ]
+        for path in paths:
+            if not path.is_file():
+                parser.error(f"SHACL shapes file does not exist: {path}")
+        args.shacl_shapes = paths
     if args.shacl_ontology is not None:
         args.shacl_ontology = args.shacl_ontology.resolve()
         if not args.shacl_ontology.is_file():

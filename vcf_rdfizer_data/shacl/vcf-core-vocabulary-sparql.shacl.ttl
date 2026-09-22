@@ -1,0 +1,212 @@
+@prefix sh:   <http://www.w3.org/ns/shacl#> .
+@prefix vcfc: <https://w3id.org/vcf-core/vocab#> .
+
+#################################################################
+# VCF Core cross-resource constraints
+#
+# Kept separate from vcf-core-vocabulary.shacl.ttl so validators without
+# SPARQL support can apply the portable core profile.
+#################################################################
+
+vcfc:HeaderOrderingSparqlShape a sh:NodeShape ;
+  sh:targetClass vcfc:VCFHeader ;
+  sh:sparql [
+    sh:message "Header-line indices must be unique within a VCF header."@en ;
+    sh:select """
+      SELECT $this WHERE {
+        $this vcfc:hasHeaderLine ?left, ?right .
+        ?left vcfc:lineIndex ?index .
+        ?right vcfc:lineIndex ?index .
+        FILTER (?left != ?right)
+      }
+    """
+  ] ;
+  sh:sparql [
+    sh:message "The fileformat header line must have lineIndex 1."@en ;
+    sh:select """
+      SELECT $this WHERE {
+        $this vcfc:hasHeaderLine ?line .
+        ?line a vcfc:FileFormatHeaderLine ; vcfc:lineIndex ?index .
+        FILTER (?index != 1)
+      }
+    """
+  ] ;
+  sh:sparql [
+    sh:message "Structured header-line ID attributes must be unique within their header type."@en ;
+    sh:select """
+      SELECT $this WHERE {
+        $this vcfc:hasHeaderLine ?left, ?right .
+        ?left a ?type ; vcfc:hasAttribute ?leftAttribute .
+        ?right a ?type ; vcfc:hasAttribute ?rightAttribute .
+        ?leftAttribute vcfc:attributeKey "ID" ; vcfc:attributeValue ?id .
+        ?rightAttribute vcfc:attributeKey "ID" ; vcfc:attributeValue ?id .
+        FILTER (?left != ?right)
+        FILTER (?type IN (vcfc:INFOHeaderLine, vcfc:FORMATHeaderLine,
+                          vcfc:FILTERHeaderLine, vcfc:ALTHeaderLine,
+                          vcfc:MetaHeaderLine, vcfc:SampleHeaderLine,
+                          vcfc:PedigreeHeaderLine, vcfc:ContigHeaderLine))
+      }
+    """
+  ] .
+
+vcfc:VCFFileOrderingSparqlShape a sh:NodeShape ;
+  sh:targetClass vcfc:VCFFile ;
+  sh:sparql [
+    sh:message "Record indices must be unique within a VCF file."@en ;
+    sh:select """
+      SELECT $this WHERE {
+        $this vcfc:hasRecord ?left, ?right .
+        ?left vcfc:recordIndex ?index .
+        ?right vcfc:recordIndex ?index .
+        FILTER (?left != ?right)
+      }
+    """
+  ] ;
+  sh:sparql [
+    sh:message "Sample names and sample indices must be unique within a VCF file's SampleSet."@en ;
+    sh:select """
+      SELECT $this WHERE {
+        $this vcfc:hasSampleSet ?set .
+        ?set vcfc:hasSample ?left, ?right .
+        FILTER (?left != ?right)
+        { ?left vcfc:sampleName ?name . ?right vcfc:sampleName ?name }
+        UNION
+        { ?left vcfc:sampleIndex ?index . ?right vcfc:sampleIndex ?index }
+      }
+    """
+  ] ;
+  sh:sparql [
+    sh:message "Non-missing record ID strings must be unique within a VCF file."@en ;
+    sh:select """
+      SELECT $this WHERE {
+        $this vcfc:hasRecord ?left, ?right .
+        ?left vcfc:recordId ?id .
+        ?right vcfc:recordId ?id .
+        FILTER (?left != ?right && STR(?id) != ".")
+      }
+    """
+  ] ;
+  sh:sparql [
+    sh:message "Record positions must be nondecreasing within a CHROM block."@en ;
+    sh:select """
+      SELECT $this WHERE {
+        $this vcfc:hasRecord ?earlier, ?later .
+        ?earlier vcfc:chrom ?chrom ; vcfc:recordIndex ?earlierIndex ; vcfc:pos ?earlierPos .
+        ?later vcfc:chrom ?chrom ; vcfc:recordIndex ?laterIndex ; vcfc:pos ?laterPos .
+        FILTER (?earlierIndex < ?laterIndex && ?earlierPos > ?laterPos)
+      }
+    """
+  ] ;
+  sh:sparql [
+    sh:message "Records for one CHROM must form a contiguous record-index block."@en ;
+    sh:select """
+      SELECT $this WHERE {
+        $this vcfc:hasRecord ?first, ?middle, ?last .
+        ?first vcfc:chrom ?chrom ; vcfc:recordIndex ?firstIndex .
+        ?middle vcfc:chrom ?otherChrom ; vcfc:recordIndex ?middleIndex .
+        ?last vcfc:chrom ?chrom ; vcfc:recordIndex ?lastIndex .
+        FILTER (?chrom != ?otherChrom)
+        FILTER (?firstIndex < ?middleIndex && ?middleIndex < ?lastIndex)
+      }
+    """
+  ] ;
+  sh:sparql [
+    sh:message "A VCF RDF graph must not mix expanded sample calls and condensed call matrices."@en ;
+    sh:select """
+      SELECT $this WHERE {
+        $this vcfc:hasRecord/vcfc:hasCall ?expandedCall, ?condensedCall .
+        ?expandedCall vcfc:hasSampleCall ?sampleCall .
+        ?condensedCall vcfc:hasCallMatrix ?matrix .
+      }
+    """
+  ] ;
+  sh:sparql [
+    sh:message "GT must be the first FORMAT key when it is present."@en ;
+    sh:select """
+      SELECT $this WHERE {
+        $this vcfc:hasRecord/vcfc:hasCall ?call .
+        ?call vcfc:formatRaw ?format .
+        FILTER (REGEX(STR(?format), "(^|:)GT(:|$)") && !REGEX(STR(?format), "^GT(:|$)"))
+      }
+    """
+  ] .
+
+vcfc:RecommendedHeaderSparqlShape a sh:NodeShape ;
+  sh:targetClass vcfc:VCFFile ;
+  sh:severity sh:Warning ;
+  sh:sparql [
+    sh:message "VCF 4.5 recommends contig declarations for files with records."@en ;
+    sh:select """
+      SELECT $this WHERE {
+        $this vcfc:hasRecord ?record .
+        FILTER NOT EXISTS {
+          $this vcfc:hasHeader/vcfc:hasHeaderLine ?contig .
+          ?contig a vcfc:ContigHeaderLine .
+        }
+      }
+    """
+  ] ;
+  sh:sparql [
+    sh:message "VCF 4.5 recommends reference metadata for files with records."@en ;
+    sh:select """
+      SELECT $this WHERE {
+        $this vcfc:hasRecord ?record .
+        FILTER NOT EXISTS { $this vcfc:referenceGenome ?reference }
+      }
+    """
+  ] .
+
+vcfc:RecordContigBoundSparqlShape a sh:NodeShape ;
+  sh:targetClass vcfc:VCFRecord ;
+  sh:sparql [
+    sh:message "POS must not exceed the declared contig length plus one."@en ;
+    sh:select """
+      SELECT $this WHERE {
+        $this vcfc:pos ?pos ; vcfc:chromosome ?contig .
+        ?contig vcfc:contigLength ?length .
+        FILTER (?pos > ?length + 1)
+      }
+    """
+  ] .
+
+# SV tuple rules are scoped by version in vcf-4.x.shacl.ttl.
+
+vcfc:SampleCallLocalAlleleSparqlShape a sh:NodeShape ;
+  sh:targetClass vcfc:SampleCall ;
+  sh:sparql [
+    sh:message "A local-allele FORMAT key requires LAA, positioned after GT when GT is present."@en ;
+    sh:select """
+      SELECT $this WHERE {
+        $this ^vcfc:hasSampleCall/vcfc:formatRaw ?format .
+        FILTER (REGEX(STR(?format), "(^|:)(LAD|LADF|LADR|LEC|LGL|LGP|LPL|LPP)(:|$)") &&
+                (!REGEX(STR(?format), "(^|:)LAA(:|$)") ||
+                 (!REGEX(STR(?format), "(^|:)GT(:|$)") && !REGEX(STR(?format), "^LAA(:|$)")) ||
+                 (REGEX(STR(?format), "(^|:)GT(:|$)") && !REGEX(STR(?format), "^GT:LAA(:|$)"))))
+      }
+    """
+  ] ;
+  sh:sparql [
+    sh:message "PS and PSL must not both be populated for the same sample call."@en ;
+    sh:select """
+      SELECT $this WHERE {
+        $this vcfc:hasFormatValue ?ps, ?psl .
+        ?ps vcfc:declaredBy/vcfc:fieldId "PS" ; vcfc:fieldValue ?psValue .
+        FILTER (STR(?psValue) != ".")
+        ?psl vcfc:declaredBy/vcfc:fieldId "PSL" ; vcfc:fieldValue ?pslValue .
+        FILTER (STR(?pslValue) != ".")
+      }
+    """
+  ] .
+
+vcfc:FieldAritySparqlShape a sh:NodeShape ;
+  sh:targetClass vcfc:FieldDefinition ;
+  sh:sparql [
+    sh:message "fieldArity must agree with the lossless fieldNumber token."@en ;
+    sh:select """
+      SELECT $this WHERE {
+        $this vcfc:fieldArity ?arity ; vcfc:fieldNumber ?number .
+        ?arity vcfc:arityCode ?code .
+        FILTER (STR(?number) != STR(?code))
+      }
+    """
+  ] .

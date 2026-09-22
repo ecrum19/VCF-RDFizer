@@ -19,6 +19,11 @@ import shutil
 import subprocess
 import sys
 import time
+
+try:  # POSIX only; the container is Linux, but the module imports on Windows too.
+    import resource
+except ImportError:  # pragma: no cover - Windows
+    resource = None
 from pathlib import Path
 
 
@@ -162,6 +167,13 @@ def stream_chunks(
         "target_chunk_bytes": target_bytes,
         "min_chunk_bytes": min_bytes,
         "max_chunk_bytes": max_bytes,
+        # Wall time spent decompressing the aggregate and writing chunks,
+        # accumulated across resumptions of the generator. This pass is SHARED:
+        # one stream feeds every requested representation, and each chunk is
+        # unlinked once all of them have consumed it. Recording it separately is
+        # what lets a reader see that the 99 GB read happens once, which the
+        # per-method totals alone cannot show -- they exclude it entirely.
+        "chunk_stream_seconds": 0.0,
         "chunks": [],
     }
 
@@ -175,9 +187,12 @@ def stream_chunks(
         record_count = 0
         chunk_index = 0
         last_progress_offset = 0
+        chunk_started = None
+        stream_seconds = 0.0
 
         def open_chunk():
-            nonlocal handle, chunk_path, chunk_size, chunk_start_offset, chunk_start_record, chunk_index
+            nonlocal handle, chunk_path, chunk_size, chunk_start_offset, chunk_start_record, chunk_index, chunk_started
+            chunk_started = time.perf_counter()
             chunk_path = chunk_dir / f"chunk-{chunk_index:05d}.nt"
             chunk_index += 1
             handle = chunk_path.open("wb")
@@ -186,7 +201,7 @@ def stream_chunks(
             chunk_start_record = record_count
 
         def close_chunk():
-            nonlocal handle, chunk_path, chunk_size
+            nonlocal handle, chunk_path, chunk_size, chunk_started
             if handle is None or chunk_path is None:
                 return None
             handle.close()
@@ -199,6 +214,13 @@ def stream_chunks(
                 "end_uncompressed_byte": logical_offset,
                 "record_count": record_count - chunk_start_record,
                 "payload_bytes": chunk_size,
+                # Time to read and write THIS chunk, so a slow one is
+                # attributable instead of hidden in a build total.
+                "write_seconds": (
+                    time.perf_counter() - chunk_started
+                    if chunk_started is not None
+                    else None
+                ),
             }
             plan["chunks"].append(metadata)
             plan["chunk_count"] = len(plan["chunks"])
@@ -221,6 +243,7 @@ def stream_chunks(
             return completed_path, metadata
 
         try:
+            resumed_at = time.perf_counter()
             for line in iter_rdf_lines(source):
                 if not line.endswith(b"\n"):
                     raise ValueError(f"RDF source contains a non-line-terminated record: {source}")
@@ -233,7 +256,12 @@ def stream_chunks(
                 ):
                     completed_chunk = close_chunk()
                     if completed_chunk is not None:
+                        # Stop the clock across the yield: the consumer's build
+                        # time is its own, not this stream's.
+                        stream_seconds += time.perf_counter() - resumed_at
+                        plan["chunk_stream_seconds"] = stream_seconds
                         yield completed_chunk
+                        resumed_at = time.perf_counter()
                     open_chunk()
 
                 handle.write(line)
@@ -258,6 +286,8 @@ def stream_chunks(
                     last_progress_offset = logical_offset
 
             completed_chunk = close_chunk()
+            stream_seconds += time.perf_counter() - resumed_at
+            plan["chunk_stream_seconds"] = stream_seconds
             if completed_chunk is not None:
                 yield completed_chunk
         finally:
@@ -425,6 +455,54 @@ def parse_time_log(path: Path) -> dict:
     }
 
 
+def directory_tree_bytes(root: Path) -> int | None:
+    """Total size of the files under ``root``, or None if it cannot be read.
+
+    Symlinks are not followed and their targets are not counted, so a link into
+    a mounted output tree cannot inflate the scratch figure.
+    """
+    # rglob on a missing directory yields nothing and raises nothing, so an
+    # absent workspace would otherwise report a confident 0.
+    if not root.is_dir():
+        return None
+    total = 0
+    try:
+        for path in root.rglob("*"):
+            try:
+                if path.is_symlink() or not path.is_file():
+                    continue
+                total += path.stat().st_size
+            except OSError:
+                continue
+    except OSError:
+        return None
+    return total
+
+
+def children_peak_rss_kb() -> int | None:
+    """Peak RSS of every child process reaped so far, in KB.
+
+    A fallback for the common case where GNU ``time -v`` is not in the image:
+    ``max_rss_kb`` was null for every hdt and cottas total in the benchmark
+    campaign, which left the stage taking 90% of wall time reporting no memory
+    at all -- while the mapping stage, taking under 0.3%, reported 1.3-1.8 GB.
+    A feasibility claim cannot rest on the wrong stage's number.
+
+    This is a high-water mark across all children, not a per-stage delta, so it
+    is meaningful as a run maximum and is recorded that way.
+    """
+    if resource is None:
+        return None
+    try:
+        peak = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+    except (OSError, ValueError):
+        return None
+    if not peak:
+        return None
+    # Linux reports kilobytes; macOS and the BSDs report bytes.
+    return int(peak // 1024) if sys.platform == "darwin" else int(peak)
+
+
 class StageRunner:
     """Execute stages and accumulate both detailed and method-level metrics."""
 
@@ -433,6 +511,27 @@ class StageRunner:
         self.progress_path = progress_path
         prepare_progress_path(progress_path)
         self.stages: list[dict] = []
+
+    def peak_workspace_bytes(self) -> int | None:
+        """Highest workspace-tree size seen across every stage so far.
+
+        Measures the tree, not the filesystem. ``shutil.disk_usage`` on /work
+        reports the whole backing device: on bench-1 that read 126,956,531,712
+        bytes -- 127 GB of host disk in use -- for a build whose scratch was a
+        single 11.9 MB chunk. Free-space deltas are equally unusable, because
+        anything else on the host moves them.
+
+        The host-side out-tree trace cannot see this directory, and the two
+        numbers must never be added: one is the published artifact tree, this
+        is the container's scratch.
+        """
+        peaks = [
+            stage[key]
+            for stage in self.stages
+            for key in ("workspace_tree_bytes_before", "workspace_tree_bytes_after")
+            if stage.get(key) is not None
+        ]
+        return max(peaks) if peaks else None
 
     def run(
         self,
@@ -459,6 +558,7 @@ class StageRunner:
         started = time.perf_counter()
         workspace_free_before = None
         workspace_total = None
+        workspace_tree_before = directory_tree_bytes(self.work_dir)
         try:
             workspace_usage = shutil.disk_usage(self.work_dir)
             workspace_free_before = workspace_usage.free
@@ -529,6 +629,13 @@ class StageRunner:
             if output_path is not None and output_path.is_file()
             else 0,
         }
+        workspace_tree_after = directory_tree_bytes(self.work_dir)
+        if workspace_tree_before is not None:
+            result["workspace_tree_bytes_before"] = workspace_tree_before
+        if workspace_tree_after is not None:
+            result["workspace_tree_bytes_after"] = workspace_tree_after
+        # Device-level figures are kept because a build that fills the volume
+        # needs them to say so -- but they describe the HOST, not this build.
         try:
             workspace_usage = shutil.disk_usage(self.work_dir)
             result["workspace_free_bytes_after"] = workspace_usage.free
@@ -542,6 +649,15 @@ class StageRunner:
         if stderr_tail:
             result["stderr_tail"] = stderr_tail
         result.update(parse_time_log(time_path))
+        if result.get("max_rss_kb") is None:
+            # GNU time is absent or did not report. Fall back to the kernel's
+            # own accounting rather than recording nothing.
+            fallback_rss = children_peak_rss_kb()
+            if fallback_rss is not None:
+                result["max_rss_kb"] = fallback_rss
+                result["max_rss_source"] = "rusage_children_highwater"
+        elif result.get("max_rss_source") is None:
+            result["max_rss_source"] = "gnu_time"
         self.stages.append({"name": name, **result})
         time_path.unlink(missing_ok=True)
         return result
@@ -644,6 +760,59 @@ def merge_pairwise(
             next_paths.append(merged)
         current = next_paths
     return (current[0] if current else None), rounds
+
+
+def build_profile(runner: "StageRunner", plan: dict | None) -> dict:
+    """Where the representation build's time and disk actually went.
+
+    The benchmark campaign could attribute 90% of end-to-end wall time to "the
+    representation build" and no further: per-chunk and per-merge timings were
+    collected by StageRunner and then dropped at the wrapper boundary, the
+    shared chunk pass was never timed at all, and max_rss_kb was null for both
+    representations. This turns that opaque block into a breakdown.
+    """
+    buckets: dict[str, dict] = {}
+    for stage in runner.stages:
+        name = str(stage.get("name") or "")
+        if "-merge-r" in name:
+            kind = f"{name.split('-merge-r', 1)[0]}-merge"
+        elif name.startswith("hdt-build-"):
+            kind = "hdt-chunk-build"
+        elif name.startswith("cottas-build-"):
+            kind = "cottas-chunk-build"
+        else:
+            kind = name
+        bucket = buckets.setdefault(
+            kind, {"stage_count": 0, "wall_seconds": 0.0, "max_rss_kb": None}
+        )
+        bucket["stage_count"] += 1
+        bucket["wall_seconds"] += float(stage.get("wall_seconds") or 0.0)
+        rss = stage.get("max_rss_kb")
+        if rss is not None:
+            bucket["max_rss_kb"] = max(bucket["max_rss_kb"] or 0, int(rss))
+
+    merge_rounds: dict[str, int] = {}
+    for stage in runner.stages:
+        name = str(stage.get("name") or "")
+        if "-merge-r" in name:
+            prefix, _, rest = name.partition("-merge-r")
+            round_number = int(rest.split("-", 1)[0])
+            merge_rounds[prefix] = max(merge_rounds.get(prefix, 0), round_number)
+
+    return {
+        # Shared across every representation: one decompress, one chunk write.
+        "chunk_stream_seconds": (plan or {}).get("chunk_stream_seconds"),
+        "chunk_count": (plan or {}).get("chunk_count"),
+        "chunk_input_bytes": (plan or {}).get("chunk_input_bytes"),
+        "by_stage_kind": buckets,
+        "merge_rounds": merge_rounds,
+        "peak_volume_workspace_bytes": runner.peak_workspace_bytes(),
+        "max_rss_kb": max(
+            (int(stage["max_rss_kb"]) for stage in runner.stages
+             if stage.get("max_rss_kb") is not None),
+            default=None,
+        ),
+    }
 
 
 def main() -> int:
@@ -1132,6 +1301,7 @@ def main() -> int:
                 "methods": results,
                 "stages": runner.stages,
                 "index_warnings": index_warnings,
+                "build_profile": build_profile(runner, plan),
             }
         )
         return 0
@@ -1144,7 +1314,13 @@ def main() -> int:
                 "one raw chunk plus the in-progress HDT/COTTAS artifacts. Reduce "
                 "--chunk-target-bytes and --chunk-max-bytes, or increase Docker's disk limit."
             )
-        write_result({"exit_code": 1, "methods": results, "stages": runner.stages, "error": error})
+        write_result({
+            "exit_code": 1,
+            "methods": results,
+            "stages": runner.stages,
+            "build_profile": build_profile(runner, locals().get("plan")),
+            "error": error,
+        })
         print(f"partitioned compression failed: {error}", file=sys.stderr)
         return 1
 

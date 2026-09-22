@@ -1,0 +1,39 @@
+Validation Report
+Conforms: False
+Results (6):
+Validation Result in MinCountConstraintComponent (http://www.w3.org/ns/shacl#MinCountConstraintComponent):
+	Severity: sh:Warning
+	Source Shape: [ sh:datatype xsd:string ; sh:message Literal("VCF 4.5 recommends Source on INFO declarations.", lang=en) ; sh:minCount Literal("1", datatype=xsd:integer) ; sh:path vcfc:fieldSource ; sh:severity sh:Warning ]
+	Focus Node: <file://test-1k.vcf#header/line/11>
+	Result Path: vcfc:fieldSource
+	Message: VCF 4.5 recommends Source on INFO declarations.
+Validation Result in MinCountConstraintComponent (http://www.w3.org/ns/shacl#MinCountConstraintComponent):
+	Severity: sh:Warning
+	Source Shape: [ sh:datatype xsd:string ; sh:message Literal("VCF 4.5 recommends Source on INFO declarations.", lang=en) ; sh:minCount Literal("1", datatype=xsd:integer) ; sh:path vcfc:fieldSource ; sh:severity sh:Warning ]
+	Focus Node: <file://test-1k.vcf#header/line/9>
+	Result Path: vcfc:fieldSource
+	Message: VCF 4.5 recommends Source on INFO declarations.
+Validation Result in MinCountConstraintComponent (http://www.w3.org/ns/shacl#MinCountConstraintComponent):
+	Severity: sh:Warning
+	Source Shape: [ sh:datatype xsd:string ; sh:message Literal("VCF 4.5 recommends Source on INFO declarations.", lang=en) ; sh:minCount Literal("1", datatype=xsd:integer) ; sh:path vcfc:fieldSource ; sh:severity sh:Warning ]
+	Focus Node: <file://test-1k.vcf#header/line/10>
+	Result Path: vcfc:fieldSource
+	Message: VCF 4.5 recommends Source on INFO declarations.
+Validation Result in MinCountConstraintComponent (http://www.w3.org/ns/shacl#MinCountConstraintComponent):
+	Severity: sh:Warning
+	Source Shape: [ sh:datatype xsd:string ; sh:message Literal("VCF 4.5 recommends Version on INFO declarations.", lang=en) ; sh:minCount Literal("1", datatype=xsd:integer) ; sh:path vcfc:fieldVersion ; sh:severity sh:Warning ]
+	Focus Node: <file://test-1k.vcf#header/line/11>
+	Result Path: vcfc:fieldVersion
+	Message: VCF 4.5 recommends Version on INFO declarations.
+Validation Result in MinCountConstraintComponent (http://www.w3.org/ns/shacl#MinCountConstraintComponent):
+	Severity: sh:Warning
+	Source Shape: [ sh:datatype xsd:string ; sh:message Literal("VCF 4.5 recommends Version on INFO declarations.", lang=en) ; sh:minCount Literal("1", datatype=xsd:integer) ; sh:path vcfc:fieldVersion ; sh:severity sh:Warning ]
+	Focus Node: <file://test-1k.vcf#header/line/9>
+	Result Path: vcfc:fieldVersion
+	Message: VCF 4.5 recommends Version on INFO declarations.
+Validation Result in MinCountConstraintComponent (http://www.w3.org/ns/shacl#MinCountConstraintComponent):
+	Severity: sh:Warning
+	Source Shape: [ sh:datatype xsd:string ; sh:message Literal("VCF 4.5 recommends Version on INFO declarations.", lang=en) ; sh:minCount Literal("1", datatype=xsd:integer) ; sh:path vcfc:fieldVersion ; sh:severity sh:Warning ]
+	Focus Node: <file://test-1k.vcf#header/line/10>
+	Result Path: vcfc:fieldVersion
+	Message: VCF 4.5 recommends Version on INFO declarations.
