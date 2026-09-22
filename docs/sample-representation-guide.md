@@ -113,29 +113,57 @@ Let:
 
 - `V` = number of variant records;
 - `S` = number of samples;
-- `F` = average number of FORMAT fields per record.
+- `F` = number of FORMAT keys on a record;
+- `p` = ploidy of a genotype, and `r` the positions in it that resolve to an
+  allele (`r ≤ p`).
 
-Expanded mode creates approximately:
-
-```text
-V × S       SampleCall resources
-V × S × F   FormatFieldValue resources
-```
-
-In the simplified case where each sample call has four structural statements
-(link, type, sample ID, and `forSample`), and each FORMAT value has four
-statements (link, type, `declaredBy`, and value), the sample portion of the
-graph contains approximately:
+Both profiles begin with the same file-level block, which is why it cancels out
+of every comparison below:
 
 ```text
-4 × (V × S) + 4 × (V × S × F)
+B = 3 + 5S + D
 ```
 
-statements, before counting the parsed genotype layer and the rest of the VCF
-graph. A diploid `GT` adds roughly nine more statements per sample call: five
-for the `vcfc:Genotype` and four for each `vcfc:GenotypeAlleleCall`.
+one statement for `vcfc:representationProfile`, two for the `vcfc:SampleSet`,
+five per sample column (`hasSample`, `rdf:type`, `sampleName`, `sampleIndex`,
+and the `#CHROM` line's `hasGenotypeColumns`), and `D` for the FORMAT
+definitions — **one** statement per distinct key declared by a `##FORMAT` line,
+since the header emitter owns its attributes, or **six** for an undeclared key
+the sample emitter has to synthesize. With every key declared, `D = F`.
 
-For the worked example (`V=1`, `S=3`, `F=3`):
+Expanded mode then emits, per record and sample:
+
+```text
+T_expanded = B + V × S × (4 + Σ c_k)
+```
+
+Four statements for the `vcfc:SampleCall` — `hasSampleCall`, `rdf:type`,
+`sampleId`, `forSample` — plus `c_k` for each FORMAT key `k`:
+
+| Contribution to `c_k` | Statements | When |
+|---|---:|---|
+| `hasFormatValue`, `rdf:type`, `declaredBy` | 3 | always |
+| `fieldValue` | 1 | the cell is not empty |
+| `fieldValueInteger` / `fieldValueDecimal` | 1 | single-valued, declared `Integer`/`Float`, and parses |
+| `vcfc:FieldValueItem` | 5 per item | the declared `Number` makes positions meaningful (`A`, `R`, `LA`, `LR`, `G`, `LG`, `P`, and the version's tuple keys); a sixth per item for a tuple key's `tupleArity` |
+| the genotype layer | `5 + 5p + r` | `k` is `GT` |
+
+The genotype layer is five statements for the `vcfc:Genotype`
+(`hasGenotype`, `rdf:type`, `genotypeString`, `ploidy`, `phasingStatus`), five
+per position for the `vcfc:GenotypeAlleleCall` (`hasAlleleCall`, `rdf:type`,
+`callIndex`, `isNoCall`, `phaseIndicator`), and one `calledAllele` per position
+that names an allele the record actually has. A fully resolvable diploid gives
+`5 + 10 + 2 = 17`; a `./.` gives 15, since a no-call calls no allele. `GT` is a
+String, so it earns no typed companion and costs `4 + 17 = 21` in total.
+
+In the simplest uniform case — `F` single-valued `Integer`/`Float` keys, no
+`GT` — every `c_k` is 5 and the whole expression collapses to:
+
+```text
+T_expanded = 3 + 5S + F + V × S × (4 + 5F)
+```
+
+For the worked example (`V=1`, `S=3`, `FORMAT=GT:DP:AD` on a biallelic record):
 
 | Expanded item | Count |
 |---|---:|
@@ -143,17 +171,15 @@ For the worked example (`V=1`, `S=3`, `F=3`):
 | `FormatFieldValue` resources | 9 |
 | `Genotype` resources | 3 |
 | `GenotypeAlleleCall` resources | 6 |
-| Approximate sample-related statements | 75 |
-| File-level `SampleSet` + `VCFSample` statements | 18 |
+| `FieldValueItem` resources (`AD` is `Number=R`) | 6 |
+| Per-sample statements (`3 × 44`) | 132 |
+| File-level `SampleSet` + `VCFSample` statements | 17 |
+| FORMAT definition statements | 3 |
 | Representation-profile statement | 1 |
+| **Total** | **153** |
 
-The genotype layer makes expanded mode more expensive than it was, which sharpens
-rather than changes the trade-off below: expanded mode buys direct queryability
-at a cost that multiplies by both samples and FORMAT fields.
-
-The exact number can vary when values are missing or when custom mappings add
-properties, but the important pattern is the multiplication by both samples
-and FORMAT fields.
+Expanded mode buys direct queryability at a cost that multiplies by both
+samples and FORMAT fields.
 
 ## 3. Condensed representation: shared samples plus ordered vectors
 
@@ -236,27 +262,39 @@ record-level ID/FILTER/FORMAT-key decompositions are all emitted the same way.
 
 ### Condensed growth
 
-Using the same variables, condensed mode creates approximately:
+Condensed mode emits the same file-level block `B`, then three statements per
+record for the `vcfc:CohortCallMatrix` — `hasCallMatrix`, `rdf:type`,
+`appliesToSampleSet` — and five per vector: `hasFormatValueVector`, `rdf:type`,
+`declaredBy`, `valueEncoding`, `encodedValues`.
 
 ```text
-S       reusable sample descriptions
-V       cohort matrices
-V × F   format-value vectors
-F       shared FORMAT definitions (per file/header)
+T_condensed = B + V × (3 + 5F)
+            = 3 + 5S + F + V × (3 + 5F)
 ```
 
-The RDF structure grows roughly with `S + V + (V × F)`, while each vector
-literal still contains the `S` values for that variant and key.
+with every key declared. `--sample-data-raw` adds one more statement per record.
 
-For `V=1`, `S=3`, and `F=3`, the graph has approximately:
+Two properties follow directly, and they are the point of the profile:
+
+- **`S` appears only in the file-level term.** The `S` values for a variant and
+  key live inside one `encodedValues` literal, not as `S` separate statements.
+- **The count is independent of ploidy, of `GT`, and of how many values a
+  FORMAT key holds.** The genotype layer and the `vcfc:FieldValueItem`
+  decomposition are expanded-only, so a `Number=R` field costs a condensed
+  graph exactly what a scalar does.
+
+For the worked example (`V=1`, `S=3`, `FORMAT=GT:DP:AD`):
 
 | Condensed item | Count |
 |---|---:|
 | Reusable `VCFSample` resources | 3 |
 | `CohortCallMatrix` resources | 1 |
 | `FormatValueVector` resources | 3 |
-| Shared FORMAT definitions | 3 |
-| Vector literals containing sample values | 3 |
+| Per-record statements (`3 + 5 × 3`) | 18 |
+| File-level `SampleSet` + `VCFSample` statements | 17 |
+| FORMAT definition statements | 3 |
+| Representation-profile statement | 1 |
+| **Total** | **39** |
 
 Because a condensed graph has fixed metadata for the sample set, matrix, and
 FORMAT definitions, it can be similar in size to—or even slightly larger than—
@@ -273,43 +311,49 @@ S = 2,500 samples
 F = 3 FORMAT fields
 ```
 
-### Expanded counts
+### The difference
+
+Subtracting the two closed forms, the shared file-level block cancels and the
+whole difference is per-record:
 
 ```text
-SampleCall resources:       1,000 × 2,500 = 2,500,000
-FormatFieldValue resources: 1,000 × 2,500 × 3 = 7,500,000
-Total per-value resources:  10,000,000
+ΔT = T_expanded − T_condensed = V × [ S × (4 + Σ c_k) − (3 + 5F) ]
 ```
 
-Using the simplified three-statements-per-resource estimate, this is about
-30,000,000 sample-related RDF statements.
-
-### Condensed counts
+and the ratio has a limit that depends only on the cohort width:
 
 ```text
-Reusable samples:       2,500
-Cohort matrices:        1,000
-Format-value vectors:   1,000 × 3 = 3,000
-FORMAT definitions:     3
+T_expanded / T_condensed  ──V→∞──▶  S × (4 + Σ c_k) / (3 + 5F)  ──F→∞──▶  S
 ```
 
-That is roughly 6,500 resources in the sample representation, plus vector
-literals containing the same 7,500,000 scalar values. Counting the explicit
-statements emitted by the built-in condensed writer gives about 28,000
-sample-related statements for this simplified case (the exact total depends on
-header metadata and other record properties).
+Condensation removes exactly the per-sample dimension, so the saving in
+statements approaches the number of samples. Convergence in `V` is slow while
+`S` is large, because the `5S` term dominates `T_condensed` until `V ≫ S`.
 
-So the RDF *structure* is reduced by roughly:
+### Counts for the example cohort
 
-```text
-30,000,000 ÷ 28,000 ≈ 1,070×
-```
+Expanded totals depend on the FORMAT shape, so three are given. Condensed is
+**30,506** in every one of them — it does not depend on `Σ c_k` at all:
 
-This does not mean the compressed file will always be 1,070 times smaller. The
-75 million values still exist inside vector literals, and their text length,
+| FORMAT shape | per sample call | Expanded | Condensed | Ratio |
+|---|---:|---:|---:|---:|
+| 3 single-valued typed scalars, no `GT` | 19 | 47,512,506 | 30,506 | 1,557× |
+| `GT` + 2 typed scalars, diploid | 35 | 87,512,506 | 30,506 | 2,869× |
+| `GT:DP:AD`, diploid, biallelic | 44 | 110,012,506 | 30,506 | 3,606× |
+
+The limit for the first shape is `2,500 × 19/18 ≈ 2,639×`, which the ratio at
+`V = 1,000` has not yet reached.
+
+This does not mean the compressed file shrinks by the same factor. The same
+scalar values still exist inside the vector literals, and their text length,
 escaping, dictionary compression, and the rest of the VCF graph affect the
 final `.nt`, `.hdt`, or `.cottas` size. The large saving is the removal of
 millions of repeated RDF nodes, predicates, and type statements.
+
+Every constant in these formulas is asserted against the emitters' real output
+in [`test/test_representation_growth_unit.py`](../test/test_representation_growth_unit.py),
+so a change to any per-resource triple count fails a test that names the
+resource it belongs to.
 
 ## 5. Why VCF-RDFizer keeps both strategies
 
