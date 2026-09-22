@@ -5155,87 +5155,6 @@ def hdt_strategy_rejection(
     return None
 
 
-def cottas_condensed_resolution(
-    *,
-    engines: list[str],
-    sample_representation: str,
-    requested_all: bool,
-    allow: bool,
-) -> tuple[list[str], str | None, str | None]:
-    """Resolve the cottas x condensed combination.
-
-    Returns ``(engines, warning, refusal)``. Exactly one of warning/refusal is
-    ever set, and the distinction is deliberate:
-
-    * naming ``cottas`` explicitly is a request the tool cannot honour, so it
-      is refused rather than silently ignored; but
-    * ``--validation-engine all`` is a request for breadth, and dropping the
-      one engine that cannot finish serves that better than failing the run.
-      The campaign's 06_equivalence used ``all`` and hung twice; under this it
-      would have completed on the other three engines and said why.
-    """
-    refusal = cottas_condensed_engine_rejection(
-        engines=engines, sample_representation=sample_representation, allow=allow
-    )
-    if refusal is None:
-        return engines, None, None
-    if not requested_all:
-        return engines, None, refusal
-    remaining = [engine for engine in engines if engine != "cottas"]
-    return (
-        remaining,
-        "dropped the cottas engine: it does not terminate on the condensed "
-        "genotype encoding (two archived attempts ran 41 h and ~10 h on "
-        "q05_sample_genotype_counts). Validating with "
-        f"{', '.join(remaining)}. Pass --allow-cottas-condensed to include it.",
-        None,
-    )
-
-
-def cottas_condensed_engine_rejection(
-    *,
-    engines: list[str],
-    sample_representation: str,
-    allow: bool,
-) -> str | None:
-    """Return why native COTTAS cannot query a condensed graph, or None.
-
-    This is a known non-termination, reproduced twice and archived. Native
-    pycottas answered the fourteen preflight queries and Q1-Q4 against the
-    condensed encoding of a 10,000-record fixture, then failed to complete
-    q05_sample_genotype_counts: 41 hours in the first attempt, about 10 in the
-    second, both at roughly 190% CPU. QLever answered all thirteen questions on
-    that same cell, and the sibling expanded encoding finished every engine in
-    185-194 minutes -- so the defect is specific to
-    native pycottas x condensed genotype encoding x a genotype-level query.
-
-    The condensed encoding stores genotypes as S + (V x F) rather than V x S, so
-    a per-sample genotype query has to join across the sample block; the working
-    hypothesis is a missing or unusable index on that join column rather than
-    data volume, at a scale QLever answers in about a second.
-
-    Refusing it is the interim. The alternative -- letting it start -- is what
-    cost 51 hours of unattended runtime, and the per-query timeout could not
-    bound it at the time. Once that is fixed and the hang is diagnosed, this
-    goes away; until then a clear refusal costs a user nothing they could
-    otherwise get.
-    """
-    if allow or sample_representation != "condensed":
-        return None
-    if "cottas" not in engines:
-        return None
-    return (
-        "--validation-engine cottas does not terminate on the condensed "
-        "genotype encoding. Reproduced twice on a 10,000-record fixture: native "
-        "pycottas answered 18 of 27 queries and then ran 41 h, and on a second "
-        "attempt about 10 h, on q05_sample_genotype_counts without completing.\n"
-        "  Use --validation-engine qlever, which answered all thirteen "
-        "questions on that same cell, or --sample-representation expanded, "
-        "where every engine including cottas completes. Pass "
-        "--allow-cottas-condensed to attempt it anyway."
-    )
-
-
 # ---------------------------------------------------------------------------
 # Run metrics layout: naming, manifest, and summary
 # ---------------------------------------------------------------------------
@@ -9464,16 +9383,6 @@ def main():
         ),
     )
     parser.add_argument(
-        "--allow-cottas-condensed",
-        action="store_true",
-        help=(
-            "Attempt --validation-engine cottas against a condensed graph "
-            "anyway. Refused by default: native pycottas did not terminate on "
-            "q05_sample_genotype_counts there in two archived attempts (41 h, "
-            "then ~10 h) while qlever answered the same cell in about a second"
-        ),
-    )
-    parser.add_argument(
         "--shacl-profile",
         choices=SHACL_PROFILE_CHOICES,
         default="core",
@@ -9701,18 +9610,6 @@ def main():
             raise ValueError("--qlever-port must be between 1 and 65535")
         validation_engines = parse_validation_engines(args.validation_engine)
         validation_artifacts = parse_validation_targets(args.validate_artifacts)
-        validation_engines, cottas_warning, cottas_rejection = (
-            cottas_condensed_resolution(
-                engines=validation_engines,
-                sample_representation=args.sample_representation,
-                requested_all=(args.validation_engine or "").strip() == "all",
-                allow=args.allow_cottas_condensed,
-            )
-        )
-        if cottas_rejection is not None:
-            raise ValueError(cottas_rejection)
-        if cottas_warning is not None:
-            eprint(f"Warning: {cottas_warning}")
         if args.shacl_shapes is not None:
             # Comma-separated: the published profile is split across files and
             # only some of them catch a corrupted value.
