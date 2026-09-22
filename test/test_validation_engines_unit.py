@@ -10,6 +10,7 @@ import importlib.util
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -877,3 +878,82 @@ class QleverEnvironmentTests(VerboseTestCase):
             self.assertIn(accepted, accepted_list)
         for rejected in ("xsd:string", "xsd:decimal", "xsd:double"):
             self.assertNotIn(rejected, accepted_list)
+
+
+class QueryTimeoutEnforcementTests(VerboseTestCase):
+    """A query that will not finish must be stopped and reported as a timeout.
+
+    Regression: 06_equivalence hung twice on the same cottas query -- 41 h, then
+    10 h with --validation-query-timeout 1800 and --validation-time-budget 14400
+    on the command line. Neither bound could fire. CottasEngine queried
+    in-process through rdflib, so nothing could interrupt it, and no engine ever
+    produced exit 124, so the loop's timeout handling was unreachable in any
+    case. run_query_process -- which does the right thing -- existed and had no
+    callers at all.
+    """
+
+    def test_run_query_process_reports_124_and_kills_the_tree(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            out, err = tmp / "out.json", tmp / "err.txt"
+            marker = tmp / "child_survived"
+            # A parent that forks a child outliving it, exactly the shape the
+            # helper exists for: killing the leader must not leave the child.
+            source = (
+                "import subprocess, sys, time\n"
+                "subprocess.Popen([sys.executable, '-c',"
+                " \"import time,pathlib;time.sleep(8);"
+                f"pathlib.Path(r'{marker}').write_text('x')\"])\n"
+                "time.sleep(60)\n"
+            )
+            started = time.monotonic()
+            code, error = V.run_query_process(
+                [sys.executable, "-c", source],
+                stdout_path=out, stderr_path=err, timeout=2,
+            )
+            elapsed = time.monotonic() - started
+            self.assertEqual(code, 124)
+            self.assertIn("exceeded", error or "")
+            self.assertLess(elapsed, 30, "the timeout did not actually interrupt")
+            time.sleep(9)
+            self.assertFalse(
+                marker.exists(),
+                "the forked child outlived the group kill and kept running",
+            )
+
+    def test_cottas_is_not_queried_in_process(self):
+        """In-process querying is what made the hang unkillable.
+
+        It is now answered over comunica's endpoint, where the mixin's timeout
+        applies like any other HTTP engine -- so this engine inherits the 124
+        classification rather than needing its own kill path.
+        """
+        source = Path(V.__file__).read_text(encoding="utf-8")
+        cottas = source[source.index("class CottasEngine"):]
+        cottas = cottas[: cottas.index("\nENGINE_CLASSES")]
+        self.assertIn("ComunicaHttpEndpointMixin", cottas)
+        self.assertNotIn(
+            "self.graph.query", cottas,
+            "CottasEngine is querying in-process again; a hung query cannot be "
+            "stopped that way, which is the bug this replaced",
+        )
+
+    def test_http_timeouts_are_classified_as_timeouts(self):
+        """Exit 1 for a timeout makes it a crash; the loop keys on 124."""
+        import socket
+        import urllib.error
+        self.assertTrue(V.is_timeout_error(TimeoutError()))
+        self.assertTrue(V.is_timeout_error(socket.timeout()))
+        self.assertTrue(
+            V.is_timeout_error(urllib.error.URLError(socket.timeout()))
+        )
+        self.assertFalse(V.is_timeout_error(ValueError("bad query")))
+        self.assertFalse(
+            V.is_timeout_error(urllib.error.URLError(ConnectionRefusedError()))
+        )
+
+    def test_the_timeout_convention_has_a_producer(self):
+        """124 is what the query loop keys on, so something must emit it."""
+        source = Path(V.__file__).read_text(encoding="utf-8")
+        self.assertIn("return 124", source)
+        self.assertIn("returncode=124", source)

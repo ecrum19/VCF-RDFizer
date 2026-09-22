@@ -5,6 +5,11 @@ ARG COMUNICA_VERSION=5.3.0
 # behind it. It provides native SPARQL over a .hdt artifact, so validation can
 # query the compressed representation directly instead of decoding it first.
 ARG COMUNICA_HDT_VERSION=5.0.1
+#: Native COTTAS querying. Replaces the pycottas/rdflib path, which pulled
+#: triples through the Store API in Python and could not answer a genotype
+#: query at benchmark scale. Ships a DuckDB addon: glibc base only, and the
+#: prebuild is per-architecture.
+ARG COMUNICA_COTTAS_VERSION=0.1.0
 # QLever is an optional second SPARQL engine for validation. Its binaries are
 # copied from the upstream published image rather than built here: compiling
 # QLever needs a large C++ toolchain and would dominate this image's build.
@@ -175,6 +180,7 @@ RUN python3 -m venv /opt/pycottas-venv \
     pyshacl==0.30.1
 
 ARG COMUNICA_HDT_VERSION
+ARG COMUNICA_COTTAS_VERSION
 
 # The HDT engine compiles native bindings, so a toolchain is needed at install
 # time but not afterwards; it is purged in the same layer to keep it out of the
@@ -184,8 +190,30 @@ RUN apt-get update \
   && npm install --global \
     "@comunica/query-sparql-file@${COMUNICA_VERSION}" \
     "@comunica/query-sparql-hdt@${COMUNICA_HDT_VERSION}" \
+    "@elias.crum/query-sparql-cottas@${COMUNICA_COTTAS_VERSION}" \
   && apt-get purge -y --auto-remove build-essential \
   && rm -rf /var/lib/apt/lists/*
+
+# A DuckDB addon that cannot load is a runtime failure inside a benchmark cell
+# hours later, so prove the whole path here: write a triple, build a .cottas
+# with pycottas, and answer a query over it with the comunica engine.
+#
+# Checking the binary alone is not enough. `--version` prints its table and
+# then exits 1, and the addon is ESM so `require()` cannot probe it either --
+# both look like failures when the engine is fine. Only a real query settles it,
+# and it also covers rdf2cottas, which is the other half of this engine.
+RUN set -eu; \
+    printf '<http://example.org/s> <http://example.org/p> <http://example.org/o> .\n' \
+      > /tmp/cottas-probe.nt; \
+    /opt/pycottas-venv/bin/python -c \
+      "import pycottas; pycottas.rdf2cottas('/tmp/cottas-probe.nt', '/tmp/cottas-probe.cottas')"; \
+    out="$(comunica-sparql-cottas cottas@/tmp/cottas-probe.cottas \
+            'SELECT ?s WHERE { ?s ?p ?o }' 2>&1)"; \
+    printf '%s' "$out" | grep -q 'example.org/s' \
+      || { echo "cottas engine built the artifact but cannot query it:"; \
+           printf '%s\n' "$out"; exit 1; }; \
+    rm -f /tmp/cottas-probe.nt /tmp/cottas-probe.cottas; \
+    echo "cottas engine verified end to end"
 
 RUN mkdir -p /opt/rmlstreamer \
   && curl -fsSL \
