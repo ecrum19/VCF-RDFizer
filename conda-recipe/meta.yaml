@@ -36,6 +36,10 @@ test:
     - vcf-rdfizer --help
     - vcf-rdfizer-rules --help
     - vcf-rdfizer-link list
+    # The vendored vocabulary is package data, not code, so no import touches
+    # it: a dropped package-data glob would pass every check above and only
+    # surface when SHACL validation runs. One file per glob in pyproject.toml.
+    - python -c "import importlib.resources as r; d = r.files('vcf_rdfizer_data'); assert d.joinpath('VOCABULARY_PROVENANCE.json').is_file() and d.joinpath('shacl').joinpath('vcf-4.5.shacl.ttl').is_file() and d.joinpath('ontology').joinpath('vcf-core-vocabulary.bundle.ttl').is_file()"
   imports:
     - vcf_rdfizer
     # The vocabulary terms, VCF-version model and lexical parsers. Importing it
