@@ -599,6 +599,32 @@ class EngineArmTests(VerboseTestCase):
         self.assertEqual(len(rows), 4 * 2)  # every window, two questions
         self.assertTrue(all(row["agrees_with_reference"] == "True" for row in rows))
 
+    def test_a_thin_engine_is_timed_on_the_sampled_windows_only(self):
+        """Comunica, HDT and COTTAS cost tens of seconds a question, so the
+        harness times them as thinly as the scan arm."""
+        with mock.patch.object(R.V, "build_engine",
+                               side_effect=lambda *a, **k: _StandInEngine(self.results, "agree")):
+            status, _ = run_main(base_argv(self.results, self.scratch, "cyvcf2-scan,qlever",
+                                           queries=self.QUERIES, rdf=self.graph,
+                                           thin_arms="qlever"))
+        self.assertEqual(status, 0)
+        report = json.loads((self.results / "regional.json").read_text())
+        self.assertEqual(report["thinArms"], ["qlever"])
+        with (self.results / "regional.csv").open(encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        per_arm = {arm: {row["window_id"] for row in rows if row["arm"] == arm}
+                   for arm in ("qlever", "cyvcf2-scan")}
+        # One window per size for the thin arm; the scan arm, not named as
+        # thin here, is timed on both.
+        self.assertEqual(len(per_arm["qlever"]), 2)
+        self.assertEqual(len(per_arm["cyvcf2-scan"]), 4)
+        self.assertLess(per_arm["qlever"], per_arm["cyvcf2-scan"])
+        self.assertTrue(all(row["agrees_with_reference"] == "True" for row in rows))
+
+    def test_an_unknown_thin_arm_is_refused(self):
+        with self.assertRaisesRegex(SystemExit, "--thin-arms"):
+            run_main(base_argv(self.results, self.scratch, "cyvcf2-scan", thin_arms="duckdb"))
+
     def test_an_engine_failure_is_recorded_per_execution(self):
         status, report, rows = self.run_with("fail")
         self.assertEqual(status, 0)

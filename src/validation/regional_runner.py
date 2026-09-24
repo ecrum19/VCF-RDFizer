@@ -791,6 +791,10 @@ def run(args: argparse.Namespace) -> int:
     unknown = [a for a in arms if a not in VCF_ARMS and a not in V.SPARQL_ENGINES]
     if unknown:
         raise SystemExit(f"unknown arm(s): {', '.join(unknown)}")
+    thin_arms = {arm.strip() for arm in args.thin_arms.split(",") if arm.strip()}
+    unknown_thin = sorted(a for a in thin_arms if a not in VCF_ARMS and a not in V.SPARQL_ENGINES)
+    if unknown_thin:
+        raise SystemExit(f"unknown arm(s) in --thin-arms: {', '.join(unknown_thin)}")
     queries = [q.strip() for q in args.queries.split(",") if q.strip()]
     unknown_queries = [q for q in queries if q not in REGIONAL_QUERIES]
     if unknown_queries:
@@ -873,12 +877,14 @@ def run(args: argparse.Namespace) -> int:
 
     # The scan arm's cost does not depend on the window -- it reads the whole
     # file whichever region is asked for. Timing it on all 80 windows would
-    # measure one number 80 times, at roughly 11 s a go. It is sampled instead,
-    # and the sample size is reported so the thinness is visible.
-    scan_windows = _sample_scan_windows(windows, args.scan_windows_per_size)
+    # measure one number 80 times. It is sampled instead, and the sample size is
+    # reported so the thinness is visible. The same applies to any arm named in
+    # --thin-arms: Comunica, HDT and COTTAS cost tens of seconds a question, so
+    # timing them on every window would take a day and a half per scale.
+    thin_windows = _sample_scan_windows(windows, args.scan_windows_per_size)
 
     for arm in [a for a in arms if a in VCF_ARMS]:
-        targets = scan_windows if arm == "cyvcf2-scan" else windows
+        targets = thin_windows if arm in thin_arms else windows
         print(f"[arm] {arm}: {len(targets)} windows x {len(queries)} questions "
               f"x {args.replicates} replicates")
         for query_id in queries:
@@ -917,7 +923,8 @@ def run(args: argparse.Namespace) -> int:
             setup["rdfMaterialization"] = materialization
 
         for arm in engine_arms:
-            _run_engine_arm(arm, args, ntriples, raw_dir, setup, windows, queries, record)
+            targets = thin_windows if arm in thin_arms else windows
+            _run_engine_arm(arm, args, ntriples, raw_dir, setup, targets, queries, record)
 
     _write_outputs(results_dir, args, rows, mismatches, setup, windows, queries, arms)
 
@@ -1081,6 +1088,8 @@ def _write_outputs(
         "queries": queries,
         "replicates": args.replicates,
         "scanWindowsPerSize": args.scan_windows_per_size,
+        "thinArms": [a for a in arms if a in {
+            t.strip() for t in args.thin_arms.split(",") if t.strip()}],
         "windowCount": len(windows),
         "setup": setup,
         "regionSemantics": REGION_SEMANTICS,
@@ -1121,8 +1130,12 @@ def build_parser() -> argparse.ArgumentParser:
                         default=",".join(str(s) for s in DEFAULT_WINDOW_SIZES))
     parser.add_argument("--windows-per-size", type=int, default=DEFAULT_WINDOWS_PER_SIZE)
     parser.add_argument("--scan-windows-per-size", type=int, default=3,
-                        help="windows timed for cyvcf2-scan, whose cost does not "
-                             "depend on the window (default: 3)")
+                        help="windows timed for each arm in --thin-arms "
+                             "(default: 3)")
+    parser.add_argument("--thin-arms", default="cyvcf2-scan",
+                        help="arms timed on only --scan-windows-per-size windows "
+                             "of each size; cyvcf2-scan by default, whose cost "
+                             "does not depend on the window")
     parser.add_argument("--replicates", type=int, default=3)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--index-kind", choices=("auto", "tbi", "csi"), default="auto")

@@ -462,11 +462,16 @@ sees identical regions.
 
 **The scan arm is timed on fewer windows than the others.** Its cost does not
 depend on the window -- it reads the file whichever region is asked for -- so
-timing it on every window measures one number repeatedly at roughly 11 s a go.
-Correctness is still checked on every window: the equality reference is a single
-whole-file pass that fills all of them at once, and it is deliberately not
-timed, because a pass that answers eighty windows is not what a one-question
-user pays for.
+timing it on every window measures one number repeatedly (0.64 s a question on
+the 100,000-record HG005 slice, on vcf-bench-1). `--scan-windows-per-size` sets
+how many windows of each size it gets. `--thin-arms` names other arms to time
+the same way; the benchmark uses it for Comunica, HDT and COTTAS, which cost tens
+of seconds a question, so timing them on all eighty windows would take about
+a day and a half. The equality reference still covers every window: it
+is a single whole-file pass that fills all of them at once, and it is
+deliberately not timed, because a pass that answers eighty windows is not what
+a one-question user pays for. A thin arm's own agreement is checked on the
+windows it is timed on.
 
 Results are compared for exact equality before any timing is reported. The
 runner exits non-zero when arms disagree, because a speed number from arms that
