@@ -157,7 +157,7 @@ class ToolFallbackTests(VerboseTestCase):
         real_which = shutil.which
         with tempfile.TemporaryDirectory() as td:
             target = Path(td) / "small.vcf.gz"
-            R._bgzip(SMALL_VCF, target)
+            R._bgzip(write_vcf(Path(td) / "small.vcf"), target)
             with mock.patch.object(
                     R.shutil, "which",
                     side_effect=lambda name: None if name == "tabix" else real_which(name)):
@@ -168,11 +168,66 @@ class ToolFallbackTests(VerboseTestCase):
                         self.assertGreater(index.stat().st_size, 0)
 
 
+@unittest.skipUnless(R is not None, "regional_runner must import")
+class UnsortedInputTests(VerboseTestCase):
+    """An index needs coordinate order; a VCF is not obliged to have it."""
+
+    def error(self, stderr):
+        return R.subprocess.CalledProcessError(1, ["tabix"], stderr=stderr)
+
+    def test_both_tools_unsorted_messages_are_recognised(self):
+        self.assertTrue(R._is_unsorted_error(self.error(b"[E::hts_idx_push] Chromosome blocks not continuous")))
+        self.assertTrue(R._is_unsorted_error(self.error("[E::hts_idx_push] Unsorted positions on sequence #1")))
+
+    def test_any_other_index_failure_is_not_read_as_unsorted(self):
+        self.assertFalse(R._is_unsorted_error(self.error(b"[E::hts_open] fail to open file")))
+        self.assertFalse(R._is_unsorted_error(self.error(None)))
+
+    def test_an_unrelated_index_failure_is_raised_not_sorted_around(self):
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(R, "_bgzip", side_effect=lambda s, t: t.write_bytes(b"x")), \
+                mock.patch.object(R, "_needs_csi", return_value=False), \
+                mock.patch.object(R, "_index", side_effect=self.error(b"fail to open file")), \
+                mock.patch.object(R, "_sort") as sort:
+            with self.assertRaises(R.subprocess.CalledProcessError):
+                R.prepare_indexed_vcf(SMALL_VCF, Path(td) / "indexed")
+        sort.assert_not_called()
+
+    def test_sorting_without_bcftools_is_a_clear_error(self):
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(R.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "not coordinate-sorted"):
+                R._sort(SMALL_VCF, Path(td) / "out.vcf.gz", Path(td))
+
+
 @unittest.skipUnless(R is not None and have_bgzip and have_tabix,
                      "bgzip and tabix are required")
 class PrepareIndexedVcfTests(VerboseTestCase):
     """The VCF side's one-time cost, built for real and reported separately."""
 
+    def test_a_sorted_vcf_is_indexed_without_sorting(self):
+        with tempfile.TemporaryDirectory() as td:
+            report = R.prepare_indexed_vcf(write_vcf(Path(td) / "sorted.vcf"), Path(td) / "indexed")
+            self.assertNotIn("sorted", report)
+            self.assertEqual(report["sortSeconds"], 0.0)
+
+    @unittest.skipUnless(have_bcftools, "bcftools is required to sort")
+    def test_an_unsorted_vcf_is_sorted_before_indexing(self):
+        """test-1k interleaves contigs, which tabix refuses to index as it stands."""
+        with tempfile.TemporaryDirectory() as td:
+            report = R.prepare_indexed_vcf(SMALL_VCF, Path(td) / "indexed")
+            self.assertIn("not coordinate-sorted", report["sorted"])
+            self.assertGreater(report["sortSeconds"], 0.0)
+            self.assertTrue(report["indexedVcf"].endswith(".sorted.vcf.gz"))
+            self.assertTrue(Path(report["indexPath"]).is_file())
+            self.assertAlmostEqual(
+                report["totalSetupSeconds"],
+                report["bgzipSeconds"] + report["sortSeconds"] + report["indexSeconds"])
+            # Only the sorted copy is kept, so a reader cannot pick up the wrong one.
+            self.assertEqual(sorted(p.name for p in (Path(td) / "indexed").glob("*.vcf.gz")),
+                             ["test-1k.sorted.vcf.gz"])
+
+    @unittest.skipUnless(have_bcftools, "bcftools is required to sort")
     def test_a_plain_vcf_is_bgzipped_and_indexed(self):
         with tempfile.TemporaryDirectory() as td:
             report = R.prepare_indexed_vcf(SMALL_VCF, Path(td) / "indexed")
@@ -183,15 +238,17 @@ class PrepareIndexedVcfTests(VerboseTestCase):
             self.assertTrue(Path(report["indexPath"]).is_file())
             self.assertGreater(report["indexBytes"], 0)
             self.assertAlmostEqual(report["totalSetupSeconds"],
-                                   report["bgzipSeconds"] + report["indexSeconds"])
+                                   report["bgzipSeconds"] + report["sortSeconds"]
+                                   + report["indexSeconds"])
 
     def test_an_already_bgzf_input_is_copied_not_recompressed(self):
         """Recompressing would charge the VCF side for work no user repeats."""
         with tempfile.TemporaryDirectory() as td:
             source = Path(td) / "source.vcf.gz"
-            R._bgzip(SMALL_VCF, source)
+            R._bgzip(write_vcf(Path(td) / "source.vcf"), source)
             report = R.prepare_indexed_vcf(source, Path(td) / "indexed")
             self.assertEqual(report["compression"], "already-bgzf (copied)")
+            self.assertNotIn("sorted", report)
             self.assertEqual(Path(report["indexedVcf"]).read_bytes(), source.read_bytes())
 
     def test_auto_picks_csi_for_a_contig_a_tbi_cannot_address(self):
@@ -204,7 +261,8 @@ class PrepareIndexedVcfTests(VerboseTestCase):
 
     def test_an_explicit_index_kind_is_honoured(self):
         with tempfile.TemporaryDirectory() as td:
-            report = R.prepare_indexed_vcf(SMALL_VCF, Path(td) / "indexed", index_kind="csi")
+            report = R.prepare_indexed_vcf(write_vcf(Path(td) / "sorted.vcf"),
+                                           Path(td) / "indexed", index_kind="csi")
             self.assertEqual(report["indexKind"], "csi")
             self.assertNotIn("indexKindReason", report)
 
@@ -212,8 +270,8 @@ class PrepareIndexedVcfTests(VerboseTestCase):
 # ---------------------------------------------------------------------------
 # The indexed arms against a real index
 # ---------------------------------------------------------------------------
-@unittest.skipUnless(cyvcf2_available and have_bgzip and have_tabix,
-                     "cyvcf2, bgzip and tabix are required")
+@unittest.skipUnless(cyvcf2_available and have_bgzip and have_tabix and have_bcftools,
+                     "cyvcf2, bgzip, tabix and bcftools are required")
 class IndexedArmTests(VerboseTestCase):
     """The seek path must return exactly what the scan path returns."""
 

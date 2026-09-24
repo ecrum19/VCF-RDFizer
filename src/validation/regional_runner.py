@@ -251,14 +251,64 @@ def prepare_indexed_vcf(
             if index_kind == "csi" else "every contig fits a .tbi"
         )
 
+    report["sortSeconds"] = 0.0
     started = time.monotonic()
-    index_path = _index(target, index_kind)
+    try:
+        index_path = _index(target, index_kind)
+    except subprocess.CalledProcessError as error:
+        if not _is_unsorted_error(error):
+            raise
+        # An index needs coordinate order, and a VCF is not required to be in
+        # it. Sorting is what a user would have to do before seeking, so it is
+        # done here and charged to the VCF side's one-time cost -- reported as
+        # its own line rather than folded into the index time.
+        sorted_target = target.with_name(target.name.replace(".vcf.gz", "") + ".sorted.vcf.gz")
+        sort_started = time.monotonic()
+        _sort(vcf_path, sorted_target, workdir)
+        report["sortSeconds"] = time.monotonic() - sort_started
+        report["sorted"] = "input was not coordinate-sorted; sorted with bcftools sort"
+        target.unlink(missing_ok=True)
+        target = sorted_target
+        report["bgzipBytes"] = target.stat().st_size
+        started = time.monotonic()
+        index_path = _index(target, index_kind)
     report["indexSeconds"] = time.monotonic() - started
     report["indexedVcf"] = str(target)
     report["indexPath"] = str(index_path)
     report["indexBytes"] = index_path.stat().st_size
-    report["totalSetupSeconds"] = report["bgzipSeconds"] + report["indexSeconds"]
+    report["totalSetupSeconds"] = (
+        report["bgzipSeconds"] + report["sortSeconds"] + report["indexSeconds"]
+    )
     return report
+
+
+#: What tabix and bcftools print when records are not in coordinate order:
+#: "Chromosome blocks not continuous" when a contig recurs after another one,
+#: "unsorted positions" when POS goes backwards within a contig.
+UNSORTED_MARKERS = ("not continuous", "unsorted")
+
+
+def _is_unsorted_error(error: subprocess.CalledProcessError) -> bool:
+    stderr = error.stderr or b""
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", "replace")
+    return any(marker in stderr.lower() for marker in UNSORTED_MARKERS)
+
+
+def _sort(source: Path, target: Path, workdir: Path) -> None:
+    """Coordinate-sort into a BGZF file, the only way an unsorted VCF can be indexed."""
+    if not shutil.which("bcftools"):
+        raise RuntimeError(
+            "the VCF is not coordinate-sorted, so it cannot be indexed, and bcftools "
+            "is not available to sort it"
+        )
+    sort_tmp = workdir / "bcftools-sort-tmp"
+    sort_tmp.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["bcftools", "sort", "-Oz", "-T", str(sort_tmp), "-o", str(target), str(source)],
+        check=True, capture_output=True,
+    )
+    shutil.rmtree(sort_tmp, ignore_errors=True)
 
 
 def _bgzip(source: Path, target: Path) -> None:
