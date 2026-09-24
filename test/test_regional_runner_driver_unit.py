@@ -93,6 +93,33 @@ class BgzfDetectionTests(VerboseTestCase):
                 handle.write(SMALL_VCF.read_bytes())
             self.assertFalse(R.is_bgzf(path))
 
+    @unittest.skipUnless(have_bgzip and have_tabix, "bgzip and tabix are required")
+    def test_a_plain_gzip_input_is_decompressed_before_bgzip(self):
+        """Found on bench-1: the derived slices are plain gzip, and bgzip -c on
+        one compressed it twice, which tabix could not parse."""
+        with tempfile.TemporaryDirectory() as td:
+            plain = Path(td) / "plain.vcf.gz"
+            with gzip.open(plain, "wb") as handle:
+                handle.write(write_vcf(Path(td) / "src.vcf").read_bytes())
+            target = Path(td) / "out" / "plain.vcf.gz"
+            target.parent.mkdir()
+            R._bgzip(plain, target)
+            self.assertTrue(R.is_bgzf(target))
+            with gzip.open(target, "rt", encoding="utf-8") as handle:
+                self.assertTrue(handle.readline().startswith("##fileformat=VCFv4.2"))
+            report = R.prepare_indexed_vcf(plain, Path(td) / "indexed")
+            self.assertEqual(report["compression"], "bgzip")
+            self.assertTrue(Path(report["indexPath"]).is_file())
+
+    def test_gzip_is_recognised_whether_or_not_it_is_bgzf(self):
+        with tempfile.TemporaryDirectory() as td:
+            plain = Path(td) / "plain.vcf.gz"
+            with gzip.open(plain, "wb") as handle:
+                handle.write(b"x")
+            self.assertTrue(R._is_gzip(plain))
+            self.assertFalse(R._is_gzip(SMALL_VCF))
+            self.assertFalse(R._is_gzip(Path(td) / "missing.gz"))
+
     @unittest.skipUnless(have_bgzip, "bgzip is required to produce a real BGZF file")
     def test_real_bgzip_output_is_bgzf(self):
         with tempfile.TemporaryDirectory() as td:
@@ -465,6 +492,17 @@ class DriverTests(VerboseTestCase):
     def test_a_sparql_arm_without_a_graph_is_refused(self):
         with self.assertRaisesRegex(SystemExit, "--rdf is required"):
             run_main(base_argv(self.results, self.scratch, "qlever"))
+
+    def test_a_failing_tool_is_an_error_exit_not_a_traceback(self):
+        error = R.subprocess.CalledProcessError(
+            1, ["tabix", "-p", "vcf", "x.vcf.gz"], stderr=b"[E::get_intv] Failed to parse TBX_VCF")
+        from contextlib import redirect_stderr
+        err = StringIO()
+        with mock.patch.object(R, "run", side_effect=error), redirect_stderr(err):
+            status, _ = run_main(base_argv(self.results, self.scratch, "cyvcf2-scan"))
+        self.assertEqual(status, 2)
+        self.assertIn("tabix -p vcf x.vcf.gz exited 1: [E::get_intv] Failed to parse TBX_VCF",
+                      err.getvalue())
 
     def test_a_vcf_without_records_is_an_error_exit_not_a_traceback(self):
         path = self.root / "empty.vcf"

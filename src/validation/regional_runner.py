@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gzip
 import json
 import random
 import shutil
@@ -320,7 +321,24 @@ def _bgzip(source: Path, target: Path) -> None:
     """
     if shutil.which("bgzip"):
         with target.open("wb") as handle:
-            subprocess.run(["bgzip", "-c", str(source)], stdout=handle, check=True)
+            if _is_gzip(source):
+                # A plain-gzip VCF has to be decompressed first. `bgzip -c` on
+                # it compresses the gzip bytes a second time, and tabix then
+                # fails to parse the result ("was wrong -p [type] used?"). The
+                # benchmark's derived slices are plain gzip, so this is the
+                # common case, not an edge one.
+                with gzip.open(source, "rb") as src:
+                    proc = subprocess.Popen(["bgzip", "-c"], stdin=subprocess.PIPE,
+                                            stdout=handle)
+                    assert proc.stdin is not None
+                    try:
+                        shutil.copyfileobj(src, proc.stdin, length=1024 * 1024)
+                    finally:
+                        proc.stdin.close()
+                    if proc.wait() != 0:
+                        raise subprocess.CalledProcessError(proc.returncode, ["bgzip", "-c"])
+            else:
+                subprocess.run(["bgzip", "-c", str(source)], stdout=handle, check=True)
         return
     if shutil.which("bcftools"):
         subprocess.run(
@@ -329,6 +347,15 @@ def _bgzip(source: Path, target: Path) -> None:
         )
         return
     raise RuntimeError("neither bgzip nor bcftools is available to produce a BGZF file")
+
+
+def _is_gzip(path: Path) -> bool:
+    """True for any gzip stream, BGZF or not (BGZF is checked by is_bgzf)."""
+    try:
+        with path.open("rb") as handle:
+            return handle.read(2) == b"\x1f\x8b"
+    except OSError:
+        return False
 
 
 def _needs_csi(bgzf_path: Path) -> bool:
@@ -1114,6 +1141,14 @@ def main(argv: list[str] | None = None) -> int:
     args.scratch_dir.mkdir(parents=True, exist_ok=True)
     try:
         return run(args)
+    except subprocess.CalledProcessError as error:
+        # A tool the runner shells out to failed: say which one and what it
+        # printed, instead of ending in a traceback.
+        detail = error.stderr.decode("utf-8", "replace").strip() if isinstance(
+            error.stderr, bytes) else (error.stderr or "").strip()
+        print(f"error: {' '.join(map(str, error.cmd))} exited {error.returncode}"
+              + (f": {detail.splitlines()[-1]}" if detail else ""), file=sys.stderr)
+        return 2
     except (RuntimeError, ValueError, OSError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
