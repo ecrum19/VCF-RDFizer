@@ -1,12 +1,15 @@
 PREFIX vcfc: <https://w3id.org/vcf-core/vocab#>
 
 # Exact number of missing tokens serialized as a plain "." literal.
-# The predicate exclusions must match preflight_missing_token_conformance.rq
-# exactly, or the count and its sample describe different populations.
+# The exclusions -- the two predicates and the header Number attribute -- must
+# match preflight_missing_token_conformance.rq exactly, or the count and its
+# sample describe different populations.
 SELECT (COUNT(*) AS ?anomalyCount)
 WHERE {
   ?s ?p ?o .
   FILTER(ISLITERAL(?o) && STR(?o) = ".")
   FILTER(DATATYPE(?o) != vcfc:Null)
   FILTER(?p NOT IN (vcfc:fieldNumber, vcfc:genotypeString))
+  OPTIONAL { ?s vcfc:attributeKey ?attributeKey }
+  FILTER(?p != vcfc:attributeValue || !BOUND(?attributeKey) || STR(?attributeKey) != "Number")
 }
