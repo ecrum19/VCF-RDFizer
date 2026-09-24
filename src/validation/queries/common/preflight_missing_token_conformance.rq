@@ -16,11 +16,22 @@ PREFIX vcfc: <https://w3id.org/vcf-core/vocab#>
 # header as a conformance failure. On the 100,000-record HG005 benchmark cell
 # it returned 20 such rows, and all of them were declarations the vocabulary
 # requires to look exactly that way.
+#
+# The same token appears once more, in the structured-header attribute layer:
+# every declaration's attributes are also carried verbatim as
+# vcfc:HeaderAttribute resources, so Number=. becomes an attributeValue of "."
+# on the attribute whose attributeKey is "Number". The shapes require that
+# value to be exactly xsd:string, so it can never be vcfc:Null. With only the
+# two predicates above excluded, the HG005 cell still returned ten rows -- one
+# per Number=. INFO declaration in its header. Only the Number attribute is
+# excluded; a bare "." on any other attribute is still reported.
 SELECT ?s ?p ?o (DATATYPE(?o) AS ?datatype)
 WHERE {
   ?s ?p ?o .
   FILTER(ISLITERAL(?o) && STR(?o) = ".")
   FILTER(DATATYPE(?o) != vcfc:Null)
   FILTER(?p NOT IN (vcfc:fieldNumber, vcfc:genotypeString))
+  OPTIONAL { ?s vcfc:attributeKey ?attributeKey }
+  FILTER(?p != vcfc:attributeValue || !BOUND(?attributeKey) || STR(?attributeKey) != "Number")
 }
 LIMIT 100

@@ -436,6 +436,15 @@ The vocabulary's `vcfc:missingValuePolicy` says a missing token should be
 reports a plain `"."` literal as an anomaly, and `--strict-conformance` promotes
 that from a report to a failure.
 
+Not every `"."` is a missing value, and the check excludes the three places the
+vocabulary requires a bare dot: `vcfc:fieldNumber` (`Number=.` is VCF's
+variable-cardinality arity), `vcfc:genotypeString` (a fully missing call is
+literally `.` or `./.`), and the `vcfc:attributeValue` of a header attribute
+whose `vcfc:attributeKey` is `Number` — the structured-header layer carries each
+declaration's attributes verbatim, so `Number=.` appears there too, and the
+shapes require that value to be `xsd:string`. A bare dot anywhere else, including
+on any other header attribute, is still reported.
+
 This used to conflict with the published SHACL shapes, which constrained
 `vcfc:alt` to `sh:datatype xsd:string` and so rejected every REF-only and
 gVCF-style record. **The vocabulary fixed that**: `vcfc:VCFRecordShape` now
