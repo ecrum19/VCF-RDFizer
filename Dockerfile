@@ -164,6 +164,10 @@ RUN apt-get update \
     python3 \
     python3-venv \
     raptor2-utils \
+    # bgzip and tabix, for the indexed regional-access arm. bcftools alone
+    # cannot do it: the Debian package links libhts but does not install
+    # the htslib command-line tools.
+    tabix \
     time \
   && rm -rf /var/lib/apt/lists/*
 

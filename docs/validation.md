@@ -413,6 +413,65 @@ whether they resolve, and the validator reports that note if the engine cannot
 start. Comunica remains the default, so an image whose QLever binaries do not
 link still validates normally.
 
+### Indexed regional access
+
+The timings above compare SPARQL against cyvcf2 **scanning the file**, because
+none of Q1-Q13 is coordinate-restricted. That is internally consistent, and it
+is the one VCF access mode nobody uses for a selective question: real VCF work
+seeks, through a `bgzip` + `tabix` index.
+
+`validation/regional_runner.py` adds that arm. It asks five region-restricted
+questions -- record count, allele shape, Ti/Tv, FILTER distribution, per-sample
+genotype classes -- of every access path:
+
+| Arm | Access path |
+| --- | --- |
+| `cyvcf2-scan` | whole-file iteration with a POS filter (the status quo baseline) |
+| `cyvcf2-indexed` | `VCF(path)(region)` over the bgzipped, indexed copy |
+| `bcftools-indexed` | `bcftools query -r`, the only route to the exact FILTER text |
+| `comunica`, `hdt`, `cottas`, `qlever` | the same question as SPARQL |
+
+```bash
+/opt/pycottas-venv/bin/python /opt/vcf-rdfizer/validation/regional_runner.py \
+  --vcf /data/vcf/sample.vcf.gz --rdf /data/rdf/sample.nt.gz --rdf-format nt.gz \
+  --arms cyvcf2-indexed,bcftools-indexed,qlever \
+  --results-dir /data/regional --dataset-id slice
+```
+
+It writes `regional.csv` (one row per arm, question, window and replicate),
+`regional.json` (medians, plus each side's one-time setup), `windows.json` (the
+regions, so a rerun measures the same ones) and `mismatches.json`.
+
+Three things about it are easy to get wrong, so they are worth stating.
+
+**A window means POS, not overlap.** A tabix or CSI seek returns every record
+whose *span* overlaps the region, so a deletion beginning before the window and
+reaching into it comes back from htslib while a SPARQL `?pos` filter excludes
+it. Every VCF arm therefore keeps the seek and then drops records whose POS
+falls outside the window. The seek still does the work; the post-filter only
+reconciles the convention, and without it the arms would disagree on any window
+whose left edge cuts an indel -- which would look like a graph defect rather
+than a coordinate convention.
+
+**Windows are anchored on real records.** A GIAB benchmark VCF covers a few
+percent of the genome, so uniformly drawn 1 kb windows would be almost all
+empty and the experiment would measure the cost of returning nothing. Each
+window starts at a randomly chosen record position, from a fixed seed, so the
+four sizes are a selectivity ladder rather than a sparsity ladder and every arm
+sees identical regions.
+
+**The scan arm is timed on fewer windows than the others.** Its cost does not
+depend on the window -- it reads the file whichever region is asked for -- so
+timing it on every window measures one number repeatedly at roughly 11 s a go.
+Correctness is still checked on every window: the equality reference is a single
+whole-file pass that fills all of them at once, and it is deliberately not
+timed, because a pass that answers eighty windows is not what a one-question
+user pays for.
+
+Results are compared for exact equality before any timing is reported. The
+runner exits non-zero when arms disagree, because a speed number from arms that
+disagree is a bug report rather than a result.
+
 ### Engine equivalence, and one place they differed
 
 Every engine is held to producing identical results. That is verified, not

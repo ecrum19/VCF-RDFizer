@@ -1,0 +1,30 @@
+PREFIX vcfc: <https://w3id.org/vcf-core/vocab#>
+PREFIX xsd:  <http://www.w3.org/2001/XMLSchema#>
+
+# R5 - per-sample genotype classes inside one window.
+#
+# Unlike the whole-file q05, this starts from the record rather than the
+# SampleCall, because the coordinate restriction lives on the record. The
+# genotype classification below is identical to q05's.
+SELECT ?sampleId ?genotypeClass (COUNT(DISTINCT ?sampleCall) AS ?callCount)
+WHERE {
+  ?record a vcfc:VCFRecord ; vcfc:chrom ?chrom ; vcfc:pos ?pos ; vcfc:hasCall ?call .
+  FILTER(STR(?chrom) = "{{CHROM}}")
+  FILTER(xsd:integer(?pos) >= {{START}} && xsd:integer(?pos) <= {{END}})
+  ?call vcfc:hasSampleCall ?sampleCall .
+  ?sampleCall vcfc:sampleId ?sampleId .
+  OPTIONAL {
+    ?sampleCall vcfc:hasFormatValue ?gtValueNode .
+    FILTER(STRENDS(STR(?gtValueNode), "/fmt/GT"))
+    ?gtValueNode vcfc:fieldValue ?gtLiteral .
+  }
+  BIND(IF(BOUND(?gtLiteral), REPLACE(STR(?gtLiteral), "[|]", "/"), "") AS ?gt)
+  BIND(IF(!BOUND(?gtLiteral), "NO_GT_FIELD",
+    IF(CONTAINS(?gt, "."), "MISSING",
+      IF(REGEX(?gt, "^[0-9]+$"), IF(?gt = "0", "HAPLOID_REF", "HAPLOID_ALT"),
+        IF(REGEX(?gt, "^[0-9]+/[0-9]+$"),
+          IF(STRBEFORE(?gt, "/") = STRAFTER(?gt, "/"), IF(STRBEFORE(?gt, "/") = "0", "HOM_REF", "HOM_ALT"), "HET"),
+          "OTHER_PLOIDY")))) AS ?genotypeClass)
+}
+GROUP BY ?sampleId ?genotypeClass
+ORDER BY ?sampleId ?genotypeClass

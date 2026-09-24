@@ -1,0 +1,18 @@
+PREFIX vcfc: <https://w3id.org/vcf-core/vocab#>
+PREFIX xsd:  <http://www.w3.org/2001/XMLSchema#>
+
+# R1 - how many records fall inside one coordinate window.
+#
+# The window is POS-based and 1-based inclusive, matching the VCF arms after
+# their post-seek POS filter. A tabix seek returns every record whose span
+# OVERLAPS the region, so an indel starting before the window would come back
+# from htslib but not from this pattern; the VCF arms drop those explicitly so
+# both sides mean the same thing. See regional_runner.REGION_SEMANTICS.
+#
+# {{CHROM}}, {{START}} and {{END}} are substituted by the runner.
+SELECT (COUNT(DISTINCT ?record) AS ?recordCount)
+WHERE {
+  ?record a vcfc:VCFRecord ; vcfc:chrom ?chrom ; vcfc:pos ?pos .
+  FILTER(STR(?chrom) = "{{CHROM}}")
+  FILTER(xsd:integer(?pos) >= {{START}} && xsd:integer(?pos) <= {{END}})
+}
