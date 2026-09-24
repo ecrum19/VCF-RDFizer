@@ -543,11 +543,12 @@ class EngineArmTests(VerboseTestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def run_with(self, mode: str, build=None):
+    def run_with(self, mode: str, build=None, *, rdf=None, rdf_format="nt"):
         build = build or (lambda *a, **k: _StandInEngine(self.results, mode))
         with mock.patch.object(R.V, "build_engine", side_effect=build):
             status, _ = run_main(base_argv(self.results, self.scratch, "qlever",
-                                           queries=self.QUERIES, rdf=self.graph))
+                                           queries=self.QUERIES, rdf=rdf or self.graph,
+                                           rdf_format=rdf_format))
         report = json.loads((self.results / "regional.json").read_text())
         with (self.results / "regional.csv").open(encoding="utf-8") as handle:
             rows = list(csv.DictReader(handle))
@@ -579,6 +580,67 @@ class EngineArmTests(VerboseTestCase):
         self.assertEqual(status, 0)
         self.assertEqual(report["setup"]["engineErrors"], {"qlever": "qlever-index not on PATH"})
         self.assertEqual(rows, [])
+
+    def test_any_start_up_failure_is_the_engines_not_the_runs(self):
+        """Found on bench-1: the COTTAS builder raised KeyError on an .nt.gz."""
+        class Crashes(_StandInEngine):
+            def __enter__(self):
+                raise KeyError(".gz")
+
+        status, report, rows = self.run_with(
+            "agree", build=lambda *a, **k: Crashes(self.results, "agree"))
+        self.assertEqual(status, 0)
+        self.assertEqual(report["setup"]["engineErrors"], {"qlever": "KeyError: '.gz'"})
+        self.assertEqual(rows, [])
+
+    def test_a_packaged_graph_is_decoded_once_before_any_engine_sees_it(self):
+        """qlever-index, Comunica and the COTTAS builder all refuse an .nt.gz."""
+        packed = self.root / "graph.nt.gz"
+        with gzip.open(packed, "wt", encoding="utf-8") as handle:
+            handle.write('<urn:s> <urn:p> "o" .\n')
+        seen = {}
+
+        def build(name, source, **kwargs):
+            seen["source"] = Path(source)
+            seen["readable"] = Path(source).read_text(encoding="utf-8")
+            seen["options"] = kwargs["options"]
+            return _StandInEngine(self.results, "agree")
+
+        status, report, _ = self.run_with("agree", build=build, rdf=packed, rdf_format="nt.gz")
+        self.assertEqual(status, 0)
+        self.assertEqual(seen["source"].suffix, ".nt")
+        self.assertIn("<urn:s>", seen["readable"])
+        self.assertTrue(report["setup"]["rdfMaterialization"]["materialized"])
+        self.assertGreaterEqual(report["setup"]["rdfMaterialization"]["wallSeconds"], 0.0)
+        # The native artifact is still offered, so HDT and COTTAS can use one.
+        self.assertEqual(seen["options"]["artifact_path"], str(packed))
+        self.assertEqual(seen["options"]["artifact_format"], "nt.gz")
+
+    def test_a_plain_graph_is_used_in_place(self):
+        seen = {}
+
+        def build(name, source, **kwargs):
+            seen["source"] = Path(source)
+            return _StandInEngine(self.results, "agree")
+
+        self.run_with("agree", build=build)
+        self.assertEqual(seen["source"], self.graph)
+
+
+@unittest.skipUnless(R is not None, "regional_runner must import")
+class EngineOptionTests(VerboseTestCase):
+    def test_the_engines_are_given_the_option_names_they_read(self):
+        """The runner's own flag names were silently ignored by the engines."""
+        args = R.build_parser().parse_args([
+            "--vcf", "x.vcf", "--results-dir", "r", "--dataset-id", "d",
+            "--rdf", "g.hdt", "--rdf-format", "hdt",
+            "--qlever-memory-gb", "12", "--qlever-port", "7100",
+            "--qlever-startup-timeout", "60", "--query-timeout", "30",
+        ])
+        self.assertEqual(R.engine_options(args), {
+            "query_timeout": 30, "memory_gb": 12, "port": 7100, "startup_timeout": 60,
+            "artifact_path": "g.hdt", "artifact_format": "hdt",
+        })
 
 
 if __name__ == "__main__":

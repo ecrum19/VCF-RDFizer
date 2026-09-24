@@ -869,59 +869,28 @@ def run(args: argparse.Namespace) -> int:
     if engine_arms and args.rdf is None:
         raise SystemExit("--rdf is required when a SPARQL engine is among --arms")
 
-    for arm in engine_arms:
-        print(f"[arm] {arm}: preparing engine")
-        engine_raw = raw_dir / arm
-        engine_raw.mkdir(parents=True, exist_ok=True)
-        options = {
-            "query_timeout": args.query_timeout,
-            "rdf_format": args.rdf_format,
-            "qlever_memory_gb": args.qlever_memory_gb,
-            "qlever_port": args.qlever_port,
-            "qlever_startup_timeout": args.qlever_startup_timeout,
-        }
-        try:
-            engine = V.build_engine(arm, args.rdf, raw_dir=engine_raw,
-                                    scratch=args.scratch_dir, options=options)
-        except (ValueError, RuntimeError) as error:
-            setup.setdefault("engineErrors", {})[arm] = str(error)
-            print(f"[arm] {arm}: unavailable ({error})")
-            continue
+    with tempfile.TemporaryDirectory(prefix="regional-rdf-", dir=str(args.scratch_dir)) as rdf_scratch:
+        ntriples = None
+        if engine_arms:
+            # The engines take N-Triples, exactly as in the validation stage: a
+            # packaged artifact (.nt.gz, .nt.br, .hdt, .cottas) is materialized
+            # once, here, and the engines are handed the plain file. Passing the
+            # package straight through made qlever-index, Comunica and the COTTAS
+            # builder all fail on an .nt.gz, which is the artifact the harness
+            # reuses from 13_query_cost. The decode is one-time setup and is
+            # reported as such.
+            print(f"[setup] materializing {args.rdf_format} as N-Triples for the SPARQL arms")
+            started = time.monotonic()
+            ntriples, materialization = V.materialize_ntriples(
+                args.rdf, args.rdf_format, Path(rdf_scratch),
+                log_dir=raw_dir / "materialization",
+            )
+            materialization["wallSeconds"] = time.monotonic() - started
+            materialization["ntriplesPath"] = str(ntriples)
+            setup["rdfMaterialization"] = materialization
 
-        try:
-            with engine:
-                setup.setdefault("engineSetupSeconds", {})[arm] = engine.setup_seconds
-                print(f"[arm] {arm}: setup {engine.setup_seconds:.2f}s; "
-                      f"{len(windows)} windows x {len(queries)} questions "
-                      f"x {args.replicates} replicates")
-                with tempfile.TemporaryDirectory(dir=str(args.scratch_dir)) as rendered_dir:
-                    rendered_root = Path(rendered_dir)
-                    for query_id in queries:
-                        template = regional_query_path(args.representation, query_id)
-                        for window in windows:
-                            rendered = rendered_root / f"{query_id}__{window['window_id']}.rq"
-                            rendered.write_text(render_query(template, window), encoding="utf-8")
-                            for replicate in range(1, args.replicates + 1):
-                                envelope = engine.execute(
-                                    f"{query_id}__{window['window_id']}__r{replicate}", rendered)
-                                if envelope["status"] != "PASS":
-                                    record(arm, query_id, window, replicate, None,
-                                           envelope["wallSeconds"], status="FAILED",
-                                           error=envelope.get("error") or "engine execution failed")
-                                    continue
-                                try:
-                                    answer = normalize_regional(
-                                        query_id, Path(envelope["rawResult"]))
-                                except (ValueError, KeyError, OSError) as error:
-                                    record(arm, query_id, window, replicate, None,
-                                           envelope["wallSeconds"], status="UNREADABLE",
-                                           error=str(error))
-                                    continue
-                                record(arm, query_id, window, replicate, answer,
-                                       envelope["wallSeconds"])
-        except RuntimeError as error:
-            setup.setdefault("engineErrors", {})[arm] = str(error)
-            print(f"[arm] {arm}: failed ({error})")
+        for arm in engine_arms:
+            _run_engine_arm(arm, args, ntriples, raw_dir, setup, windows, queries, record)
 
     _write_outputs(results_dir, args, rows, mismatches, setup, windows, queries, arms)
 
@@ -934,6 +903,87 @@ def run(args: argparse.Namespace) -> int:
         print(f"See {results_dir / 'mismatches.json'}")
         return 1
     return 0
+
+
+def engine_options(args: argparse.Namespace) -> dict[str, Any]:
+    """The option names the validation engines read, not the runner's own flags.
+
+    The engines are validation_runner's, and they look up ``memory_gb``,
+    ``port``, ``startup_timeout``, ``query_timeout`` and -- for HDT and COTTAS --
+    ``artifact_path`` / ``artifact_format``, which lets them query the supplied
+    artifact natively instead of rebuilding it from N-Triples. Passing the
+    runner's flag names instead made every one of those settings a silent no-op.
+    """
+    return {
+        "query_timeout": args.query_timeout,
+        "memory_gb": args.qlever_memory_gb,
+        "port": args.qlever_port,
+        "startup_timeout": args.qlever_startup_timeout,
+        "artifact_path": str(args.rdf),
+        "artifact_format": args.rdf_format,
+    }
+
+
+def _run_engine_arm(
+    arm: str,
+    args: argparse.Namespace,
+    ntriples: Path,
+    raw_dir: Path,
+    setup: dict[str, Any],
+    windows: list[dict[str, Any]],
+    queries: list[str],
+    record,
+) -> None:
+    """Time one SPARQL engine on every window; record, never raise, its failures."""
+    print(f"[arm] {arm}: preparing engine")
+    engine_raw = raw_dir / arm
+    engine_raw.mkdir(parents=True, exist_ok=True)
+    try:
+        engine = V.build_engine(arm, ntriples, raw_dir=engine_raw,
+                                scratch=args.scratch_dir, options=engine_options(args))
+    except (ValueError, RuntimeError) as error:
+        setup.setdefault("engineErrors", {})[arm] = str(error)
+        print(f"[arm] {arm}: unavailable ({error})")
+        return
+
+    try:
+        with engine:
+            setup.setdefault("engineSetupSeconds", {})[arm] = engine.setup_seconds
+            print(f"[arm] {arm}: setup {engine.setup_seconds:.2f}s; "
+                  f"{len(windows)} windows x {len(queries)} questions "
+                  f"x {args.replicates} replicates")
+            with tempfile.TemporaryDirectory(dir=str(args.scratch_dir)) as rendered_dir:
+                rendered_root = Path(rendered_dir)
+                for query_id in queries:
+                    template = regional_query_path(args.representation, query_id)
+                    for window in windows:
+                        rendered = rendered_root / f"{query_id}__{window['window_id']}.rq"
+                        rendered.write_text(render_query(template, window), encoding="utf-8")
+                        for replicate in range(1, args.replicates + 1):
+                            envelope = engine.execute(
+                                f"{query_id}__{window['window_id']}__r{replicate}", rendered)
+                            if envelope["status"] != "PASS":
+                                record(arm, query_id, window, replicate, None,
+                                       envelope["wallSeconds"], status="FAILED",
+                                       error=envelope.get("error") or "engine execution failed")
+                                continue
+                            try:
+                                answer = normalize_regional(
+                                    query_id, Path(envelope["rawResult"]))
+                            except (ValueError, KeyError, OSError) as error:
+                                record(arm, query_id, window, replicate, None,
+                                       envelope["wallSeconds"], status="UNREADABLE",
+                                       error=str(error))
+                                continue
+                            record(arm, query_id, window, replicate, answer,
+                                   envelope["wallSeconds"])
+    except Exception as error:  # noqa: BLE001 - one engine must not end the run
+        # Start-up is where engines fail, and they fail in their own ways: the
+        # COTTAS builder raised KeyError on an .nt.gz, for instance. Whatever
+        # the type, it is this engine's failure -- recorded against it, while
+        # the other arms' results stand.
+        setup.setdefault("engineErrors", {})[arm] = f"{type(error).__name__}: {error}"
+        print(f"[arm] {arm}: failed ({type(error).__name__}: {error})")
 
 
 def _sample_scan_windows(
