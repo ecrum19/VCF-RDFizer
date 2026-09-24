@@ -420,8 +420,10 @@ none of Q1-Q13 is coordinate-restricted. That is internally consistent, and it
 is the one VCF access mode nobody uses for a selective question: real VCF work
 seeks, through a `bgzip` + `tabix` index.
 
-`validation/regional_runner.py` adds that arm. It asks five region-restricted
-questions -- record count, allele shape, Ti/Tv, FILTER distribution, per-sample
+`validation/regional_runner.py` adds that arm as a standalone performance
+investigation: nothing in conversion or `--mode validation` calls it, and its
+tests (`test/test_regional_runner*.py`) are outside the CI suite. It asks five
+region-restricted questions -- record count, allele shape, Ti/Tv, FILTER distribution, per-sample
 genotype classes -- of every access path:
 
 | Arm | Access path |
