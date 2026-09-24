@@ -600,8 +600,7 @@ class EngineArmTests(VerboseTestCase):
         self.assertTrue(all(row["agrees_with_reference"] == "True" for row in rows))
 
     def test_a_thin_engine_is_timed_on_the_sampled_windows_only(self):
-        """Comunica, HDT and COTTAS cost tens of seconds a question, so the
-        harness times them as thinly as the scan arm."""
+        """--thin-arms gives any slow arm the scan arm's sampled windows."""
         with mock.patch.object(R.V, "build_engine",
                                side_effect=lambda *a, **k: _StandInEngine(self.results, "agree")):
             status, _ = run_main(base_argv(self.results, self.scratch, "cyvcf2-scan,qlever",

@@ -465,9 +465,11 @@ depend on the window -- it reads the file whichever region is asked for -- so
 timing it on every window measures one number repeatedly (0.64 s a question on
 the 100,000-record HG005 slice, on vcf-bench-1). `--scan-windows-per-size` sets
 how many windows of each size it gets. `--thin-arms` names other arms to time
-the same way; the benchmark uses it for Comunica, HDT and COTTAS, which cost tens
-of seconds a question, so timing them on all eighty windows would take about
-a day and a half. The equality reference still covers every window: it
+the same way, for an arm too slow to time on every window. The benchmark does
+not need it: a region-restricted question costs Comunica, HDT and COTTAS about
+one second on the 10,000-record fixture (vcf-bench-1), against 23-45 s for the
+whole-file questions above, so every engine is timed on every window. The
+equality reference still covers every window: it
 is a single whole-file pass that fills all of them at once, and it is
 deliberately not timed, because a pass that answers eighty windows is not what
 a one-question user pays for. A thin arm's own agreement is checked on the

@@ -878,9 +878,8 @@ def run(args: argparse.Namespace) -> int:
     # The scan arm's cost does not depend on the window -- it reads the whole
     # file whichever region is asked for. Timing it on all 80 windows would
     # measure one number 80 times. It is sampled instead, and the sample size is
-    # reported so the thinness is visible. The same applies to any arm named in
-    # --thin-arms: Comunica, HDT and COTTAS cost tens of seconds a question, so
-    # timing them on every window would take a day and a half per scale.
+    # reported so the thinness is visible. --thin-arms extends the same
+    # treatment to any arm too slow to time on every window.
     thin_windows = _sample_scan_windows(windows, args.scan_windows_per_size)
 
     for arm in [a for a in arms if a in VCF_ARMS]:
