@@ -1,6 +1,6 @@
 """The regional runner's driver, index preparation and failure paths.
 
-test_regional_runner_unit.py covers agreement between the arms' folding and
+test_regional_runner.py covers agreement between the arms' folding and
 classification logic. This module covers what surrounds it: building the
 bgzip + index copy the indexed arms seek through, dispatching one timed
 execution to the right arm, and the driver end to end -- the files it writes,
