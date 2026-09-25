@@ -4040,16 +4040,19 @@ def run_validation(args: argparse.Namespace) -> int:
             # arrived.
             decoded_triples = rdf_validation.get("tripleCount")
             shacl_skipped: dict[str, Any] | None = None
+            shacl_limit = getattr(
+                args, "shacl_max_triples", DEFAULT_SHACL_MAX_TRIPLES
+            )
             if args.shacl_shapes is not None and shacl_exceeds_limit(
-                decoded_triples, args.shacl_max_triples
+                decoded_triples, shacl_limit
             ):
                 shacl_skipped = {
                     "status": "SKIPPED_TOO_LARGE",
                     "tripleCount": decoded_triples,
-                    "limitTriples": args.shacl_max_triples,
+                    "limitTriples": shacl_limit,
                     "reason": (
                         f"the decoded graph holds {decoded_triples:,} triples, above the "
-                        f"--shacl-max-triples limit of {args.shacl_max_triples:,}. "
+                        f"--shacl-max-triples limit of {shacl_limit:,}. "
                         f"pyshacl is in-memory, so attempting it risks exhausting memory "
                         f"mid-run; skipping is recoverable and is recorded here."
                     ),
@@ -4076,7 +4079,7 @@ def run_validation(args: argparse.Namespace) -> int:
                 "comunica_port": args.comunica_port,
                 "hdt_port": args.hdt_port,
                 "comunica_bind_timeout": args.comunica_bind_timeout,
-                "node_heap_mb": args.node_heap_mb,
+                "node_heap_mb": getattr(args, "node_heap_mb", DEFAULT_NODE_HEAP_MB),
                 "comunica_warmup_timeout": args.comunica_warmup_timeout,
             }
             engine_options["artifact_path"] = str(args.rdf)

@@ -136,3 +136,90 @@ class NodeHeapEnvTests(VerboseTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RunValidationToleratesAMinimalNamespaceTests(VerboseTestCase):
+    """A new option must not become a required attribute of run_validation.
+
+    run_validation is driven by hand-built namespaces in several places -- this
+    suite and the mutation harness among them -- so reading a new option with
+    plain attribute access breaks those callers at runtime rather than at
+    import. That is exactly how adding --shacl-max-triples and --node-heap-mb
+    broke CI: five tests failed with "'Namespace' object has no attribute
+    'node_heap_mb'", and the failure surfaced in a merged feature's tests
+    rather than in the change that caused it.
+
+    The convention the file already used for progress_path and quiet is
+    getattr with the documented default. This pins it, so the next option
+    added cannot reintroduce the same break silently.
+    """
+
+    def test_run_validation_accepts_a_namespace_without_the_new_options(self):
+        """Behavioural, not textual: drive run_validation and look for the break.
+
+        An earlier version of this test asserted on the source text and failed
+        twice on formatting, which is the wrong instrument -- it constrains how
+        the guard is written rather than that it works.
+        """
+        import argparse
+        import json
+        import tempfile
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            (tmp / "scratch").mkdir()
+            (tmp / "s.vcf").write_text("##fileformat=VCFv4.2\n#CHROM\tPOS\n")
+            (tmp / "s.nt").write_text("<s> <p> <o> .\n")
+            # Deliberately missing shacl_max_triples and node_heap_mb.
+            args = argparse.Namespace(
+                results_dir=tmp / "results", representation="expanded",
+                info_representation="structured", header_representation="structured",
+                progress_path=None, quiet=True, scratch_dir=tmp / "scratch",
+                rdf=tmp / "s.nt", rdf_format="nt", engine="comunica",
+                engines=["comunica"], mapping_policy="strict",
+                strict_conformance=False, shacl_shapes=None,
+                query_timeout=60, validation_time_budget=0,
+                stop_after_query_timeout=False, qlever_memory_gb=4,
+                qlever_port=7019, comunica_port=7020, hdt_port=7021,
+                comunica_bind_timeout=60, comunica_warmup_timeout=60,
+                qlever_startup_timeout=60, qlever_index_arg=[],
+                qlever_server_arg=[], vcf=tmp / "s.vcf",
+                filter_oracle="cyvcf2", dataset_id="sample", queries=None,
+            )
+            engine = mock.MagicMock()
+            engine.describe.return_value = {"engine": "comunica"}
+            engine.execute.return_value = {"status": "FAILED"}
+            with mock.patch.object(V, "parse_vcf", return_value={
+                        "totalRecords": 1, "sampleCount": 0, "gtRecordCount": 0,
+                        "sourceSha256": "0" * 64}), \
+                    mock.patch.object(V, "attach_census_expectations",
+                                      side_effect=lambda p, *a, **k: p), \
+                    mock.patch.object(V, "validate_ntriples",
+                                      return_value={"status": "PASS", "tripleCount": 1}), \
+                    mock.patch.object(V, "materialize_ntriples",
+                                      return_value=(tmp / "s.nt", {})), \
+                    mock.patch.object(V, "build_manifest", return_value={}), \
+                    mock.patch.object(V, "build_engine", return_value=engine):
+                V.run_validation(args)
+            summary = json.loads((args.results_dir / "summary.json").read_text())
+
+        # The run may fail for its own reasons -- the engine here is a stub --
+        # but never because an option was read by attribute.
+        self.assertNotIn(
+            "has no attribute", str(summary.get("error") or ""),
+            "run_validation read a new option by attribute; use getattr with "
+            "its documented default so callers that build their own Namespace "
+            "keep working",
+        )
+
+    def test_a_namespace_without_them_still_resolves(self):
+        """The behaviour the getattr guard buys, checked rather than assumed."""
+        import argparse
+
+        args = argparse.Namespace()
+        self.assertEqual(
+            getattr(args, "shacl_max_triples", V.DEFAULT_SHACL_MAX_TRIPLES),
+            V.DEFAULT_SHACL_MAX_TRIPLES,
+        )
+        self.assertIsNone(getattr(args, "node_heap_mb", V.DEFAULT_NODE_HEAP_MB))
