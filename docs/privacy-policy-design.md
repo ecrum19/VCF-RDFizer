@@ -6,6 +6,12 @@ contract before code depends on it — and, in this case, to be explicit about
 what a policy layer can and cannot achieve, because the failure mode of a
 privacy feature is a false sense of safety.*
 
+*The first slice to be built is specified separately:
+[`policy-demonstrator.md`](policy-demonstrator.md), v0.1.0 — ODRL attached to
+files, regions and variants over single-sample fixtures, with per-request views
+verified against an oracle. It implements a subset of this document and cites
+the sections it defers.*
+
 VCF-RDFizer currently makes one decision about disclosure: it converts
 everything. Every sample, every genotype, every header line, every free-text
 `Description` goes into the graph, and every artifact is all-or-nothing. The
