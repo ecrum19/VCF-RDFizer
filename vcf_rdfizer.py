@@ -8857,6 +8857,9 @@ def run_validation_mode(
         ("--comunica-port", "comunica_port"),
         ("--hdt-port", "hdt_port"),
         ("--comunica-warmup-timeout", "comunica_warmup_timeout"),
+        # A subset selection. The runner turns this into a TIMING_ONLY result
+        # rather than a validation verdict -- see its --queries help.
+        ("--queries", "queries"),
     ):
         value = options.get(key)
         if value is not None:
@@ -9462,6 +9465,19 @@ def main():
         help="Per-query timeout in seconds for validation (default: engine default)",
     )
     parser.add_argument(
+        "--validation-queries",
+        default=None,
+        metavar="LIST",
+        help=(
+            "Run only these validation queries: comma-separated ids, or the "
+            "groups 'core', 'preflight', 'all'. A subset yields a TIMING_ONLY "
+            "result rather than a validation verdict, because the PASS "
+            "decision needs the whole set; each selected query is still "
+            "checked against the VCF oracle. Use it to measure retrieval cost "
+            "for one question without paying for the rest."
+        ),
+    )
+    parser.add_argument(
         "--validation-time-budget",
         default=None,
         help=(
@@ -9602,6 +9618,8 @@ def main():
                     "--validation-stop-after-query-timeout are mutually exclusive"
                 )
             validation_engine_options["stop_after_query_timeout"] = True
+        if args.validation_queries is not None:
+            validation_engine_options["queries"] = args.validation_queries
         if args.qlever_index_arg:
             validation_engine_options["qlever_index_args"] = list(args.qlever_index_arg)
         if args.qlever_server_arg:

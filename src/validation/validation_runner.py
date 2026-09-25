@@ -136,6 +136,51 @@ ANOMALY_PREFLIGHT_QUERIES = (
     "preflight_empty_values",
 )
 PREFLIGHT_COUNT_QUERIES = tuple(f"{name}_count" for name in ANOMALY_PREFLIGHT_QUERIES)
+
+#: Named groups for --queries, so a caller can ask for "core" rather than
+#: spelling out thirteen identifiers. "all" is the full set and is the default
+#: when --queries is absent.
+QUERY_GROUPS = {
+    "core": CORE_QUERIES,
+    "preflight": PREFLIGHT_QUERIES + PREFLIGHT_COUNT_QUERIES,
+    "all": PREFLIGHT_QUERIES + PREFLIGHT_COUNT_QUERIES + CORE_QUERIES,
+}
+
+
+def parse_query_selection(raw: str) -> tuple[str, ...]:
+    """Expand a --queries value into canonical query ids.
+
+    Accepts group names and individual ids, comma-separated. The result is
+    ordered by the canonical execution order rather than by the order the
+    caller wrote, because an anomaly preflight's `_count` companion is derived
+    from the sample that must already have run.
+    """
+    known = QUERY_GROUPS["all"]
+    wanted: set[str] = set()
+    for token in (item.strip() for item in raw.split(",")):
+        if not token:
+            continue
+        if token in QUERY_GROUPS:
+            wanted.update(QUERY_GROUPS[token])
+        elif token in known:
+            wanted.add(token)
+        else:
+            raise ValueError(
+                f"Unknown query '{token}'. Use a group "
+                f"({', '.join(sorted(QUERY_GROUPS))}) or one of: "
+                f"{', '.join(known)}"
+            )
+    if not wanted:
+        raise ValueError("--queries requires at least one query or group")
+    # An anomaly preflight's exact count is derived from its sample, so asking
+    # for the count alone would otherwise re-scan the graph for a number the
+    # sample query already carries. Pull the sample in rather than silently
+    # paying twice.
+    for name in tuple(wanted):
+        if name.endswith("_count") and name in PREFLIGHT_COUNT_QUERIES:
+            wanted.add(name[: -len("_count")])
+    return tuple(name for name in known if name in wanted)
+
 ANOMALY_SAMPLE_LIMIT = 100
 TRANSITIONS = {("A", "G"), ("G", "A"), ("C", "T"), ("T", "C")}
 
@@ -3448,6 +3493,74 @@ BLOCKING_PREFLIGHT_QUERIES = (
 )
 
 
+def evaluate_timing_only(
+    executions: dict[str, dict[str, Any]],
+    parser: dict[str, Any],
+    representation: str,
+    *,
+    selected: tuple[str, ...],
+) -> dict[str, Any]:
+    """Compare the selected core queries without producing a validation verdict.
+
+    evaluate_validation() cannot be reused on a subset. Its PASS/MISMATCH
+    decision reads preflight gating, the sample/GT inventory and invariants
+    computed across the whole query set, so handing it a subset would either
+    crash on the missing keys or -- worse -- report a pass that only means
+    "the four queries you asked for agreed". This path therefore reports per
+    query and refuses to aggregate.
+
+    What it does keep is the equality check. A retrieval timing whose answer
+    was never compared against the parser is not a measurement of anything, so
+    every selected core query is still compared, and a disagreement makes the
+    run fail even though no verdict is issued.
+    """
+    sparql: dict[str, Any] = {}
+    failures: dict[str, str] = {}
+    queries: dict[str, Any] = {}
+    core_selected = [name for name in CORE_QUERIES if name in selected]
+    for query_id in core_selected:
+        try:
+            sparql[query_id] = normalize(
+                query_id, Path(executions[query_id]["rawResult"])
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            failures[query_id] = str(error)
+            continue
+        queries[query_id] = compare_rows(
+            query_id, parser[query_id], sparql[query_id]
+        )
+    # Same carve-out evaluate_validation() applies: with no samples or no GT
+    # column these two have nothing to compare, and that is a verified
+    # not-applicable rather than a mismatch.
+    if not (parser["sampleCount"] and parser["gtRecordCount"]):
+        for query_id in ("q05_sample_genotype_counts", "q06_ac_an_distribution"):
+            if query_id in queries:
+                queries[query_id] = {
+                    "status": "NOT_APPLICABLE_VERIFIED_NO_SAMPLES_OR_GT",
+                    "diagnosticComparison": queries[query_id],
+                }
+    allowed = {"PASS", "NOT_APPLICABLE_VERIFIED_NO_SAMPLES_OR_GT"}
+    agreed = not failures and all(
+        value["status"] in allowed for value in queries.values()
+    )
+    preflight_selected = {
+        name: {"status": executions[name]["status"]}
+        for name in PREFLIGHT_QUERIES + PREFLIGHT_COUNT_QUERIES
+        if name in selected and name in executions
+    }
+    return {
+        "status": "TIMING_ONLY",
+        "selectedQueries": list(selected),
+        "comparedQueries": queries,
+        "normalizationFailures": failures,
+        "preflightExecutions": preflight_selected,
+        "answersAgree": agreed,
+        "sparql": sparql,
+        # Named so nobody greps for a verdict here and finds an empty string.
+        "verdict": "not-evaluated: a subset cannot produce a validation verdict",
+    }
+
+
 def evaluate_validation(
     executions: dict[str, dict[str, Any]],
     parser: dict[str, Any],
@@ -3721,8 +3834,12 @@ def build_manifest(
     *,
     engine_description: dict[str, Any],
     materialization: dict[str, Any],
+    query_ids: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
-    query_paths = sorted({query_path(query_dir, query_id) for query_id in PREFLIGHT_QUERIES + CORE_QUERIES})
+    # Digest the queries that will actually run. On a subset run the full
+    # catalogue would claim evidence the run never produced.
+    manifest_queries = query_ids or (PREFLIGHT_QUERIES + CORE_QUERIES)
+    query_paths = sorted({query_path(query_dir, query_id) for query_id in manifest_queries})
     source_rdf_entry = {
         "path": str(args.rdf),
         "sha256": sha256_file(args.rdf),
@@ -3770,6 +3887,13 @@ def run_validation(args: argparse.Namespace) -> int:
     normalized_dir.mkdir(parents=True, exist_ok=True)
     query_dir = QUERY_ROOT / args.representation
     query_ids = PREFLIGHT_QUERIES + PREFLIGHT_COUNT_QUERIES + CORE_QUERIES
+    # A subset run is a measurement, not a validation. Keeping the two apart
+    # here means evaluate_validation() never has to reason about a missing
+    # query, and no consumer can mistake a timing run for a passed validation.
+    selected = getattr(args, "queries", None)
+    timing_only = selected is not None
+    if timing_only:
+        query_ids = tuple(name for name in query_ids if name in selected)
     missing = [name for name in query_ids if not query_path(query_dir, name).is_file()]
     if missing:
         raise RuntimeError(f"Missing {args.representation} validation query files: {', '.join(missing)}")
@@ -3860,6 +3984,7 @@ def run_validation(args: argparse.Namespace) -> int:
                 args, query_dir, parser,
                 engine_description={"engines": list(args.engines), "options": engine_options},
                 materialization=materialization,
+                query_ids=query_ids,
             )
             write_json(results_dir / "manifest.json", manifest)
             if rdf_validation["status"] != "PASS":
@@ -4006,16 +4131,24 @@ def run_validation(args: argparse.Namespace) -> int:
                         per_engine[engine_name]["queriesPlanned"] = len(query_ids)
                     continue
 
-                verdict = evaluate_validation(
-                    executions, parser, args.representation,
-                    strict_conformance=args.strict_conformance,
-                    mapping_policy=args.mapping_policy,
-                    parsed_triple_count=rdf_validation.get("tripleCount"),
-                )
-                write_json(engine_dir / "preflight.json", verdict["preflight"])
-                if verdict["status"] != "EXECUTION_FAILED":
+                if timing_only:
+                    verdict = evaluate_timing_only(
+                        executions, parser, args.representation,
+                        selected=query_ids,
+                    )
+                    write_json(engine_dir / "timing-only.json", verdict)
                     write_json(engine_dir / "sparql.json", verdict["sparql"])
-                    write_json(engine_dir / "comparison.json", verdict["comparison"])
+                else:
+                    verdict = evaluate_validation(
+                        executions, parser, args.representation,
+                        strict_conformance=args.strict_conformance,
+                        mapping_policy=args.mapping_policy,
+                        parsed_triple_count=rdf_validation.get("tripleCount"),
+                    )
+                    write_json(engine_dir / "preflight.json", verdict["preflight"])
+                    if verdict["status"] != "EXECUTION_FAILED":
+                        write_json(engine_dir / "sparql.json", verdict["sparql"])
+                        write_json(engine_dir / "comparison.json", verdict["comparison"])
                 verdict["executions"] = executions
                 per_engine[engine_name] = verdict
 
@@ -4041,7 +4174,8 @@ def run_validation(args: argparse.Namespace) -> int:
             primary = args.engines[0]
             primary_verdict = per_engine[primary]
             report = primary_verdict.get("preflight", {})
-            write_json(results_dir / "preflight.json", report)
+            if not timing_only:
+                write_json(results_dir / "preflight.json", report)
             if primary_verdict["status"] == "EXECUTION_FAILED":
                 summary = {
                     "datasetId": args.dataset_id, "representation": args.representation,
@@ -4057,6 +4191,48 @@ def run_validation(args: argparse.Namespace) -> int:
             for query_id, rows in sparql.items():
                 write_json(normalized_dir / f"{query_id}.json", rows)
             write_json(results_dir / "sparql.json", sparql)
+
+            if timing_only:
+                # No verdict, and deliberately no "comparisonStatus" key: a
+                # consumer that reads this file expecting a validation result
+                # should fail to find one rather than read a subset as a pass.
+                disagreed = sorted(
+                    name for name, value in primary_verdict["comparedQueries"].items()
+                    if value["status"] not in {
+                        "PASS", "NOT_APPLICABLE_VERIFIED_NO_SAMPLES_OR_GT",
+                    }
+                )
+                agree = all(
+                    value.get("answersAgree", False) for value in per_engine.values()
+                )
+                summary = {
+                    "datasetId": args.dataset_id,
+                    "representation": args.representation,
+                    "status": "TIMING_ONLY",
+                    "engine": primary, "engines": list(args.engines),
+                    "engineStatuses": {
+                        name: value["status"] for name, value in per_engine.items()
+                    },
+                    "engineAgreement": agreement["agree"],
+                    "sourceFormat": args.rdf_format,
+                    "selectedQueries": list(query_ids),
+                    "answersAgree": agree,
+                    "disagreeingQueries": disagreed,
+                    "recordCount": parser["totalRecords"],
+                    "sampleCount": parser["sampleCount"],
+                    "gtRecordCount": parser["gtRecordCount"],
+                    "benchmark": benchmark["totals"],
+                    "results": {
+                        "manifest": str(results_dir / "manifest.json"),
+                        "parser": str(results_dir / "parser.json"),
+                        "sparql": str(results_dir / "sparql.json"),
+                        "benchmark": str(results_dir / "benchmark.csv"),
+                    },
+                }
+                # A disagreement is still a failure. The point of comparing on
+                # a timing run is that a fast wrong answer is not a result.
+                return 0 if (agree and agreement["agree"]) else 1
+
             comparison = primary_verdict["comparison"]
             write_json(results_dir / "comparison.json", comparison)
 
@@ -4105,7 +4281,7 @@ def run_validation(args: argparse.Namespace) -> int:
         else:
             progress.emit(
                 "complete",
-                completed=progress.total if status in {"PASS", "MISMATCH"} else 0,
+                completed=progress.total if status in {"PASS", "MISMATCH", "TIMING_ONLY"} else 0,
                 detail=f"validation {status.lower()}",
             )
         if not quiet:
@@ -4161,6 +4337,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--results-dir", type=Path, required=True)
     parser.add_argument("--dataset-id", required=True)
+    parser.add_argument(
+        "--queries",
+        default=None,
+        metavar="LIST",
+        help=(
+            "Run only these queries (comma-separated ids, or the groups "
+            "'core', 'preflight', 'all'). Selecting a subset produces a "
+            "TIMING_ONLY result, not a validation verdict: the preflight "
+            "gating and cross-query invariants that decide PASS/MISMATCH need "
+            "the whole set. Each selected core query is still compared against "
+            "the oracle, so a subset run measures cost on answers that were "
+            "checked."
+        ),
+    )
     parser.add_argument("--filter-oracle", choices=("auto", "bcftools", "cyvcf2"), default="auto")
     parser.add_argument("--scratch-dir", type=Path, default=Path("/work"))
     parser.add_argument(
@@ -4380,6 +4570,11 @@ def resolve_args(parser: argparse.ArgumentParser, argv: list[str] | None = None)
         parser.error(str(error))
     # Retained as the primary engine's name for reports and callers that read it.
     args.engine = args.engines[0]
+    if args.queries is not None:
+        try:
+            args.queries = parse_query_selection(args.queries)
+        except ValueError as error:
+            parser.error(str(error))
     args.vcf = args.vcf.resolve()
 
     supplied = args.rdf or args.rdf_gz or args.rdf_nt
