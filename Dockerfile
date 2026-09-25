@@ -254,6 +254,7 @@ COPY src/validation/ /opt/vcf-rdfizer/validation/
 # Shared, dependency-free helpers used by both the host CLI and the in-container
 # runners, so they live at the repository root rather than in src/.
 COPY vcf_rdfizer_gzip.py /opt/vcf-rdfizer/
+COPY vcf_rdfizer_cottas.py /opt/vcf-rdfizer/
 # The vocabulary terms, the VCF-version model and the lexical parsers. The
 # validation runner imports this as a sibling module, so the oracle and the
 # emitters share one description of what the graph should contain instead of

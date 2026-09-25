@@ -252,7 +252,7 @@ class ValidateTests(VerboseTestCase):
         with mock.patch.dict(sys.modules, {"pycottas": mock.Mock()}), \
                 mock.patch.object(M, "count_decoded", return_value=2):
             result = M.validate(self.args(format="cottas"))
-        self.assertEqual(result["validator"], "pycottas.cottas2rdf")
+        self.assertEqual(result["validator"], "cottas_tool.decompress")
         self.assertTrue(result["count_match"])
 
 

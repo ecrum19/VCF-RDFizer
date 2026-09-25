@@ -74,6 +74,8 @@ try:
 except ImportError:  # pragma: no cover - shipped alongside this module
     vcf_rdfizer_gzip = None
 
+from vcf_rdfizer_cottas import cottas_index_paths, parse_cottas_indexes, require_dataset_indexes
+
 import vcf_rdfizer_vocab as vocab
 from vcf_rdfizer_vocab import (
     CONTIG_ATTRIBUTES,
@@ -1558,18 +1560,17 @@ def rdf_label_for_path(path: Path) -> str:
 
 def rdf_output_basename(path: Path) -> str:
     """Return the common output basename for ``.nt`` and ``.nt.gz`` RDF."""
-    if path.name.endswith(".nt.gz"):
-        return path.name[: -len(".nt.gz")]
-    if path.name.endswith(".nt"):
-        return path.name[: -len(".nt")]
+    for suffix in (".nt.gz", ".nq.gz", ".nt", ".nq"):
+        if path.name.endswith(suffix):
+            return path.name[:-len(suffix)]
     return path.stem
 
 
 def compression_artifact_name_for_method(path: Path, method: str) -> str:
     """Compute expected compressed artifact filename for a method."""
-    if path.name.endswith(".nt.gz"):
+    if path.name.endswith((".nt.gz", ".nq.gz")):
         stem = rdf_output_basename(path)
-        ext = "nt"
+        ext = Path(path.stem).suffix.lstrip(".")
     else:
         stem = rdf_output_basename(path)
         ext = path.suffix.lstrip(".") or "nt"
@@ -1599,6 +1600,8 @@ def planned_output_paths(
     rdf_name: str | None,
     methods: list[str],
     partitioned: bool,
+    cottas_indexes: tuple[str, ...] = ("spo",),
+    source_rdf_name: str | None = None,
 ) -> set[Path]:
     """List final output paths that a compression plan would create."""
     target_dir = out_dir / output_name
@@ -1606,7 +1609,7 @@ def planned_output_paths(
     if rdf_name is not None:
         planned.add(target_dir / rdf_name)
 
-    rdf_path = Path(rdf_name or f"{output_name}.nt")
+    rdf_path = Path(source_rdf_name or rdf_name or f"{output_name}.nt")
     planned.update(
         target_dir / compression_artifact_name_for_method(rdf_path, method)
         for method in methods
@@ -1616,7 +1619,12 @@ def planned_output_paths(
         # The pinned Java-free indexer generates this canonical sidecar.
         planned.add(target_dir / f"{output_name}.hdt.index.v1-1")
     if any(method in COTTAS_COMPRESSION_METHODS for method in methods):
-        planned.add(target_dir / f"{output_name}.cottas")
+        for path in cottas_index_paths(target_dir / f"{output_name}.cottas", cottas_indexes).values():
+            planned.add(path)
+            if "cottas_gzip" in methods:
+                planned.add(Path(str(path) + ".gz"))
+            if "cottas_brotli" in methods:
+                planned.add(Path(str(path) + ".br"))
     if partitioned:
         planned.add(target_dir / f".{safe_metrics_name(output_name)}.partitioned-results.json")
     return planned
@@ -1653,8 +1661,8 @@ def validate_no_output_collisions(plans: dict[str, set[Path]]):
 def compression_method_label_for_path(path: Path, method: str) -> str:
     """Return human-readable compression method label for a path."""
     ext = path.suffix.lstrip(".") or "nt"
-    if path.name.endswith(".nt.gz"):
-        ext = "nt"
+    if path.name.endswith((".nt.gz", ".nq.gz")):
+        ext = Path(path.stem).suffix.lstrip(".")
     labels = {
         "gzip": f"gzip (.{ext}.gz)",
         "brotli": f"brotli (.{ext}.br)",
@@ -5815,6 +5823,8 @@ def write_compression_metrics_artifacts(
         },
         "cottas_conversion": {
             "output_cottas_path": cottas_result.get("output_path", ""),
+            "index": cottas_result.get("details", {}).get("index", "spo"),
+            "indexes": cottas_result.get("details", {}).get("indexes", {}),
             "output_cottas_size_bytes": int(cottas_result.get("output_size_bytes") or 0),
             "exit_code": int(cottas_result.get("exit_code") or 0),
             "timing": timing_payload(cottas_result),
@@ -5843,12 +5853,14 @@ def write_compression_metrics_artifacts(
         },
         "gzip_on_cottas": {
             "output_cottas_gz_path": cottas_gzip_result.get("output_path", ""),
+            "indexes": cottas_gzip_result.get("details", {}).get("indexes", {}),
             "output_cottas_gz_size_bytes": int(cottas_gzip_result.get("output_size_bytes") or 0),
             "exit_code": int(cottas_gzip_result.get("exit_code") or 0),
             "timing": timing_payload(cottas_gzip_result),
         },
         "brotli_on_cottas": {
             "output_cottas_br_path": cottas_brotli_result.get("output_path", ""),
+            "indexes": cottas_brotli_result.get("details", {}).get("indexes", {}),
             "output_cottas_br_size_bytes": int(cottas_brotli_result.get("output_size_bytes") or 0),
             "exit_code": int(cottas_brotli_result.get("exit_code") or 0),
             "timing": timing_payload(cottas_brotli_result),
@@ -6343,7 +6355,7 @@ def run_compression_methods_for_rdf(
     in_dir = rdf_path.parent
     input_container = f"/data/in/{rdf_path.name}"
     input_stem = rdf_output_basename(rdf_path)
-    input_ext = "nt" if rdf_path.name.endswith(".nt.gz") else rdf_path.suffix.lstrip(".") or "nt"
+    input_ext = Path(rdf_path.stem).suffix.lstrip(".") if rdf_path.name.endswith(".gz") else rdf_path.suffix.lstrip(".") or "nt"
     if target_out_dir is None:
         target_out_dir = out_dir / input_stem
     ensure_dir(target_out_dir)
@@ -6924,6 +6936,7 @@ def run_containerized_partitioned_representation_methods(
     max_chunk_bytes: int,
     expected_triples: int | None = None,
     index_warnings: list[dict] | None = None,
+    cottas_indexes: tuple[str, ...] = ("spo",),
 ):
     """Run partitioned compression in an ephemeral Docker-managed volume.
 
@@ -7013,6 +7026,8 @@ def run_containerized_partitioned_representation_methods(
                 output_name,
                 "--methods",
                 ",".join(methods),
+                "--cottas-indexes",
+                ",".join(cottas_indexes),
                 "--target-chunk-bytes",
                 str(target_chunk_bytes),
                 "--min-chunk-bytes",
@@ -7065,6 +7080,8 @@ def run_containerized_partitioned_representation_methods(
                 result["output_path"] = str(artifact_path)
                 result["output_size_bytes"] = int(file_size_bytes(artifact_path) or 0)
                 details = result.setdefault("details", {})
+                for indexed in details.get("indexes", {}).values():
+                    indexed["output_path"] = str(out_dir / Path(indexed["output_path"]).name)
                 if method == "hdt":
                     index_path = find_hdt_index_sidecar(artifact_path)
                     details["index_path"] = str(index_path) if index_path else ""
@@ -7152,6 +7169,7 @@ def run_partitioned_representation_methods_for_rdf_files(
     max_chunk_bytes: int,
     expected_triples: int | None = None,
     index_warnings: list[dict] | None = None,
+    cottas_indexes: tuple[str, ...] = ("spo",),
 ):
     """Dispatch aggregate RDF to the ephemeral container pipeline.
 
@@ -7170,6 +7188,7 @@ def run_partitioned_representation_methods_for_rdf_files(
             return False, {}
         source_rdf_path = rdf_paths[0]
     return run_containerized_partitioned_representation_methods(
+        cottas_indexes=cottas_indexes,
         source_rdf_path=source_rdf_path,
         out_dir=out_dir,
         image_ref=image_ref,
@@ -7260,6 +7279,7 @@ def run_full_mode(
     linking_manifests: list | None = None,
     linking_options: dict | None = None,
     allow_cohort_expansion: bool = False,
+    cottas_indexes: tuple[str, ...] = ("spo",),
 ):
     """Execute full pipeline: per-input TSV -> RDF -> compression -> validation."""
     linking_options = dict(linking_options or {})
@@ -7841,6 +7861,7 @@ def run_full_mode(
 
             if not input_failed and use_partitioned_compression and partitioned_methods:
                 ok, partitioned_representation_results = run_partitioned_representation_methods_for_rdf_files(
+                    cottas_indexes=cottas_indexes,
                     rdf_paths=[],
                     source_rdf_path=raw_rdf_files[0],
                     out_dir=out_dir / output_name,
@@ -8284,6 +8305,7 @@ def run_compress_mode(
     chunk_min_bytes: int,
     chunk_max_bytes: int,
     wrapper_log_path: Path,
+    cottas_indexes: tuple[str, ...] = ("spo",),
 ):
     """Execute compression-only mode for a designated RDF file."""
     print("Step 3/3: Compressing RDF input")
@@ -8343,6 +8365,7 @@ def run_compress_mode(
                 return 1
             method_results.update(raw_method_results)
         ok, partitioned_results = run_partitioned_representation_methods_for_rdf_files(
+            cottas_indexes=cottas_indexes,
             rdf_paths=[],
             source_rdf_path=rdf_path,
             out_dir=out_dir / input_stem,
@@ -8500,11 +8523,11 @@ def detect_compressed_format(path: Path):
 def default_decompressed_name(path: Path, fmt: str):
     """Compute default output filename for decompression mode."""
     if fmt == "gzip":
-        if path.name.endswith(".nt.gz"):
+        if path.name.endswith((".nt.gz", ".nq.gz")):
             return path.name[: -len(".gz")]
         return f"{path.stem}.nt"
     if fmt == "brotli":
-        if path.name.endswith(".nt.br"):
+        if path.name.endswith((".nt.br", ".nq.br")):
             return path.name[: -len(".br")]
         return f"{path.stem}.nt"
     if fmt == "cottas":
@@ -8523,6 +8546,7 @@ def run_index_mode(
     wrapper_log_path: Path,
     run_id: str | None = None,
     timestamp: str | None = None,
+    cottas_indexes: tuple[str, ...] = ("spo",),
 ):
     """Generate or regenerate the query index for one existing artifact.
 
@@ -8551,7 +8575,7 @@ def run_index_mode(
             'if [[ -z "$PYTHON_BIN" || ! -x "$PYTHON_BIN" ]]; then '
             'echo "Missing pycottas Python executable in container" >&2; exit 127; fi; '
             f'"$PYTHON_BIN" {shlex.quote(COTTAS_TOOL_CONTAINER)} reindex '
-            f"{shlex.quote(source_container)} spo"
+            f"{shlex.quote(source_container)} {shlex.quote(','.join(cottas_indexes))}"
         )
     safe_input = safe_metrics_name(index_path.name)
     timing_host = metrics_dir / "timings" / "index" / f"{safe_input}.txt"
@@ -8591,6 +8615,10 @@ def run_index_mode(
         else (index_path if file_size_bytes(index_path) else None)
     )
     index_ready = index_path_after is not None
+    if index_format == "cottas":
+        index_ready = index_ready and all(
+            file_size_bytes(path) for path in cottas_index_paths(index_path, cottas_indexes).values()
+        )
     final_code = int(exit_code) if int(exit_code) != 0 else (0 if index_ready else 1)
     index_was_present = existing_index_path is not None or index_format == "cottas"
     payload = {
@@ -8611,7 +8639,7 @@ def run_index_mode(
         },
         "index_status": (
             "regenerated" if index_was_present else "generated"
-        ) if index_ready else "failed",
+        ) if final_code == 0 else "failed",
         "index_size_bytes": file_size_bytes(index_path_after) if index_path_after else 0,
     }
     if index_format == "hdt":
@@ -8619,6 +8647,9 @@ def run_index_mode(
         payload["hdt_path"] = str(index_path)
     else:
         payload["cottas_path"] = str(index_path)
+        payload["indexes"] = {
+            order: str(path) for order, path in cottas_index_paths(index_path, cottas_indexes).items()
+        }
     metrics_path = metrics_dir / "stages" / "index" / f"{index_format}-{safe_input}.json"
     metrics_path.parent.mkdir(parents=True, exist_ok=True)
     metrics_path.write_text(
@@ -9129,7 +9160,7 @@ def main():
     parser.add_argument(
         "--rdf",
         default=None,
-        help="Input RDF file (.nt or .nt.gz) for --mode compress; .nt.gz required for --mode validation",
+        help="Input RDF file (.nt/.nt.gz or .nq/.nq.gz) for --mode compress; RDF artifact for --mode validation",
     )
     parser.add_argument(
         "-C",
@@ -9293,6 +9324,10 @@ def main():
             "Queryable RDF representations (comma-separated): hdt,cottas, or none "
             f"(default: {DEFAULT_REPRESENTATIONS})"
         ),
+    )
+    parser.add_argument(
+        "--cottas-indexes", type=parse_cottas_indexes, default="spo",
+        help="COTTAS orders: permutations of spo or spog (comma-separated); all selects six triple orders, all-quads selects 24 dataset orders (default: spo)",
     )
     parser.add_argument(
         "--artifact-compression",
@@ -9532,6 +9567,12 @@ def main():
     from vcf_rdfizer_link import add_link_arguments, run_options, run_posthoc, selected_linkers
     add_link_arguments(parser)
     args = parser.parse_args()
+    if args.cottas_indexes != ("spo",) and (
+        args.mode not in {"full", "compress", "index"}
+        or (args.mode == "index" and not args.cottas)
+    ):
+        eprint("Error: --cottas-indexes requires COTTAS conversion or --mode index --cottas")
+        return 2
     if args.mode not in {"full", "link"} and (args.link or args.linker_path or args.offline or args.links_cache_only or args.assembly or args.links_contact_email):
         eprint("Error: linking options require --mode full or --mode link")
         return 2
@@ -9724,6 +9765,8 @@ def main():
                     representations=args.representations,
                     artifact_compression=args.artifact_compression,
                 )
+            if args.cottas_indexes != ("spo",) and not any(method in COTTAS_COMPRESSION_METHODS for method in full_methods):
+                raise ValueError("--cottas-indexes requires --representations cottas")
             hdt_strategy_error = hdt_strategy_rejection(
                 hdt_strategy=args.hdt_strategy,
                 methods=full_methods,
@@ -9760,6 +9803,7 @@ def main():
                     rdf_name=rdf_name,
                     methods=full_methods,
                     partitioned=full_uses_partitioning,
+                    cottas_indexes=args.cottas_indexes,
                 )
                 if linking_manifests:
                     output_plans[f"input {index} ({prefix})"].add(
@@ -9817,8 +9861,8 @@ def main():
             rdf_path = Path(args.rdf).expanduser().resolve()
             if not rdf_path.exists() or not rdf_path.is_file():
                 raise ValueError(f"RDF input file not found: {rdf_path}")
-            if rdf_path.suffix != ".nt" and not rdf_path.name.endswith(".nt.gz"):
-                raise ValueError("Compression input must be a .nt or .nt.gz file")
+            if not rdf_path.name.endswith((".nt", ".nt.gz", ".nq", ".nq.gz")):
+                raise ValueError("Compression input must be a .nt, .nt.gz, .nq or .nq.gz file")
             if args.legacy_compression is not None:
                 if (
                     args.rdf_compression != DEFAULT_RDF_COMPRESSION
@@ -9836,6 +9880,13 @@ def main():
                     representations=args.representations,
                     artifact_compression=args.artifact_compression,
                 )
+            if args.cottas_indexes != ("spo",) and not any(method in COTTAS_COMPRESSION_METHODS for method in methods):
+                raise ValueError("--cottas-indexes requires --representations cottas")
+            if rdf_path.name.endswith((".nq", ".nq.gz")):
+                if any(method in HDT_COMPRESSION_METHODS for method in methods):
+                    raise ValueError("HDT does not preserve named graphs; select --representations cottas")
+                if any(method in COTTAS_COMPRESSION_METHODS for method in methods):
+                    require_dataset_indexes(args.cottas_indexes)
             hdt_strategy_error = hdt_strategy_rejection(
                 hdt_strategy=args.hdt_strategy,
                 methods=methods,
@@ -9865,6 +9916,8 @@ def main():
                         rdf_name=None,
                         methods=methods,
                         partitioned=compression_uses_partitioning_for_input,
+                        cottas_indexes=args.cottas_indexes,
+                        source_rdf_name=rdf_path.name,
                     )
                 }
             )
@@ -9889,6 +9942,10 @@ def main():
                 raise ValueError(
                     f"{index_format.upper()} input file not found: {index_path}"
                 )
+            if index_format == "cottas":
+                validate_no_output_collisions({
+                    "COTTAS indexes": set(list(cottas_index_paths(index_path, args.cottas_indexes).values())[1:])
+                })
             validate_mode_dirs([out_root, out_dir, metrics_root])
         else:
             if args.spark_partitions is not None:
@@ -10172,6 +10229,7 @@ def main():
         if mode == "full":
             # Full-mode orchestrates conversion + compression pipeline.
             return run_full_mode(
+                cottas_indexes=args.cottas_indexes,
                 input_mount_dir=input_mount_dir,
                 container_inputs=container_inputs,
                 expected_prefixes=expected_prefixes,
@@ -10228,6 +10286,7 @@ def main():
         if mode == "compress":
             # Compression-only mode.
             return run_compress_mode(
+                cottas_indexes=args.cottas_indexes,
                 rdf_path=rdf_path,
                 out_dir=out_dir,
                 metrics_dir=metrics_dir,
@@ -10266,6 +10325,7 @@ def main():
             )
         if mode == "index":
             return run_index_mode(
+                cottas_indexes=args.cottas_indexes,
                 index_path=index_path,
                 index_format=index_format,
                 metrics_dir=metrics_dir,

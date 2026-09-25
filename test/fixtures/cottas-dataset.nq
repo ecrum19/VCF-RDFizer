@@ -1,0 +1,11 @@
+# Shared blank nodes, named graphs and the default graph span chunk boundaries.
+<urn:s> <urn:p> "same" <urn:g1> .
+<urn:s> <urn:p> "same" <urn:g2> .
+<urn:s> <urn:p> "same" .
+_:shared <urn:p> _:object _:graph .
+<urn:a> <urn:z> "é"@fr <urn:g1> .
+<urn:z> <urn:a> "01"^^<http://www.w3.org/2001/XMLSchema#integer> <urn:g2> .
+<urn:q> <urn:p> "line\nquote\"slash\\" _:graph .
+_:shared <urn:q> _:object <urn:g1> .
+<urn:z> <urn:z> <urn:o> .
+<urn:a> <urn:a> "" _:graph .
