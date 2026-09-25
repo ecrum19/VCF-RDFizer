@@ -31,7 +31,7 @@ artifacts, run metrics and logs, and hidden intermediates all live beneath it.
 
 | Flag | Meaning |
 | --- | --- |
-| `-i, --input` | VCF file or directory. Only `*.vcf` and `*.vcf.gz` are recognised; a directory is enumerated one level deep and snapshotted at run start |
+| `-i, --input` | VCF file or directory. Only `*.vcf` and `*.vcf.gz` are recognised; a directory is enumerated one level deep and snapshotted at run start. macOS AppleDouble sidecars (`._*.vcf`, which tar and copies from macOS add) are skipped with a notice. An input that is not UTF-8 text fails on its own at stage `input-encoding` ("not a UTF-8 text VCF") and the other inputs still convert |
 | `--rdf` | RDF input for `compress`/`link`, or the artifact to check in `validation` |
 | `-C, --compressed-input` | `.nt.gz`, `.nt.br`, `.hdt`, `.cottas`, `.cottas.gz`, `.cottas.br` |
 | `-H, --hdt` / `--cottas` | Existing artifact for `--mode index` |

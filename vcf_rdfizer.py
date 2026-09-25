@@ -52,6 +52,7 @@ Mode runners ...................................... `run_full_mode`,
 """
 
 import argparse
+import codecs
 import csv
 import gzip
 import importlib.resources as importlib_resources
@@ -392,11 +393,55 @@ def count_records_tsv_rows(records_tsv: Path) -> int:
     return max(0, total - 1)
 
 
+class InputEncodingError(ValueError):
+    """An input whose bytes do not decode as UTF-8, so it is not a text VCF."""
+
+
+#: How much of a records TSV the encoding probe decodes. A binary file posing
+#: as a VCF -- a macOS AppleDouble ``._x.vcf`` is the usual one -- is caught in
+#: its first bytes, and a bounded read keeps the probe free at cohort scale.
+RECORDS_TSV_ENCODING_PROBE_BYTES = 1024 * 1024
+
+
+def _not_utf8_message(exc: UnicodeDecodeError) -> str:
+    bad_byte = exc.object[exc.start : exc.start + 1].hex() or "??"
+    return (
+        f"not a UTF-8 text VCF (byte 0x{bad_byte} does not decode as UTF-8; "
+        f"is this a binary file, such as a macOS ._ AppleDouble file?)"
+    )
+
+
+def check_records_tsv_is_utf8(records_tsv: Path) -> None:
+    """Raise InputEncodingError when the start of a records TSV is not UTF-8.
+
+    Every downstream reader opens the TSV as UTF-8 text, so a binary input
+    otherwise surfaces as a bare ``UnicodeDecodeError`` from whichever reader
+    touches it first. An unreadable file is left for the pipeline to report.
+    """
+    try:
+        with records_tsv.open("rb") as handle:
+            head = handle.read(RECORDS_TSV_ENCODING_PROBE_BYTES)
+    except OSError:
+        return
+    try:
+        # final=False: a multi-byte character cut by the probe boundary is not
+        # an error, only a byte that can never start or continue one is.
+        codecs.getincrementaldecoder("utf-8")().decode(head, final=False)
+    except UnicodeDecodeError as exc:
+        raise InputEncodingError(_not_utf8_message(exc)) from exc
+
+
 def read_records_tsv_sample_count(records_tsv: Path) -> int:
-    """Sample columns declared by a records TSV, or 0 when it has none."""
+    """Sample columns declared by a records TSV, or 0 when it has none.
+
+    Raises InputEncodingError for a TSV that is not UTF-8 text: that is a bad
+    input to report, not an unreadable one to wave through.
+    """
     try:
         with SampleRecordStream(records_tsv) as stream:
             return len(stream.columns)
+    except UnicodeDecodeError as exc:
+        raise InputEncodingError(_not_utf8_message(exc)) from exc
     except (OSError, csv.Error, StopIteration):
         return 0
 
@@ -1145,13 +1190,35 @@ def is_vcf_file(path: Path) -> bool:
     return name.endswith(".vcf") or name.endswith(".vcf.gz")
 
 
+def is_appledouble_file(path: Path) -> bool:
+    """Return True for a macOS AppleDouble sidecar (``._name``).
+
+    tar and copies from macOS to non-HFS volumes add one ``._x.vcf`` binary
+    resource fork per file. It carries the VCF suffix but is never a VCF.
+    """
+    return path.name.startswith("._")
+
+
 def list_vcfs_in_dir(path: Path):
-    """List VCF inputs in a stable order for deterministic processing."""
+    """List VCF inputs in a stable order for deterministic processing.
+
+    AppleDouble ``._*`` sidecars are left out rather than queued as inputs
+    that can only fail; ``list_appledouble_in_dir`` names what was left out.
+    """
     files = []
     for item in sorted(path.iterdir()):
-        if item.is_file() and is_vcf_file(item):
+        if item.is_file() and is_vcf_file(item) and not is_appledouble_file(item):
             files.append(item)
     return files
+
+
+def list_appledouble_in_dir(path: Path):
+    """The ``._*.vcf`` / ``._*.vcf.gz`` sidecars ``list_vcfs_in_dir`` skips."""
+    return [
+        item
+        for item in sorted(path.iterdir())
+        if item.is_file() and is_vcf_file(item) and is_appledouble_file(item)
+    ]
 
 
 def vcf_output_prefix(path: Path) -> str:
@@ -1196,6 +1263,12 @@ def resolve_input_snapshot(input_path: Path):
 
     if input_path.is_dir():
         snapshot_files = list_vcfs_in_dir(input_path)
+        skipped = list_appledouble_in_dir(input_path)
+        if skipped:
+            print(
+                f"  Skipping {len(skipped)} macOS AppleDouble file(s), which "
+                f"are never VCFs: {', '.join(p.name for p in skipped)}"
+            )
         if not snapshot_files:
             raise ValueError("No .vcf or .vcf.gz files found in the input directory")
         mount_dir = input_path
@@ -7444,12 +7517,20 @@ def run_full_mode(
         # This sits ahead of the helper TSVs deliberately: building those is
         # already records x samples work, so a guard after them has let the
         # failure mode start.
-        refusal = cohort_scale_refusal(
-            records_tsv=triplet["records"],
-            sample_representation=sample_workflow.representation,
-            out_dir=out_dir,
-            allow=allow_cohort_expansion,
-        )
+        # The encoding probe runs first and for every representation: the
+        # guard and all later readers decode the TSV as UTF-8, and a binary
+        # input must fail here, as this input, not crash the whole run.
+        try:
+            check_records_tsv_is_utf8(triplet["records"])
+            refusal = cohort_scale_refusal(
+                records_tsv=triplet["records"],
+                sample_representation=sample_workflow.representation,
+                out_dir=out_dir,
+                allow=allow_cohort_expansion,
+            )
+        except InputEncodingError as exc:
+            fail_current("input-encoding", str(exc))
+            continue
         if refusal is not None:
             fail_current("cohort-scale-guard", refusal)
             continue

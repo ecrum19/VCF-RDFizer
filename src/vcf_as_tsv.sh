@@ -39,7 +39,8 @@ if [ -f "$input_path" ]; then
 elif [ -d "$input_path" ]; then
   while IFS= read -r discovered_file; do
     files+=("$discovered_file")
-  done < <(find "$input_path" -maxdepth 1 -type f \( -name '*.vcf' -o -name '*.vcf.gz' \) | sort)
+  # ._* are macOS AppleDouble sidecars: binary, never VCFs, despite the suffix.
+  done < <(find "$input_path" -maxdepth 1 -type f \( -name '*.vcf' -o -name '*.vcf.gz' \) ! -name '._*' | sort)
 else
   echo "Error: input path '$input_path' not found."
   exit 1

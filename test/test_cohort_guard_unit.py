@@ -13,6 +13,7 @@ grew 0.9% in total across the same 1-to-2504 sample ladder.
 """
 
 import csv
+import os
 import shutil
 import sys
 import tempfile
@@ -24,6 +25,7 @@ from unittest import mock
 
 import vcf_rdfizer
 from test.helpers import VerboseTestCase
+from test.test_vcf_rdfizer_unit import invoke_main, latest_metrics_run_dir
 
 
 def write_records_tsv(path: Path, *, sample_ids: list[str], records: int) -> Path:
@@ -94,6 +96,25 @@ class RecordsTsvReadingTests(VerboseTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "missing.tsv"
             self.assertEqual(vcf_rdfizer.read_records_tsv_sample_count(path), 0)
+
+    def test_a_non_utf8_tsv_raises_an_input_error_not_a_decode_error(self):
+        """The guard's reader must not leak UnicodeDecodeError past the per-input handler."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "r.tsv"
+            path.write_bytes(APPLEDOUBLE_BYTES)
+            with self.assertRaises(vcf_rdfizer.InputEncodingError) as caught:
+                vcf_rdfizer.read_records_tsv_sample_count(path)
+            self.assertIn("not a UTF-8 text VCF", str(caught.exception))
+            with self.assertRaises(vcf_rdfizer.InputEncodingError):
+                vcf_rdfizer.check_records_tsv_is_utf8(path)
+
+    def test_the_encoding_probe_accepts_utf8_cut_at_the_probe_boundary(self):
+        """A multi-byte character split by the bounded read is not a bad byte."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "r.tsv"
+            limit = vcf_rdfizer.RECORDS_TSV_ENCODING_PROBE_BYTES
+            path.write_bytes(b"a" * (limit - 1) + "\u00e9".encode("utf-8"))
+            vcf_rdfizer.check_records_tsv_is_utf8(path)
 
 
 class GuardDecisionTests(VerboseTestCase):
@@ -193,6 +214,123 @@ class GuardDecisionTests(VerboseTestCase):
                     free_bytes=needed,
                 )
             )
+
+
+#: The head of a real macOS AppleDouble sidecar: magic, version, then binary
+#: entries. 0xa3 is the byte the vcf-bench-1 run died on.
+APPLEDOUBLE_BYTES = (
+    b"\x00\x05\x16\x07\x00\x02\x00\x00Mac OS X        \x00\x02"
+    + b"\x00" * 110
+    + b"\xa3\x9f\xff\xfe" * 16
+)
+
+
+class NonUtf8InputTests(VerboseTestCase):
+    """A binary input fails on its own; it does not take the directory down.
+
+    vcf-bench-1, v3.1.0: a directory carrying macOS ``._P001.vcf`` sidecars
+    crashed ``--sample-representation expanded`` with a UnicodeDecodeError out
+    of the cohort guard, while condensed reported the same file as a failed
+    input and converted the rest.
+    """
+
+    def _run_full(self, tmp_path: Path, vcf_names: dict[str, bytes], representation: str):
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        tsv_dir = tmp_path / "tsv_fixture"
+        tsv_dir.mkdir()
+        triplets = []
+        for name, payload in vcf_names.items():
+            (input_dir / name).write_bytes(payload)
+            prefix = vcf_rdfizer.vcf_output_prefix(Path(name))
+            records = tsv_dir / f"{prefix}.records.tsv"
+            if payload.startswith(b"##fileformat"):
+                write_records_tsv(records, sample_ids=["NA1", "NA2"], records=3)
+            else:
+                # vcf_as_tsv.sh passes bytes through, so the binary survives
+                # into the records TSV that the Python side then decodes.
+                records.write_bytes(payload)
+            (tsv_dir / f"{prefix}.header_lines.tsv").write_text(
+                f"SOURCE_FILE\tLINE\n{name}\t##fileformat=VCFv4.2\n", encoding="utf-8"
+            )
+            (tsv_dir / f"{prefix}.file_metadata.tsv").write_text(
+                "SOURCE_FILE\tKEY\tVALUE\n", encoding="utf-8"
+            )
+            triplets.append(
+                {
+                    "prefix": prefix,
+                    "records": records,
+                    "headers": tsv_dir / f"{prefix}.header_lines.tsv",
+                    "metadata": tsv_dir / f"{prefix}.file_metadata.tsv",
+                }
+            )
+        out_dir = tmp_path / "out"
+        stdout, stderr = StringIO(), StringIO()
+        old_cwd = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            with (
+                mock.patch.object(vcf_rdfizer, "run", return_value=0),
+                mock.patch.object(vcf_rdfizer, "check_docker", return_value=True),
+                mock.patch.object(vcf_rdfizer, "docker_image_exists", return_value=True),
+                mock.patch.object(vcf_rdfizer, "discover_tsv_triplets", return_value=triplets),
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                rc = invoke_main(
+                    [
+                        "--input", str(input_dir),
+                        "--sample-representation", representation,
+                        "--rdf-storage-mode", "plain",
+                        "--compression", "none",
+                        "--out", str(out_dir),
+                    ]
+                )
+        finally:
+            os.chdir(old_cwd)
+        return rc, out_dir, stdout.getvalue(), stderr.getvalue()
+
+    def test_a_directory_with_an_appledouble_sidecar_converts_the_vcf_and_reports_the_sidecar(self):
+        with tempfile.TemporaryDirectory() as td:
+            rc, out_dir, stdout, stderr = self._run_full(
+                Path(td),
+                {"P001.vcf": VALID_VCF, "._P001.vcf": APPLEDOUBLE_BYTES},
+                "expanded",
+            )
+            self.assertNotIn("Traceback", stderr)
+            self.assertNotIn("UnicodeDecodeError", stderr)
+            self.assertEqual(rc, 0, stderr)
+            self.assertIn("Skipping 1 macOS AppleDouble file(s)", stdout)
+            self.assertIn("._P001.vcf", stdout)
+            self.assertIn("Input 1/1: P001.vcf", stdout)
+            self.assertTrue((out_dir / "P001" / "P001.nt").exists())
+
+    def test_a_binary_vcf_fails_as_one_input_and_the_others_still_convert(self):
+        """Not every binary is an AppleDouble sidecar; the encoding probe catches the rest."""
+        for representation in ("expanded", "condensed"):
+            with self.subTest(representation=representation), tempfile.TemporaryDirectory() as td:
+                rc, out_dir, stdout, stderr = self._run_full(
+                    Path(td),
+                    {"P001.vcf": VALID_VCF, "x.vcf": APPLEDOUBLE_BYTES},
+                    representation,
+                )
+                self.assertNotIn("Traceback", stderr)
+                self.assertEqual(rc, 1, stderr)
+                self.assertIn("(x.vcf) failed at input-encoding: not a UTF-8 text VCF", stderr)
+                self.assertTrue((out_dir / "P001" / "P001.nt").exists())
+                report = (
+                    latest_metrics_run_dir(out_dir / "run_metrics")
+                    / "reports" / "failed_inputs.csv"
+                )
+                with report.open(newline="", encoding="utf-8") as handle:
+                    failures = list(csv.DictReader(handle))
+                self.assertEqual(
+                    [(f["expected_prefix"], f["stage"]) for f in failures],
+                    [("x", "input-encoding")],
+                )
+
+
+VALID_VCF = b"##fileformat=VCFv4.2\n#CHROM\tPOS\n1\t10\n"
 
 
 class CliTests(VerboseTestCase):
