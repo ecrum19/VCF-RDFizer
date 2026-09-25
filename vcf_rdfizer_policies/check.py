@@ -1,114 +1,66 @@
-"""Verify a release view against an oracle computed from the source VCFs.
+"""Verify a release view: structural checks for any graph, plus an optional oracle.
 
-The oracle reads records straight from the VCF text -- no graph, no SPARQL --
-and decides them with decide.py. A view passes only if its records equal the
-oracle's released set exactly (an extra record is a leak; a missing one is
-over-withholding) and it survives three structural checks: no triple inside
-a prohibited target, no reference to anything withheld, and no mention of a
-withheld file. Each failure is returned as one human-readable line.
+Given the view, the policy, and the source graph the view was made from:
+
+1. the view was produced under this policy (its manifest's digest matches);
+2. nothing a binding prohibition owns appears in the view, as subject or object;
+3. every subject in the view is owned by a binding permission (default-deny);
+4. no triple points at a node of the source that the view does not contain.
+
+Checks 2-4 reuse the engine's selectors and partition, so they confirm the view
+honours the policy; they cannot catch a mistake in a selector itself. That is
+what an oracle is for: `vcf_oracle.compare` re-derives the expected records
+from the VCF text, an input the graph and its conversion never touched.
+Each failure is returned as one human-readable line.
 """
 
-import gzip
 from pathlib import Path
-import re
 
-from . import ODRL, VCFC, VCFP
-from .decide import Request, applies, check_assemblies, decide
-from .graphs import Record, records, split
-from .profile import FileTarget, RegionTarget, policy_digest
+from . import ODRL, VCFP
+from .engine import Partition, Request, applies, select
+from .policy import policy_digest
 
-
-def read_vcf(path: Path):
-    """(file IRI, assembly, [Record]) from a VCF, numbering rows as the converter does."""
-    path = Path(path)
-    opener = gzip.open if path.name.endswith(".gz") else open
-    name = re.sub(r"\.gz$", "", path.name)
-    file_iri, assembly, found = f"file://{name}", None, []
-    with opener(path, "rt", encoding="utf-8") as handle:
-        for line in handle:
-            if line.startswith("##reference="):
-                assembly = line.split("=", 1)[1].strip()
-            if line.startswith("#"):
-                continue
-            chrom, pos, _, ref, alt = line.rstrip("\n").split("\t")[:5]
-            found.append(Record(file_iri, len(found) + 1, chrom, int(pos), ref,
-                                tuple(sorted(a for a in alt.split(",") if a != "."))))
-    return file_iri, assembly, found
+#: Enough to diagnose; a broken view can otherwise fail thousands of times.
+LIMIT = 20
 
 
-def oracle(vcf_paths, rules, request):
-    """The (file, row) pairs a correct view releases, and the files it withholds."""
-    parsed = [read_vcf(p) for p in vcf_paths]
-    check_assemblies(rules, {f: a for f, a, _ in parsed})
-    released, withheld_files = set(), set()
-    for file_iri, _, file_records in parsed:
-        if not decide(file_iri, rules, request).released:
-            withheld_files.add(file_iri)
-            continue
-        released |= {(r.file, r.row) for r in file_records if decide(r, rules, request).released}
-    return released, withheld_files
-
-
-def _only(graph, predicate):
-    """The object of the one triple with this predicate (Graph.value needs a subject)."""
-    import rdflib
-
-    return next(graph.objects(None, rdflib.URIRef(predicate)), None)
-
-
-def read_request(manifest_graph) -> Request:
-    import rdflib
-
-    request = _only(manifest_graph, VCFP + "request")
-    return Request(str(manifest_graph.value(request, rdflib.URIRef(ODRL + "assignee"))),
-                   str(manifest_graph.value(request, rdflib.URIRef(ODRL + "purpose"))))
-
-
-def check_view(view_dir: Path, policy_path: Path, rules, vcf_paths) -> list:
-    """Every way the view in `view_dir` departs from the policy; empty means it passes."""
+def read_view(view_dir: Path):
+    """(view graph, manifest graph, request) from a directory written by evaluate."""
     import rdflib
 
     view_dir = Path(view_dir)
     manifest = rdflib.Graph().parse(str(view_dir / "manifest.ttl"), format="turtle")
-    view = rdflib.Graph().parse(str(view_dir / "view.nt"), format="nt")
-    request = read_request(manifest)
-    failures = []
+    request_node = next(manifest.objects(None, rdflib.URIRef(VCFP + "request")))
+    request = Request(str(manifest.value(request_node, rdflib.URIRef(ODRL + "assignee"))),
+                      str(manifest.value(request_node, rdflib.URIRef(ODRL + "purpose"))))
+    return rdflib.Graph().parse(str(view_dir / "view.nt"), format="nt"), manifest, request
 
-    recorded = str(_only(manifest, VCFP + "policyDigest"))
+
+def check_view(view, manifest, request, *, policy_path, rules, profile, vocabulary, source) -> list:
+    """Every way `view` departs from the policy, given the `source` it was made from."""
+    import rdflib
+
+    failures = []
+    recorded = str(next(manifest.objects(None, rdflib.URIRef(VCFP + "policyDigest")), None))
     if recorded != policy_digest(policy_path):
         failures.append(f"view was produced under a different policy ({recorded})")
 
-    expected, withheld_files = oracle(vcf_paths, rules, request)
-    actual = {(r.file, r.row) for r in records(view)}
-    failures += [f"leak: {f}#record/{row} is released but the policy withholds it"
-                 for f, row in sorted(actual - expected)]
-    failures += [f"over-withheld: {f}#record/{row} should have been released"
-                 for f, row in sorted(expected - actual)]
+    partition = Partition(source, profile)
+    binding = [(rule, partition.owned(select(source, rule.target)))
+               for rule in rules if applies(rule, request, vocabulary)]
+    terms = {t for triple in view for t in (triple[0], triple[2])
+             if isinstance(t, (rdflib.URIRef, rdflib.BNode))}
+    for rule, owned in binding:
+        if rule.kind == "prohibition":
+            present = sorted(str(t) for t in terms if partition.contains(owned, t))
+            failures += [f"prohibited content present: {rule.label} owns <{t}>" for t in present[:LIMIT]]
 
-    for rule in rules:
-        if rule.kind == "prohibition" and applies(rule, request) and view.query(_ask(rule.target)).askAnswer:
-            failures.append(f"prohibited content present: {rule.label}")
+    granted = [owned for rule, owned in binding if rule.kind == "permission"]
+    ungoverned = sorted(str(s) for s in set(view.subjects())
+                        if not any(partition.contains(owned, s) for owned in granted))
+    failures += [f"no permission covers <{s}>" for s in ungoverned[:LIMIT]]
 
-    subjects = {s for s in view.subjects() if isinstance(s, rdflib.URIRef)}
-    for s, p, o in view:
-        if isinstance(o, rdflib.URIRef) and split(str(o))[0] and o not in subjects:
-            failures.append(f"dangling reference: <{s}> <{p}> <{o}>")
-
-    names = {f.split("://", 1)[1] for f in withheld_files}
-    for term in {t for triple in view for t in triple}:
-        for name in names:
-            if name in str(term):
-                failures.append(f"withheld file {name} is named by {term.n3()}")
+    nodes, present = set(source.subjects()), set(view.subjects())
+    dangling = sorted((str(s), str(o)) for s, _, o in view if o in nodes and o not in present)
+    failures += [f"dangling reference: <{s}> -> <{o}>" for s, o in dangling[:LIMIT]]
     return failures
-
-
-def _ask(target) -> str:
-    """A SPARQL ASK that is true when anything the target selects is in the graph."""
-    if isinstance(target, FileTarget):
-        return f'ASK {{ ?s ?p ?o FILTER(STRSTARTS(STR(?s), "{target.iri}#") || STR(?s) = "{target.iri}") }}'
-    if isinstance(target, RegionTarget):
-        where = f"FILTER(?pos >= {target.start} && ?pos <= {target.end})"
-    else:
-        where = f'FILTER(?pos = {target.pos}) ?r vcfc:ref "{target.ref}" ; vcfc:alt "{target.alt}" .'
-    return (f'PREFIX vcfc: <{VCFC}> ASK {{ ?r a vcfc:VCFRecord ; vcfc:chrom "{target.chrom}" ; '
-            f"vcfc:pos ?pos . {where} }}")

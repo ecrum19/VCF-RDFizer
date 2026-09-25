@@ -269,8 +269,9 @@ record what an artifact was permitted to contain. Three consequences today:
 The plan is [`privacy-policy-design.md`](privacy-policy-design.md), which is
 explicit that what it offers is *governed release*, not anonymization. Its first
 slice exists as a demonstrator, [`vcf-rdfizer-policy`](policy-demonstrator.md)
-v0.1.0: ODRL policies on files, regions and variants, verified release views,
-over single-sample fixtures only. It changes none of the points above for a
+v0.1.0: ODRL policies on files and on declared graph selections (region and
+variant ship; others are Turtle declarations), verified release views, in
+memory and after conversion. It changes none of the points above for a
 graph produced by a normal conversion.
 
 **No clinical claims.** The tool transcribes a VCF. It does not interpret,

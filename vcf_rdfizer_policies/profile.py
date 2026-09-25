@@ -1,172 +1,102 @@
-"""Read an ODRL policy file into rules, rejecting anything v0.1.0 cannot evaluate.
+"""Profiles: the selector types and the partitioning rule, read from Turtle.
 
-The supported subset is docs/policy-demonstrator.md §3. Everything outside it --
-an unknown selector, an effect other than drop, a conflict strategy other than
-deny-wins, an unrecognised property on a rule -- raises PolicyError. Silently
-ignoring a rule would be worse than refusing the policy.
+A profile is what makes the engine specific to a kind of graph without any
+code. It declares the selector types a policy may use -- each a SPARQL SELECT
+that projects ?resource -- and how a withheld resource takes others with it.
+The bundled VCF Core profile (vcf_rdfizer_data/policy/vcf-core-profile.ttl)
+covers graphs written by VCF-RDFizer; its comments document every term.
 """
 
-from dataclasses import dataclass
-import hashlib
+from dataclasses import dataclass, field
+from importlib.resources import files
 from pathlib import Path
 
-from . import ODRL, VCFP, PolicyError
-from .purposes import purpose_iri
+from . import VCFP, PolicyError
 
-RDF_TYPE = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
-POLICY_CLASSES = {ODRL + name for name in ("Policy", "Set", "Offer", "Agreement")}
-#: Properties a rule may carry. Anything else (odrl:refinement, odrl:remedy,
-#: ...) could change what the rule means, so it is refused, not dropped.
-RULE_PROPERTIES = {RDF_TYPE, ODRL + "target", ODRL + "action", ODRL + "assignee",
-                   ODRL + "assigner", ODRL + "constraint", ODRL + "duty"}
+#: The name `--profile vcf-core` refers to, and the default when none is given.
+BUNDLED = {"vcf-core": "vcf-core-profile.ttl"}
 
 
 @dataclass(frozen=True)
-class FileTarget:
-    """A whole converted file, named by its file IRI, e.g. <file://P003.vcf>."""
+class SelectorType:
     iri: str
+    query: str
+    parameters: tuple          # property IRIs; each binds ?<local name>
+    violations: str = None     # optional SELECT; any row means "cannot apply here"
 
 
 @dataclass(frozen=True)
-class RegionTarget:
-    """Records with POS in [start, end] on chrom, 1-based and inclusive."""
-    asset: str
-    assembly: str
-    chrom: str
-    start: int
-    end: int
+class Profile:
+    iri: str
+    ownership_path: str = None
+    iri_subtree: bool = False
+    unit_query: str = None
+    selectors: dict = field(default_factory=dict)   # type IRI -> SelectorType
 
 
-@dataclass(frozen=True)
-class VariantTarget:
-    """Records with exactly this chrom, pos, ref and alt."""
-    asset: str
-    assembly: str
-    chrom: str
-    pos: int
-    ref: str
-    alt: str
+def variable(prop: str) -> str:
+    """The query variable a parameter property binds: vcfp:start -> 'start'."""
+    return prop.rstrip("/#").replace("#", "/").rsplit("/", 1)[1]
 
 
-@dataclass(frozen=True)
-class Constraint:
-    """A purpose constraint: odrl:isAnyOf or odrl:isNoneOf a set of DUO terms."""
-    operator: str
-    purposes: frozenset
+def load_profile(sources=(), extra_graph=None) -> Profile:
+    """Merge profile files (paths or bundled names) and any declarations in `extra_graph`.
 
-
-@dataclass(frozen=True)
-class Rule:
-    kind: str                 # "permission" or "prohibition"
-    policy: str               # the policy IRI the rule belongs to
-    target: object            # FileTarget | RegionTarget | VariantTarget
-    assignee: str = None      # None means odrl:All
-    constraints: tuple = ()
-    duties: tuple = ()        # ODRL action IRIs; recorded, not enforced
-
-    @property
-    def label(self) -> str:
-        """Short, stable name for reports: kind and target."""
-        target = getattr(self.target, "asset", None) or self.target.iri
-        return f"{self.kind} on <{target}>"
-
-
-def policy_digest(path: Path) -> str:
-    """sha256 of the policy file's bytes, as recorded in every manifest."""
-    return "sha256:" + hashlib.sha256(Path(path).read_bytes()).hexdigest()
-
-
-def load_policy(path: Path):
-    """Parse and validate a policy file; returns (rdflib graph, [Rule, ...])."""
+    `extra_graph` is the policy's own graph, so a policy can declare the selector
+    types it uses. Exactly one vcfp:Profile must result.
+    """
     import rdflib
 
-    graph = rdflib.Graph().parse(str(path), format="turtle")
-    policies = {s for s, o in graph.subject_objects(rdflib.RDF.type) if str(o) in POLICY_CLASSES}
-    if not policies:
-        raise PolicyError(f"{path}: no odrl:Policy, Set, Offer or Agreement found")
-    rules = []
-    for policy in sorted(policies, key=str):
-        conflict = graph.value(policy, rdflib.URIRef(ODRL + "conflict"))
-        if str(conflict) != ODRL + "prohibit":
-            raise PolicyError(f"<{policy}>: v0.1.0 requires odrl:conflict odrl:prohibit (deny wins)")
-        if graph.value(policy, rdflib.URIRef(ODRL + "obligation")) is not None:
-            raise PolicyError(f"<{policy}>: odrl:obligation is not supported in v0.1.0")
-        for kind in ("permission", "prohibition"):
-            for node in graph.objects(policy, rdflib.URIRef(ODRL + kind)):
-                rules.append(_rule(graph, str(policy), kind, node))
-    return graph, rules
+    graph = rdflib.Graph()
+    for source in sources or ("vcf-core",):
+        path = files("vcf_rdfizer_data.policy") / BUNDLED[source] if source in BUNDLED else Path(source)
+        graph.parse(str(path), format="turtle")
+    if extra_graph is not None:
+        graph += extra_graph
 
+    def one(node, name, cast=str):
+        value = graph.value(node, rdflib.URIRef(VCFP + name))
+        return None if value is None else cast(value)
 
-def _rule(graph, policy, kind, node):
-    import rdflib
-
-    unknown = {str(p) for p in graph.predicates(node)} - RULE_PROPERTIES
-    if unknown:
-        raise PolicyError(f"{kind} in <{policy}> uses unsupported properties: {sorted(unknown)}")
-    if str(graph.value(node, rdflib.URIRef(ODRL + "action"))) != ODRL + "read":
-        raise PolicyError(f"{kind} in <{policy}>: the only supported action is odrl:read")
-    assignee = graph.value(node, rdflib.URIRef(ODRL + "assignee"))
-    return Rule(
-        kind=kind,
-        policy=policy,
-        target=_target(graph, graph.value(node, rdflib.URIRef(ODRL + "target"))),
-        assignee=None if assignee is None or str(assignee) == ODRL + "All" else str(assignee),
-        constraints=tuple(_constraint(graph, c) for c in graph.objects(node, rdflib.URIRef(ODRL + "constraint"))),
-        duties=tuple(sorted(_duty(graph, d) for d in graph.objects(node, rdflib.URIRef(ODRL + "duty")))),
+    profiles = list(graph.subjects(rdflib.RDF.type, rdflib.URIRef(VCFP + "Profile")))
+    if len(profiles) != 1:
+        raise PolicyError(f"expected exactly one vcfp:Profile, found {len(profiles)}")
+    node = profiles[0]
+    selectors = {}
+    for kind in graph.subjects(rdflib.RDF.type, rdflib.URIRef(VCFP + "SelectorType")):
+        selectors[str(kind)] = _selector(graph, kind, one)
+    return Profile(
+        iri=str(node),
+        ownership_path=one(node, "ownershipPath"),
+        iri_subtree=bool(one(node, "iriSubtree", lambda v: v.toPython())),
+        unit_query=_checked(one(node, "unitQuery"), f"<{node}> vcfp:unitQuery", ("resource", "group")),
+        selectors=selectors,
     )
 
 
-def _target(graph, node):
+def _selector(graph, kind, one) -> SelectorType:
     import rdflib
 
-    if node is None:
-        raise PolicyError("a rule has no odrl:target")
-    selectors = list(graph.objects(node, rdflib.URIRef(VCFP + "selector")))
-    if not selectors:
-        iri = str(node)
-        if isinstance(node, rdflib.URIRef) and iri.startswith("file://") and "#" not in iri:
-            return FileTarget(iri)
-        raise PolicyError(f"target <{node}> is neither a file IRI nor a vcfp:GraphSelection")
-    if len(selectors) != 1:
-        raise PolicyError(f"<{node}>: a GraphSelection needs exactly one vcfp:selector")
-    selector = selectors[0]
-    kind = str(graph.value(selector, rdflib.RDF.type) or "")
-
-    def get(name, cast=str):
-        value = graph.value(selector, rdflib.URIRef(VCFP + name))
-        if value is None:
-            raise PolicyError(f"<{node}>: selector is missing vcfp:{name}")
-        return cast(value)
-
-    if kind == VCFP + "RegionSelector":
-        target = RegionTarget(str(node), get("assembly"), get("chrom"), get("start", int), get("end", int))
-        if target.start > target.end:
-            raise PolicyError(f"<{node}>: vcfp:start is after vcfp:end")
-        return target
-    if kind == VCFP + "VariantSelector":
-        return VariantTarget(str(node), get("assembly"), get("chrom"), get("pos", int), get("ref"), get("alt"))
-    raise PolicyError(f"<{node}>: selector type {kind or '(none)'} is not supported in v0.1.0")
+    query = one(kind, "query")
+    if query is None:
+        raise PolicyError(f"selector type <{kind}> has no vcfp:query")
+    parameters = tuple(sorted(str(p) for p in graph.objects(kind, rdflib.URIRef(VCFP + "parameter"))))
+    return SelectorType(str(kind), _checked(query, f"<{kind}> vcfp:query", ("resource",)),
+                        parameters, _checked(one(kind, "violations"), f"<{kind}> vcfp:violations", ()))
 
 
-def _constraint(graph, node):
-    import rdflib
+def _checked(query, where, required):
+    """Parse a declared query now, so a typo fails at load time, not mid-evaluation."""
+    if query is None:
+        return None
+    from rdflib.plugins.sparql import prepareQuery
 
-    left = str(graph.value(node, rdflib.URIRef(ODRL + "leftOperand")))
-    operator = str(graph.value(node, rdflib.URIRef(ODRL + "operator")))
-    if left != ODRL + "purpose":
-        raise PolicyError(f"only odrl:purpose constraints are supported, not <{left}>")
-    if operator not in (ODRL + "isAnyOf", ODRL + "isNoneOf"):
-        raise PolicyError(f"only odrl:isAnyOf and odrl:isNoneOf are supported, not <{operator}>")
-    values = list(graph.objects(node, rdflib.URIRef(ODRL + "rightOperand")))
-    if not values:
-        raise PolicyError("a purpose constraint has no odrl:rightOperand")
-    return Constraint(operator.rsplit("/", 1)[1], frozenset(purpose_iri(str(v)) for v in values))
-
-
-def _duty(graph, node):
-    import rdflib
-
-    transform = graph.value(node, rdflib.URIRef(VCFP + "transform"))
-    if transform is not None and str(transform) != VCFP + "drop":
-        raise PolicyError(f"effect <{transform}> is not supported in v0.1.0; only vcfp:drop")
-    return str(graph.value(node, rdflib.URIRef(ODRL + "action")))
+    try:
+        prepared = prepareQuery(query)
+    except Exception as error:  # rdflib raises several parser exception types
+        raise PolicyError(f"{where} does not parse: {error}") from None
+    projected = {str(v) for v in prepared.algebra.get("PV", [])}
+    missing = [v for v in required if v not in projected]
+    if missing:
+        raise PolicyError(f"{where} must project {', '.join('?' + v for v in missing)}")
+    return query

@@ -54,10 +54,12 @@ deciding whether the tool fits your problem, read
   graph: an ODRL profile with graph selectors, three enforcement tiers, and
   verification — plus a candid account of why access control is not
   anonymization when the genotypes are themselves identifiers.
-- **[Policy demonstrator v0.1.0](policy-demonstrator.md)** — *implemented;
-  walkthrough in `examples/policy/`.* The first slice of the privacy design: ODRL policies attached
-  to files, regions and variants of single-sample VCFs, per-request release
-  views, and an oracle that checks each view withholds exactly what it should.
+- **[Policy attachment v0.1.0](policy-demonstrator.md)** — *implemented;
+  walkthrough in `examples/policy/`.* The first slice of the privacy design:
+  ODRL policies attached to any resource or declared graph selection, a
+  partition rule that says what a withheld resource takes with it, per-request
+  release views, and checks — including a VCF-text oracle — that each view
+  withholds exactly what it should. Selectors and partitions are Turtle, not code.
 
 ### What the graph looks like
 

@@ -49,11 +49,11 @@ PARTICIPANTS = {
 }
 
 REQUESTERS = {
-    "gru": {"assignee": "https://example.org/party/research-consortium", "purpose": "DUO_0000042",
+    "gru": {"assignee": "https://example.org/party/research-consortium", "purpose": "DUO:0000042",
             "label": "General-research consortium"},
-    "alz": {"assignee": "https://example.org/party/alz-consortium", "purpose": "DUO_0000007",
+    "alz": {"assignee": "https://example.org/party/alz-consortium", "purpose": "DUO:0000007",
             "label": "Alzheimer's consortium"},
-    "clinical": {"assignee": "https://example.org/party/clinical-genetics", "purpose": "DUO_0000043",
+    "clinical": {"assignee": "https://example.org/party/clinical-genetics", "purpose": "DUO:0000043",
                  "label": "Clinical genetics lab"},
 }
 

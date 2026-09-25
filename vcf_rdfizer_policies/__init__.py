@@ -1,11 +1,16 @@
-"""Policy demonstrator v0.1.0: ODRL policies attached to VCF-RDFizer graphs.
+"""Policy demonstrator v0.1.0: attach ODRL policies to RDF graphs and release governed views.
 
-Policies attach to files, genomic regions and single variants. One policy set
-yields a different release view per request (who asks, and for what purpose),
-and each view can be checked against an oracle computed from the source VCFs.
+Three generic steps, each configured in Turtle rather than code:
 
-This is governed release, not anonymization. The specification, including what
-v0.1.0 deliberately leaves out, is docs/policy-demonstrator.md.
+    select     a rule's target is an IRI, or a selection computed by a declared
+               SPARQL selector type (profile.py)
+    partition  the profile's ownership rule extends each selection to what it owns
+    decide     ODRL: a binding permission must own a resource, and no binding
+               prohibition may; deny wins (engine.py)
+
+The bundled VCF Core profile makes it work on VCF-RDFizer graphs; vcf_oracle.py
+adds an independent check against the source VCFs. This is governed release, not
+anonymization. The specification is docs/policy-demonstrator.md.
 """
 
 VERSION = "0.1.0"

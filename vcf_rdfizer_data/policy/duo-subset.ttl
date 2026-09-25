@@ -11,6 +11,8 @@
 # v0.1.0 treats it as a purpose like the others; it matches only itself.
 
 @prefix obo:  <http://purl.obolibrary.org/obo/> .
+# So DUO:0000007 resolves as a prefixed name, with no special-case code.
+@prefix DUO:  <http://purl.obolibrary.org/obo/DUO_> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
 @prefix owl:  <http://www.w3.org/2002/07/owl#> .
 

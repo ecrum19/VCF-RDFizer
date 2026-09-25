@@ -30,7 +30,7 @@ while read -r key assignee purpose; do
   echo; echo "== $key ($purpose)"
   "${POLICY_CMD[@]}" evaluate --rdf "${RDF[@]}" --policy "$POLICY" \
       --assignee "$assignee" --purpose "$purpose" -o "$OUT/views/$key"
-  "${POLICY_CMD[@]}" check --view "$OUT/views/$key" --policy "$POLICY" --vcf "${VCF[@]}"
+  "${POLICY_CMD[@]}" check --view "$OUT/views/$key" --policy "$POLICY" --rdf "${RDF[@]}" --vcf "${VCF[@]}"
 done < <(python3 -c 'import json,sys
 for k, r in json.load(open(sys.argv[1]))["requesters"].items(): print(k, r["assignee"], r["purpose"])' "$HERE/fixture.json")
 
@@ -40,10 +40,10 @@ import json, sys
 from pathlib import Path
 views = sorted(Path(sys.argv[1]).iterdir())
 summaries = {v.name: json.loads((v / "summary.json").read_text()) for v in views}
-files = sorted(next(iter(summaries.values()))["files"])
+files = sorted(next(iter(summaries.values()))["groups"])
 print("requester".ljust(10) + "".join(f.split("//")[1].ljust(10) for f in files) + "triples withheld")
 for name, s in summaries.items():
-    cells = "".join((str(s["files"][f]["records_released"]) if s["files"][f]["released"] else "withheld").ljust(10)
+    cells = "".join((str(s["groups"][f]["records_released"]) if s["groups"][f]["released"] else "withheld").ljust(10)
                     for f in files)
     print(name.ljust(10) + cells + str(s["triples_withheld"]))
 PY

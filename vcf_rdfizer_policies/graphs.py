@@ -1,86 +1,46 @@
-"""Load converted graphs and read the records the selectors act on.
+"""Load RDF inputs, and walk an IRI's hierarchy."""
 
-A record is identified by its file IRI and row number, which is how the
-converter mints its IRIs (docs/conversion.md §6). Everything that belongs to
-row N lives under one of three IRI subtrees -- #record/N, #call/N and
-#sample/N -- so withholding a record means withholding those subtrees.
-"""
-
-from dataclasses import dataclass
 import gzip
 from pathlib import Path
-import re
 
-from . import VCFC, PolicyError
+from . import PolicyError
 
-#: v0.1.0 evaluates in memory. Above this the demonstrator is the wrong tool.
+#: The engine evaluates in memory. Above this, the demonstrator is the wrong tool.
 MAX_TRIPLES = 5_000_000
 
-_ROW = re.compile(r"(?:record|call|sample)/(\d+)(?:/.*)?")
 
-
-@dataclass(frozen=True)
-class Record:
-    file: str          # file IRI, e.g. file://P001.vcf
-    row: int
-    chrom: str
-    pos: int
-    ref: str
-    alts: tuple
+def _open(path: Path, mode: str):
+    return gzip.open(path, mode) if path.name.endswith(".gz") else open(path, mode)
 
 
 def load(paths) -> "rdflib.Graph":
     """Parse .nt / .nt.gz files into one graph, after a size check."""
     import rdflib
 
+    paths = [Path(p) for p in paths]
     total = 0
-    for path in map(Path, paths):
-        opener = gzip.open if path.name.endswith(".gz") else open
-        with opener(path, "rt", encoding="utf-8") as handle:
+    for path in paths:
+        with _open(path, "rb") as handle:
             total += sum(1 for _ in handle)
     if total > MAX_TRIPLES:
-        raise PolicyError(f"{total:,} triples exceeds the v0.1.0 in-memory limit of "
-                          f"{MAX_TRIPLES:,}; the demonstrator is for fixtures, not cohorts")
+        raise PolicyError(f"{total:,} triples exceeds the in-memory limit of {MAX_TRIPLES:,}; "
+                          "the demonstrator is for fixtures, not cohorts")
     graph = rdflib.Graph()
-    for path in map(Path, paths):
-        opener = gzip.open if path.name.endswith(".gz") else open
-        with opener(path, "rb") as handle:
+    for path in paths:
+        with _open(path, "rb") as handle:
             graph.parse(handle, format="nt")
     return graph
 
 
-def records(graph) -> list:
-    """Every vcfc:VCFRecord in the graph, with the fields selectors use."""
-    rows = graph.query(f"""
-        PREFIX vcfc: <{VCFC}>
-        SELECT ?record ?chrom ?pos ?ref (GROUP_CONCAT(?alt; separator=",") AS ?alts)
-        WHERE {{ ?record a vcfc:VCFRecord ; vcfc:chrom ?chrom ; vcfc:pos ?pos ; vcfc:ref ?ref .
-                 OPTIONAL {{ ?record vcfc:alt ?alt }} }}
-        GROUP BY ?record ?chrom ?pos ?ref""")
-    found = []
-    for record, chrom, pos, ref, alts in rows:
-        file_iri, row = split(str(record))
-        found.append(Record(file_iri, row, str(chrom), int(pos), str(ref),
-                            tuple(sorted(str(alts).split(","))) if alts else ()))
-    return sorted(found, key=lambda r: (r.file, r.row))
+def ancestors(iri: str):
+    """The IRI itself, then each prefix of it that ends just before a '#' or '/'.
 
-
-def assemblies(graph) -> dict:
-    """Each file IRI mapped to its declared vcfc:referenceGenome."""
-    rows = graph.query(f"""PREFIX vcfc: <{VCFC}>
-        SELECT ?file ?assembly WHERE {{ ?file a vcfc:VCFFile . OPTIONAL {{ ?file vcfc:referenceGenome ?assembly }} }}""")
-    return {str(f): (str(a) if a is not None else None) for f, a in rows}
-
-
-def split(iri: str):
-    """(file IRI, row or None) for any IRI the converter mints; (None, None) otherwise.
-
-    Every IRI under file://X belongs to file X -- header lines and the sample set
-    included, which is what lets a withheld file take its header with it. Only
-    the #record/, #call/ and #sample/ subtrees also carry a row.
+    file://P1.vcf#record/9/allele/0 -> itself, file://P1.vcf#record/9/allele,
+    file://P1.vcf#record/9, file://P1.vcf#record, file://P1.vcf. The scheme's own
+    slashes are skipped, so nothing shorter than the authority is yielded.
     """
-    if not iri.startswith("file://"):
-        return None, None
-    file_iri, _, fragment = iri.partition("#")
-    match = _ROW.fullmatch(fragment)
-    return file_iri, int(match.group(1)) if match else None
+    yield iri
+    start = iri.find("://") + 3 if "://" in iri else 0
+    for index in range(len(iri) - 1, start, -1):
+        if iri[index] in "#/":
+            yield iri[:index]

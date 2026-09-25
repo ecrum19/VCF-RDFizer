@@ -1,0 +1,53 @@
+# Extending the policy engine without code: a selector type declared in the
+# policy file itself.
+#
+# ex:QualityBelow selects records whose call has QUAL under a threshold. The
+# declaration is a SPARQL SELECT projecting ?resource; its one parameter,
+# ex:threshold, is bound to ?threshold from the selector node below. The engine
+# loads it alongside the bundled VCF Core profile and treats it exactly like
+# the shipped region and variant selectors.
+#
+#   vcf-rdfizer-policy evaluate --rdf converted/expanded/P00*.nt.gz \
+#       --policy custom-selector.ttl --assignee https://example.org/party/anyone \
+#       --purpose DUO:0000042 -o views/quality
+
+@prefix odrl: <http://www.w3.org/ns/odrl/2/> .
+@prefix vcfp: <https://w3id.org/vcf-rdfizer/policy#> .
+@prefix obo:  <http://purl.obolibrary.org/obo/> .
+@prefix ex:   <https://example.org/policy/quality/> .
+
+# --- The new selector type --------------------------------------------------
+ex:QualityBelow a vcfp:SelectorType ;
+    vcfp:parameter ex:threshold ;
+    vcfp:query """
+        PREFIX vcfc: <https://w3id.org/vcf-core/vocab#>
+        SELECT ?resource WHERE {
+            ?resource a vcfc:VCFRecord ; vcfc:hasCall ?call .
+            ?call vcfc:qual ?qual .
+            FILTER(?qual < ?threshold) }""" .
+
+# --- A policy that uses it ------------------------------------------------------
+ex:low-quality a odrl:Asset , vcfp:GraphSelection ;
+    vcfp:selector [ a ex:QualityBelow ; ex:threshold 60 ] .
+
+ex:release a odrl:Set ;
+    odrl:uid ex:release ;
+    odrl:conflict odrl:prohibit ;
+    # Every file may be read for general research ...
+    odrl:permission [ odrl:target <file://P001.vcf> ; odrl:action odrl:read ;
+        odrl:constraint [ odrl:leftOperand odrl:purpose ; odrl:operator odrl:isAnyOf ;
+                          odrl:rightOperand obo:DUO_0000042 ] ] ;
+    odrl:permission [ odrl:target <file://P002.vcf> ; odrl:action odrl:read ;
+        odrl:constraint [ odrl:leftOperand odrl:purpose ; odrl:operator odrl:isAnyOf ;
+                          odrl:rightOperand obo:DUO_0000042 ] ] ;
+    odrl:permission [ odrl:target <file://P003.vcf> ; odrl:action odrl:read ;
+        odrl:constraint [ odrl:leftOperand odrl:purpose ; odrl:operator odrl:isAnyOf ;
+                          odrl:rightOperand obo:DUO_0000042 ] ] ;
+    odrl:permission [ odrl:target <file://P004.vcf> ; odrl:action odrl:read ;
+        odrl:constraint [ odrl:leftOperand odrl:purpose ; odrl:operator odrl:isAnyOf ;
+                          odrl:rightOperand obo:DUO_0000042 ] ] ;
+    odrl:permission [ odrl:target <file://P005.vcf> ; odrl:action odrl:read ;
+        odrl:constraint [ odrl:leftOperand odrl:purpose ; odrl:operator odrl:isAnyOf ;
+                          odrl:rightOperand obo:DUO_0000042 ] ] ;
+    # ... except records below the quality threshold, which no one receives.
+    odrl:prohibition [ odrl:target ex:low-quality ; odrl:action odrl:read ] .
