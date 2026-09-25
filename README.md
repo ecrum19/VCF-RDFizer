@@ -17,6 +17,7 @@ VCF-RDFizer is a Docker-first CLI wrapper for:
 2. Optional RDF compression/decompression, into queryable HDT and COTTAS artifacts
 3. Semantic validation of a compressed RDF graph against its source VCF
 4. Data linking, which writes a provenance-tracked side-graph of external links
+5. Policy attachment, which applies ODRL policies to files, regions and variants and writes checked release views
 
 The conversion targets the **VCF Core vocabulary**, published at
 [https://w3id.org/vcf-core/vocab#](https://w3id.org/vcf-core/vocab#) (prefix
@@ -924,6 +925,26 @@ Links go into `sample.links.nt`; the base graph is unchanged. The
 See [Data linking](docs/datalinking.md) for all three worked examples, reference
 and network safeguards, provenance, and the remaining design limitations.
 
+### Policy attachment plug-in
+
+`vcf-rdfizer-policy` attaches ODRL policies to a converted graph and writes one
+release view per request, without Docker. A policy can target a file, a region
+or a variant, and withholding a record withholds everything it owns (its call,
+alleles and genotypes). Selectors are SPARQL declared in Turtle, so adding one
+needs no code. `check` confirms that a view withholds exactly what the policy
+says, optionally against the source VCF text:
+
+```bash
+vcf-rdfizer-policy evaluate --rdf converted/P00*.nt.gz --policy policy.ttl \
+  --assignee https://example.org/party/alz-consortium --purpose DUO:0000007 -o views/alz
+vcf-rdfizer-policy check --view views/alz --rdf converted/P00*.nt.gz \
+  --policy policy.ttl --vcf P00*.vcf
+```
+
+This is governed release, not anonymization: a released genotype still
+identifies the person it came from. See [Policy attachment](docs/policy-demonstrator.md)
+and the runnable cohort in [`examples/policy/`](examples/policy/README.md).
+
 ### Custom RML Mappings
 
 `--rules` accepts any RML mapping, so you can change what RDF the pipeline
@@ -1007,6 +1028,8 @@ launches Docker, and reads back the JSON/CSV reports each stage writes.
 | `vcf_rdfizer_rules.py` | `vcf-rdfizer-rules` CLI: scaffold, document, and validate custom RML mappings. |
 | `vcf_rdfizer_link.py`, `vcf_rdfizer_linking/` | Linker authoring CLI and shared token/interval/API runner. |
 | `vcf_rdfizer_data/linkers/` | Packaged examples of all three plug-in tiers. |
+| `vcf_rdfizer_policy.py`, `vcf_rdfizer_policies/` | `vcf-rdfizer-policy` CLI and its select → partition → decide engine. |
+| `vcf_rdfizer_data/policy/` | The VCF Core profile, a DUO subset and the `vcfp:` vocabulary. |
 | `vcf_rdfizer_gzip.py` | Uncompressed size of a gzip/BGZF VCF without decompressing it. Used by the host preflight estimate and, inside the image, by `run_conversion.sh`. |
 | `src/vcf_as_tsv.sh` | VCF -> per-input `records`/`header_lines`/`file_metadata` TSV, in one `awk` pass. |
 | `src/run_conversion.sh` | Runs RMLStreamer, normalizes Spark part files, merges them into one `.nt`/`.nt.gz` aggregate, records conversion metrics. |
@@ -1044,6 +1067,7 @@ how each part of the tool works, why, and where it stops working.
 | [Roadmap](docs/roadmap.md) | Planned work, known defects, and rejected options |
 | [Data linking](docs/datalinking.md) | Runnable examples of all three plug-in tiers, authoring, safeguards, and provenance |
 | [Data linking design](docs/datalinking-design.md) | Broader proposal and remaining work |
+| [Policy attachment](docs/policy-demonstrator.md) | Implemented v0.1.0: ODRL policies on files, regions and variants, release views, and checks |
 | [Privacy policy design](docs/privacy-policy-design.md) | Proposal: ODRL-based granular disclosure control over the graph |
 
 - [`ACKNOWLEDGEMENTS.md`](ACKNOWLEDGEMENTS.md) - funding and attribution
@@ -1098,7 +1122,7 @@ Safe termination:
 
 If you use VCF-RDFizer in a publication, please cite:
 
-VCF-RDFizer maintainers. (2026). *VCF-RDFizer* (Version 3.1.0) [Computer software]. GitHub. https://github.com/ecrum19/VCF-RDFizer
+VCF-RDFizer maintainers. (2026). *VCF-RDFizer* (Version 3.2.0) [Computer software]. GitHub. https://github.com/ecrum19/VCF-RDFizer
 
 BibTeX:
 
@@ -1107,7 +1131,7 @@ BibTeX:
   author  = {{VCF-RDFizer maintainers}},
   title   = {VCF-RDFizer},
   year    = {2026},
-  version = {3.1.0},
+  version = {3.2.0},
   url     = {https://github.com/ecrum19/VCF-RDFizer},
   note    = {Computer software}
 }

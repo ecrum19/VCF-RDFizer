@@ -33,8 +33,8 @@ vcfc: a owl:Ontology ;
   dct:description "Vocabulary for representing the logical VCF 4.5 model in RDF: files, headers, records, alleles, values, genotype data, and VCF-specific structural-variant syntax. It supports both expanded per-sample and condensed, sample-ordered representations, and delegates broader variation semantics through FALDO, VRS, SO, GENO, and ChEBI alignments. BCF 2.2 byte layout is out of scope."@en ;
   dct:license <https://creativecommons.org/licenses/by/4.0/> ;
   dct:creator "Elias Crum" ;
-  owl:versionIRI <https://w3id.org/vcf-core/vocab/2.1.2> ;
-  owl:versionInfo "2.1.2" ;
+  owl:versionIRI <https://w3id.org/vcf-core/vocab/2.1.3> ;
+  owl:versionInfo "2.1.3" ;
   dct:modified "2026-09-08"^^xsd:date ;
   owl:priorVersion <https://w3id.org/vcf-core/vocab/2.0.0> ;
   dct:replaces <https://w3id.org/vcf-rdfizer/vocab> ;
@@ -846,7 +846,7 @@ vcfc:VCF45File a owl:Class ; rdfs:subClassOf vcfc:VCFFile ; rdfs:label "VCF 4.5 
   rdfs:label "VCF Core allele and value-indexing module"@en ;
   dct:description "VCF-specific allele carriers and indexed values for Number=A/R/G/LA/LR/LG/P/M fields."@en ;
   owl:imports <https://w3id.org/vcf-core/vocab> ;
-  owl:versionInfo "2.1.2" .
+  owl:versionInfo "2.1.3" .
 
 vcfc:Allele a owl:Class ;
   rdfs:label "VCF allele"@en ;
@@ -1011,7 +1011,7 @@ vcfc:paddingAnchorPosition a owl:DatatypeProperty ;
   rdfs:label "VCF Core genotype module"@en ;
   dct:description "Parsed GT, phasing, phase-set, local-allele, and sample-filter carriers for VCF 4.5."@en ;
   owl:imports <https://w3id.org/vcf-core/vocab>, <https://w3id.org/vcf-core/alleles> ;
-  owl:versionInfo "2.1.2" .
+  owl:versionInfo "2.1.3" .
 
 vcfc:Genotype a owl:Class ;
   rdfs:label "VCF genotype"@en ;
@@ -1115,7 +1115,7 @@ vcfc:allelePhaseSet a owl:ObjectProperty ; rdfs:label "allele phase set"@en ;
   owl:imports <https://w3id.org/vcf-core/vocab>,
               <https://w3id.org/vcf-core/alleles>,
               <https://w3id.org/vcf-core/genotypes> ;
-  owl:versionInfo "2.1.2" .
+  owl:versionInfo "2.1.3" .
 
 vcfc:SymbolicAlleleType a owl:Class ;
   rdfs:label "symbolic allele type"@en ;
@@ -1295,7 +1295,7 @@ vcfc:blockAllele a owl:ObjectProperty ; rdfs:label "block allele"@en ; rdfs:doma
   rdfs:label "VCF Core reserved-key registry for VCF 4.5"@en ;
   dct:source <https://raw.githubusercontent.com/samtools/hts-specs/master/VCFv4.5.tex> ;
   owl:imports <https://w3id.org/vcf-core/vocab> ;
-  owl:versionInfo "2.1.2" ;
+  owl:versionInfo "2.1.3" ;
   vcfc:specificationVersion "VCFv4.5" .
 
 vcfc:specificationVersion a owl:AnnotationProperty ;

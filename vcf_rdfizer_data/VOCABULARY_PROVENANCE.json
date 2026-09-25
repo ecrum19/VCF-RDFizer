@@ -1,9 +1,9 @@
 {
   "source_repository": "https://github.com/ecrum19/vcf-rdfizer-vocabulary",
-  "source_commit": "5bfd19d3c8fc377cd7eda689f3f8cad0d8d9bf8b",
+  "source_commit": "8a5f23ae552f519f1a14a9370e6d9d3f14934027",
   "note": "Vendored so SHACL validation works from an installed package, with no vocabulary checkout. test_shacl_default_unit.py re-checks these digests against a sibling checkout when one is present.",
   "files": {
-    "ontology/vcf-core-vocabulary.bundle.ttl": "20fd2d8820eb3c8d2796175a6e89212bc5ce04f607ab092addc631e4eff2489c",
+    "ontology/vcf-core-vocabulary.bundle.ttl": "b645b363a395dcd7e4bec990aab655814b589f21af6db4dff171299aaf2aa16e",
     "shacl/vcf-4.1.shacl.ttl": "5eafc441f2bae5c3b19d80dfc34eff0c2c6cefd61b569eadd38900f4343721f9",
     "shacl/vcf-4.2.shacl.ttl": "186131c85a483eaec457b545a9e1d310b6eccc2c9fadc95aaa37b34946d7e226",
     "shacl/vcf-4.3.shacl.ttl": "026105bb56660348239e3ada633e5d00a82f74df28b98798e0db2d1906b63470",
