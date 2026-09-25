@@ -269,6 +269,7 @@ host filesystem.
   - `space-optimized`: gzip each part into one `.nt.gz` aggregate and delete the source part immediately
 - `--rdf-compression {gzip,brotli,none}` raw RDF artifacts to retain
 - `--representations {hdt,cottas,none}` queryable primary representations
+- `--cottas-indexes` one or more of `spo,sop,pso,pos,osp,ops`, or `all` (default `spo`)
 - `--artifact-compression {gzip,brotli,none}` optional packaging applied to each selected representation
 - `--hdt-strategy {auto,partitioned,single}`
   - `auto`: in full mode, build smaller HDT chunks and merge them with native `hdtc`
@@ -431,11 +432,12 @@ compatible with condensed emission.
 
 - `-H, --hdt` existing `.hdt` file; creates or regenerates its sibling sidecar
 - `--cottas` existing `.cottas` file; rebuilds its embedded query index in place
+- `--cottas-indexes` selects the replacement order and optional additional index copies
 - Exactly one of `--hdt` or `--cottas` is required.
 - HDT indexing is Java-free: the image uses `hdtc` 1.1.0 to generate the
   canonical v1-1 sidecar named `<file>.hdt.index.v1-1`.
-- COTTAS indexes are stored inside the Parquet-based `.cottas` file, so the
-  file is rewritten atomically; no separate COTTAS index file is expected.
+- Each COTTAS copy stores its index inside the Parquet-based `.cottas` file;
+  the primary is rewritten atomically and there is no index sidecar.
 - Existing indexes are intentionally replaced. Use this mode when an HDT
   sidecar is missing/stale or when a COTTAS file needs its query ordering and
   zone-map metadata rebuilt. No VCF conversion, RDF conversion, packaging, or
@@ -644,10 +646,18 @@ buffers and may increase temporary I/O; higher values can improve performance
 when memory is available. Temporary files live in the container's `/work` area
 and are removed after the attempt.
 
+Choose COTTAS orders with `--cottas-indexes spo,pso,pos` or `--cottas-indexes all`.
+The first order keeps `sample.cottas`; additional whole-graph copies are named
+`sample.pso.cottas`, `sample.pos.cottas`, etc. Query one copy at a time. Each RDF
+chunk is parsed once; extra orders sort its deduplicated Parquet data. Each order
+gets its own streaming merge, round-trip check and requested gzip/Brotli packages.
+JSON metrics list every index; existing CSV sizes refer to the primary copy.
+See [COTTAS representations](docs/representations.md#5-cottas) for details.
+
 COTTAS avoids both a global in-memory `DISTINCT` and a global external sort.
-Each chunk is already written in `spo` order, so the final stage performs a
+Each chunk is written in each requested order, so the final stage performs a
 bounded k-way Parquet merge: it holds one small batch from each chunk, writes
-one copy of each adjacent equal triple, and preserves the `spo` index. Its
+one copy of each adjacent equal triple, and preserves that index. Its
 memory use is controlled by `COTTAS_MERGE_BATCH_ROWS` (default `2048`), not by
 the total RDF graph size or a temporary DuckDB sort area. Override it only to
 tune the memory/throughput tradeoff, for example:
@@ -822,7 +832,7 @@ COTTAS chunk conversion uses `pycottas.rdf2cottas(..., disk=True)`. The final
 COTTAS merge deliberately does **not** call `pycottas.cat`: version 1.1.0 runs
 its global `DISTINCT` plus `ORDER BY` through an unbounded in-memory DuckDB
 connection, which can be killed on large condensed graphs. VCF-RDFizer instead
-uses a PyArrow k-way merge of the already `spo`-sorted Parquet chunks. It keeps
+uses a PyArrow k-way merge of the already index-sorted Parquet chunks. It keeps
 only a configurable batch from each input, drops adjacent duplicate triples,
 and writes the final COTTAS file incrementally—no graph-wide DuckDB hash table
 or external-sort spill directory is created. The merge emits processed-source

@@ -186,3 +186,20 @@ Example (truncated):
 Ran 10 tests in 0.90s
 OK
 ```
+
+## COTTAS index coverage
+
+Install the pinned container libraries to exercise real Parquet conversion,
+all six orders, reindexing, deduplication, packaging dispatch and failure cleanup:
+
+```bash
+python -m pip install pycottas==1.1.0 duckdb==1.5.5 pyarrow==22.0.0 coverage
+coverage run --branch -m unittest test.test_cottas_indexes_unit test.test_cottas_tool
+coverage report -m --include='*cottas_tool.py,*vcf_rdfizer_cottas.py'
+```
+
+For Docker end-to-end checks, generate a small fixture with `--cottas-indexes all`
+and `--artifact-compression gzip,brotli`, then run `test/cottas_index_roundtrip.py`
+inside that image with `--source <aggregate.nt.gz> --cottas <primary.cottas>
+--indexes all --packages`. It checks exact RDF equality, ordering, metadata,
+eight native triple-pattern shapes per order, and package contents.

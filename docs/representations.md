@@ -120,12 +120,23 @@ the raw RDF is retained so it can be repaired later with `--mode index`.
 COTTAS is a Parquet-based representation with its index **inside** the artifact;
 there is no sidecar. Chunk conversion uses
 `pycottas.rdf2cottas(..., disk=True)` with a fresh container-local DuckDB
-workspace per operation.
+workspace per operation. `--cottas-indexes` accepts `spo` (default), `sop`,
+`pso`, `pos`, `osp`, `ops`, a comma-separated selection, or `all`; case is
+ignored and repeated orders are built once. The first order uses `name.cottas`;
+additional orders use `name.<order>.cottas`. Each file contains the whole graph
+in one order. Query one copy at a time; loading them together repeats the graph.
+
+The RDF chunk is parsed and deduplicated once. Additional orders sort that
+chunk's Parquet data using DuckDB, without repeating RDF parsing or `DISTINCT`.
+Indexes merge sequentially, so adding orders increases disk use and work without
+multiplying merge memory. Gzip/Brotli packaging and round-trip checks cover each
+copy. Per-index paths, sizes and validation are in JSON `details.indexes`; the
+existing CSV size columns describe the primary copy, with timings for all orders.
 
 The final merge deliberately does **not** call `pycottas.cat`. In version 1.1.0
 that runs a global `DISTINCT` plus `ORDER BY` through an unbounded in-memory
 DuckDB connection, which gets OOM-killed on large condensed graphs. VCF-RDFizer
-instead performs a **k-way PyArrow merge** of the already `spo`-sorted Parquet
+instead performs a **k-way PyArrow merge** of the already index-sorted Parquet
 chunks: it holds at most `COTTAS_MERGE_BATCH_ROWS` (default 2048) rows per
 input, drops adjacent duplicate triples, and writes the result incrementally.
 There is no graph-wide hash table and no external-sort spill directory; memory
@@ -160,7 +171,7 @@ deliberate exception to "never overwrite a planned artifact".
 | Input | Behaviour |
 | --- | --- |
 | `--hdt file.hdt` | Existing versioned sidecars are moved aside, regenerated, and restored if indexing fails; incomplete replacements are removed first |
-| `--cottas file.cottas` | The artifact is rewritten atomically through the same bounded streaming Parquet rewrite with the default `spo` index; the original stays in place if it fails |
+| `--cottas file.cottas` | `--cottas-indexes` selects the replacement order and optional additional copies; default `spo`. Changed orders use bounded sorted batches and streaming merges (at most 128 runs per merge). The primary is replaced only after all indexes build successfully; existing additional outputs are refused |
 
 No conversion, packaging, or decompression output is produced. Standalone index
 mode is **strict** — unlike the in-run degradation above, a failure is a failure.

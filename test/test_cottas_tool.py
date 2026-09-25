@@ -201,8 +201,9 @@ class CottasToolTests(unittest.TestCase):
         module = load_cottas_tool()
         calls = []
 
-        def fake_streaming_merge(paths, cottas_path, *, index, remove_input_files, progress_path=None):
-            calls.append((paths, cottas_path, index, remove_input_files))
+        def fake_reindex(source_path, outputs):
+            index, cottas_path = next(iter(outputs.items()))
+            calls.append(([str(source_path)], str(cottas_path), index, False))
             self.assertNotEqual(Path(cottas_path), source)
             self.assertTrue(Path(cottas_path).name.startswith(f".{source.name}.reindex-"))
             Path(cottas_path).write_text("reindexed COTTAS\n")
@@ -219,7 +220,7 @@ class CottasToolTests(unittest.TestCase):
             ), mock.patch.dict(
                 os.environ, {"COTTAS_SCRATCH_DIR": str(scratch_root)}, clear=False
             ), mock.patch.object(
-                module, "streaming_cottas_merge", side_effect=fake_streaming_merge
+                module, "reindex_cottas", side_effect=fake_reindex
             ), mock.patch.object(
                 sys,
                 "argv",
@@ -253,7 +254,7 @@ class CottasToolTests(unittest.TestCase):
             ), mock.patch.dict(
                 os.environ, {"COTTAS_SCRATCH_DIR": str(scratch_root)}, clear=False
             ), mock.patch.object(
-                module, "streaming_cottas_merge", side_effect=failing_streaming_merge
+                module, "reindex_cottas", side_effect=failing_streaming_merge
             ), mock.patch.object(
                 sys,
                 "argv",

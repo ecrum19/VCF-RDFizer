@@ -80,6 +80,7 @@ See [Data linking](datalinking.md) for commands and current limits. There is no
 | `--rdf-storage-mode` | `plain`, `space-optimized` | `space-optimized` |
 | `--rdf-compression` | `gzip`, `brotli`, `none` | `gzip,brotli` |
 | `--representations` | `hdt`, `cottas`, `none` | `hdt` |
+| `--cottas-indexes` | `spo,sop,pso,pos,osp,ops` (one or more), or `all`; also applies to COTTAS index mode | `spo` |
 | `--artifact-compression` | `gzip`, `brotli`, `none` | `none` |
 | `--hdt-strategy` | `auto`, `partitioned`, `single` | `auto` |
 | `--chunk-target-bytes` | bytes | 512 MiB |

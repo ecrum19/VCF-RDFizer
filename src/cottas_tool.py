@@ -10,10 +10,68 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
+from vcf_rdfizer_cottas import COTTAS_INDEXES, cottas_index_paths, parse_cottas_indexes
+
 
 DEFAULT_COTTAS_MERGE_BATCH_ROWS = 2048
 COTTAS_OUTPUT_BATCH_ROWS = 16 * 1024
 COTTAS_MERGE_PROGRESS_ROWS = 250_000
+COTTAS_REINDEX_FAN_IN = 128
+
+
+def sort_cottas_chunk(source: Path, outputs: dict[str, Path]) -> None:
+    """Build extra orders from one parsed chunk, with disk-backed sorting."""
+    import duckdb
+
+    with duckdb.connect("index-sort.duckdb") as connection:
+        connection.execute("SET preserve_insertion_order = false")
+        for index, output in outputs.items():
+            if index not in COTTAS_INDEXES:
+                raise ValueError("COTTAS index must be a permutation of spo")
+            connection.execute(
+                f"COPY (SELECT s, p, o FROM read_parquet($source) ORDER BY {', '.join(index)}) "
+                f"TO $target (FORMAT PARQUET, COMPRESSION ZSTD, COMPRESSION_LEVEL 22, "
+                f"PARQUET_VERSION v2, KV_METADATA {{index: '{index}'}})",
+                {"source": str(source), "target": str(output)},
+            )
+
+
+def reindex_cottas(source: Path, outputs: dict[str, Path]) -> None:
+    """Reorder bounded Parquet batches, then merge each requested index."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    with pq.ParquetFile(source) as parquet:
+        if len(outputs) == 1 and cottas_file_index(parquet) == next(iter(outputs)):
+            index, output = next(iter(outputs.items()))
+            streaming_cottas_merge([str(source)], str(output), index=index, remove_input_files=False)
+            return
+        # Sorting batches keeps reindexing bounded even for a cohort-sized file.
+        with tempfile.TemporaryDirectory(prefix="reindex-runs-", dir=Path.cwd()) as directory:
+            runs = {index: [] for index in outputs}
+            for number, batch in enumerate(parquet.iter_batches(batch_size=COTTAS_OUTPUT_BATCH_ROWS, columns=["s", "p", "o"])):
+                table = pa.Table.from_batches([batch])
+                for index in outputs:
+                    path = Path(directory) / f"{number}.{index}.cottas"
+                    ordered = table.sort_by([(column, "ascending") for column in index])
+                    pq.write_table(ordered.replace_schema_metadata({b"index": index.encode()}), path, compression="zstd")
+                    runs[index].append(str(path))
+            for index, output in outputs.items():
+                if runs[index]:
+                    paths = runs[index]
+                    round_number = 0
+                    while len(paths) > COTTAS_REINDEX_FAN_IN:
+                        merged = []
+                        for start in range(0, len(paths), COTTAS_REINDEX_FAN_IN):
+                            path = Path(directory) / f"merge-{index}-{round_number}-{start}.cottas"
+                            streaming_cottas_merge(paths[start:start + COTTAS_REINDEX_FAN_IN], str(path), index=index, remove_input_files=True)
+                            merged.append(str(path))
+                        paths = merged
+                        round_number += 1
+                    streaming_cottas_merge(paths, str(output), index=index, remove_input_files=True)
+                else:
+                    schema = pa.schema([parquet.schema_arrow.field(name) for name in ("s", "p", "o")], metadata={b"index": index.encode()})
+                    pq.write_table(pa.Table.from_batches([], schema=schema), output, compression="zstd")
 
 
 @contextmanager
@@ -94,34 +152,38 @@ class CottasTripleStream:
         self.path = path
         self.index = index
         self.parquet_file = parquet_module.ParquetFile(path)
-        self.schema = self.parquet_file.schema_arrow
-        missing_columns = {"s", "p", "o"} - set(self.schema.names)
-        if missing_columns:
-            raise RuntimeError(
-                f"COTTAS input {path.name} is missing columns: {', '.join(sorted(missing_columns))}"
+        try:
+            self.schema = self.parquet_file.schema_arrow
+            missing_columns = {"s", "p", "o"} - set(self.schema.names)
+            if missing_columns:
+                raise RuntimeError(
+                    f"COTTAS input {path.name} is missing columns: {', '.join(sorted(missing_columns))}"
+                )
+            source_index = cottas_file_index(self.parquet_file)
+            if source_index != index:
+                found = source_index or "missing"
+                raise RuntimeError(
+                    f"COTTAS input {path.name} is indexed as {found!r}, not {index!r}; "
+                    "a streaming merge requires every input to use the requested index"
+                )
+            self.fields = tuple(self.schema.field(name) for name in ("s", "p", "o"))
+            positions = {"s": 0, "p": 1, "o": 2}
+            self._sort_positions = tuple(positions[column] for column in index)
+            self._batches = self.parquet_file.iter_batches(
+                batch_size=batch_rows,
+                columns=["s", "p", "o"],
+                use_threads=False,
             )
-        source_index = cottas_file_index(self.parquet_file)
-        if source_index != index:
-            found = source_index or "missing"
-            raise RuntimeError(
-                f"COTTAS input {path.name} is indexed as {found!r}, not {index!r}; "
-                "a streaming merge requires every input to use the requested index"
-            )
-        self.fields = tuple(self.schema.field(name) for name in ("s", "p", "o"))
-        positions = {"s": 0, "p": 1, "o": 2}
-        self._sort_positions = tuple(positions[column] for column in index)
-        self._batches = self.parquet_file.iter_batches(
-            batch_size=batch_rows,
-            columns=["s", "p", "o"],
-            use_threads=False,
-        )
-        self._values: tuple[list, list, list] | None = None
-        self._row = 0
-        self.current: tuple | None = None
-        self.sort_key: tuple | None = None
-        self._previous_sort_key: tuple | None = None
-        self.exhausted = False
-        self.advance()
+            self._values: tuple[list, list, list] | None = None
+            self._row = 0
+            self.current: tuple | None = None
+            self.sort_key: tuple | None = None
+            self._previous_sort_key: tuple | None = None
+            self.exhausted = False
+            self.advance()
+        except Exception:
+            self.close()
+            raise
 
     @property
     def row_count(self) -> int:
@@ -200,10 +262,8 @@ def streaming_cottas_merge(
     temporary_path: Path | None = None
     writer = None
     try:
-        streams = [
-            CottasTripleStream(pq, Path(path), normalized_index, batch_rows)
-            for path in input_paths
-        ]
+        for path in input_paths:
+            streams.append(CottasTripleStream(pq, Path(path), normalized_index, batch_rows))
         fields = streams[0].fields
         expected_types = tuple(field.type for field in fields)
         for stream in streams[1:]:
@@ -332,13 +392,13 @@ def main() -> int:
     convert = subparsers.add_parser("convert", help="convert one RDF file to COTTAS")
     convert.add_argument("rdf_path")
     convert.add_argument("cottas_path")
-    convert.add_argument("index", nargs="?", default="spo")
+    convert.add_argument("index", nargs="?", default="spo", type=parse_cottas_indexes)
 
     merge = subparsers.add_parser("merge", help="merge two COTTAS files")
     merge.add_argument("left_path")
     merge.add_argument("right_path")
     merge.add_argument("cottas_path")
-    merge.add_argument("index", nargs="?", default="spo")
+    merge.add_argument("index", nargs="?", default="spo", type=str.lower, choices=COTTAS_INDEXES)
 
     merge_many = subparsers.add_parser(
         "merge-many",
@@ -351,7 +411,7 @@ def main() -> int:
         help="COTTAS inputs to merge",
     )
     merge_many.add_argument("--output-cottas-file", required=True)
-    merge_many.add_argument("--index", default="spo")
+    merge_many.add_argument("--index", default="spo", type=str.lower, choices=COTTAS_INDEXES)
     merge_many.add_argument(
         "--progress-path",
         help="optional JSONL sidecar for bounded streaming-merge progress",
@@ -362,7 +422,7 @@ def main() -> int:
         help="rebuild the embedded COTTAS query index in place",
     )
     reindex.add_argument("cottas_path")
-    reindex.add_argument("index", nargs="?", default="spo")
+    reindex.add_argument("index", nargs="?", default="spo", type=parse_cottas_indexes)
 
     decompress = subparsers.add_parser("decompress", help="convert COTTAS to RDF")
     decompress.add_argument("cottas_path")
@@ -384,9 +444,13 @@ def main() -> int:
             pycottas.rdf2cottas(
                 rdf_path,
                 cottas_path,
-                index=args.index,
+                index=args.index[0],
                 disk=True,
             )
+            outputs = cottas_index_paths(Path(cottas_path), args.index)
+            outputs.pop(args.index[0])
+            if outputs:
+                sort_cottas_chunk(Path(cottas_path), outputs)
         return 0
 
     if args.command == "decompress":
@@ -408,29 +472,29 @@ def main() -> int:
         # files. Rebuild into a temporary file in the same directory, then
         # replace the original only after the streaming Parquet rewrite
         # completes successfully.
-        temporary_path = None
+        outputs = cottas_index_paths(cottas_path, args.index)
+        for output in list(outputs.values())[1:]:
+            if output.exists():
+                raise FileExistsError(f"COTTAS index output already exists: {output}")
+        temporary_paths = {}
         try:
-            file_descriptor, temporary_name = tempfile.mkstemp(
-                prefix=f".{cottas_path.name}.reindex-",
-                suffix=".cottas",
-                dir=str(cottas_path.parent),
-            )
-            os.close(file_descriptor)
-            temporary_path = Path(temporary_name)
-            temporary_path.unlink()
-            with cottas_scratch_workspace():
-                streaming_cottas_merge(
-                    [str(cottas_path)],
-                    str(temporary_path),
-                    index=args.index,
-                    remove_input_files=False,
+            for index, output in outputs.items():
+                file_descriptor, temporary_name = tempfile.mkstemp(
+                    prefix=f".{output.name}.reindex-", suffix=".cottas", dir=str(output.parent),
                 )
-            if not temporary_path.is_file() or temporary_path.stat().st_size == 0:
-                raise RuntimeError("pycottas did not create a non-empty reindexed file")
-            os.replace(temporary_path, cottas_path)
-            temporary_path = None
+                os.close(file_descriptor)
+                temporary_paths[index] = Path(temporary_name)
+                temporary_paths[index].unlink()
+            with cottas_scratch_workspace():
+                reindex_cottas(cottas_path, temporary_paths)
+            for temporary_path in temporary_paths.values():
+                if not temporary_path.is_file() or temporary_path.stat().st_size == 0:
+                    raise RuntimeError("pycottas did not create a non-empty reindexed file")
+            # Publish the primary last so failed builds preserve the original.
+            for index in reversed(args.index):
+                os.replace(temporary_paths[index], outputs[index])
         finally:
-            if temporary_path is not None:
+            for temporary_path in temporary_paths.values():
                 temporary_path.unlink(missing_ok=True)
         return 0
 

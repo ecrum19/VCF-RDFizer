@@ -26,6 +26,8 @@ except ImportError:  # pragma: no cover - Windows
     resource = None
 from pathlib import Path
 
+from vcf_rdfizer_cottas import cottas_index_paths, parse_cottas_indexes
+
 
 HDT_METHODS = {"hdt", "hdt_gzip", "hdt_brotli"}
 COTTAS_METHODS = {"cottas", "cottas_gzip", "cottas_brotli"}
@@ -108,6 +110,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--output-name", required=True)
     parser.add_argument("--methods", required=True, help="comma-separated internal method names")
+    parser.add_argument("--cottas-indexes", default="spo", type=parse_cottas_indexes)
     parser.add_argument("--target-chunk-bytes", required=True, type=int)
     parser.add_argument("--min-chunk-bytes", required=True, type=int)
     parser.add_argument("--max-chunk-bytes", required=True, type=int)
@@ -386,6 +389,7 @@ def cottas_merge_many_command(
     inputs: list[Path],
     merged: Path,
     *,
+    index: str = "spo",
     progress_path: Path | None = None,
 ) -> list[str]:
     """Build one bounded-memory, multi-input COTTAS merge command.
@@ -404,7 +408,7 @@ def cottas_merge_many_command(
         "--output-cottas-file",
         str(merged),
         "--index",
-        "spo",
+        index,
         *(["--progress-path", str(progress_path)] if progress_path else []),
     ]
 
@@ -414,6 +418,7 @@ def cottas_merge_command(
     left: Path,
     right: Path,
     merged: Path,
+    index: str = "spo",
 ) -> list[str]:
     """Build a compatible two-input bounded-memory COTTAS merge command.
 
@@ -428,7 +433,7 @@ def cottas_merge_command(
         str(left),
         str(right),
         str(merged),
-        "spo",
+        index,
     ]
 
 
@@ -832,6 +837,8 @@ def main() -> int:
     cottas_total = {"exit_code": 0, "wall_seconds": 0.0, "user_seconds": 0.0, "sys_seconds": 0.0, "max_rss_kb": 0, "has_user": False, "has_sys": False, "has_rss": False}
     output_hdt = output_dir / f"{args.output_name}.hdt"
     output_cottas = output_dir / f"{args.output_name}.cottas"
+    cottas_indexes = args.cottas_indexes
+    cottas_outputs = cottas_index_paths(output_cottas, cottas_indexes)
     cottas_failed = False
     cottas_warning = None
 
@@ -913,7 +920,8 @@ def main() -> int:
         def cleanup_cottas_intermediates() -> None:
             """Release COTTAS chunks/merge outputs after a failed attempt."""
             for path in list(cottas_paths):
-                path.unlink(missing_ok=True)
+                for indexed_path in cottas_index_paths(path, cottas_indexes).values():
+                    indexed_path.unlink(missing_ok=True)
             cottas_paths.clear()
             for path in work_dir.glob("cottas-merge-*.cottas"):
                 path.unlink(missing_ok=True)
@@ -1046,7 +1054,7 @@ def main() -> int:
                     chunk_cottas = work_dir / f"chunk-{index:05d}.cottas"
                     stage = runner.run(
                         f"cottas-build-{index:05d}",
-                        [cottas_python, "/opt/vcf-rdfizer/cottas_tool.py", "convert", str(chunk), str(chunk_cottas), "spo"],
+                        [cottas_python, "/opt/vcf-rdfizer/cottas_tool.py", "convert", str(chunk), str(chunk_cottas), ",".join(cottas_indexes)],
                         chunk_cottas,
                     )
                     add_totals(cottas_total, stage)
@@ -1065,7 +1073,8 @@ def main() -> int:
                             ),
                             stage_result=stage,
                         )
-                        chunk_cottas.unlink(missing_ok=True)
+                        for path in cottas_index_paths(chunk_cottas, cottas_indexes).values():
+                            path.unlink(missing_ok=True)
                         cleanup_cottas_intermediates()
                     else:
                         cottas_paths.append(chunk_cottas)
@@ -1178,94 +1187,69 @@ def main() -> int:
             }
 
         if cottas_paths and not cottas_failed:
-            # Each COTTAS chunk is already sorted by the `spo` index. The
-            # adapter k-way merges those ordered Parquet streams with one small
-            # batch per input, avoiding both pycottas.cat's global hash table
-            # and DuckDB external-sort spill files that exceeded 41 GiB for a
-            # 52-chunk condensed cohort.
+            # Merge one order at a time: memory does not multiply by index count.
+            indexed_results = {}
             cottas_stage = None
-            cottas_rounds = 0
-            if len(cottas_paths) == 1:
-                final_cottas = cottas_paths[0]
-            else:
-                cottas_merged_path = work_dir / "cottas-merge-final.cottas"
-                cottas_stage = runner.run(
-                    "cottas-merge-stream",
-                    cottas_merge_many_command(
-                        cottas_python,
-                        cottas_paths,
-                        cottas_merged_path,
-                        progress_path=progress_path,
-                    ),
-                    cottas_merged_path,
-                )
-                cottas_stage["cottas_merge_batch_rows"] = os.environ.get(
-                    "COTTAS_MERGE_BATCH_ROWS", DEFAULT_COTTAS_MERGE_BATCH_ROWS
-                )
-                runner.stages[-1].update(cottas_stage)
-                add_totals(cottas_total, cottas_stage)
-                cottas_rounds = 1
-                final_cottas = (
-                    cottas_merged_path
-                    if cottas_stage["exit_code"] == 0 and cottas_merged_path.is_file()
-                    else None
-                )
-            if final_cottas is None:
-                if not args.allow_index_failures:
-                    raise RuntimeError(
-                        failure_message(cottas_stage, "COTTAS merge/index creation failed")
+            try:
+                for order, output in cottas_outputs.items():
+                    paths = [cottas_index_paths(path, cottas_indexes)[order] for path in cottas_paths]
+                    final_cottas = paths[0]
+                    if len(paths) > 1:
+                        final_cottas = work_dir / f"cottas-merge-{order}.cottas"
+                        cottas_stage = runner.run(
+                            "cottas-merge-stream" if order == cottas_indexes[0] else f"cottas-merge-{order}",
+                            cottas_merge_many_command(
+                                cottas_python, paths, final_cottas,
+                                index=order, progress_path=progress_path,
+                            ),
+                            final_cottas,
+                        )
+                        cottas_stage["cottas_merge_batch_rows"] = os.environ.get(
+                            "COTTAS_MERGE_BATCH_ROWS", DEFAULT_COTTAS_MERGE_BATCH_ROWS
+                        )
+                        runner.stages[-1].update(cottas_stage)
+                        add_totals(cottas_total, cottas_stage)
+                        if cottas_stage["exit_code"] != 0 or not final_cottas.is_file():
+                            raise RuntimeError(failure_message(cottas_stage, "COTTAS merge/index creation failed"))
+                    shutil.copyfile(final_cottas, output)
+                    final_cottas.unlink(missing_ok=True)
+                    validation = validate_artifact(
+                        name="cottas-validate" if order == cottas_indexes[0] else f"cottas-validate-{order}",
+                        artifact=output, artifact_format="cottas", python_bin=cottas_python,
                     )
+                    indexed_results[order] = {
+                        "output_path": str(output),
+                        "output_size_bytes": output.stat().st_size,
+                        "validation": validation,
+                    }
+            except RuntimeError as exc:
+                if not args.allow_index_failures:
+                    raise
                 cottas_failed = True
                 cottas_total["exit_code"] = 0
-                cleanup_cottas_intermediates()
+                for output in cottas_outputs.values():
+                    output.unlink(missing_ok=True)
                 cottas_warning = record_index_warning(
-                    "cottas",
-                    "cottas-index",
-                    output_cottas,
-                    failure_message(cottas_stage, "COTTAS merge/index creation failed"),
-                    stage_result=cottas_stage,
+                    "cottas", "cottas-index", output_cottas, str(exc), stage_result=cottas_stage,
                 )
-            else:
-                shutil.copyfile(final_cottas, output_cottas)
-                final_cottas.unlink(missing_ok=True)
+            finally:
                 cleanup_cottas_intermediates()
-                try:
-                    cottas_validation = validate_artifact(
-                        name="cottas-validate",
-                        artifact=output_cottas,
-                        artifact_format="cottas",
-                        python_bin=cottas_python,
-                    )
-                except RuntimeError as exc:
-                    if not args.allow_index_failures:
-                        raise
-                    cottas_failed = True
-                    cottas_total["exit_code"] = 0
-                    output_cottas.unlink(missing_ok=True)
-                    cottas_warning = record_index_warning(
-                        "cottas",
-                        "cottas-index",
-                        output_cottas,
-                        str(exc),
-                    )
-                if not cottas_failed:
-                    results["cottas"] = {
-                        **finalize_totals(cottas_total),
-                        "output_path": str(output_cottas),
-                        "output_size_bytes": output_cottas.stat().st_size,
-                        "source": "partitioned_generated",
-                        "details": {
-                            **plan,
-                            "merge_rounds": cottas_rounds,
-                            "merge_strategy": "pyarrow_streaming_k_way",
-                            "merge_batch_rows": os.environ.get(
-                                "COTTAS_MERGE_BATCH_ROWS",
-                                DEFAULT_COTTAS_MERGE_BATCH_ROWS,
-                            ),
-                            "index": "spo",
-                            "validation": cottas_validation,
-                        },
-                    }
+            if not cottas_failed:
+                results["cottas"] = {
+                    **finalize_totals(cottas_total),
+                    "output_path": str(output_cottas),
+                    "output_size_bytes": output_cottas.stat().st_size,
+                    "source": "partitioned_generated",
+                    "details": {
+                        **plan,
+                        "merge_rounds": int(plan["chunk_count"] > 1),
+                        "merge_strategy": "pyarrow_streaming_k_way",
+                        "merge_batch_rows": os.environ.get("COTTAS_MERGE_BATCH_ROWS", DEFAULT_COTTAS_MERGE_BATCH_ROWS),
+                        "index": cottas_indexes[0],
+                        "indexes": indexed_results,
+                        "validation": indexed_results[cottas_indexes[0]]["validation"],
+                    },
+                }
 
         if any(method in COTTAS_METHODS for method in methods) and cottas_failed:
             results["cottas"] = skipped_cottas_result("cottas")
@@ -1277,18 +1261,27 @@ def main() -> int:
             elif method == "hdt_brotli":
                 artifact = output_dir / f"{args.output_name}.hdt.br"
                 stage = runner.run("hdt-brotli", ["brotli", "-q", "7", "-c", str(output_hdt)], artifact, artifact)
-            elif method == "cottas_gzip":
+            elif method in {"cottas_gzip", "cottas_brotli"}:
                 if cottas_failed:
                     results[method] = skipped_cottas_result(method)
                     continue
-                artifact = output_dir / f"{args.output_name}.cottas.gz"
-                stage = runner.run("cottas-gzip", ["gzip", "-c", str(output_cottas)], artifact, artifact)
-            elif method == "cottas_brotli":
-                if cottas_failed:
-                    results[method] = skipped_cottas_result(method)
-                    continue
-                artifact = output_dir / f"{args.output_name}.cottas.br"
-                stage = runner.run("cottas-brotli", ["brotli", "-q", "7", "-c", str(output_cottas)], artifact, artifact)
+                codec = "gzip" if method == "cottas_gzip" else "brotli"
+                suffix = ".gz" if codec == "gzip" else ".br"
+                packages = {}
+                total = {"exit_code": 0, "wall_seconds": 0.0, "user_seconds": 0.0, "sys_seconds": 0.0, "max_rss_kb": 0, "has_user": False, "has_sys": False, "has_rss": False}
+                for order, output in cottas_outputs.items():
+                    artifact = Path(str(output) + suffix)
+                    command = ["gzip", "-c"] if codec == "gzip" else ["brotli", "-q", "7", "-c"]
+                    stage = runner.run(f"cottas-{codec}-{order}", [*command, str(output)], artifact, artifact)
+                    if stage["exit_code"] != 0:
+                        raise RuntimeError(f"{method} packaging failed for {order}")
+                    add_totals(total, stage)
+                    packages[order] = stage
+                results[method] = {
+                    **packages[cottas_indexes[0]], **finalize_totals(total),
+                    "details": {"index": cottas_indexes[0], "indexes": packages},
+                }
+                continue
             else:
                 continue
             if stage["exit_code"] != 0:
