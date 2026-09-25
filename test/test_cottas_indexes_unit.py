@@ -26,7 +26,7 @@ class IndexSelectionTests(unittest.TestCase):
     def test_selection_and_names(self):
         self.assertEqual(parse_cottas_indexes(' SPO, pso,spo,POS '), ('spo', 'pso', 'pos'))
         self.assertEqual(parse_cottas_indexes(' ALL '), COTTAS_INDEXES)
-        for value in ('', 'spo,', ',spo', 'sp', 'sspo', 'spog', 'all,spo', 'spp', 'sp o'):
+        for value in ('', 'spo,', ',spo', 'sp', 'sspo', 'spogg', 'all,spo', 'spp', 'sp o'):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 parse_cottas_indexes(value)
         self.assertEqual(cottas_index_paths(Path('a.cottas'), ('pos', 'spo')),
@@ -249,11 +249,11 @@ class CottasIndexTests(unittest.TestCase):
 
 
 class PartitionedIndexTests(unittest.TestCase):
-    def run_pipeline(self, root, *, indexes=('pos', 'spo', 'ops'), chunk_bytes=55, failure=None, allow=False, methods='cottas,cottas_gzip,cottas_brotli'):
+    def run_pipeline(self, root, *, indexes=('pos', 'spo', 'ops'), chunk_bytes=55, failure=None, allow=False, methods='cottas,cottas_gzip,cottas_brotli', dataset=False):
         runner = load_runner_module()
         work, out = root / 'work', root / 'out'
         work.mkdir(); out.mkdir()
-        source = root / 'source.nt'
+        source = root / ('source.nq' if dataset else 'source.nt')
         source.write_text(''.join(f'<urn:s{i}> <urn:p> <urn:o> .\n' for i in range(7)))
         result_path = out / 'result.json'
         calls = []
@@ -314,6 +314,16 @@ class PartitionedIndexTests(unittest.TestCase):
             code, report, *_ = self.run_pipeline(Path(td), failure='cottas-gzip-spo')
             self.assertEqual(code, 1)
             self.assertIn('packaging failed for spo', report['error'])
+
+    def test_dataset_pipeline_and_graph_loss_guards(self):
+        for methods, indexes, expected in [('cottas', ('gspo', 'spog'), 0), ('cottas', ('spo',), 1), ('hdt', ('gspo',), 1)]:
+            with tempfile.TemporaryDirectory() as td, self.subTest(methods=methods, indexes=indexes):
+                code, report, calls, *_ = self.run_pipeline(Path(td), dataset=True, indexes=indexes, methods=methods)
+                self.assertEqual(code, expected, report)
+                if expected:
+                    self.assertFalse(calls)
+                else:
+                    self.assertTrue(all(command[3].endswith('.nq') for name, command in calls if name.startswith('cottas-build')))
 
 class HostIndexRoutingTests(unittest.TestCase):
     def test_host_forwards_indexes_and_translates_every_artifact(self):

@@ -42,7 +42,7 @@ queries must run without a decompression step.
 ## 3. Record-safe chunking
 
 When HDT or COTTAS is selected, the aggregate is read sequentially and split
-into chunks on **complete N-Triples line boundaries**. Only one uncompressed
+into chunks on **complete N-Triples or N-Quads line boundaries**. Only one uncompressed
 chunk exists at a time: it is consumed by both converters and removed before the
 next is read. That property is what makes a `space-optimized` `.nt.gz` aggregate
 usable without ever expanding a second full raw copy.
@@ -122,7 +122,9 @@ there is no sidecar. Chunk conversion uses
 `pycottas.rdf2cottas(..., disk=True)` with a fresh container-local DuckDB
 workspace per operation. `--cottas-indexes` accepts `spo` (default), `sop`,
 `pso`, `pos`, `osp`, `ops`, a comma-separated selection, or `all`; case is
-ignored and repeated orders are built once. The first order uses `name.cottas`;
+ignored and repeated orders are built once. Dataset orders accept all 24
+permutations of `spog` (such as `spog,gspo,pgos`), or `all-quads` for all 24.
+The first order uses `name.cottas`;
 additional orders use `name.<order>.cottas`. Each file contains the whole graph
 in one order. Query one copy at a time; loading them together repeats the graph.
 
@@ -133,12 +135,24 @@ multiplying merge memory. Gzip/Brotli packaging and round-trip checks cover each
 copy. Per-index paths, sizes and validation are in JSON `details.indexes`; the
 existing CSV size columns describe the primary copy, with timings for all orders.
 
+`--mode compress --rdf dataset.nq` (also `.nq.gz`) preserves named and default
+graphs. Every selected order must include `g`; HDT and triple-only orders are
+rejected for datasets. N-Quads uses a streaming RDFLib parser with bounded
+Parquet batches because the pinned pycottas parser renames blank nodes per
+chunk. This preserves shared blank nodes, literal lexical forms and graph
+identity across chunks. Default graphs are stored as NULL, sorted last.
+Graph-aware indexes on VCF/N-Triples input add the default graph. Reindexing
+also accepts dataset orders and normalizes legacy pycottas `DEFAULT` values.
+When using pycottas 1.1.0 directly, pass a four-term RDFLib tuple to `search`
+for quad patterns; its string-pattern parser ignores the fourth term.
+
 The final merge deliberately does **not** call `pycottas.cat`. In version 1.1.0
 that runs a global `DISTINCT` plus `ORDER BY` through an unbounded in-memory
 DuckDB connection, which gets OOM-killed on large condensed graphs. VCF-RDFizer
 instead performs a **k-way PyArrow merge** of the already index-sorted Parquet
 chunks: it holds at most `COTTAS_MERGE_BATCH_ROWS` (default 2048) rows per
-input, drops adjacent duplicate triples, and writes the result incrementally.
+input, drops adjacent duplicate triples/quads, and writes the result incrementally.
+The same triple in different graphs remains a separate quad in each graph.
 There is no graph-wide hash table and no external-sort spill directory; memory
 is a function of the batch size and the chunk count, not of the graph size.
 
@@ -179,10 +193,13 @@ The same operation runs automatically after each partitioned HDT merge.
 
 ## 8. Decompression
 
-`--mode decompress` decodes `.nt.gz`, `.nt.br`, `.hdt`, `.cottas`, `.cottas.gz`
-and `.cottas.br` back to N-Triples. A packaged COTTAS is unwrapped **inside the
-container** before `pycottas` writes the decoded output, so the intermediate
-unwrapped file never appears on the host.
+`--mode decompress` decodes raw RDF archives and HDT/COTTAS artifacts. For a
+COTTAS dataset, specify `--decompress-out <out>/dataset.nq` to preserve named graphs;
+the default `.nt` output is accepted only for triple/default-graph data.
+The streaming quad decoder omits the graph term for default-graph statements.
+A packaged COTTAS is unwrapped **inside the container**, so the intermediate
+unwrapped file never appears on the host. Raw `.nq.gz`/`.nq.br` archives keep
+their `.nq` extension when decompressed.
 
 ## 9. Choosing
 
@@ -211,8 +228,8 @@ unwrapped file never appears on the host.
 - **Packaged representations are not queryable**, which is easy to forget when
   `--artifact-compression` is set and `--remove-rdf-storage-output` has removed
   the alternative.
-- **Neither HDT nor COTTAS carries named graphs**, matching the conversion's
-  triples-only output.
+- **HDT cannot carry named graphs.** COTTAS preserves them with dataset indexes;
+  VCF conversion itself still produces triples in the default graph.
 - **No incremental update.** Adding variants means reconverting and rebuilding
   the representation from scratch.
 

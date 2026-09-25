@@ -182,7 +182,7 @@ class CottasToolTests(unittest.TestCase):
             with mock.patch.dict(
                 sys.modules,
                 {"pycottas": types.SimpleNamespace(cottas2rdf=fake_cottas2rdf)},
-            ), mock.patch.dict(
+            ), mock.patch.object(module, "decompress_cottas", side_effect=fake_cottas2rdf), mock.patch.dict(
                 os.environ, {"COTTAS_SCRATCH_DIR": str(scratch_root)}, clear=False
             ), mock.patch.object(
                 sys,

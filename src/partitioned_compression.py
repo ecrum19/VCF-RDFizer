@@ -26,7 +26,7 @@ except ImportError:  # pragma: no cover - Windows
     resource = None
 from pathlib import Path
 
-from vcf_rdfizer_cottas import cottas_index_paths, parse_cottas_indexes
+from vcf_rdfizer_cottas import cottas_index_paths, parse_cottas_indexes, require_dataset_indexes
 
 
 HDT_METHODS = {"hdt", "hdt_gzip", "hdt_brotli"}
@@ -106,7 +106,7 @@ def is_triple_line(line: bytes) -> bool:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="VCF-RDFizer partitioned compression runner")
-    parser.add_argument("--source", required=True, help="plain or gzip-compressed N-Triples input")
+    parser.add_argument("--source", required=True, help="plain or gzip-compressed N-Triples/N-Quads input")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--output-name", required=True)
     parser.add_argument("--methods", required=True, help="comma-separated internal method names")
@@ -161,6 +161,7 @@ def stream_chunks(
 
     chunk_dir.mkdir(parents=True, exist_ok=True)
     prepare_progress_path(progress_path)
+    chunk_suffix = ".nq" if source.name.endswith((".nq", ".nq.gz")) else ".nt"
     plan = {
         "source_file_count": 1,
         "source_paths": [str(source)],
@@ -196,7 +197,7 @@ def stream_chunks(
         def open_chunk():
             nonlocal handle, chunk_path, chunk_size, chunk_start_offset, chunk_start_record, chunk_index, chunk_started
             chunk_started = time.perf_counter()
-            chunk_path = chunk_dir / f"chunk-{chunk_index:05d}.nt"
+            chunk_path = chunk_dir / f"chunk-{chunk_index:05d}{chunk_suffix}"
             chunk_index += 1
             handle = chunk_path.open("wb")
             chunk_size = 0
@@ -913,6 +914,11 @@ def main() -> int:
             raise FileNotFoundError(f"RDF source not found: {source}")
         if not methods or not all(method in HDT_METHODS | COTTAS_METHODS for method in methods):
             raise ValueError(f"Unsupported partitioned method list: {methods}")
+
+        if source.name.endswith((".nq", ".nq.gz")):
+            if any(method in HDT_METHODS for method in methods):
+                raise ValueError("HDT does not preserve named graphs; select --representations cottas")
+            require_dataset_indexes(cottas_indexes)
 
         hdt_paths: list[Path] = []
         cottas_paths: list[Path] = []

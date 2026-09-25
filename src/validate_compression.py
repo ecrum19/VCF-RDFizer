@@ -111,20 +111,12 @@ def validate(args: argparse.Namespace) -> dict:
         except ImportError as exc:
             raise RuntimeError(f"COTTAS dependency is unavailable: {exc}") from exc
 
-        # pycottas exposes cottas2rdf; its output path can be /dev/stdout, so
-        # the COTTAS reader is exercised without materializing decoded RDF.
+        # The adapter also preserves default/named graphs when decoding quads.
         decoded_triples = count_decoded(
-            [
-                sys.executable,
-                "-c",
-                (
-                    "import pycottas, sys; "
-                    "pycottas.cottas2rdf(sys.argv[1], '/dev/stdout')"
-                ),
-                str(artifact),
-            ]
+            [sys.executable, str(Path(__file__).with_name("cottas_tool.py")),
+             "decompress", str(artifact), "/dev/stdout"]
         )
-        validator = "pycottas.cottas2rdf"
+        validator = "cottas_tool.decompress"
 
     return {
         "valid": True,
@@ -143,7 +135,7 @@ def validate(args: argparse.Namespace) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Validate an HDT or COTTAS artifact")
-    parser.add_argument("--source", required=True, help="plain or gzip-compressed N-Triples")
+    parser.add_argument("--source", required=True, help="plain or gzip-compressed N-Triples/N-Quads")
     parser.add_argument("--artifact", required=True, help="HDT or COTTAS artifact")
     parser.add_argument("--format", required=True, choices=("hdt", "cottas"))
     parser.add_argument("--expected-triples", type=int)

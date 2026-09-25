@@ -74,7 +74,7 @@ try:
 except ImportError:  # pragma: no cover - shipped alongside this module
     vcf_rdfizer_gzip = None
 
-from vcf_rdfizer_cottas import cottas_index_paths, parse_cottas_indexes
+from vcf_rdfizer_cottas import cottas_index_paths, parse_cottas_indexes, require_dataset_indexes
 
 import vcf_rdfizer_vocab as vocab
 from vcf_rdfizer_vocab import (
@@ -1560,18 +1560,17 @@ def rdf_label_for_path(path: Path) -> str:
 
 def rdf_output_basename(path: Path) -> str:
     """Return the common output basename for ``.nt`` and ``.nt.gz`` RDF."""
-    if path.name.endswith(".nt.gz"):
-        return path.name[: -len(".nt.gz")]
-    if path.name.endswith(".nt"):
-        return path.name[: -len(".nt")]
+    for suffix in (".nt.gz", ".nq.gz", ".nt", ".nq"):
+        if path.name.endswith(suffix):
+            return path.name[:-len(suffix)]
     return path.stem
 
 
 def compression_artifact_name_for_method(path: Path, method: str) -> str:
     """Compute expected compressed artifact filename for a method."""
-    if path.name.endswith(".nt.gz"):
+    if path.name.endswith((".nt.gz", ".nq.gz")):
         stem = rdf_output_basename(path)
-        ext = "nt"
+        ext = Path(path.stem).suffix.lstrip(".")
     else:
         stem = rdf_output_basename(path)
         ext = path.suffix.lstrip(".") or "nt"
@@ -1602,6 +1601,7 @@ def planned_output_paths(
     methods: list[str],
     partitioned: bool,
     cottas_indexes: tuple[str, ...] = ("spo",),
+    source_rdf_name: str | None = None,
 ) -> set[Path]:
     """List final output paths that a compression plan would create."""
     target_dir = out_dir / output_name
@@ -1609,7 +1609,7 @@ def planned_output_paths(
     if rdf_name is not None:
         planned.add(target_dir / rdf_name)
 
-    rdf_path = Path(rdf_name or f"{output_name}.nt")
+    rdf_path = Path(source_rdf_name or rdf_name or f"{output_name}.nt")
     planned.update(
         target_dir / compression_artifact_name_for_method(rdf_path, method)
         for method in methods
@@ -1661,8 +1661,8 @@ def validate_no_output_collisions(plans: dict[str, set[Path]]):
 def compression_method_label_for_path(path: Path, method: str) -> str:
     """Return human-readable compression method label for a path."""
     ext = path.suffix.lstrip(".") or "nt"
-    if path.name.endswith(".nt.gz"):
-        ext = "nt"
+    if path.name.endswith((".nt.gz", ".nq.gz")):
+        ext = Path(path.stem).suffix.lstrip(".")
     labels = {
         "gzip": f"gzip (.{ext}.gz)",
         "brotli": f"brotli (.{ext}.br)",
@@ -6355,7 +6355,7 @@ def run_compression_methods_for_rdf(
     in_dir = rdf_path.parent
     input_container = f"/data/in/{rdf_path.name}"
     input_stem = rdf_output_basename(rdf_path)
-    input_ext = "nt" if rdf_path.name.endswith(".nt.gz") else rdf_path.suffix.lstrip(".") or "nt"
+    input_ext = Path(rdf_path.stem).suffix.lstrip(".") if rdf_path.name.endswith(".gz") else rdf_path.suffix.lstrip(".") or "nt"
     if target_out_dir is None:
         target_out_dir = out_dir / input_stem
     ensure_dir(target_out_dir)
@@ -8523,11 +8523,11 @@ def detect_compressed_format(path: Path):
 def default_decompressed_name(path: Path, fmt: str):
     """Compute default output filename for decompression mode."""
     if fmt == "gzip":
-        if path.name.endswith(".nt.gz"):
+        if path.name.endswith((".nt.gz", ".nq.gz")):
             return path.name[: -len(".gz")]
         return f"{path.stem}.nt"
     if fmt == "brotli":
-        if path.name.endswith(".nt.br"):
+        if path.name.endswith((".nt.br", ".nq.br")):
             return path.name[: -len(".br")]
         return f"{path.stem}.nt"
     if fmt == "cottas":
@@ -9160,7 +9160,7 @@ def main():
     parser.add_argument(
         "--rdf",
         default=None,
-        help="Input RDF file (.nt or .nt.gz) for --mode compress; .nt.gz required for --mode validation",
+        help="Input RDF file (.nt/.nt.gz or .nq/.nq.gz) for --mode compress; RDF artifact for --mode validation",
     )
     parser.add_argument(
         "-C",
@@ -9327,7 +9327,7 @@ def main():
     )
     parser.add_argument(
         "--cottas-indexes", type=parse_cottas_indexes, default="spo",
-        help="COTTAS orders: spo,sop,pso,pos,osp,ops (comma-separated), or all; first is primary (default: spo)",
+        help="COTTAS orders: permutations of spo or spog (comma-separated); all selects six triple orders, all-quads selects 24 dataset orders (default: spo)",
     )
     parser.add_argument(
         "--artifact-compression",
@@ -9861,8 +9861,8 @@ def main():
             rdf_path = Path(args.rdf).expanduser().resolve()
             if not rdf_path.exists() or not rdf_path.is_file():
                 raise ValueError(f"RDF input file not found: {rdf_path}")
-            if rdf_path.suffix != ".nt" and not rdf_path.name.endswith(".nt.gz"):
-                raise ValueError("Compression input must be a .nt or .nt.gz file")
+            if not rdf_path.name.endswith((".nt", ".nt.gz", ".nq", ".nq.gz")):
+                raise ValueError("Compression input must be a .nt, .nt.gz, .nq or .nq.gz file")
             if args.legacy_compression is not None:
                 if (
                     args.rdf_compression != DEFAULT_RDF_COMPRESSION
@@ -9882,6 +9882,11 @@ def main():
                 )
             if args.cottas_indexes != ("spo",) and not any(method in COTTAS_COMPRESSION_METHODS for method in methods):
                 raise ValueError("--cottas-indexes requires --representations cottas")
+            if rdf_path.name.endswith((".nq", ".nq.gz")):
+                if any(method in HDT_COMPRESSION_METHODS for method in methods):
+                    raise ValueError("HDT does not preserve named graphs; select --representations cottas")
+                if any(method in COTTAS_COMPRESSION_METHODS for method in methods):
+                    require_dataset_indexes(args.cottas_indexes)
             hdt_strategy_error = hdt_strategy_rejection(
                 hdt_strategy=args.hdt_strategy,
                 methods=methods,
@@ -9912,6 +9917,7 @@ def main():
                         methods=methods,
                         partitioned=compression_uses_partitioning_for_input,
                         cottas_indexes=args.cottas_indexes,
+                        source_rdf_name=rdf_path.name,
                     )
                 }
             )

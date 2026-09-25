@@ -269,7 +269,7 @@ host filesystem.
   - `space-optimized`: gzip each part into one `.nt.gz` aggregate and delete the source part immediately
 - `--rdf-compression {gzip,brotli,none}` raw RDF artifacts to retain
 - `--representations {hdt,cottas,none}` queryable primary representations
-- `--cottas-indexes` one or more of `spo,sop,pso,pos,osp,ops`, or `all` (default `spo`)
+- `--cottas-indexes` permutations of `spo` or `spog`, comma-separated; `all` selects six triple orders, `all-quads` selects 24 dataset orders (default `spo`)
 - `--artifact-compression {gzip,brotli,none}` optional packaging applied to each selected representation
 - `--hdt-strategy {auto,partitioned,single}`
   - `auto`: in full mode, build smaller HDT chunks and merge them with native `hdtc`
@@ -647,6 +647,11 @@ when memory is available. Temporary files live in the container's `/work` area
 and are removed after the attempt.
 
 Choose COTTAS orders with `--cottas-indexes spo,pso,pos` or `--cottas-indexes all`.
+Datasets (`--mode compress --rdf dataset.nq` or `.nq.gz`) use graph-aware orders,
+for example `--representations cottas --cottas-indexes spog,gspo`, or
+`--cottas-indexes all-quads` for all 24 permutations. Named and default graphs
+are preserved; triple-only orders and HDT are rejected for dataset inputs.
+Graph-aware orders also work on VCF/triple input, using the default graph.
 The first order keeps `sample.cottas`; additional whole-graph copies are named
 `sample.pso.cottas`, `sample.pos.cottas`, etc. Query one copy at a time. Each RDF
 chunk is parsed once; extra orders sort its deduplicated Parquet data. Each order
