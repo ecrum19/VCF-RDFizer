@@ -1,0 +1,73 @@
+# Policies for the demonstrator cohort (docs/policy-demonstrator.md §2, §4).
+#
+# One consent policy per participant, attached to that participant's file, and
+# one cohort policy with two rules that cut across files. Every rule reads the
+# graph (odrl:read); deny wins (odrl:conflict odrl:prohibit); anything no
+# permission covers is withheld.
+
+@prefix odrl: <http://www.w3.org/ns/odrl/2/> .
+@prefix vcfp: <https://w3id.org/vcf-rdfizer/policy#> .
+@prefix obo:  <http://purl.obolibrary.org/obo/> .
+@prefix ex:   <https://example.org/policy/demo-cohort/> .
+
+# --- Cohort-wide rules ------------------------------------------------------
+
+ex:brca1 a odrl:Asset , vcfp:GraphSelection ;
+    vcfp:selector [ a vcfp:RegionSelector ; vcfp:assembly "GRCh38" ;
+                    vcfp:chrom "chr17" ; vcfp:start 43044295 ; vcfp:end 43125483 ] .
+
+ex:apoe-e4 a odrl:Asset , vcfp:GraphSelection ;
+    vcfp:selector [ a vcfp:VariantSelector ; vcfp:assembly "GRCh38" ;
+                    vcfp:chrom "chr19" ; vcfp:pos 44908684 ; vcfp:ref "T" ; vcfp:alt "C" ] .
+
+ex:cohort a odrl:Set ;
+    odrl:uid ex:cohort ;
+    odrl:profile <https://w3id.org/vcf-rdfizer/policy> ;
+    odrl:conflict odrl:prohibit ;
+    # Actionable incidental findings: readable only for clinical care.
+    odrl:prohibition [ odrl:target ex:brca1 ; odrl:action odrl:read ; odrl:assignee odrl:All ;
+        odrl:constraint [ odrl:leftOperand odrl:purpose ; odrl:operator odrl:isNoneOf ;
+                          odrl:rightOperand obo:DUO_0000043 ] ] ;
+    # APOE e4: readable only for disease-specific research.
+    odrl:prohibition [ odrl:target ex:apoe-e4 ; odrl:action odrl:read ; odrl:assignee odrl:All ;
+        odrl:constraint [ odrl:leftOperand odrl:purpose ; odrl:operator odrl:isNoneOf ;
+                          odrl:rightOperand obo:DUO_0000007 ] ] .
+
+# --- Participant consents ---------------------------------------------------
+
+ex:consent-P001 a odrl:Set ; odrl:uid ex:consent-P001 ;
+    odrl:profile <https://w3id.org/vcf-rdfizer/policy> ; odrl:conflict odrl:prohibit ;
+    odrl:permission [ odrl:target <file://P001.vcf> ; odrl:action odrl:read ; odrl:assignee odrl:All ;
+        odrl:constraint [ odrl:leftOperand odrl:purpose ; odrl:operator odrl:isAnyOf ;
+                          odrl:rightOperand obo:DUO_0000042 , obo:DUO_0000043 ] ;
+        odrl:duty [ odrl:action odrl:attribute ] ] .
+
+ex:consent-P002 a odrl:Set ; odrl:uid ex:consent-P002 ;
+    odrl:profile <https://w3id.org/vcf-rdfizer/policy> ; odrl:conflict odrl:prohibit ;
+    odrl:permission [ odrl:target <file://P002.vcf> ; odrl:action odrl:read ; odrl:assignee odrl:All ;
+        odrl:constraint [ odrl:leftOperand odrl:purpose ; odrl:operator odrl:isAnyOf ;
+                          odrl:rightOperand obo:DUO_0000042 , obo:DUO_0000043 ] ;
+        odrl:duty [ odrl:action odrl:attribute ] ] .
+
+ex:consent-P003 a odrl:Set ; odrl:uid ex:consent-P003 ;
+    odrl:profile <https://w3id.org/vcf-rdfizer/policy> ; odrl:conflict odrl:prohibit ;
+    odrl:permission [ odrl:target <file://P003.vcf> ; odrl:action odrl:read ; odrl:assignee odrl:All ;
+        odrl:constraint [ odrl:leftOperand odrl:purpose ; odrl:operator odrl:isAnyOf ;
+                          odrl:rightOperand obo:DUO_0000006 ] ;
+        odrl:duty [ odrl:action odrl:attribute ] ] .
+
+# P004 consented to general research and later withdrew. The withdrawal is a
+# prohibition, so it overrides the permission under deny-wins.
+ex:consent-P004 a odrl:Set ; odrl:uid ex:consent-P004 ;
+    odrl:profile <https://w3id.org/vcf-rdfizer/policy> ; odrl:conflict odrl:prohibit ;
+    odrl:permission [ odrl:target <file://P004.vcf> ; odrl:action odrl:read ; odrl:assignee odrl:All ;
+        odrl:constraint [ odrl:leftOperand odrl:purpose ; odrl:operator odrl:isAnyOf ;
+                          odrl:rightOperand obo:DUO_0000042 ] ] ;
+    odrl:prohibition [ odrl:target <file://P004.vcf> ; odrl:action odrl:read ; odrl:assignee odrl:All ] .
+
+ex:consent-P005 a odrl:Set ; odrl:uid ex:consent-P005 ;
+    odrl:profile <https://w3id.org/vcf-rdfizer/policy> ; odrl:conflict odrl:prohibit ;
+    odrl:permission [ odrl:target <file://P005.vcf> ; odrl:action odrl:read ; odrl:assignee odrl:All ;
+        odrl:constraint [ odrl:leftOperand odrl:purpose ; odrl:operator odrl:isAnyOf ;
+                          odrl:rightOperand obo:DUO_0000007 ] ;
+        odrl:duty [ odrl:action odrl:attribute ] ] .

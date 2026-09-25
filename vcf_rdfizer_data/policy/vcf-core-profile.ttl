@@ -1,0 +1,63 @@
+# The VCF Core profile for vcf-rdfizer-policy: everything the engine needs to know
+# about graphs written by VCF-RDFizer, declared here rather than coded.
+#
+#  * vcfp:SelectorType -- a kind of graph selection. Its vcfp:query is a SPARQL
+#    SELECT that must project ?resource. Each vcfp:parameter is a property the
+#    policy's selector node must carry; its value is bound to the query variable
+#    named after the property's local name (vcfp:start -> ?start). An optional
+#    vcfp:violations query lists reasons the selector cannot be applied to this
+#    graph; any row stops evaluation.
+#  * vcfp:Profile -- how the graph is partitioned. A withheld resource takes with
+#    it everything it owns: the resources reached by vcfp:ownershipPath (a SPARQL
+#    property path), and, when vcfp:iriSubtree is true, every IRI beneath any of
+#    them (…#record/9 owns …#record/9/allele/0). vcfp:unitQuery names what the
+#    per-record report counts: ?resource and ?group are required, other
+#    variables become report columns.
+#
+# New selectors need no code: declare another vcfp:SelectorType here, in a
+# file passed with --profile, or in the policy file itself.
+
+@prefix vcfp: <https://w3id.org/vcf-rdfizer/policy#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+
+vcfp:VCFCore a vcfp:Profile ;
+    rdfs:label "VCF Core graphs as VCF-RDFizer writes them" ;
+    # A record owns its call, and through the call its per-sample calls
+    # (expanded profile); the condensed matrix already sits under the call's IRI.
+    vcfp:ownershipPath "<https://w3id.org/vcf-core/vocab#hasCall>/<https://w3id.org/vcf-core/vocab#hasSampleCall>?" ;
+    vcfp:iriSubtree true ;
+    vcfp:unitQuery """
+        PREFIX vcfc: <https://w3id.org/vcf-core/vocab#>
+        SELECT ?resource ?group ?chrom ?pos ?ref (GROUP_CONCAT(?a; separator=",") AS ?alt)
+        WHERE { ?group vcfc:hasRecord ?resource .
+                ?resource vcfc:chrom ?chrom ; vcfc:pos ?pos ; vcfc:ref ?ref .
+                OPTIONAL { ?resource vcfc:alt ?a } }
+        GROUP BY ?resource ?group ?chrom ?pos ?ref""" .
+
+vcfp:RegionSelector a vcfp:SelectorType ;
+    rdfs:comment "Records whose POS lies in [start, end] on chrom, 1-based and inclusive." ;
+    vcfp:parameter vcfp:assembly , vcfp:chrom , vcfp:start , vcfp:end ;
+    vcfp:query """
+        PREFIX vcfc: <https://w3id.org/vcf-core/vocab#>
+        SELECT ?resource WHERE {
+            ?resource a vcfc:VCFRecord ; vcfc:chrom ?c ; vcfc:pos ?pos .
+            FILTER(STR(?c) = STR(?chrom) && ?pos >= ?start && ?pos <= ?end) }""" ;
+    vcfp:violations """
+        PREFIX vcfc: <https://w3id.org/vcf-core/vocab#>
+        SELECT ?file ?declared WHERE {
+            ?file a vcfc:VCFFile . OPTIONAL { ?file vcfc:referenceGenome ?declared }
+            FILTER(!BOUND(?declared) || STR(?declared) != STR(?assembly)) }""" .
+
+vcfp:VariantSelector a vcfp:SelectorType ;
+    rdfs:comment "Records with exactly this chrom, pos, ref and one ALT equal to alt." ;
+    vcfp:parameter vcfp:assembly , vcfp:chrom , vcfp:pos , vcfp:ref , vcfp:alt ;
+    vcfp:query """
+        PREFIX vcfc: <https://w3id.org/vcf-core/vocab#>
+        SELECT ?resource WHERE {
+            ?resource a vcfc:VCFRecord ; vcfc:chrom ?c ; vcfc:pos ?p ; vcfc:ref ?r ; vcfc:alt ?a .
+            FILTER(STR(?c) = STR(?chrom) && ?p = ?pos && STR(?r) = STR(?ref) && STR(?a) = STR(?alt)) }""" ;
+    vcfp:violations """
+        PREFIX vcfc: <https://w3id.org/vcf-core/vocab#>
+        SELECT ?file ?declared WHERE {
+            ?file a vcfc:VCFFile . OPTIONAL { ?file vcfc:referenceGenome ?declared }
+            FILTER(!BOUND(?declared) || STR(?declared) != STR(?assembly)) }""" .

@@ -1,0 +1,10 @@
+{
+  "description": "The five fixture VCFs converted once per sample profile, committed so the demonstrator and its tests run without Docker.",
+  "host": "vcf-bench-1",
+  "converted": "2026-09-25",
+  "image": "ecrum19/vcf-rdfizer@sha256:1904e96dde12ab2e2e70d8ee1267765c293ab100a8bd1b14d5b009b2bf8e34aa",
+  "image_tag": "ecrum19/vcf-rdfizer:3.1.0",
+  "wrapper_commit": "3da1a5a4a85204c74ed986a953f9098286d1bc80",
+  "command": "vcf_rdfizer.py --mode full --input <dir of P00*.vcf> --sample-representation {expanded|condensed} --representations none --rdf-storage-mode plain --rdf-compression gzip --image ecrum19/vcf-rdfizer --image-version 3.1.0 --no-build",
+  "outputs": {"expanded": "expanded/P00n.nt.gz", "condensed": "condensed/P00n.nt.gz"}
+}

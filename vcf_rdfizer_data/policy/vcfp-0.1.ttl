@@ -1,0 +1,41 @@
+# Terms of the VCF-RDFizer policy profile that v0.1.0 defines. The engine reads
+# ODRL policies; these terms describe the three things it is configured with:
+# selections (what a rule targets), profiles (how a graph is partitioned), and
+# release views (what it writes). docs/policy-demonstrator.md explains each.
+
+@prefix vcfp: <https://w3id.org/vcf-rdfizer/policy#> .
+@prefix odrl: <http://www.w3.org/ns/odrl/2/> .
+@prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+
+<https://w3id.org/vcf-rdfizer/policy> a odrl:Profile ;
+    rdfs:label "VCF-RDFizer policy profile, v0.1.0" .
+
+# --- Selections --------------------------------------------------------------
+vcfp:GraphSelection a rdfs:Class ; rdfs:subClassOf odrl:Asset ;
+    rdfs:comment "An asset that is a selection of a graph, described by exactly one vcfp:selector." .
+vcfp:selector a rdf:Property ; rdfs:domain vcfp:GraphSelection ;
+    rdfs:comment "The selector node: typed with a vcfp:SelectorType, carrying its parameters." .
+vcfp:selects a rdf:Property ; rdfs:domain vcfp:GraphSelection ;
+    rdfs:comment "Written by `attach`: a resource the selection selects." .
+vcfp:SelectorType a rdfs:Class ;
+    rdfs:comment "A kind of selection, declared by a SPARQL SELECT that projects ?resource." .
+vcfp:query a rdf:Property ; rdfs:domain vcfp:SelectorType .
+vcfp:parameter a rdf:Property ; rdfs:domain vcfp:SelectorType ;
+    rdfs:comment "A required property of the selector node, bound to the query variable named after its local name." .
+vcfp:violations a rdf:Property ; rdfs:domain vcfp:SelectorType ;
+    rdfs:comment "A SPARQL SELECT whose rows are reasons the selector cannot be applied; any row stops evaluation." .
+
+# --- Partitioning --------------------------------------------------------------
+vcfp:Profile a rdfs:Class ;
+    rdfs:comment "How a graph is partitioned, and what the per-unit report counts." .
+vcfp:ownershipPath a rdf:Property ; rdfs:domain vcfp:Profile ;
+    rdfs:comment "A SPARQL property path: a withheld resource also withholds what it reaches." .
+vcfp:iriSubtree a rdf:Property ; rdfs:domain vcfp:Profile ;
+    rdfs:comment "When true, a withheld resource also withholds every IRI beneath it (after '#' or '/')." .
+vcfp:unitQuery a rdf:Property ; rdfs:domain vcfp:Profile ;
+    rdfs:comment "A SPARQL SELECT of the reported units: ?resource and ?group required." .
+
+# --- Release views ---------------------------------------------------------------
+vcfp:ReleaseView a rdfs:Class ;
+    rdfs:comment "A graph produced under a policy for one request. Governed release, not anonymization." .
