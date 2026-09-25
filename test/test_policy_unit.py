@@ -245,7 +245,11 @@ class ReleaseTests(FixtureViews):
         for expected in ("governed release; not anonymization", "DUO_0000007", "odrl:attribute",
                          f"vcfp:recordsWithheld {sum(not d.released for _, d in release.decisions)}"):
             self.assertIn(expected, manifest)
-        self.assertEqual(json.loads((out / "summary.json").read_text())["files"]["file://P004.vcf"]["released"], False)
+        files = json.loads((out / "summary.json").read_text())["files"]
+        self.assertEqual(files["file://P004.vcf"]["released"], False)       # the decision, not a count
+        self.assertEqual(files["file://P001.vcf"]["released"], True)
+        self.assertEqual(sum(f["records_released"] for f in files.values()),
+                         sum(d.released for _, d in release.decisions))
 
     def test_a_release_is_never_written_over_another(self):
         from vcf_rdfizer_policies.release import write_release

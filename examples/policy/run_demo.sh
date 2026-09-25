@@ -43,7 +43,7 @@ summaries = {v.name: json.loads((v / "summary.json").read_text()) for v in views
 files = sorted(next(iter(summaries.values()))["files"])
 print("requester".ljust(10) + "".join(f.split("//")[1].ljust(10) for f in files) + "triples withheld")
 for name, s in summaries.items():
-    cells = "".join((str(s["files"][f].get("released", 0)) if s["files"][f]["released"] else "withheld").ljust(10)
+    cells = "".join((str(s["files"][f]["records_released"]) if s["files"][f]["released"] else "withheld").ljust(10)
                     for f in files)
     print(name.ljust(10) + cells + str(s["triples_withheld"]))
 PY

@@ -67,8 +67,8 @@ def summary(release) -> dict:
     """Counts per file and per deciding reason, for the manifest and the paper figure."""
     per_file = {}
     for record, decision in release.decisions:
-        counts = per_file.setdefault(record.file, {"released": 0, "withheld": 0})
-        counts["released" if decision.released else "withheld"] += 1
+        counts = per_file.setdefault(record.file, {"records_released": 0, "records_withheld": 0})
+        counts["records_released" if decision.released else "records_withheld"] += 1
     reasons = {}
     for _, decision in release.decisions:
         reasons[decision.reason] = reasons.get(decision.reason, 0) + 1
