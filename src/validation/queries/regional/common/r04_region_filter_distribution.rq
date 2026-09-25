@@ -1,0 +1,16 @@
+PREFIX vcfc: <https://w3id.org/vcf-core/vocab#>
+PREFIX xsd:  <http://www.w3.org/2001/XMLSchema#>
+
+# R4 - FILTER status and exact lexical value inside one window. The VCF side
+# uses `bcftools query -r`, which is the only route to the exact FILTER text.
+SELECT ?filterStatus ?filterLexical (COUNT(DISTINCT ?record) AS ?recordCount)
+WHERE {
+  ?record a vcfc:VCFRecord ; vcfc:chrom ?chrom ; vcfc:pos ?pos ; vcfc:hasCall ?call .
+  FILTER(STR(?chrom) = "{{CHROM}}")
+  FILTER(xsd:integer(?pos) >= {{START}} && xsd:integer(?pos) <= {{END}})
+  ?call vcfc:filter ?filterLiteral .
+  BIND(STR(?filterLiteral) AS ?filterLexical)
+  BIND(IF(?filterLexical = "PASS", "PASS", IF(?filterLexical = ".", "NOT_APPLIED", "FAILED")) AS ?filterStatus)
+}
+GROUP BY ?filterStatus ?filterLexical
+ORDER BY ?filterStatus ?filterLexical

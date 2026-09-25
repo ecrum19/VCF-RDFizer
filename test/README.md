@@ -62,6 +62,17 @@ This repository uses `unittest` (Python standard library) to isolate orchestrati
     must agree with the Python oracle and not merely with the other engines.
   - Pass a comma-separated subset as the first argument to narrow it.
 
+- `test/test_regional_runner.py` and `test/test_regional_runner_driver.py`
+  - Cover `src/validation/regional_runner.py`, the indexed regional-access
+    performance investigation (see "Indexed regional access" in
+    `docs/validation.md`): agreement between the access paths, index
+    preparation, and the driver end to end.
+  - Not run in CI or by the normal test workflow. The names deliberately miss
+    the `test_*_unit.py` pattern, because the runner is a performance tool, not
+    part of conversion or validation. Run them explicitly when changing it,
+    inside the image so the index and bcftools tests do not skip:
+    `python -m unittest test.test_regional_runner test.test_regional_runner_driver`.
+
 - `test/test_validation_logic_unit.py`
   - Mutation tests over the validator's pure comparison layer, run on the host
     without cyvcf2 or Docker.
