@@ -125,6 +125,7 @@ compatibility. Use the three explicit selectors.
 | `--validation-id` | name | source basename | Report directory name; existing directories are never overwritten |
 | `--validation-engine` | `comunica`, `qlever`, `hdt`, `cottas`, `all`, or a comma-separated list | `comunica` | SPARQL backend(s); a scale and performance decision, never a semantic one. `hdt`/`cottas` query the compressed artifact in place. Several engines answer the whole query set, are cross-checked against each other, and are timed in `benchmark.csv` |
 | `--filter-oracle` | `auto`, `bcftools`, `cyvcf2` | `auto` | FILTER-field oracle |
+| `--validation-queries` | query ids, or `core` / `preflight` / `all` | all | Run only these queries. A subset reports `TIMING_ONLY` rather than a validation verdict, because the PASS decision needs the whole set; each selected query is still compared against the VCF oracle, so a disagreement still fails the run. Use it to measure retrieval cost for one question without paying for the rest |
 | `--shacl-shapes` | path | off | Independent structural layer via `pyshacl`; in-memory, so not for cohort scale |
 | `--strict-conformance` | — | off | Promote a missing-token conformance anomaly from report to failure |
 | `--validation-query-timeout` | seconds | 3600 | Per-query timeout, every engine |

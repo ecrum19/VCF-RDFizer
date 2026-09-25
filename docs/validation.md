@@ -342,6 +342,39 @@ comparison: the validation suite computes every expected value twice, once by
 parsing and once by querying, so a run measures a SPARQL engine against a
 purpose-built parser on identical work.
 
+#### Timing one question instead of all of them
+
+`--validation-queries` runs a subset: individual ids, or the groups `core` (the
+thirteen `q01`-`q13`), `preflight`, or `all`.
+
+```bash
+vcf_rdfizer.py --mode validation --input cohort.vcf.gz --rdf cohort.hdt \
+  --validation-engine qlever --validation-queries core
+```
+
+The cost it saves is not marginal. Measured on a 17.1M-triple graph, per
+artifact, the thirteen core queries took 17 s and the preflight set took 201 s.
+If what you want is the retrieval cost of the thirteen, running everything pays
+twelve times over.
+
+**A subset does not produce a validation verdict, and that is deliberate.** The
+PASS/MISMATCH decision reads preflight gating, the sample/GT inventory and
+invariants computed across the whole query set; on a subset it could only mean
+"the queries you happened to ask for agreed", which is not a statement anyone
+should be able to quote as a pass. So a subset run reports `TIMING_ONLY`, and
+`summary.json` omits `comparisonStatus` and `preflight` entirely — a consumer
+that reads a subset expecting a validation result fails to find one rather than
+misreading it.
+
+What a subset keeps is the equality check. Every selected core query is still
+compared against the cyvcf2 oracle and a disagreement still fails the run, so a
+timing is never reported for an answer that was not checked.
+
+Two smaller behaviours worth knowing: asking for an anomaly preflight's
+`_count` alone also runs its sample query, because the count is derived from
+the sample rather than measured separately; and the selection is executed in
+canonical order regardless of the order you write it, for the same reason.
+
 An engine that produced no timed query reports `null` rather than `0`, because
 zero seconds reads as "instant" rather than "never ran".
 
