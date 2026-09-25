@@ -2024,6 +2024,64 @@ def merge_shapes_graph(shapes: list[Path]):
     return graph
 
 
+#: pyshacl loads the whole graph into memory, so the shape layer needs a size
+#: gate. This one is in triples rather than bytes, because what pyshacl pays
+#: for is the graph, not the packaging -- see the comment at its call site for
+#: the failure that motivated it.
+#:
+#: 50M is chosen to sit above the largest graph the published campaign actually
+#: validated with shapes (17.1M triples, the 100,000-record HG005 slice) and
+#: below the one that exhausted 31 GB (170.9M). It is deliberately not derived
+#: from measured bytes-per-triple: rdflib's footprint depends on term sharing
+#: and IRI length, so a constant here is a conservative guard rather than a
+#: prediction, and it is overridable for a machine that can afford more.
+DEFAULT_SHACL_MAX_TRIPLES = 50_000_000
+
+#: Node's V8 heap ceiling for the Comunica-backed endpoints (comunica, hdt,
+#: cottas -- all three go through ComunicaHttpEndpointMixin).
+#:
+#: Node sizes its old-space from a default that does not track the machine, so
+#: on a 31 GB host the endpoint still died with "Reached heap limit Allocation
+#: failed - JavaScript heap out of memory" on the sample-level query of a
+#: 170.9M-triple HDT graph, with 25 GB free. The kernel OOM killer was never
+#: involved: the process aborted itself inside a ceiling it chose.
+#:
+#: None keeps Node's default, which is the behaviour every published result was
+#: produced under. Set a value to raise it.
+DEFAULT_NODE_HEAP_MB: int | None = None
+
+
+def node_endpoint_env(heap_mb: int | None, base: dict[str, str] | None = None) -> dict[str, str]:
+    """Environment for a Comunica endpoint, with an optional heap ceiling.
+
+    Appends rather than replaces NODE_OPTIONS, so a caller's own setting is
+    kept and only the heap is added.
+    """
+    env = dict(base if base is not None else os.environ)
+    if not heap_mb:
+        return env
+    option = f"--max-old-space-size={heap_mb}"
+    existing = env.get("NODE_OPTIONS", "").strip()
+    env["NODE_OPTIONS"] = f"{existing} {option}".strip() if existing else option
+    return env
+
+
+
+def shacl_exceeds_limit(triple_count: int | None, limit: int | None) -> bool:
+    """Whether a decoded graph is too large to hand to pyshacl.
+
+    An unknown count is treated as too large, for the same reason the wrapper
+    treats an unreadable size that way: skipping a check is recoverable and is
+    recorded, while exhausting memory mid-run loses the whole validation.
+    A limit of 0 disables the gate.
+    """
+    if not limit:
+        return False
+    if triple_count is None:
+        return True
+    return triple_count > limit
+
+
 def validate_shacl(
     source: Path,
     shapes: Path | list[Path],
@@ -2435,6 +2493,9 @@ class ComunicaHttpEndpointMixin:
             options.get("comunica_warmup_timeout")
             or max(DEFAULT_COMUNICA_WARMUP_TIMEOUT, self.query_timeout)
         )
+        # None leaves Node's own default, which is what every published result
+        # was produced under.
+        self.node_heap_mb = options.get("node_heap_mb") or DEFAULT_NODE_HEAP_MB
         self.server: subprocess.Popen | None = None
         self.executable: str | None = None
         self.endpoint: str | None = None
@@ -2486,6 +2547,7 @@ class ComunicaHttpEndpointMixin:
             stdout=server_log.open("wb"),
             stderr=subprocess.STDOUT,
             start_new_session=True,
+            env=node_endpoint_env(getattr(self, "node_heap_mb", None)),
         )
         self._await_bind(server_log)
         self._await_warm(server_log)
@@ -3958,11 +4020,52 @@ def run_validation(args: argparse.Namespace) -> int:
             )
             rdf_validation = validate_ntriples(decoded, results_dir)
             shacl_result = None
-            if args.shacl_shapes is not None:
+            # The authoritative size gate for pyshacl, because this is the only
+            # point that knows what pyshacl will actually load.
+            #
+            # The wrapper also gates, on the PACKAGED artifact's bytes, and that
+            # measure is wrong in a way that bites hardest on the best format.
+            # On a 170,935,101-triple graph the same graph landed on both sides
+            # of the wrapper's 512 MiB gate purely by packaging:
+            #
+            #   cottas    390,728,158 B  under -> shapes attempted -> OOM
+            #   nt.gz     756,594,166 B  over  -> skipped
+            #   hdt     1,182,206,289 B  over  -> skipped
+            #
+            # The COTTAS run was SIGKILLed at 32.2 GB RSS on a 31 GB machine
+            # after decoding and rapper had both succeeded on every triple. So
+            # the better a format compresses, the likelier it was to exhaust
+            # memory -- the guard inverted. Gating on the triple count fixes
+            # that, because a graph's cost to pyshacl does not depend on how it
+            # arrived.
+            decoded_triples = rdf_validation.get("tripleCount")
+            shacl_skipped: dict[str, Any] | None = None
+            shacl_limit = getattr(
+                args, "shacl_max_triples", DEFAULT_SHACL_MAX_TRIPLES
+            )
+            if args.shacl_shapes is not None and shacl_exceeds_limit(
+                decoded_triples, shacl_limit
+            ):
+                shacl_skipped = {
+                    "status": "SKIPPED_TOO_LARGE",
+                    "tripleCount": decoded_triples,
+                    "limitTriples": shacl_limit,
+                    "reason": (
+                        f"the decoded graph holds {decoded_triples:,} triples, above the "
+                        f"--shacl-max-triples limit of {shacl_limit:,}. "
+                        f"pyshacl is in-memory, so attempting it risks exhausting memory "
+                        f"mid-run; skipping is recoverable and is recorded here."
+                    ),
+                }
+                eprint(f"[{args.dataset_id}] shapes skipped: {shacl_skipped['reason']}")
+            if args.shacl_shapes is not None and shacl_skipped is None:
                 progress.emit("progress", completed=0, detail="validating SHACL shapes")
                 shacl_result = validate_shacl(
                     decoded, args.shacl_shapes, results_dir, args.shacl_ontology
                 )
+            if shacl_skipped is not None:
+                shacl_result = shacl_skipped
+                write_json(results_dir / "shacl.json", shacl_skipped)
             write_json(results_dir / "rdf-validation.json", rdf_validation)
             materialization["decodedTripleCount"] = rdf_validation.get("tripleCount")
             write_json(results_dir / "materialization.json", materialization)
@@ -3976,6 +4079,7 @@ def run_validation(args: argparse.Namespace) -> int:
                 "comunica_port": args.comunica_port,
                 "hdt_port": args.hdt_port,
                 "comunica_bind_timeout": args.comunica_bind_timeout,
+                "node_heap_mb": getattr(args, "node_heap_mb", DEFAULT_NODE_HEAP_MB),
                 "comunica_warmup_timeout": args.comunica_warmup_timeout,
             }
             engine_options["artifact_path"] = str(args.rdf)
@@ -4349,6 +4453,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "the whole set. Each selected core query is still compared against "
             "the oracle, so a subset run measures cost on answers that were "
             "checked."
+        ),
+    )
+    parser.add_argument(
+        "--node-heap-mb",
+        type=int,
+        default=DEFAULT_NODE_HEAP_MB,
+        help=(
+            "Raise the V8 old-space ceiling (MB) for the Comunica-backed "
+            "endpoints (comunica, hdt, cottas). Node does not size its heap "
+            "from the machine, so an endpoint can abort with a JavaScript "
+            "heap-out-of-memory while the host still has free memory. Unset "
+            "keeps Node's default"
+        ),
+    )
+    parser.add_argument(
+        "--shacl-max-triples",
+        type=int,
+        default=DEFAULT_SHACL_MAX_TRIPLES,
+        help=(
+            "Skip the shape layer when the decoded graph holds more triples "
+            "than this, recording the skip and its reason (0 disables the "
+            "gate). pyshacl is in-memory, and its cost tracks the graph rather "
+            f"than the artifact it arrived in (default: {DEFAULT_SHACL_MAX_TRIPLES:,})"
         ),
     )
     parser.add_argument("--filter-oracle", choices=("auto", "bcftools", "cyvcf2"), default="auto")
