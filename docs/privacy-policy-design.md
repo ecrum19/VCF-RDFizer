@@ -6,7 +6,7 @@ contract before code depends on it — and, in this case, to be explicit about
 what a policy layer can and cannot achieve, because the failure mode of a
 privacy feature is a false sense of safety.*
 
-*The first slice to be built is specified separately:
+*The first slice is implemented and specified separately:
 [`policy-demonstrator.md`](policy-demonstrator.md), v0.1.0 — ODRL attached to
 files, regions and variants over single-sample fixtures, with per-request views
 verified against an oracle. It implements a subset of this document and cites

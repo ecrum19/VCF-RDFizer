@@ -1,0 +1,95 @@
+{
+  "description": "Synthetic single-sample cohort for the v0.1.0 policy demonstrator. Genotypes are synthetic; see make_fixture.py.",
+  "seed": 20260925,
+  "assembly": "GRCh38",
+  "participants": {
+    "P001": {
+      "consent": [
+        "DUO_0000042",
+        "DUO_0000043"
+      ]
+    },
+    "P002": {
+      "consent": [
+        "DUO_0000042",
+        "DUO_0000043"
+      ]
+    },
+    "P003": {
+      "consent": [
+        "DUO_0000006"
+      ]
+    },
+    "P004": {
+      "consent": [
+        "DUO_0000042"
+      ],
+      "withdrawn": true
+    },
+    "P005": {
+      "consent": [
+        "DUO_0000007"
+      ]
+    }
+  },
+  "files": {
+    "P001.vcf": {
+      "participant": "P001",
+      "records": 34
+    },
+    "P002.vcf": {
+      "participant": "P002",
+      "records": 23
+    },
+    "P003.vcf": {
+      "participant": "P003",
+      "records": 27
+    },
+    "P004.vcf": {
+      "participant": "P004",
+      "records": 26
+    },
+    "P005.vcf": {
+      "participant": "P005",
+      "records": 29
+    }
+  },
+  "loci": {
+    "brca1": {
+      "chrom": "chr17",
+      "start": 43044295,
+      "end": 43125483
+    },
+    "apoe_e4": {
+      "chrom": "chr19",
+      "pos": 44908684,
+      "ref": "T",
+      "alt": "C",
+      "id": "rs429358"
+    },
+    "apoe_e2": {
+      "chrom": "chr19",
+      "pos": 44908822,
+      "ref": "C",
+      "alt": "T",
+      "id": "rs7412"
+    }
+  },
+  "requesters": {
+    "gru": {
+      "assignee": "https://example.org/party/research-consortium",
+      "purpose": "DUO_0000042",
+      "label": "General-research consortium"
+    },
+    "alz": {
+      "assignee": "https://example.org/party/alz-consortium",
+      "purpose": "DUO_0000007",
+      "label": "Alzheimer's consortium"
+    },
+    "clinical": {
+      "assignee": "https://example.org/party/clinical-genetics",
+      "purpose": "DUO_0000043",
+      "label": "Clinical genetics lab"
+    }
+  }
+}

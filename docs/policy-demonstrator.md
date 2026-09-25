@@ -1,7 +1,7 @@
 # Policy attachment demonstrator — v0.1.0
 
-*Part of the [VCF-RDFizer documentation](README.md). Status: **design, not yet
-implemented.** This is the first, deliberately small slice of
+*Part of the [VCF-RDFizer documentation](README.md). Status: **implemented
+(v0.1.0)**; walkthrough in [`examples/policy/`](../examples/policy/README.md). This is the first, deliberately small slice of
 [`privacy-policy-design.md`](privacy-policy-design.md): it uses that document's
 vocabulary and rules, implements a subset of them, and states plainly what it
 leaves out.*
@@ -60,8 +60,8 @@ Five synthetic participants, **one small VCF each**:
 | `P004.vcf` | P004 | **Withdrawn**: prohibited for every requester |
 | `P005.vcf` | P005 | Disease-specific research only |
 
-Each file is `VCFv4.3` with `##reference=GRCh38`, about 40 records, and one
-sample column. The records sit at real GRCh38 positions in three groups:
+Each file is `VCFv4.3` with `##reference=GRCh38`, 23–34 records (139 in all),
+and one sample column. The records sit at real GRCh38 positions in three groups:
 
 | Group | Where | Why |
 | --- | --- | --- |
@@ -71,9 +71,17 @@ sample column. The records sit at real GRCh38 positions in three groups:
 
 **The genotypes are synthetic and generated from a fixed seed.** The design
 doc's first premise is that genotypes identify people, and a privacy
-demonstrator should not be built on real individuals. Positions and alleles
-are real, so the region and variant selectors are tested against real
-coordinates. Everything else is invented.
+demonstrator should not be built on real individuals. Positions fall in real
+GRCh38 loci, and rs429358 and rs7412 are the real variants, so the region and
+variant selectors are tested against real coordinates. Every other allele, and
+every genotype, is invented. Those REF alleles are not checked against the
+reference.
+
+The site catalogue also plants the boundary cases the tests need:
+- records one base outside each end of the *BRCA1* window, and records on
+  each end of it, so the bounds are tested as inclusive;
+- a decoy T>G at rs429358's position, so the variant rule is tested on its
+  alleles and not on its position alone.
 
 The generator is `examples/policy/make_fixture.py`. It is deterministic, and
 it writes the five VCFs together with a `fixture.json` that records the seed,
@@ -136,12 +144,16 @@ Purposes are GA4GH Data Use Ontology terms:
 | DS, disease-specific research | `obo:DUO_0000007` | P005 consent; the Alzheimer's consortium's purpose |
 | CC, clinical care use | `obo:DUO_0000043` | P001, P002 consent; the clinical requester |
 
+In DUO the first three form a chain, DS ⊑ HMB ⊑ GRU. Clinical care use sits
+elsewhere: DUO files it as a data use *modifier*, not a permission. v0.1.0
+treats it as a purpose like the others, and it matches only itself.
+
 Matching uses subsumption. **A requester's purpose satisfies a consent when
 the purpose is the consented term or a narrower one**, so a disease-specific
 study falls within a general-research consent, but not the other way round.
 v0.1.0 bundles the four terms and their `rdfs:subClassOf` links as
-`vcf_rdfizer_data/policy/duo-subset.ttl`, with the DUO release they were taken
-from recorded in the file. Full DUO, with disease qualifiers via MONDO and
+`vcf_rdfizer_data/policy/duo-subset.ttl`, copied from DUO release 2021-02-23,
+which the file records. Full DUO, with disease qualifiers via MONDO and
 release pinning in the policy (`vcfp:duoVersion`), is later (§10).
 
 ---
@@ -296,17 +308,17 @@ with the fields v0.1.0 can fill:
   vcfp:policyDigest    "sha256:…" ;
   vcfp:request         [ odrl:assignee <https://example.org/party/alz-consortium> ;
                          odrl:purpose  obo:DUO_0000007 ] ;
-  vcfp:recordsReleased 142 ; vcfp:recordsWithheld 58 ;
-  vcfp:filesWithheld   1 ;   vcfp:triplesWithheld 9412 ;
+  vcfp:recordsReleased 76 ; vcfp:recordsWithheld 63 ;
+  vcfp:filesWithheld   1 ;  vcfp:triplesWithheld 4649 ;
   vcfp:obligation      [ odrl:action odrl:attribute ] ;
   vcfp:disclosureModel "governed release; not anonymization" ;
   prov:wasGeneratedBy  [ prov:used <urn:vcf-rdfizer-policy:0.1.0> ] ;
   prov:generatedAtTime "…"^^xsd:dateTime .
 ```
 
-The numbers in the example are placeholders. The policy is referenced by
-digest as well as by IRI, and the view keeps the original IRIs, since
-pseudonymization is v0.4 (§10). The manifest says so in
+The numbers are the Alzheimer's consortium's view of the expanded fixture. The
+policy is referenced by digest as well as by IRI, and the view keeps the
+original IRIs, since pseudonymization is v0.4 (§10). The manifest says so in
 `vcfp:disclosureModel`.
 
 ### 6.2 Implementation
@@ -319,7 +331,9 @@ dependency, so no image change is needed. It then does three things:
   checked against each file's `vcfc:referenceGenome`.
 - **Decides each record** by §4.
 - **Expands each withheld record to its subtree by IRI prefix**, using the
-  hierarchy in [conversion §6](conversion.md#6-iri-templates):
+  hierarchy in [conversion §6](conversion.md#6-iri-templates). Every IRI under
+  `file://{FILE}` belongs to that file, header and sample set included; only
+  the three row subtrees also carry a row:
   - `#record/{ROW}` and everything under it (alleles, events);
   - `#call/{ROW}` and everything under it (INFO values; the condensed matrix
     and vectors);
@@ -359,6 +373,12 @@ independent computation, not taken on trust.
    whole-file withdrawal, which the prefix rule removes, so the check
    guards against regressions in that rule.
 
+**The check proved its worth on its first run.** An early `split()` recognised
+only the three row subtrees, so a withdrawn file's header and sample set stayed
+in every view. Every record decision was correct, so the leak was invisible from the
+record counts. Check 4 flagged it at once, naming the IRI that should not
+have been there.
+
 **Mutation tests** (`test/test_policy_unit.py`) break a correct view on
 purpose and assert that `check` catches each break:
 
@@ -395,24 +415,27 @@ vcf-rdfizer-policy explain  --policy policy.ttl       # the §4.1 grid, from the
 **Layout:**
 
 ```text
-vcf_rdfizer_policy_cli.py        console entry point (pyproject: vcf-rdfizer-policy)
-vcf_rdfizer_policy/
-  __init__.py                    version 0.1.0
+vcf_rdfizer_policy.py            console entry point: vcf-rdfizer-policy
+vcf_rdfizer_policies/            (named like vcf_rdfizer_link.py / vcf_rdfizer_linking/)
+  __init__.py                    version, namespaces, PolicyError
   profile.py                     parse + validate a policy against the v0.1.0 subset
   purposes.py                    DUO subsumption over the bundled subset
-  selectors.py                   file, region and variant selectors -> record IRIs
+  graphs.py                      load graphs; records; which file and row an IRI belongs to
   decide.py                      the §4 semantics; the one place they live
-  attach.py  evaluate.py  check.py  manifest.py
+  release.py                     evaluate, attach, and the manifest
+  check.py                       the VCF-side oracle and the structural checks
 vcf_rdfizer_data/policy/
   vcfp-0.1.ttl                   the profile terms v0.1.0 defines
   duo-subset.ttl                 four DUO terms and their hierarchy, release recorded
 examples/policy/
-  make_fixture.py  fixture.json  P001.vcf … P005.vcf
-  policy.ttl  requests/{gru,alz,clinical}.ttl
-  converted/                     the five converted graphs, committed so the demo runs without Docker
+  make_fixture.py  fixture.json  P001.vcf … P005.vcf  policy.ttl
+  converted/{expanded,condensed}/ the converted graphs, committed so the demo runs without Docker
   run_demo.sh  README.md
 test/test_policy_unit.py         runs in CI (matches test_*_unit.py)
 ```
+
+The requesters live in `fixture.json`, which both `run_demo.sh` and the
+tests read.
 
 `decide.py` holds the semantics, and **both `evaluate` and `check`'s oracle
 call it**, so the §4 rules exist in exactly one place. The oracle's

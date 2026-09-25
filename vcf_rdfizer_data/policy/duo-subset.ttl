@@ -1,0 +1,26 @@
+# The four GA4GH Data Use Ontology terms the v0.1.0 policy demonstrator uses,
+# with their subclass links exactly as DUO states them.
+#
+# Source: http://purl.obolibrary.org/obo/duo/releases/2021-02-23/duo.owl
+# (EBISPOT/DUO master, read 2026-09-25). Only rdfs:subClassOf and labels are
+# copied. A purpose satisfies a consented term when it is that term or a
+# subclass of it, so disease-specific research falls within a
+# general-research consent and not the reverse.
+#
+# Clinical care use is, in DUO, a data use *modifier* rather than a permission.
+# v0.1.0 treats it as a purpose like the others; it matches only itself.
+
+@prefix obo:  <http://purl.obolibrary.org/obo/> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl:  <http://www.w3.org/2002/07/owl#> .
+
+<http://purl.obolibrary.org/obo/duo/releases/2021-02-23/duo.owl> a owl:Ontology .
+
+obo:DUO_0000042 rdfs:label "general research use" ;
+    rdfs:subClassOf obo:DUO_0000001 .
+obo:DUO_0000006 rdfs:label "health or medical or biomedical research" ;
+    rdfs:subClassOf obo:DUO_0000042 .
+obo:DUO_0000007 rdfs:label "disease specific research" ;
+    rdfs:subClassOf obo:DUO_0000006 .
+obo:DUO_0000043 rdfs:label "clinical care use" ;
+    rdfs:subClassOf obo:DUO_0000017 .

@@ -1,0 +1,34 @@
+# The VCF-RDFizer policy profile terms that v0.1.0 defines. The full profile is
+# specified in docs/privacy-policy-design.md; docs/policy-demonstrator.md lists
+# which parts v0.1.0 implements. Anything a policy uses beyond these terms is
+# rejected by the evaluator rather than ignored.
+
+@prefix vcfp: <https://w3id.org/vcf-rdfizer/policy#> .
+@prefix odrl: <http://www.w3.org/ns/odrl/2/> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+@prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+<https://w3id.org/vcf-rdfizer/policy> a odrl:Profile ;
+    rdfs:label "VCF-RDFizer policy profile, v0.1.0 subset" .
+
+vcfp:GraphSelection a rdfs:Class ; rdfs:subClassOf odrl:Asset ;
+    rdfs:comment "An asset that is a selection of a VCF graph, described by exactly one vcfp:selector." .
+vcfp:selector a rdf:Property ; rdfs:domain vcfp:GraphSelection .
+vcfp:selects a rdf:Property ; rdfs:domain vcfp:GraphSelection ;
+    rdfs:comment "Written by `vcf-rdfizer-policy attach`: a record the selection selects." .
+
+vcfp:RegionSelector a rdfs:Class ;
+    rdfs:comment "Records whose POS lies in [vcfp:start, vcfp:end] on vcfp:chrom, 1-based and inclusive." .
+vcfp:VariantSelector a rdfs:Class ;
+    rdfs:comment "Records with exactly this chrom, pos, ref and alt." .
+vcfp:assembly a rdf:Property ; rdfs:comment "Required. Must equal the file's vcfc:referenceGenome." .
+vcfp:chrom a rdf:Property .
+vcfp:start a rdf:Property ; rdfs:range xsd:integer .
+vcfp:end a rdf:Property ; rdfs:range xsd:integer .
+vcfp:pos a rdf:Property ; rdfs:range xsd:integer .
+vcfp:ref a rdf:Property .
+vcfp:alt a rdf:Property .
+
+vcfp:ReleaseView a rdfs:Class ;
+    rdfs:comment "A graph produced from source files under a policy for one request. Governed release, not anonymization." .
