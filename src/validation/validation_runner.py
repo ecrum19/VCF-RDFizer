@@ -4046,15 +4046,27 @@ def run_validation(args: argparse.Namespace) -> int:
             if args.shacl_shapes is not None and shacl_exceeds_limit(
                 decoded_triples, shacl_limit
             ):
+                # An unknown count is refused too (see shacl_exceeds_limit), so
+                # the reason must not assume there is a number to format.
+                if decoded_triples is None:
+                    size = (
+                        "the decoded graph's triple count is unknown, so it cannot "
+                        f"be shown to be within the --shacl-max-triples limit of "
+                        f"{shacl_limit:,}"
+                    )
+                else:
+                    size = (
+                        f"the decoded graph holds {decoded_triples:,} triples, above "
+                        f"the --shacl-max-triples limit of {shacl_limit:,}"
+                    )
                 shacl_skipped = {
                     "status": "SKIPPED_TOO_LARGE",
                     "tripleCount": decoded_triples,
                     "limitTriples": shacl_limit,
                     "reason": (
-                        f"the decoded graph holds {decoded_triples:,} triples, above the "
-                        f"--shacl-max-triples limit of {shacl_limit:,}. "
-                        f"pyshacl is in-memory, so attempting it risks exhausting memory "
-                        f"mid-run; skipping is recoverable and is recorded here."
+                        f"{size}. pyshacl is in-memory, so attempting it risks "
+                        f"exhausting memory mid-run; skipping is recoverable and is "
+                        f"recorded here."
                     ),
                 }
                 eprint(f"[{args.dataset_id}] shapes skipped: {shacl_skipped['reason']}")
