@@ -425,7 +425,7 @@ endpoint serving the `--rdf` inputs, and never load the graph:
   view once for what each line shows (prohibited content, uncovered subjects),
   and asks `--view-endpoint`, serving the view alone, for dangling references:
   one `FILTER NOT EXISTS` query, after confirming the endpoint holds as many
-  triples as the view has lines.
+  triples as the view has lines. An empty view needs no view endpoint.
 - `--oracle-endpoint` points at an endpoint serving `oracle` output, which is
   the VCF-text oracle as N-Triples:
 

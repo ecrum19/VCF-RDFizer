@@ -107,12 +107,11 @@ def cmd_check(args):
     _, profile, vocabulary, rules = _setup(args)
     common = {"policy_path": args.policy, "rules": rules, "profile": profile, "vocabulary": vocabulary}
     if args.endpoint:
-        if not args.view_endpoint:
-            raise PolicyError("check --endpoint also needs --view-endpoint, serving the view")
         oracle = (EndpointStore(args.oracle_endpoint) if args.oracle_endpoint
                   else MemoryStore(graph_from_vcfs(args.vcf)) if args.vcf else None)
         failures = check_stream(args.view, store=EndpointStore(args.endpoint),
-                                view_store=EndpointStore(args.view_endpoint), oracle=oracle, **common)
+                                view_store=EndpointStore(args.view_endpoint) if args.view_endpoint else None,
+                                oracle=oracle, **common)
     else:
         view, manifest, request = read_view(args.view)
         failures = check_view(view, manifest, request, source=load(args.rdf), **common)
@@ -172,7 +171,7 @@ def build_parser():
     check.add_argument("--endpoint", help="SPARQL endpoint serving the source (for a streamed view)")
     check.add_argument("--oracle-endpoint", help="SPARQL endpoint serving `oracle` output")
     check.add_argument("--view-endpoint", help="SPARQL endpoint serving the view's view.nt.gz alone "
-                                                 "(required with --endpoint)")
+                                                 "(with --endpoint, for any non-empty view)")
     check.set_defaults(run=cmd_check)
 
     oracle = sub.add_parser("oracle", help="write the VCF-text oracle graph, for an endpoint to serve")

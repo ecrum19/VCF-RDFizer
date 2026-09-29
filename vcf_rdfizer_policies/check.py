@@ -23,7 +23,7 @@ import gzip
 import json
 from pathlib import Path
 
-from . import ODRL, VCFP
+from . import ODRL, VCFP, PolicyError
 from .engine import BATCH, Evaluation, Partition, Request, _ends, applies, select, units
 from .policy import policy_digest
 from .store import iri
@@ -84,12 +84,13 @@ def check_view(view, manifest, request, *, policy_path, rules, profile, vocabula
     return failures
 
 
-def check_stream(view_dir, *, policy_path, rules, profile, vocabulary, store, view_store, oracle=None) -> list:
+def check_stream(view_dir, *, policy_path, rules, profile, vocabulary, store, view_store=None, oracle=None) -> list:
     """check_view's four checks, and the oracle when given, for a streamed view.
 
     `store` serves the source the view was made from, `view_store` the view
-    alone, and `oracle` the graph `vcf-rdfizer-policy oracle` wrote from the VCF
-    text (or is None). The view is read once, as a stream, for what each line
+    alone (None only for an empty view, which no endpoint can index), and
+    `oracle` the graph `vcf-rdfizer-policy oracle` wrote from the VCF text (or
+    is None). The view is read once, as a stream, for what each line
     can show by itself. Dangling references are a question about the whole
     view, so the view's endpoint answers it -- after confirming it serves as
     many triples as the file has lines.
@@ -136,15 +137,18 @@ def check_stream(view_dir, *, policy_path, rules, profile, vocabulary, store, vi
                 note("prohibited", f"prohibited content present: {owner(obj)} owns <{obj}>")
     failures += counts["prohibited"] + counts["uncovered"]
 
-    served = int(next(iter(view_store.rows("SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }")))["n"])
-    if served != lines:
-        return failures + [f"the view endpoint serves {served:,} triples; view.nt.gz has {lines:,} lines"]
-
-    # Dangling: an object the view names but does not describe, which the source does describe.
-    nodes = " || ".join(f"STRSTARTS(STR(?o), {json.dumps(prefix)})" for prefix in profile.node_space)
-    missing = [row["o"] for row in view_store.rows(
-        f"SELECT DISTINCT ?o WHERE {{ ?s ?p ?o FILTER(isIRI(?o) && ({nodes})) "
-        "FILTER NOT EXISTS { ?o ?q ?x } } ORDER BY ?o")]
+    missing = []
+    if lines:                               # an empty view names nothing, so nothing dangles
+        if view_store is None:
+            raise PolicyError("a non-empty view needs an endpoint serving it (--view-endpoint)")
+        served = int(next(iter(view_store.rows("SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }")))["n"])
+        if served != lines:
+            return failures + [f"the view endpoint serves {served:,} triples; view.nt.gz has {lines:,} lines"]
+        # Dangling: an object the view names but does not describe, which the source does describe.
+        nodes = " || ".join(f"STRSTARTS(STR(?o), {json.dumps(prefix)})" for prefix in profile.node_space)
+        missing = [row["o"] for row in view_store.rows(
+            f"SELECT DISTINCT ?o WHERE {{ ?s ?p ?o FILTER(isIRI(?o) && ({nodes})) "
+            "FILTER NOT EXISTS { ?o ?q ?x } } ORDER BY ?o")]
     dangling = []
     for start in range(0, len(missing), BATCH):
         values = " ".join(iri(o) for o in missing[start:start + BATCH])
