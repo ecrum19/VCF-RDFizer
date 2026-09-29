@@ -21,6 +21,7 @@ cannot be evaluated. See docs/policy-demonstrator.md.
 """
 
 import argparse
+import gzip
 from pathlib import Path
 import sys
 
@@ -130,7 +131,10 @@ def cmd_oracle(args):
     out = Path(args.out)
     if out.exists():
         raise FileExistsError(f"{out} exists; oracle never overwrites")
-    with out.open("w", encoding="utf-8") as handle:
+    # A whole genome's oracle is gigabytes of N-Triples; .gz keeps it compressed.
+    opened = (gzip.open(out, "wt", encoding="utf-8", compresslevel=1) if out.name.endswith(".gz")
+              else out.open("w", encoding="utf-8"))
+    with opened as handle:
         print(f"wrote {write_ntriples(args.vcf, handle)} triple(s) to {out}")
     return 0
 
@@ -173,7 +177,7 @@ def build_parser():
 
     oracle = sub.add_parser("oracle", help="write the VCF-text oracle graph, for an endpoint to serve")
     oracle.add_argument("--vcf", nargs="+", required=True, help="source VCFs")
-    oracle.add_argument("-o", "--out", required=True, help=".nt file to create")
+    oracle.add_argument("-o", "--out", required=True, help=".nt or .nt.gz file to create")
     oracle.set_defaults(run=cmd_oracle)
     return parser
 

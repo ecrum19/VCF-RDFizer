@@ -5,6 +5,8 @@
 """
 
 from collections import namedtuple
+from contextlib import redirect_stdout
+from io import StringIO
 import gzip
 from pathlib import Path
 import tempfile
@@ -90,6 +92,25 @@ class StreamViewTests(VerboseTestCase):
 
     def test_parallel_workers_write_the_same_file(self):
         self.assertEqual(self.run_view(workers=2), self.run_view(workers=1))
+
+
+class OracleOutputTests(VerboseTestCase):
+    VCF = ("##fileformat=VCFv4.2\n##reference=GRCh38\n"
+           "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS\n"
+           "chr1\t10\trs1\tA\tG\t50\tPASS\t.\tGT\t0/1\n")
+
+    def test_a_gz_name_writes_the_same_triples_compressed(self):
+        import vcf_rdfizer_policy
+        with tempfile.TemporaryDirectory() as work:
+            work = Path(work)
+            (work / "P.vcf").write_text(self.VCF, encoding="utf-8")
+            for name in ("oracle.nt", "oracle.nt.gz"):
+                with redirect_stdout(StringIO()):
+                    self.assertEqual(vcf_rdfizer_policy.main(
+                        ["oracle", "--vcf", str(work / "P.vcf"), "-o", str(work / name)]), 0)
+            plain = (work / "oracle.nt").read_bytes()
+            self.assertTrue(plain)
+            self.assertEqual(gzip.open(work / "oracle.nt.gz").read(), plain)
 
 
 if __name__ == "__main__":
