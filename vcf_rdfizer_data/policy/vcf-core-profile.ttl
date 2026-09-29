@@ -7,12 +7,16 @@
 #    named after the property's local name (vcfp:start -> ?start). An optional
 #    vcfp:violations query lists reasons the selector cannot be applied to this
 #    graph; any row stops evaluation.
+#    Parameters reach the query as an inline VALUES block at the start of its
+#    outer WHERE group, so they must be used there, not inside a subquery. An RDF
+#    list binds a set of values.
 #  * vcfp:Profile -- how the graph is partitioned. A withheld resource takes with
 #    it everything it owns: the resources reached by vcfp:ownershipPath (a SPARQL
 #    property path), and, when vcfp:iriSubtree is true, every IRI beneath any of
 #    them (…#record/9 owns …#record/9/allele/0). vcfp:unitQuery names what the
 #    per-record report counts: ?resource and ?group are required, other
-#    variables become report columns.
+#    variables become report columns. vcfp:nodeSpace names the IRIs the graph
+#    mints, which is what streaming evaluation treats as nodes of the graph.
 #
 # New selectors need no code: declare another vcfp:SelectorType here, in a
 # file passed with --profile, or in the policy file itself.
@@ -26,6 +30,7 @@ vcfp:VCFCore a vcfp:Profile ;
     # (expanded profile); the condensed matrix already sits under the call's IRI.
     vcfp:ownershipPath "<https://w3id.org/vcf-core/vocab#hasCall>/<https://w3id.org/vcf-core/vocab#hasSampleCall>?" ;
     vcfp:iriSubtree true ;
+    vcfp:nodeSpace "file://" ;
     vcfp:unitQuery """
         PREFIX vcfc: <https://w3id.org/vcf-core/vocab#>
         SELECT ?resource ?group ?chrom ?pos ?ref (GROUP_CONCAT(?a; separator=",") AS ?alt)
@@ -61,3 +66,19 @@ vcfp:VariantSelector a vcfp:SelectorType ;
         SELECT ?file ?declared WHERE {
             ?file a vcfc:VCFFile . OPTIONAL { ?file vcfc:referenceGenome ?declared }
             FILTER(!BOUND(?declared) || STR(?declared) != STR(?assembly)) }""" .
+
+vcfp:LinkedSelector a vcfp:SelectorType ;
+    rdfs:comment "Records whose call links, through vcfp:predicate, to any of vcfp:entities: a gene panel over vcfl:overlapsGene, or named variants over vcfl:sameVariantAs." ;
+    vcfp:parameter vcfp:predicate , vcfp:entities ;
+    vcfp:query """
+        PREFIX vcfc: <https://w3id.org/vcf-core/vocab#>
+        SELECT DISTINCT ?resource WHERE {
+            ?resource a vcfc:VCFRecord ; vcfc:hasCall ?call .
+            ?call ?predicate ?entities . }""" ;
+    # Fails closed: a graph evaluated without its link graph has no such triple,
+    # and would otherwise select nothing and release the whole panel. NOT EXISTS,
+    # not OPTIONAL + !BOUND: rdflib misevaluates the latter when VALUES binds the
+    # predicate and returns no row, which would fail open.
+    vcfp:violations """
+        SELECT DISTINCT ?predicate WHERE {
+            FILTER NOT EXISTS { ?anything ?predicate ?linked } }""" .

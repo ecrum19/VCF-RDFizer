@@ -41,6 +41,6 @@ def ancestors(iri: str):
     """
     yield iri
     start = iri.find("://") + 3 if "://" in iri else 0
-    for index in range(len(iri) - 1, start, -1):
-        if iri[index] in "#/":
-            yield iri[:index]
+    end = len(iri)
+    while (end := max(iri.rfind("#", start + 1, end), iri.rfind("/", start + 1, end))) > start:
+        yield iri[:end]

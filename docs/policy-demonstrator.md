@@ -73,7 +73,16 @@ graph ────►│  select   │──────────────
 A selector type is a SPARQL `SELECT` that projects `?resource`, plus the
 parameters a policy supplies. Each `vcfp:parameter` is a property the
 selector node must carry, and its value is bound to the query variable named
-after the property's local name: `vcfp:start` binds `?start`. An optional
+after the property's local name: `vcfp:start` binds `?start`.
+- An RDF list binds a set of values.
+- Parameters are injected as an inline `VALUES` block at the start of the
+  query's outer `WHERE` group, identically for rdflib and any endpoint. So use
+  them in that group, not in a subquery.
+- A *trailing* `VALUES` clause would be joined after the `FILTER`s, which
+  would then see the parameters unbound. A region selector written that way
+  selects nothing, and the prohibition on the region releases it.
+
+An optional
 `vcfp:violations` query lists reasons the selector cannot apply to a graph.
 Any row it returns stops evaluation; the VCF Core selectors use it to require
 that every file declares the policy's assembly.
@@ -98,6 +107,19 @@ ex:brca1 a odrl:Asset , vcfp:GraphSelection ;
     vcfp:selector [ a vcfp:RegionSelector ; vcfp:assembly "GRCh38" ;
                     vcfp:chrom "chr17" ; vcfp:start 43044295 ; vcfp:end 43125483 ] .
 ```
+
+The profile also ships `vcfp:LinkedSelector`: records whose call links,
+through `vcfp:predicate`, to any of `vcfp:entities`. A gene panel over the
+gene linker's links is data, not SPARQL:
+
+```turtle
+ex:panel a odrl:Asset , vcfp:GraphSelection ;
+    vcfp:selector [ a vcfp:LinkedSelector ; vcfp:predicate vcfl:overlapsGene ;
+                    vcfp:entities ( ensembl:ENSG00000012048 ensembl:ENSG00000139618 ) ] .
+```
+
+It fails closed: a graph with no `?predicate` triple at all, because the link
+graph was left out, is refused rather than evaluated as selecting nothing.
 
 Selector types are read from the profile files, and also from the policy file
 itself, so a policy can bring its own (§8).
@@ -384,8 +406,43 @@ Every subcommand takes:
 - `--profile`, repeatable; a file or `vcf-core` (the default);
 - `--purposes`, the purpose vocabulary.
 
-The command runs on the host and needs `rdflib`, not Docker. It evaluates in
-memory, and refuses graphs over 5M triples.
+The command runs on the host and needs `rdflib`, not Docker. By default it
+evaluates in memory and refuses graphs over 5M triples.
+
+With `--endpoint URL`, `evaluate` and `check` send every query to a SPARQL 1.1
+endpoint serving the `--rdf` inputs, and never load the graph:
+- `evaluate` streams the inputs once and writes `view.nt.gz`, copying lines
+  byte for byte, in input order. Memory is bounded by what the rules select.
+  Inputs are filtered in parallel, one worker per CPU (on Linux, where workers
+  fork), each writing one gzip member of the view.
+- Each line costs a few set lookups, not a scan of every rule: the binding
+  prohibitions' and permissions' selections are merged once. The in-memory
+  `view` keeps the per-rule `decide`, so the equivalence tests compare two
+  independent implementations.
+- The profile's `vcfp:nodeSpace` says which object IRIs are nodes of the graph,
+  since a stream cannot know every subject in advance.
+- `check --endpoint` runs the same checks against the endpoint. It streams the
+  view once for what each line shows (prohibited content, uncovered subjects),
+  and asks `--view-endpoint`, serving the view alone, for dangling references:
+  one `FILTER NOT EXISTS` query, after confirming the endpoint holds as many
+  triples as the view has lines.
+- `--oracle-endpoint` points at an endpoint serving `oracle` output, which is
+  the VCF-text oracle as N-Triples:
+
+```bash
+vcf-rdfizer-policy oracle   --vcf P00*.vcf -o oracle.nt
+vcf-rdfizer-policy evaluate --endpoint http://localhost:7001/ --rdf P00*.nt.gz --policy policy.ttl \
+                            --assignee https://example.org/party/alz-consortium --purpose DUO:0000007 -o views/alz
+# Serve views/alz/view.nt.gz on its own endpoint (here :7003), then:
+vcf-rdfizer-policy check    --endpoint http://localhost:7001/ --view-endpoint http://localhost:7003/ \
+                            --oracle-endpoint http://localhost:7002/ \
+                            --view views/alz --rdf P00*.nt.gz --policy policy.ttl
+```
+
+On the example cohort, both sample profiles and every requester, the streaming
+executor on QLever releases exactly what the in-memory one does: the same
+triples, decisions and summary. That is tested in vcf-rdfizer-testing
+`plugin-tests/policy/test_policy_endpoint.py`.
 
 | Exit code | Meaning |
 | --- | --- |
@@ -396,7 +453,8 @@ memory, and refuses graphs over 5M triples.
 ```text
 vcf_rdfizer_policy.py         the command
 vcf_rdfizer_policies/
-  engine.py                   select, partition, decide -- generic
+  engine.py                   select, partition, decide -- generic; in-memory and streaming views
+  store.py                    where queries run (rdflib or a SPARQL endpoint); inline parameters
   policy.py                   ODRL -> rules; refuses what it cannot evaluate
   profile.py                  selector types and the ownership rule, from Turtle
   vocabulary.py               purpose hierarchies (RDFS / SKOS)
@@ -405,7 +463,7 @@ vcf_rdfizer_policies/
   vcf_oracle.py               the VCF-text oracle
   graphs.py                   loading, IRI hierarchy
 vcf_rdfizer_data/policy/
-  vcf-core-profile.ttl        the VCF Core profile: region and variant selectors, ownership, units
+  vcf-core-profile.ttl        the VCF Core profile: region, variant and linked selectors, ownership, units
   duo-subset.ttl              the default purpose vocabulary
   vcfp-0.1.ttl                the profile terms
 examples/policy/              the cohort, policy.ttl, custom-selector.ttl, run_demo.sh

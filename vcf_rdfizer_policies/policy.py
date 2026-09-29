@@ -36,7 +36,7 @@ class Selection:
     """A target computed by a declared selector type with these parameter bindings."""
     asset: str
     selector: object        # profile.SelectorType
-    bindings: tuple         # ((variable name, rdflib term), ...)
+    bindings: tuple         # ((variable name, rdflib term or tuple of terms for a list), ...)
 
 
 @dataclass(frozen=True)
@@ -129,6 +129,12 @@ def _target(graph, node, profile, where):
         value = graph.value(selectors[0], rdflib.URIRef(prop))
         if value is None:
             raise PolicyError(f"<{node}>: a {kind.rsplit('#', 1)[-1]} needs <{prop}>")
+        if graph.value(value, rdflib.RDF.first) is not None:     # an RDF list: a set of values
+            from rdflib.collection import Collection
+
+            value = tuple(Collection(graph, value))
+            if not value:
+                raise PolicyError(f"<{node}>: <{prop}> is an empty list")
         bindings.append((variable(prop), value))
     return Selection(str(node), selector, tuple(bindings))
 

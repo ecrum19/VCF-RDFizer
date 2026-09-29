@@ -5,6 +5,12 @@
     vcf-rdfizer-policy attach   --rdf P*.nt.gz --policy policy.ttl -o annotated.nt
     vcf-rdfizer-policy evaluate --rdf P*.nt.gz --policy policy.ttl --assignee IRI --purpose DUO:0000007 -o views/alz
     vcf-rdfizer-policy check    --view views/alz --rdf P*.nt.gz --policy policy.ttl [--vcf P*.vcf]
+    vcf-rdfizer-policy oracle   --vcf P*.vcf -o oracle.nt
+
+With --endpoint URL, evaluate and check send every query to that SPARQL 1.1
+endpoint (serving the --rdf inputs) instead of loading the graph, and stream
+the view to view.nt.gz. check then also needs --view-endpoint, serving that
+view.nt.gz alone, and can take --oracle-endpoint, serving `oracle` output.
 
 Selectors and the ownership rule come from a profile (--profile, default the
 bundled VCF Core profile; selector types may also be declared in the policy
@@ -73,12 +79,18 @@ def cmd_evaluate(args):
     from vcf_rdfizer_policies.engine import Request
     from vcf_rdfizer_policies.graphs import load
     from vcf_rdfizer_policies.policy import policy_digest
-    from vcf_rdfizer_policies.release import evaluate, summary, write_release
+    from vcf_rdfizer_policies.release import evaluate, evaluate_stream, summary, write_release
+    from vcf_rdfizer_policies.store import EndpointStore
 
     _, profile, vocabulary, rules = _setup(args)
     request = Request(args.assignee, vocabulary.resolve(args.purpose))
-    release = evaluate(load(args.rdf), rules, request, profile, vocabulary)
-    write_release(release, args.out, policies={r.policy for r in rules}, digest=policy_digest(args.policy))
+    written = {"policies": {r.policy for r in rules}, "digest": policy_digest(args.policy)}
+    if args.endpoint:
+        release = evaluate_stream(EndpointStore(args.endpoint), args.rdf, rules, request, profile,
+                                  vocabulary, args.out, **written)
+    else:
+        release = evaluate(load(args.rdf), rules, request, profile, vocabulary)
+        write_release(release, args.out, **written)
     counts = summary(release)
     print(f"released {counts['records_released']} record(s), withheld {counts['records_withheld']}; "
           f"{counts['triples_withheld']} triple(s) withheld -> {args.out}")
@@ -86,20 +98,41 @@ def cmd_evaluate(args):
 
 
 def cmd_check(args):
-    from vcf_rdfizer_policies.check import check_view, read_view
+    from vcf_rdfizer_policies.check import check_stream, check_view, read_view
     from vcf_rdfizer_policies.graphs import load
-    from vcf_rdfizer_policies.vcf_oracle import compare
+    from vcf_rdfizer_policies.store import EndpointStore, MemoryStore
+    from vcf_rdfizer_policies.vcf_oracle import compare, graph_from_vcfs
 
     _, profile, vocabulary, rules = _setup(args)
-    view, manifest, request = read_view(args.view)
-    failures = check_view(view, manifest, request, policy_path=args.policy, rules=rules,
-                          profile=profile, vocabulary=vocabulary, source=load(args.rdf))
-    if args.vcf:
-        failures += compare(view, args.vcf, rules=rules, request=request, profile=profile, vocabulary=vocabulary)
+    common = {"policy_path": args.policy, "rules": rules, "profile": profile, "vocabulary": vocabulary}
+    if args.endpoint:
+        if not args.view_endpoint:
+            raise PolicyError("check --endpoint also needs --view-endpoint, serving the view")
+        oracle = (EndpointStore(args.oracle_endpoint) if args.oracle_endpoint
+                  else MemoryStore(graph_from_vcfs(args.vcf)) if args.vcf else None)
+        failures = check_stream(args.view, store=EndpointStore(args.endpoint),
+                                view_store=EndpointStore(args.view_endpoint), oracle=oracle, **common)
+    else:
+        view, manifest, request = read_view(args.view)
+        failures = check_view(view, manifest, request, source=load(args.rdf), **common)
+        if args.vcf:
+            failures += compare(view, args.vcf, rules=rules, request=request, profile=profile,
+                                vocabulary=vocabulary)
     for failure in failures:
         print(f"FAIL {failure}")
     print("PASS" if not failures else f"{len(failures)} failure(s)")
     return 0 if not failures else 1
+
+
+def cmd_oracle(args):
+    from vcf_rdfizer_policies.vcf_oracle import write_ntriples
+
+    out = Path(args.out)
+    if out.exists():
+        raise FileExistsError(f"{out} exists; oracle never overwrites")
+    with out.open("w", encoding="utf-8") as handle:
+        print(f"wrote {write_ntriples(args.vcf, handle)} triple(s) to {out}")
+    return 0
 
 
 def build_parser():
@@ -125,13 +158,23 @@ def build_parser():
     evaluate.add_argument("--assignee", required=True, help="the requesting party's IRI")
     evaluate.add_argument("--purpose", required=True, help="a vocabulary term, e.g. DUO:0000007")
     evaluate.add_argument("-o", "--out", required=True, type=Path, help="new or empty directory")
+    evaluate.add_argument("--endpoint", help="SPARQL endpoint serving the --rdf inputs (streaming mode)")
     evaluate.set_defaults(run=cmd_evaluate)
 
     check = sub.add_parser("check", parents=[common], help="verify a view against its source")
     check.add_argument("--view", required=True, type=Path, help="a directory written by evaluate")
     check.add_argument("--rdf", nargs="+", required=True, help="the source the view was made from")
     check.add_argument("--vcf", nargs="+", help="source VCFs, for the independent record oracle")
+    check.add_argument("--endpoint", help="SPARQL endpoint serving the source (for a streamed view)")
+    check.add_argument("--oracle-endpoint", help="SPARQL endpoint serving `oracle` output")
+    check.add_argument("--view-endpoint", help="SPARQL endpoint serving the view's view.nt.gz alone "
+                                                 "(required with --endpoint)")
     check.set_defaults(run=cmd_check)
+
+    oracle = sub.add_parser("oracle", help="write the VCF-text oracle graph, for an endpoint to serve")
+    oracle.add_argument("--vcf", nargs="+", required=True, help="source VCFs")
+    oracle.add_argument("-o", "--out", required=True, help=".nt file to create")
+    oracle.set_defaults(run=cmd_oracle)
     return parser
 
 
