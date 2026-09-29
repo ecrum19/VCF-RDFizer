@@ -8972,6 +8972,11 @@ def run_validation_mode(
         # A subset selection. The runner turns this into a TIMING_ONLY result
         # rather than a validation verdict -- see its --queries help.
         ("--queries", "queries"),
+        # The authoritative shape-layer gate lives in the runner, which is the
+        # only place that knows the decoded graph's size. The size gate here
+        # sees the packaged artifact and cannot.
+        ("--shacl-max-triples", "shacl_max_triples"),
+        ("--node-heap-mb", "node_heap_mb"),
     ):
         value = options.get(key)
         if value is not None:
@@ -9581,6 +9586,24 @@ def main():
         help="Per-query timeout in seconds for validation (default: engine default)",
     )
     parser.add_argument(
+        "--shacl-max-triples",
+        default=None,
+        help=(
+            "Skip the shape layer when the decoded graph exceeds this many "
+            "triples, recording the skip (0 disables). pyshacl is in-memory "
+            "and its cost tracks the graph, not the artifact it arrived in"
+        ),
+    )
+    parser.add_argument(
+        "--node-heap-mb",
+        default=None,
+        help=(
+            "Raise the V8 old-space ceiling (MB) for the Comunica-backed "
+            "validation engines (comunica, hdt, cottas). Node does not size "
+            "its heap from the machine"
+        ),
+    )
+    parser.add_argument(
         "--validation-queries",
         default=None,
         metavar="LIST",
@@ -9742,6 +9765,20 @@ def main():
             validation_engine_options["stop_after_query_timeout"] = True
         if args.validation_queries is not None:
             validation_engine_options["queries"] = args.validation_queries
+        if args.shacl_max_triples is not None:
+            # 0 is meaningful here: it disables the gate, the way
+            # --validation-time-budget 0 means no ceiling.
+            try:
+                limit = int(args.shacl_max_triples)
+            except (TypeError, ValueError):
+                raise ValueError("--shacl-max-triples must be an integer")
+            if limit < 0:
+                raise ValueError("--shacl-max-triples must be zero or a positive integer")
+            validation_engine_options["shacl_max_triples"] = limit
+        if args.node_heap_mb is not None:
+            validation_engine_options["node_heap_mb"] = parse_positive_int(
+                args.node_heap_mb, name="--node-heap-mb"
+            )
         if args.qlever_index_arg:
             validation_engine_options["qlever_index_args"] = list(args.qlever_index_arg)
         if args.qlever_server_arg:

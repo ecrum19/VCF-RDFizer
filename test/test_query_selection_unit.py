@@ -422,6 +422,11 @@ class RunValidationHonoursTheSelectionTests(VerboseTestCase):
             filter_oracle="cyvcf2",
             dataset_id="sample",
             queries=queries,
+            # Mirror the real argument surface. run_validation tolerates these
+            # being absent (see RunValidationToleratesAMinimalNamespaceTests),
+            # but a fixture that omits them stops exercising the real path.
+            shacl_max_triples=V.DEFAULT_SHACL_MAX_TRIPLES,
+            node_heap_mb=V.DEFAULT_NODE_HEAP_MB,
         )
 
     def _run(self, queries, *, corrupt=None):
