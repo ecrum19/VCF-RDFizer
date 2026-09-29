@@ -60,7 +60,7 @@ helper tables, because that would emit both genotype representations at once.
 
 | Flag | Meaning |
 | --- | --- |
-| `--link` | Comma-separated installed IDs; examples: `rsid-dbsnp`, `gene-demo`, `rsid-ensembl` |
+| `--link` | Comma-separated installed IDs; examples: `rsid-dbsnp`, `gene-demo`, `rsid-ensembl`, `rsid-myvariant` |
 | `--linker-path` | Additional linker directory or parent search directory; repeatable; also `VCF_RDFIZER_LINKER_PATH` |
 | `--links-cache` | Reference/response cache; default `~/.cache/vcf-rdfizer/linkers` |
 | `--offline` / `--links-cache-only` | Disable linker network access; require local reference bytes or cached responses |
@@ -68,7 +68,7 @@ helper tables, because that would emit both genotype representations at once.
 | `--links-contact-email` | Contact address for live resolver User-Agent headers |
 
 The side-graph is `<name>.links.nt`. `gene-demo` contains synthetic intervals;
-`rsid-ensembl` requires a real contact address before a live cache miss. The
+`rsid-ensembl` and `rsid-myvariant` require a real contact address before a live cache miss. The
 companion CLI provides `list`, `keys`, `init`, `check`, `dry-run`, and `run`.
 See [Data linking](datalinking.md) for commands and current limits. There is no
 `--merge-links` in this initial implementation.

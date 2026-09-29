@@ -1,0 +1,21 @@
+@prefix vcfl: <https://w3id.org/vcf-rdfizer/linking#> .
+
+# Tier 2, offline: every record with explicit alleles gets one SPDI identifier
+# per ALT, computed from CHROM/POS/REF/ALT. The sequence map below turns a
+# contig name (chr17 or 17) into its RefSeq accession, so the same variant in
+# two files -- whatever either calls the chromosome -- links to the same IRI.
+# Normalise inputs the same way first (bcftools norm -f <ref> -m -any).
+<#spdi> a vcfl:Linker ;
+    vcfl:id "spdi" ;
+    vcfl:version "1.0.0" ;
+    vcfl:title "Normalised alleles to NCBI SPDI (GRCh38)" ;
+    vcfl:license "MIT (manifest); sequence map facts from NCBI RefSeq" ;
+    vcfl:termsOfUse <https://www.ncbi.nlm.nih.gov/home/about/policies/> ;
+    vcfl:join [ a vcfl:AlleleJoin ] ;
+    vcfl:reference [ vcfl:url <grch38-refseq.tsv> ;
+                     vcfl:sha256 "7b31388a09b00aa1f090aa2a5843b10ce5da7b151aa224b030c779fe87e7fbe7" ;
+                     vcfl:assembly "GRCh38" ;
+                     vcfl:format vcfl:SequenceMap ] ;
+    vcfl:emit [ vcfl:subject vcfl:VariantCall ;
+                vcfl:predicate vcfl:sameVariantAs ;
+                vcfl:objectTemplate "https://api.ncbi.nlm.nih.gov/variation/v0/spdi/{SPDI}" ] .

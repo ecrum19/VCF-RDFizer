@@ -146,7 +146,7 @@ class CachedSession:
             def fetch():
                 self.stats["requests"] += 1
                 try:
-                    raw = self.transport(request, timeout=30)
+                    raw = self.transport(request, timeout=self.manifest.request_timeout)
                 except HTTPError as exc:
                     raw = exc
                 with raw:

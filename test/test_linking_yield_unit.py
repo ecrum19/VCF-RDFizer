@@ -40,6 +40,11 @@ class AssertionBasisTests(VerboseTestCase):
     def test_tier_three_records_that_a_service_answered(self):
         self.assertIn("service-resolution", runner.ASSERTION_BASIS[3])
 
+    def test_the_allele_join_says_it_is_computed_not_verified(self):
+        """SPDI links are tier 2, but REF is never checked against the sequence."""
+        self.assertIn("allele-expression", runner.ALLELE_BASIS)
+        self.assertIn("not checked", runner.ALLELE_BASIS)
+
     def test_only_the_coordinate_tier_counts_as_verified(self):
         """Tier 3's answer is recorded, not checked against the call itself."""
         self.assertEqual(

@@ -910,9 +910,11 @@ finishes.
 
 ### Data linking plug-ins
 
-Three installed examples cover declarative dbSNP links (`rsid-dbsnp`), interval
-joins against a synthetic GFF3 bundle (`gene-demo`), and an Ensembl API resolver
-(`rsid-ensembl`). Add `--link <ids>` in full mode, or link an existing aggregate
+Six installed linkers cover declarative dbSNP links (`rsid-dbsnp`), interval
+joins against a synthetic GFF3 bundle (`gene-demo`) and Ensembl's gene
+annotation (`ensembl-genes-grch38`), shared variant identity through NCBI SPDI
+(`spdi`, which gives the same variant the same IRI in every file), and two live
+API resolvers (`rsid-ensembl`, `rsid-myvariant`). Add `--link <ids>` in full mode, or link an existing aggregate
 without Docker:
 
 ```bash
@@ -922,7 +924,7 @@ vcf-rdfizer --mode link --rdf ./results/sample/sample.nt.gz \
 
 Links go into `sample.links.nt`; the base graph is unchanged. The
 `vcf-rdfizer-link` companion CLI lists, scaffolds, checks and previews plug-ins.
-See [Data linking](docs/datalinking.md) for all three worked examples, reference
+See [Data linking](docs/datalinking.md) for the worked examples, reference
 and network safeguards, provenance, and the remaining design limitations.
 
 ### Policy attachment plug-in

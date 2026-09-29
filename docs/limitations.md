@@ -246,8 +246,10 @@ none is currently implemented.
 
 **Data linking is an initial implementation.** Optional plug-ins can produce
 separate linksets through token joins, GFF3 intervals or a guarded live session.
-The gene example is synthetic; allele normalization and automatic plug-in
-validation are not implemented. See [`datalinking.md`](datalinking.md) for the
+The gene example is synthetic. The allele join (`spdi`) expresses alleles as
+the file writes them and does not normalise them against the reference, so
+inputs must be normalised the same way first. Automatic plug-in validation is
+not implemented. See [`datalinking.md`](datalinking.md) for the
 implemented contract and [`datalinking-design.md`](datalinking-design.md) for
 the remaining proposal. The base graph remains a faithful, separate artifact.
 

@@ -10,9 +10,9 @@ import shutil
 import sys
 import time
 
-from vcf_rdfizer_linking.inputs import read_rdf, read_vcf
+from vcf_rdfizer_linking.inputs import read_rdf, read_store, read_vcf
 from vcf_rdfizer_linking.manifest import discover, load_manifest, select
-from vcf_rdfizer_linking.reference import acquire_reference, check_assembly, IntervalIndex
+from vcf_rdfizer_linking.reference import acquire_reference, check_assembly, load_reference_index
 from vcf_rdfizer_linking.runner import DEFAULT_CACHE, LinkRunError, run_linkers, run_stage
 
 
@@ -117,7 +117,7 @@ def build_parser():
     commands.add_parser("keys", help="Describe the supported join-key contract")
     init = commands.add_parser("init", help="Copy an annotated example into a new linker directory")
     init.add_argument("-o", "--output", required=True)
-    init.add_argument("--example", default="rsid-dbsnp", choices=["rsid-dbsnp", "gene-demo", "rsid-ensembl"])
+    init.add_argument("--example", default="rsid-dbsnp", choices=["rsid-dbsnp", "gene-demo", "ensembl-genes-grch38", "spdi", "rsid-ensembl", "rsid-myvariant"])
     check = commands.add_parser("check", help="Parse a manifest and verify its reference (no resolver execution)")
     check.add_argument("directory")
     check.add_argument("--json", action="store_true")
@@ -131,6 +131,7 @@ def build_parser():
     inputs = run.add_mutually_exclusive_group(required=True)
     inputs.add_argument("-i", "--input", help="VCF to link using the default subject templates")
     inputs.add_argument("--rdf", help="Existing .nt/.nt.gz; subjects are read from the graph")
+    inputs.add_argument("--endpoint", help="SPARQL endpoint serving an existing graph; read like --rdf")
     run.add_argument("-o", "--output", required=True, help="New .links.nt output file")
     add_link_arguments(run)
     return parser
@@ -142,7 +143,9 @@ def main(argv=None):
         if args.command == "keys":
             print("TokenJoin: field ID (splitOn ';') or INFO/<key> (splitOn ','); accept uses full regex matches; {TOKEN} is percent-encoded.")
             print("IntervalJoin: CHROM exact match; [POS, POS + len(REF) - 1], 1-based closed; explicit DNA alleles only. GFF3 attribute -> {ID}.")
-            print("Subjects: vcfl:VariantCall or vcfl:VCFRecord. AlleleJoin is not implemented.")
+            print("AlleleJoin: one key per explicit ALT, suffix- then prefix-trimmed to 0-based SPDI; CHROM through a "
+                  "SequenceMap to its accession -> {SPDI}. Inputs must be normalised first; REF is not checked.")
+            print("Subjects: vcfl:VariantCall or vcfl:VCFRecord.")
         elif args.command == "list":
             manifests = discover(args.linker_path)
             if args.json:
@@ -165,8 +168,11 @@ def main(argv=None):
             if m.reference:
                 if args.assembly:
                     check_assembly(args.assembly, m.reference.assembly)
-                path = acquire_reference(m.reference, Path(args.links_cache), offline=args.offline or args.links_cache_only)
-                IntervalIndex(path, m.reference)
+                offline = args.offline or args.links_cache_only
+                path = acquire_reference(m.reference, Path(args.links_cache), offline=offline)
+                aliases = m.contig_aliases and load_reference_index(
+                    acquire_reference(m.contig_aliases, Path(args.links_cache), offline=offline), m.contig_aliases)
+                load_reference_index(path, m.reference, aliases)
             print(json.dumps({"ok": True, "id": m.id, "tier": m.tier, "assembly": m.reference.assembly if m.reference else None,
                               "note": "Input assembly is checked at run time; resolver code was not executed"}, indent=2))
         elif args.command == "dry-run":
@@ -181,7 +187,13 @@ def main(argv=None):
                 raise ValueError("Link output must end in .nt")
             if output.with_suffix(".json").exists():
                 raise ValueError(f"Refusing to overwrite existing report: {output.with_suffix('.json')}")
-            records = read_rdf(Path(args.rdf).expanduser()) if args.rdf else read_vcf(Path(args.input).expanduser())
+            if args.endpoint:
+                from vcf_rdfizer_policies.store import EndpointStore
+                records = read_store(EndpointStore(args.endpoint))
+            elif args.rdf:
+                records = read_rdf(Path(args.rdf).expanduser())
+            else:
+                records = read_vcf(Path(args.input).expanduser())
             report = run_linkers(records, manifests, output, **run_options(args))
             from vcf_rdfizer_linking.session import atomic_bytes
             atomic_bytes(output.with_suffix(".json"), (json.dumps(report, indent=2) + "\n").encode())

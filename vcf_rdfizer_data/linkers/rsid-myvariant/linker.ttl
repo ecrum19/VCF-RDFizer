@@ -1,0 +1,22 @@
+@prefix vcfl: <https://w3id.org/vcf-rdfizer/linking#> .
+
+# Tier 3: POST batches of up to 1,000 rsIDs to MyVariant.info, linking only the
+# identifiers its dbSNP records confirm. Set contactEmail before live use.
+<#rsIDMyVariant> a vcfl:Linker ;
+    vcfl:id "rsid-myvariant" ;
+    vcfl:version "1.0.0" ;
+    vcfl:title "Service-confirmed rsID to dbSNP, via MyVariant.info" ;
+    vcfl:license "MIT (plug-in code and manifest)" ;
+    vcfl:termsOfUse <https://myvariant.info/terms/> ;
+    vcfl:endpoint <https://myvariant.info/v1/query> ;
+    vcfl:maxRequestsPerSecond 1 ;
+    vcfl:maxRequestsPerRun 30 ;
+    vcfl:batchSize 1000 ;
+    vcfl:requestTimeout 120 ;
+    vcfl:contactEmail "replace-me@example.org" ;
+    vcfl:join [ a vcfl:TokenJoin ;
+                vcfl:field "ID" ;
+                vcfl:splitOn ";" ;
+                vcfl:accept "^rs[0-9]+$" ] ;
+    vcfl:emit [ vcfl:subject vcfl:VariantCall ;
+                vcfl:predicate vcfl:sameVariantAs ] .
