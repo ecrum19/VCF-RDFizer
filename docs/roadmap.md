@@ -145,9 +145,9 @@ predicate, sample, genomic region, declared field or pattern), compiled to a
 release plan and enforced at the cheapest available point in the existing
 pipeline — TSV pre-filtering, emitter-time filtering, or a post-hoc pass.
 Full design in [`privacy-policy-design.md`](privacy-policy-design.md). The first
-slice, a v0.1.0 demonstrator over single-sample fixtures, is specified in
-[`policy-demonstrator.md`](policy-demonstrator.md); its §10 maps later versions
-onto the full design's build order.
+slice, now v0.2.0 and evaluated on single-sample real genomes up to a whole
+genome, is specified in [`policy-demonstrator.md`](policy-demonstrator.md); its
+§10 maps later versions onto the full design's build order.
 
 Two findings from that design are worth surfacing here because they affect work
 outside it:

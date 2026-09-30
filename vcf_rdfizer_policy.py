@@ -15,7 +15,7 @@ view.nt.gz alone, and can take --oracle-endpoint, serving `oracle` output.
 Selectors and the ownership rule come from a profile (--profile, default the
 bundled VCF Core profile; selector types may also be declared in the policy
 file), and purposes from a vocabulary (--purposes, default a DUO subset).
-v0.1.0 demonstrator: governed release, not anonymization. Runs on the host; no
+v0.2.0: governed release, not anonymization. Runs on the host; no
 Docker. Exit codes: 0 success, 1 a check failed, 2 the policy, graph or request
 cannot be evaluated. See docs/policy-demonstrator.md.
 """

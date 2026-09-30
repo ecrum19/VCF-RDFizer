@@ -1,7 +1,7 @@
-# Policy attachment — v0.1.0
+# Policy attachment — v0.2.0
 
 *Part of the [VCF-RDFizer documentation](README.md). Status: **implemented
-(v0.1.0)**; walkthrough in [`examples/policy/`](../examples/policy/README.md);
+(v0.2.0)**, evaluated on real genomes in vcf-rdfizer-testing's experiment 17; walkthrough in [`examples/policy/`](../examples/policy/README.md);
 tests in [vcf-rdfizer-testing `plugin-tests/policy/`](https://github.com/ecrum19/vcf-rdfizer-testing/tree/main/plugin-tests).
 This is the first slice of [`privacy-policy-design.md`](privacy-policy-design.md):
 it uses that document's vocabulary and rules, implements a subset of them, and
@@ -313,7 +313,7 @@ SELECT ?record ?chrom ?pos ?rule WHERE {
   vcfp:groupsWithheld  1 ;  vcfp:triplesWithheld 4649 ;
   vcfp:obligation      [ odrl:action odrl:attribute ] ;
   vcfp:disclosureModel "governed release; not anonymization" ;
-  prov:wasGeneratedBy  <urn:vcf-rdfizer-policy:0.1.0> ;
+  prov:wasGeneratedBy  <urn:vcf-rdfizer-policy:0.2.0> ;
   prov:generatedAtTime "…"^^xsd:dateTime .
 ```
 
@@ -471,7 +471,7 @@ examples/policy/              the cohort, policy.ttl, custom-selector.ttl, run_d
 
 ---
 
-## 10. Beyond v0.1.0
+## 10. Beyond v0.2.0
 
 Mapped onto the full design's build order
 ([`privacy-policy-design.md` §13](privacy-policy-design.md#13-build-order)).
@@ -480,10 +480,11 @@ class selectors are Turtle, not engine work. What remains needs code:
 
 | Version | Adds | Design § |
 | --- | --- | --- |
-| **v0.2** | Multi-sample files: a sample selector (a declaration) for expanded graphs, and `maskVectorPositions` for condensed ones, which rewrites a literal and so needs code; the `generalize` effect (genotype → carrier status) | §4.2, §8 |
-| **v0.3** | Enforcement during conversion (TSV and emitter tiers), and a streaming evaluator, lifting the size limit | §5 |
-| **v0.4** | Pseudonymization: IRI re-minting with per-release keys | §7 |
-| **v0.5** | Full DUO with release pinning and MONDO qualifiers; `policy diff`; enforced duties with an audit sink | §4.3, §12 |
+| v0.2.0 (done) | The streaming evaluator, lifting the size limit: `evaluate` and `check` against a SPARQL endpoint, list-valued selector parameters, `vcfp:LinkedSelector` | §5 |
+| **v0.3** | Multi-sample files: a sample selector (a declaration) for expanded graphs, and `maskVectorPositions` for condensed ones, which rewrites a literal and so needs code; the `generalize` effect (genotype → carrier status) | §4.2, §8 |
+| **v0.4** | Enforcement during conversion (TSV and emitter tiers) | §5 |
+| **v0.5** | Pseudonymization: IRI re-minting with per-release keys | §7 |
+| **v0.6** | Full DUO with release pinning and MONDO qualifiers; `policy diff`; enforced duties with an audit sink | §4.3, §12 |
 | later | `threshold`; query-time rewriting for an operated endpoint | §5, §9 |
 
 Two rules carry forward unchanged:

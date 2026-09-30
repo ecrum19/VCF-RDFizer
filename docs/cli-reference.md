@@ -128,6 +128,8 @@ compatibility. Use the three explicit selectors.
 | `--filter-oracle` | `auto`, `bcftools`, `cyvcf2` | `auto` | FILTER-field oracle |
 | `--validation-queries` | query ids, or `core` / `preflight` / `all` | all | Run only these queries. A subset reports `TIMING_ONLY` rather than a validation verdict, because the PASS decision needs the whole set; each selected query is still compared against the VCF oracle, so a disagreement still fails the run. Use it to measure retrieval cost for one question without paying for the rest |
 | `--shacl-shapes` | path | off | Independent structural layer via `pyshacl`; in-memory, so not for cohort scale |
+| `--shacl-max-triples` | N | 50,000,000 | Skip the shape layer, and record the skip, when the decoded graph exceeds N triples; `0` disables the gate. The gate reads the decoded graph, not the artifact it arrived in |
+| `--node-heap-mb` | MB | Node's own | V8 old-space ceiling for the Comunica-backed engines (`comunica`, `hdt`, `cottas`); Node does not size its heap from the machine |
 | `--strict-conformance` | — | off | Promote a missing-token conformance anomaly from report to failure |
 | `--validation-query-timeout` | seconds | 3600 | Per-query timeout, every engine |
 | `--qlever-memory-gb` | N | 4 | QLever index and server memory budget |

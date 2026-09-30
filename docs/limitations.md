@@ -270,10 +270,11 @@ record what an artifact was permitted to contain. Three consequences today:
 
 The plan is [`privacy-policy-design.md`](privacy-policy-design.md), which is
 explicit that what it offers is *governed release*, not anonymization. Its first
-slice exists as a demonstrator, [`vcf-rdfizer-policy`](policy-demonstrator.md)
-v0.1.0: ODRL policies on files and on declared graph selections (region and
-variant ship; others are Turtle declarations), verified release views, in
-memory and after conversion. It changes none of the points above for a
+slice exists as [`vcf-rdfizer-policy`](policy-demonstrator.md) v0.2.0: ODRL
+policies on files and on declared graph selections (region, variant and linked
+selectors ship; others are Turtle declarations), verified release views, after
+conversion, in memory or against a SPARQL endpoint (evaluated up to a whole
+genome). It changes none of the points above for a
 graph produced by a normal conversion.
 
 **No clinical claims.** The tool transcribes a VCF. It does not interpret,

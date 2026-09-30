@@ -1,4 +1,4 @@
-"""Policy demonstrator v0.1.0: attach ODRL policies to RDF graphs and release governed views.
+"""Policy plug-in v0.2.0: attach ODRL policies to RDF graphs and release governed views.
 
 Three generic steps, each configured in Turtle rather than code:
 
@@ -13,7 +13,7 @@ adds an independent check against the source VCFs. This is governed release, not
 anonymization. The specification is docs/policy-demonstrator.md.
 """
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 ODRL = "http://www.w3.org/ns/odrl/2/"
 VCFP = "https://w3id.org/vcf-rdfizer/policy#"
@@ -25,7 +25,7 @@ DISCLOSURE_MODEL = "governed release; not anonymization"
 
 
 class PolicyError(ValueError):
-    """A policy, graph or request that v0.1.0 cannot evaluate.
+    """A policy, graph or request that this version cannot evaluate.
 
     Always fatal. A rule that is parsed and then not applied would leave the
     operator believing a release is governed when it is not, so the tool stops
