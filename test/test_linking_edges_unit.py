@@ -200,13 +200,14 @@ class RdfInputs(Case):
     def test_a_graph_with_no_vcf_triples_never_reaches_the_bulk_loader(self):
         """The empty batch must be refused by us, not by the Rust loader.
 
-        pyoxigraph's bulk_extend rejects an empty batch with "Invalid argument:
-        ingestion arg list is empty" on Linux and accepts it on macOS, same
-        0.5.11. CI caught this and local development could not, so the contract
-        is pinned here rather than left to whichever platform runs the suite:
-        an input whose triples are all filtered out is a graph that simply
-        carries no VCF vocabulary, and the caller is owed read_store's
-        ValueError about it -- not a RuntimeError from the loader.
+        pyoxigraph 0.3.18's bulk_extend rejects an empty batch with "Invalid
+        argument: ingestion arg list is empty"; 0.5.x accepts it. CI's coverage
+        job runs 0.3.18 (pycottas 1.1.0 pins it) and the other jobs run 0.5.x,
+        so the failure appeared in one job only. The contract is pinned here
+        rather than left to whichever version is installed: an input whose
+        triples are all filtered out is a graph that simply carries no VCF
+        vocabulary, and the caller is owed read_store's ValueError about it --
+        not a RuntimeError from the loader.
         """
         import pyoxigraph as ox
 
@@ -224,8 +225,8 @@ class RdfInputs(Case):
 
         self.assertIn("No VCFFile/hasRecord", str(caught.exception))
         self.assertNotIn(0, batches,
-                         "bulk_extend was handed an empty batch; on Linux that "
-                         "raises RuntimeError instead of the intended ValueError")
+                         "bulk_extend was handed an empty batch; on pyoxigraph 0.3.18 "
+                         "that raises RuntimeError instead of the intended ValueError")
 
     def test_the_first_kept_triple_is_not_dropped(self):
         """The empty check pulls one triple off the stream; it must go back.
@@ -248,15 +249,26 @@ class RdfInputs(Case):
     def test_the_pre_0_4_parse_signature_still_works(self):
         """pyoxigraph < 0.4 has no RdfFormat and takes a MIME string instead.
 
-        Hide RdfFormat and the fallback runs for real -- current pyoxigraph still
-        accepts the legacy positional form -- so this is the shim working, not a
-        mock of it.
+        Both versions are live, not hypothetical: CI's coverage job installs
+        pycottas 1.1.0, which pins pyoxigraph 0.3.18, while the other jobs get
+        0.5.x. On 0.3.18 RdfFormat does not exist; on 0.5.x it is hidden here.
+        create=True covers both, and the spy proves the legacy call ran rather
+        than only that parsing succeeded by some route.
         """
         import pyoxigraph
 
-        with mock.patch.object(pyoxigraph, "RdfFormat", None):
+        calls, real_parse = [], pyoxigraph.parse
+
+        def spy(*args, **kwargs):
+            calls.append((args[1:], kwargs))
+            return real_parse(*args, **kwargs)
+
+        with mock.patch.object(pyoxigraph, "RdfFormat", None, create=True), \
+                mock.patch.object(pyoxigraph, "parse", spy):
             rows = list(read_rdf(self.nt(self.RECORD)))
         self.assertEqual([r.chrom for r in rows if isinstance(r, Record)], ["1"])
+        self.assertEqual(calls, [(("application/n-triples",), {})],
+                         "exactly one parse, through the legacy MIME-string form")
 
     def test_refusals(self):
         with self.assertRaisesRegex(ValueError, "existing .nt or .nt.gz"):

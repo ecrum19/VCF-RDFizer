@@ -71,9 +71,8 @@ include-package-data = true
 # includes scripts the tests themselves write into a temporary directory and
 # import -- the linking tests write a resolver.py, run it, and let the
 # TemporaryDirectory clean it up. By the time `coverage xml` runs, that file is
-# gone, and coverage reports "No source for code: .../resolver.py". On the
-# Linux CI runner that ends the step with exit 1; on macOS the same coverage
-# 7.16.2 only warns, so the failure is invisible locally.
+# gone, and coverage xml fails with "No source for code: .../resolver.py"
+# and exit 1, on any platform.
 #
 # Scoping to the repository is the honest fix rather than ignoring the error:
 # a throwaway script in a temp directory is not this project's code and was

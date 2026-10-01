@@ -174,10 +174,10 @@ def read_rdf(path: Path):
             triples = ox.parse(handle, format=ox.RdfFormat.N_TRIPLES)
         except AttributeError:                      # pyoxigraph < 0.4
             triples = ox.parse(handle, "application/n-triples")
-        # bulk_extend refuses an empty batch on some platforms --
-        # "Invalid argument: ingestion arg list is empty" from the Rust bulk
-        # loader, seen on Linux and not on macOS with the same pyoxigraph
-        # 0.5.11. An input whose triples are all filtered out is legitimate,
+        # pyoxigraph 0.3.18's bulk_extend refuses an empty batch -- "Invalid
+        # argument: ingestion arg list is empty" -- where 0.5.x accepts one.
+        # Both are installed in practice: pycottas 1.1.0 pins 0.3.18. An input
+        # whose triples are all filtered out is legitimate,
         # though: it is a graph that simply carries no VCF vocabulary, and the
         # caller should get read_store's "No VCFFile/hasRecord" rather than a
         # RuntimeError from the loader. So pull one triple first and only load
