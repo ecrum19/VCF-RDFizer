@@ -36,7 +36,7 @@ class Selection:
     """A target computed by a declared selector type with these parameter bindings."""
     asset: str
     selector: object        # profile.SelectorType
-    bindings: tuple         # ((variable name, rdflib term), ...)
+    bindings: tuple         # ((variable name, rdflib term or tuple of terms for a list), ...)
 
 
 @dataclass(frozen=True)
@@ -129,6 +129,17 @@ def _target(graph, node, profile, where):
         value = graph.value(selectors[0], rdflib.URIRef(prop))
         if value is None:
             raise PolicyError(f"<{node}>: a {kind.rsplit('#', 1)[-1]} needs <{prop}>")
+        # An RDF list: a set of values. The empty list must be tested for by
+        # name: Turtle writes () as rdf:nil, which has no rdf:first, so a check
+        # on rdf:first alone let an empty list through as the single IRI rdf:nil.
+        # A LinkedSelector panel of () then selected nothing, and a prohibition
+        # on it loaded cleanly and protected nothing.
+        if value == rdflib.RDF.nil or graph.value(value, rdflib.RDF.first) is not None:
+            from rdflib.collection import Collection
+
+            value = tuple(Collection(graph, value))
+            if not value:
+                raise PolicyError(f"<{node}>: <{prop}> is an empty list")
         bindings.append((variable(prop), value))
     return Selection(str(node), selector, tuple(bindings))
 

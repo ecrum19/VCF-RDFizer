@@ -27,10 +27,10 @@ except ModuleNotFoundError:  # pragma: no cover - exercised only without rdflib
 import vcf_rdfizer
 import vcf_rdfizer_link
 from vcf_rdfizer_linking import Link, LinkKey
-from vcf_rdfizer_linking.inputs import Record, Source, read_rdf, read_tsv, read_vcf
+from vcf_rdfizer_linking.inputs import Record, Source, read_rdf, read_vcf
 from vcf_rdfizer_linking.manifest import VCFL, VCFR, absolute_iri, discover, load_manifest, select
-from vcf_rdfizer_linking.reference import IntervalIndex, acquire_reference, check_assembly
-from vcf_rdfizer_linking.runner import LinkRunError, keys_for, run_linkers, run_stage
+from vcf_rdfizer_linking.reference import IntervalIndex, SequenceMap, acquire_reference, check_assembly
+from vcf_rdfizer_linking.runner import ALLELE_BASIS, LinkRunError, keys_for, minimal_allele, run_linkers, run_stage
 from vcf_rdfizer_linking.session import CachedSession, NetworkPolicy
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -228,11 +228,64 @@ class LinkingTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 list(resolver([LinkKey(token="rs334")], LinkerContext(session)))
 
+    def test_myvariant_confirms_only_rsids_its_dbsnp_records_carry(self):
+        from vcf_rdfizer_linking.runner import load_resolver
+        from vcf_rdfizer_linking import LinkerContext
+        resolver = load_resolver(self.manifests["rsid-myvariant"])
+        session = mock.Mock()
+        # Shape recorded from the live service: one hit per allele, notfound for a miss.
+        session.post.return_value.json.return_value = [
+            {"query": "rs334", "_id": "chr11:g.5227002T>A", "dbsnp": {"rsid": "rs334"}},
+            {"query": "rs334", "_id": "chr11:g.5227002T>C", "dbsnp": {"rsid": "rs334"}},
+            {"query": "rs699", "_id": "chr1:g.230710048A>G", "dbsnp": [{"rsid": "rs4762"}]},
+            {"query": "rs1", "notfound": True}]
+        keys = [LinkKey(token=t) for t in ("rs334", "rs699", "rs1")]
+        links = list(resolver(keys, LinkerContext(session)))
+        self.assertEqual([(l.key.token, l.object) for l in links], [("rs334", "https://identifiers.org/dbsnp:rs334")])
+        body = session.post.call_args.kwargs["json"]
+        self.assertEqual((body["q"], body["scopes"]), (["rs334", "rs699", "rs1"], "dbsnp.rsid"))
+        for payload in ({"success": False}, [{"query": "rs2"}], ["bad"]):
+            session.post.return_value.json.return_value = payload
+            with self.assertRaises(ValueError):
+                list(resolver(keys, LinkerContext(session)))
+
+    def test_myvariant_batches_through_the_session_and_replays_offline(self):
+        live = replace(self.manifests["rsid-myvariant"], contact_email="test@example.org")
+        calls = []
+        def transport(request, timeout):
+            calls.append((request, timeout))
+            return HTTPResponse([{"query": t, "dbsnp": {"rsid": t}} for t in json.loads(request.data)["q"]])
+        def factory(m, cache, policy, offline):
+            return CachedSession(m, cache, policy, offline=offline, transport=transport)
+        report = self.run_examples([live], session_factory=factory)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual((calls[0][0].full_url, calls[0][1]), ("https://myvariant.info/v1/query", 120.0))
+        self.assertEqual(report["link_triples"], 3)
+        self.output.unlink()
+        report = self.run_examples([live], session_factory=factory, offline=True)
+        self.assertEqual((len(calls), report["linkers"][0]["cache_hits"]), (1, 1))
+
     def test_offline_cache_miss_issues_no_request(self):
         transport = mock.Mock()
         with self.assertRaisesRegex(ValueError, "offline/cache-only"):
             self.session(transport, offline=True).get(self.live.endpoint)
         transport.assert_not_called()
+
+    def test_a_declared_request_timeout_reaches_the_transport(self):
+        transport = mock.Mock(return_value=HTTPResponse({}))
+        self.session(transport).get(self.live.endpoint)
+        self.assertEqual(transport.call_args.kwargs["timeout"], 30.0)          # the default
+        slow = replace(self.live, request_timeout=120.0)
+        transport = mock.Mock(return_value=HTTPResponse({}))
+        self.session(transport, manifest=slow).get(self.live.endpoint + "/slow")
+        self.assertEqual(transport.call_args.kwargs["timeout"], 120.0)
+        for bad in ('"0"', '"601"', '"soon"'):
+            with self.subTest(timeout=bad):
+                directory = self.copy_manifest(self.live, lambda text: text.replace(
+                    "vcfl:batchSize 100 ;", f"vcfl:batchSize 100 ; vcfl:requestTimeout {bad} ;"))
+                with self.assertRaisesRegex(ValueError, "requestTimeout"):
+                    load_manifest(directory)
+                shutil.rmtree(directory)
 
     def test_retry_after_and_per_run_budget_include_retries(self):
         transport = mock.Mock(side_effect=[HTTPResponse({}, 429, {"Retry-After": "4.5"}), HTTPResponse({}, 503), HTTPResponse({})])
@@ -348,6 +401,32 @@ class LinkingTests(unittest.TestCase):
             path.write_text(graph.serialize(format="nt"))
             with self.assertRaises(ValueError):
                 list(read_rdf(path))
+
+    def test_any_sparql_store_reads_like_the_file(self):
+        from vcf_rdfizer_linking.inputs import read_store
+        from vcf_rdfizer_policies.store import MemoryStore
+        path = self.root / "base.nt"
+        path.write_text(base_graph().serialize(format="nt"))
+        from_file = list(read_rdf(path))
+        self.assertEqual(list(read_store(MemoryStore(base_graph()))), from_file)
+        self.assertEqual(sum(isinstance(r, Record) for r in from_file), 4)
+
+    def test_each_declared_violation_is_refused(self):
+        source, record = URIRef("file://example.vcf"), URIRef("file://example.vcf#record/1")
+        mutations = {
+            "literal record": lambda g: g.add((source, VCFR.hasRecord, Literal("r"))),
+            "two owners": lambda g: g.add((URIRef("file://other.vcf"), VCFR.hasRecord, record)),
+            "two calls": lambda g: g.add((record, VCFR.hasCall, URIRef("file://example.vcf#call/2"))),
+            "IRI join field": lambda g: g.set((record, VCFR.chrom, URIRef("urn:chrom"))),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(mutation=name):
+                graph = base_graph()
+                mutate(graph)
+                path = self.root / "bad.nt"
+                path.write_text(graph.serialize(format="nt"))
+                with self.assertRaises(ValueError):
+                    list(read_rdf(path))
 
     def test_empty_vcf_and_rdf_emit_zero_count_provenance(self):
         empty = self.root / "empty.vcf"
@@ -465,6 +544,164 @@ class LinkingTests(unittest.TestCase):
             self.assertEqual(len(list(linked.triples((None, VCFL.overlapsGene, None)))), 4)
             actual = (out / "sample/sample.nt").read_bytes() if storage == "plain" else gzip.decompress((out / "sample/sample.nt.gz").read_bytes())
             self.assertEqual(actual, original)
+
+
+SPDI = "https://api.ncbi.nlm.nih.gov/variation/v0/spdi/"
+
+
+def allele_record(chrom, pos, ref, alt, row=1, source="file://genome.vcf", reference="GRCh38"):
+    return Record(source, f"{source}#record/{row}", f"{source}#call/{row}", reference,
+                  chrom, str(pos), ref, alt, ".", ".")
+
+
+@unittest.skipIf(rdflib is None, "rdflib is required for the linking tests")
+class AlleleJoinTests(unittest.TestCase):
+    """vcfl:AlleleJoin: trimmed SPDI keys, a sequence map, and what they assert."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.spdi = discover()["spdi"]
+
+    def link(self, records):
+        output = self.root / f"links{len(list(self.root.glob('*.nt')))}.nt"
+        report = run_linkers([Source(records[0].source, records[0].reference), *records], [self.spdi],
+                             output, cache_dir=self.root / "cache", offline=True)
+        return report, Graph().parse(output, format="nt")
+
+    def test_trimming_known_answers(self):
+        cases = {
+            ("A", "G"): (99, "A", "G"),          # SNV
+            ("AC", "GC"): (99, "A", "G"),        # MNP with a shared suffix
+            ("TCAG", "T"): (100, "CAG", ""),     # anchored deletion
+            ("T", "TA"): (100, "", "A"),         # anchored insertion
+            ("AAA", "AA"): (99, "A", ""),        # suffix first keeps it left-aligned
+            ("AC", "GT"): (99, "AC", "GT"),      # complex: nothing shared
+        }
+        for (ref, alt), expected in cases.items():
+            with self.subTest(ref=ref, alt=alt):
+                self.assertEqual(minimal_allele(100, ref, alt), expected)
+        self.assertIsNone(minimal_allele(100, "A", "A"))
+
+    def test_one_key_per_explicit_alt(self):
+        record = allele_record("chr17", 43045712, "g", "A,a,GT,<DEL>,*,.,N]2:20]")
+        self.assertEqual(keys_for(record, self.spdi), [
+            LinkKey(chrom="chr17", start=43045711, token="G:A"),
+            LinkKey(chrom="chr17", start=43045712, token=":T")])
+        self.assertEqual(keys_for(allele_record("1", 5, "R", "A"), self.spdi), [])
+        with self.assertRaisesRegex(ValueError, "Invalid POS"):
+            keys_for(allele_record("1", "x", "A", "G"), self.spdi)
+
+    def test_the_same_variant_gets_one_iri_whatever_the_contig_is_called(self):
+        report, graph = self.link([
+            allele_record("chr17", 43045712, "G", "A", row=1),
+            allele_record("17", 43045712, "G", "A", row=2),
+            allele_record("chrUn_KI270742v1", 10, "A", "G", row=3)])
+        objects = {s: set(graph.objects(s, VCFL.sameVariantAs)) for s in
+                   (URIRef(f"file://genome.vcf#call/{n}") for n in (1, 2, 3))}
+        expected = URIRef(SPDI + "NC_000017.11:43045711:G:A")
+        self.assertEqual(objects[URIRef("file://genome.vcf#call/1")], {expected})
+        self.assertEqual(objects[URIRef("file://genome.vcf#call/2")], {expected})
+        self.assertEqual(objects[URIRef("file://genome.vcf#call/3")], set())   # unmapped contig
+        stats = report["linkers"][0]
+        self.assertEqual((stats["eligible_records"], stats["linked_subjects"]), (3, 2))
+        self.assertEqual(stats["assertion_basis"], ALLELE_BASIS)
+        self.assertFalse(stats["assertion_verified"])
+
+    def test_a_position_beyond_the_sequence_fails_the_run(self):
+        with self.assertRaisesRegex(LinkRunError, "beyond NC_012920.1"):
+            self.link([allele_record("chrM", 16570, "A", "G")])
+
+    def test_a_grch37_input_is_refused_before_linking(self):
+        with self.assertRaisesRegex(LinkRunError, "Assembly mismatch"):
+            self.link([allele_record("17", 41197710, "G", "A", reference="GRCh37")])
+
+    def test_manifest_requires_a_sequence_map_and_the_spdi_placeholder(self):
+        breakages = [("vcfl:SequenceMap", "vcfl:GFF3"), ("{SPDI}", "{ID}"),
+                     ("vcfl:AlleleJoin", "vcfl:IntervalJoin")]
+        for before, after in breakages:
+            with self.subTest(change=before):
+                directory = self.root / f"broken-{len(list(self.root.iterdir()))}"
+                shutil.copytree(self.spdi.directory, directory)
+                manifest = directory / "linker.ttl"
+                manifest.write_text(manifest.read_text().replace(before, after))
+                with self.assertRaises(ValueError):
+                    load_manifest(directory)
+
+    def test_sequence_map_rejects_ambiguous_or_malformed_rows(self):
+        for body in ("NC_1.1\t10\tchr1\nNC_2.1\t10\tchr1\n",   # a name for two sequences
+                     "NC_1\t10\tchr1\n",                          # unversioned accession
+                     "NC_1.1\tten\tchr1\n", "# only comments\n"):
+            with self.subTest(body=body):
+                path = self.root / "map.tsv"
+                path.write_text(body)
+                with self.assertRaises(ValueError):
+                    SequenceMap(path)
+
+    def test_the_shipped_map_covers_the_grch38_primary_assembly(self):
+        sequences = SequenceMap(self.spdi.directory / "grch38-refseq.tsv")
+        accessions = {sequences.resolve(f"chr{c}")[0] for c in [*range(1, 23), "X", "Y", "M"]}
+        self.assertEqual(len(accessions), 25)
+        self.assertEqual(sequences.resolve("chr1"), ("NC_000001.11", 248956422))
+        self.assertEqual(sequences.resolve("MT"), sequences.resolve("chrM"))
+
+
+@unittest.skipIf(rdflib is None, "rdflib is required for the linking tests")
+class ContigAliasTests(unittest.TestCase):
+    """vcfl:contigAliases: an interval join resolves both sides' contig names through a SequenceMap."""
+
+    GFF3 = "17\tx\tgene\t100\t200\t.\t+\t.\tID=gene:A;gene_id=GENE_A\nchrUn_x\tx\tgene\t1\t50\t.\t+\t.\tgene_id=GENE_U\n"
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        shipped = ROOT / "vcf_rdfizer_data/linkers/ensembl-genes-grch38/grch38-refseq.tsv"
+        (self.root / "genes.gff3").write_text(self.GFF3)
+        shutil.copyfile(shipped, self.root / "map.tsv")
+        self.gff_sha = hashlib.sha256(self.GFF3.encode()).hexdigest()
+        self.map_sha = hashlib.sha256(shipped.read_bytes()).hexdigest()
+
+    def manifest(self, aliases=True, join="IntervalJoin", map_sha=None):
+        extra = (f'vcfl:contigAliases [ vcfl:url <map.tsv> ; vcfl:sha256 "{map_sha or self.map_sha}" ] ;'
+                 if aliases else "")
+        (self.root / "linker.ttl").write_text(f"""@prefix vcfl: <https://w3id.org/vcf-rdfizer/linking#> .
+<#g> a vcfl:Linker ; vcfl:id "genes" ; vcfl:version "1.0.0" ; vcfl:title "t" ;
+  vcfl:join [ a vcfl:{join} ; vcfl:idAttribute "gene_id" ] ;
+  vcfl:reference [ vcfl:url <genes.gff3> ; vcfl:sha256 "{self.gff_sha}" ; vcfl:assembly "GRCh38" ; vcfl:format vcfl:GFF3 ] ;
+  {extra}
+  vcfl:emit [ vcfl:subject vcfl:VariantCall ; vcfl:predicate vcfl:overlapsGene ;
+              vcfl:objectTemplate "https://example.org/{{ID}}" ] .""")
+        return load_manifest(self.root)
+
+    def link(self, manifest, *records):
+        output = self.root / f"out{len(list(self.root.glob('out*.nt')))}.nt"
+        run_linkers([Source(records[0].source, "GRCh38"), *records], [manifest], output,
+                    cache_dir=self.root / "cache", offline=True)
+        graph = Graph().parse(output, format="nt")
+        return {str(s).rsplit("/", 1)[1]: {str(o) for o in graph.objects(s, VCFL.overlapsGene)}
+                for s in set(graph.subjects(VCFL.overlapsGene, None))}
+
+    def test_chr17_and_17_both_reach_a_gene_declared_on_17(self):
+        linked = self.link(self.manifest(), allele_record("chr17", 150, "A", "G", row=1),
+                           allele_record("17", 150, "A", "G", row=2), allele_record("chr17", 250, "A", "G", row=3))
+        self.assertEqual(linked, {"1": {"https://example.org/GENE_A"}, "2": {"https://example.org/GENE_A"}})
+
+    def test_an_unmapped_contig_still_matches_by_name(self):
+        linked = self.link(self.manifest(), allele_record("chrUn_x", 10, "A", "G"))
+        self.assertEqual(linked, {"1": {"https://example.org/GENE_U"}})
+
+    def test_without_aliases_names_must_match_exactly(self):
+        self.assertEqual(self.link(self.manifest(aliases=False), allele_record("chr17", 150, "A", "G")), {})
+
+    def test_a_wrong_alias_digest_fails_closed(self):
+        with self.assertRaisesRegex(LinkRunError, "digest mismatch"):
+            self.link(self.manifest(map_sha="0" * 64), allele_record("chr17", 150, "A", "G"))
+
+    def test_aliases_are_refused_outside_an_interval_join(self):
+        with self.assertRaisesRegex(ValueError, "contigAliases"):
+            self.manifest(join="TokenJoin")
 
 
 if __name__ == "__main__":

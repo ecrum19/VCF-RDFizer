@@ -78,6 +78,7 @@ class Reference:
     assembly: str
     feature_type: str
     id_attribute: str
+    format: str = "gff3"          # "gff3" (IntervalJoin) or "sequence-map" (AlleleJoin)
 
 
 @dataclass(frozen=True)
@@ -102,6 +103,8 @@ class Manifest:
     max_requests: int
     batch_size: int
     contact_email: str
+    contig_aliases: Reference | None = None    # a SequenceMap an IntervalJoin resolves names through
+    request_timeout: float = 30.0              # seconds a tier-3 request may take; services differ
 
 
 def load_manifest(directory: Path) -> Manifest:
@@ -124,7 +127,7 @@ def load_manifest(directory: Path) -> Manifest:
 
     allowed = {"id", "version", "title", "license", "termsOfUse", "join", "emit", "reference",
                "field", "splitOn", "accept", "subject", "predicate", "objectTemplate", "format",
-               "url", "sha256", "assembly", "featureType", "idAttribute", "endpoint",
+               "url", "sha256", "assembly", "featureType", "idAttribute", "endpoint", "contigAliases", "requestTimeout",
                "maxRequestsPerSecond", "maxRequestsPerRun", "batchSize", "contactEmail"}
     for predicate in graph.predicates():
         if str(predicate).startswith(str(VCFL)) and str(predicate)[len(str(VCFL)):] not in allowed:
@@ -159,8 +162,10 @@ def load_manifest(directory: Path) -> Manifest:
         strategy = "token"
     elif types == {VCFL.IntervalJoin}:
         strategy = "interval"
+    elif types == {VCFL.AlleleJoin}:
+        strategy = "allele"
     else:
-        raise ValueError("Supported joins: TokenJoin and IntervalJoin; allele normalization is not implemented")
+        raise ValueError("Supported joins: TokenJoin, IntervalJoin and AlleleJoin")
     emit = one(root, "emit", resource=True)
     subject = one(emit, "subject", iri=True)
     if subject not in {str(VCFL.VariantCall), str(VCFL.VCFRecord)}:
@@ -180,8 +185,10 @@ def load_manifest(directory: Path) -> Manifest:
     reference_node = one(root, "reference", "", resource=True)
     reference = None
     if reference_node:
-        if one(reference_node, "format", iri=True) != str(VCFL.GFF3):
-            raise ValueError("Only vcfl:GFF3 reference bundles are supported")
+        formats = {str(VCFL.GFF3): "gff3", str(VCFL.SequenceMap): "sequence-map"}
+        reference_format = formats.get(one(reference_node, "format", iri=True))
+        if reference_format is None:
+            raise ValueError("Reference bundles must be vcfl:GFF3 or vcfl:SequenceMap")
         digest = one(reference_node, "sha256")
         if not re.fullmatch(r"[0-9a-f]{64}", digest):
             raise ValueError("vcfl:sha256 must contain 64 lowercase hexadecimal digits")
@@ -189,16 +196,29 @@ def load_manifest(directory: Path) -> Manifest:
         if not assembly:
             raise ValueError("A reference must declare a nonempty assembly")
         reference = Reference(one(reference_node, "url", url=True), digest, assembly,
-                              one(join, "featureType", "gene"), one(join, "idAttribute", "ID"))
+                              one(join, "featureType", "gene"), one(join, "idAttribute", "ID"),
+                              reference_format)
+    aliases_node = one(root, "contigAliases", "", resource=True)
+    aliases = None
+    if aliases_node:
+        if strategy != "interval" or reference is None:
+            raise ValueError("vcfl:contigAliases applies to an IntervalJoin with a reference")
+        digest = one(aliases_node, "sha256")
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("vcfl:sha256 must contain 64 lowercase hexadecimal digits")
+        aliases = Reference(one(aliases_node, "url", url=True), digest, reference.assembly, "", "",
+                            "sequence-map")
     resolver = directory / "resolver.py"
     tier = 3 if resolver.is_file() else 2 if reference else 1
-    if strategy == "interval" and (reference is None or tier == 3):
+    if strategy == "interval" and (reference is None or reference.format != "gff3" or tier == 3):
         raise ValueError("IntervalJoin requires a GFF3 reference and no resolver.py")
-    if reference and strategy != "interval":
-        raise ValueError("Reference bundles currently require IntervalJoin")
+    if strategy == "allele" and (reference is None or reference.format != "sequence-map" or tier == 3):
+        raise ValueError("AlleleJoin requires a SequenceMap reference and no resolver.py")
+    if reference and strategy == "token":
+        raise ValueError("A TokenJoin takes no reference bundle")
     template = one(emit, "objectTemplate", "")
     if tier != 3:
-        allowed = "TOKEN" if strategy == "token" else "ID"
+        allowed = PLACEHOLDERS[strategy]
         try:
             fields = list(Formatter().parse(template))
             variables = [name for _, name, _, _ in fields if name is not None]
@@ -210,7 +230,7 @@ def load_manifest(directory: Path) -> Manifest:
     elif template:
         raise ValueError("Tier 3 objects come from the resolver; omit objectTemplate")
 
-    endpoint, rps, max_requests, batch_size, contact = "", 0.0, 0, 1000, ""
+    endpoint, rps, max_requests, batch_size, contact, timeout = "", 0.0, 0, 1000, "", 30.0
     if tier == 3:
         endpoint = one(root, "endpoint", iri=True)
         parts = urlsplit(endpoint)
@@ -225,18 +245,30 @@ def load_manifest(directory: Path) -> Manifest:
         if not math.isfinite(rps) or rps <= 0 or max_requests <= 0 or not 1 <= batch_size <= 1000:
             raise ValueError("Network budgets must be positive; batchSize must be 1..1000")
         contact = one(root, "contactEmail")
+        try:
+            timeout = float(one(root, "requestTimeout", "30"))
+        except ValueError as exc:
+            raise ValueError("vcfl:requestTimeout must be a number of seconds") from exc
+        if not 1 <= timeout <= 600:
+            raise ValueError("vcfl:requestTimeout must be between 1 and 600 seconds")
         if not re.fullmatch(r"[^\s<>@]+@[^\s<>@]+\.[^\s<>@]+", contact):
             raise ValueError("vcfl:contactEmail must be an email address")
     return Manifest(directory, linker_id, version, one(root, "title"),
                     one(root, "license", "unspecified"), one(root, "termsOfUse", "", iri=True),
                     tier, strategy, field, split_on, accept, subject,
                     one(emit, "predicate", iri=True), template, reference, endpoint,
-                    rps, max_requests, batch_size, contact)
+                    rps, max_requests, batch_size, contact, aliases, timeout)
+
+
+#: The one placeholder each join's objectTemplate must contain.
+PLACEHOLDERS = {"token": "TOKEN", "interval": "ID", "allele": "SPDI"}
 
 
 def template_object(manifest: Manifest, value: str) -> str:
-    name = "TOKEN" if manifest.strategy == "token" else "ID"
-    return absolute_iri(manifest.object_template.format(**{name: quote(value, safe="")}))
+    # An SPDI expression keeps its colons: they are legal in an IRI path, and
+    # percent-encoding them would make the identifier unreadable for no gain.
+    safe = ":" if manifest.strategy == "allele" else ""
+    return absolute_iri(manifest.object_template.format(**{PLACEHOLDERS[manifest.strategy]: quote(value, safe=safe)}))
 
 
 def discover(search_paths=()) -> dict[str, Manifest]:

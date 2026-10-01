@@ -910,9 +910,11 @@ finishes.
 
 ### Data linking plug-ins
 
-Three installed examples cover declarative dbSNP links (`rsid-dbsnp`), interval
-joins against a synthetic GFF3 bundle (`gene-demo`), and an Ensembl API resolver
-(`rsid-ensembl`). Add `--link <ids>` in full mode, or link an existing aggregate
+Six installed linkers cover declarative dbSNP links (`rsid-dbsnp`), interval
+joins against a synthetic GFF3 bundle (`gene-demo`) and Ensembl's gene
+annotation (`ensembl-genes-grch38`), shared variant identity through NCBI SPDI
+(`spdi`, which gives the same variant the same IRI in every file), and two live
+API resolvers (`rsid-ensembl`, `rsid-myvariant`). Add `--link <ids>` in full mode, or link an existing aggregate
 without Docker:
 
 ```bash
@@ -922,7 +924,7 @@ vcf-rdfizer --mode link --rdf ./results/sample/sample.nt.gz \
 
 Links go into `sample.links.nt`; the base graph is unchanged. The
 `vcf-rdfizer-link` companion CLI lists, scaffolds, checks and previews plug-ins.
-See [Data linking](docs/datalinking.md) for all three worked examples, reference
+See [Data linking](docs/datalinking.md) for the worked examples, reference
 and network safeguards, provenance, and the remaining design limitations.
 
 ### Policy attachment plug-in
@@ -1067,7 +1069,7 @@ how each part of the tool works, why, and where it stops working.
 | [Roadmap](docs/roadmap.md) | Planned work, known defects, and rejected options |
 | [Data linking](docs/datalinking.md) | Runnable examples of all three plug-in tiers, authoring, safeguards, and provenance |
 | [Data linking design](docs/datalinking-design.md) | Broader proposal and remaining work |
-| [Policy attachment](docs/policy-demonstrator.md) | Implemented v0.1.0: ODRL policies on files, regions and variants, release views, and checks |
+| [Policy attachment](docs/policy-demonstrator.md) | Implemented v0.2.0: ODRL policies on files, regions, variants and linked entities; release views and checks, in memory or against a SPARQL endpoint |
 | [Privacy policy design](docs/privacy-policy-design.md) | Proposal: ODRL-based granular disclosure control over the graph |
 
 - [`ACKNOWLEDGEMENTS.md`](ACKNOWLEDGEMENTS.md) - funding and attribution
@@ -1122,7 +1124,7 @@ Safe termination:
 
 If you use VCF-RDFizer in a publication, please cite:
 
-VCF-RDFizer maintainers. (2026). *VCF-RDFizer* (Version 3.2.0) [Computer software]. GitHub. https://github.com/ecrum19/VCF-RDFizer
+VCF-RDFizer maintainers. (2026). *VCF-RDFizer* (Version 3.3.0) [Computer software]. GitHub. https://github.com/ecrum19/VCF-RDFizer
 
 BibTeX:
 
@@ -1131,7 +1133,7 @@ BibTeX:
   author  = {{VCF-RDFizer maintainers}},
   title   = {VCF-RDFizer},
   year    = {2026},
-  version = {3.2.0},
+  version = {3.3.0},
   url     = {https://github.com/ecrum19/VCF-RDFizer},
   note    = {Computer software}
 }

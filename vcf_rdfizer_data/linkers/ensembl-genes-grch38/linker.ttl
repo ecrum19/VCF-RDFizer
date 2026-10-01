@@ -1,0 +1,23 @@
+@prefix vcfl: <https://w3id.org/vcf-rdfizer/linking#> .
+
+# Tier 2: records overlapping an Ensembl release 116 gene, from its GRCh38 GFF3
+# (HTTPS, fetched once and cached by digest). Contig names go through the
+# GRCh38 sequence map, so the GFF3's "17" meets a VCF's "chr17".
+<#ensemblGenes> a vcfl:Linker ;
+    vcfl:id "ensembl-genes-grch38" ;
+    vcfl:version "1.0.0" ;
+    vcfl:title "Overlapping Ensembl 116 genes (GRCh38)" ;
+    vcfl:license "MIT (manifest); Ensembl data is freely available without restriction" ;
+    vcfl:termsOfUse <https://www.ensembl.org/info/about/legal/disclaimer.html> ;
+    vcfl:join [ a vcfl:IntervalJoin ;
+                vcfl:featureType "gene" ;
+                vcfl:idAttribute "gene_id" ] ;
+    vcfl:reference [ vcfl:url <https://ftp.ensembl.org/pub/release-116/gff3/homo_sapiens/Homo_sapiens.GRCh38.116.gff3.gz> ;
+                     vcfl:sha256 "08e881d96ab6385a2c31f063a018be4b2c36860b323f2724be07022deeef21ce" ;
+                     vcfl:assembly "GRCh38" ;
+                     vcfl:format vcfl:GFF3 ] ;
+    vcfl:contigAliases [ vcfl:url <grch38-refseq.tsv> ;
+                         vcfl:sha256 "7b31388a09b00aa1f090aa2a5843b10ce5da7b151aa224b030c779fe87e7fbe7" ] ;
+    vcfl:emit [ vcfl:subject vcfl:VariantCall ;
+                vcfl:predicate vcfl:overlapsGene ;
+                vcfl:objectTemplate "https://identifiers.org/ensembl:{ID}" ] .

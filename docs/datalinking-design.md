@@ -4,8 +4,10 @@
 plug-in tiers, with a shared runner, discovery/authoring CLI, full and post-hoc
 entry points, side-graphs, provenance and network safeguards. See
 [`datalinking.md`](datalinking.md) for the implemented contract and worked
-commands. This document retains the broader proposal: allele normalization,
-link merging, and automatic plug-in query/mutation discovery remain planned.
+commands. An allele join now exists (`vcfl:AlleleJoin`, with the `spdi`
+linker), over inputs normalised beforehand. This document retains the broader
+proposal: normalisation inside the join, link merging, and automatic plug-in
+query/mutation discovery remain planned.
 The manifest vocabulary is still provisional.*
 
 VCF-RDFizer converts a VCF into RDF that is faithful to the VCF and to nothing

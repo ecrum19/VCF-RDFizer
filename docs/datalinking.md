@@ -14,13 +14,16 @@ than approximating either syntax with regular expressions.
 
 ---
 
-## 1. Three runnable examples
+## 1. Five runnable examples
 
 | Tier | Installed ID | Join and result | Network |
 | --- | --- | --- | --- |
 | 1: declarative | `rsid-dbsnp` | `ID` rsID tokens → dbSNP identifier IRIs | None |
 | 2: reference bundle | `gene-demo` | Explicit allele REF spans → synthetic GFF3 gene intervals | None with the shipped local bundle |
+| 2: reference bundle | `ensembl-genes-grch38` | Explicit allele REF spans → overlapping Ensembl 116 genes (a real annotation, fetched once by digest) | One download, then offline |
+| 2: reference bundle | `spdi` | Normalised alleles → NCBI SPDI IRIs, the same in every file whatever it calls the chromosome | None |
 | 3: live resolver | `rsid-ensembl` | Deduplicated rsID batches → service-confirmed Ensembl variation links | Ensembl HTTPS API, or cached responses |
+| 3: live resolver | `rsid-myvariant` | rsID batches of up to 1,000 → dbSNP IRIs, linked only when MyVariant.info's dbSNP record carries the rsID | MyVariant.info HTTPS API, or cached responses |
 
 The canonical example directories are under
 [`vcf_rdfizer_data/linkers/`](../vcf_rdfizer_data/linkers/). Each has its own
@@ -84,8 +87,15 @@ Both RDF entry points read the graph's `hasRecord` and `hasCall` edges. They
 retain the actual subjects, including custom IRI templates, and reject a call
 whose subject is absent. They require the VCF-RDFizer predicates for those
 edges and the selected join fields. Arbitrary custom vocabularies cannot be
-inferred. N-Triples may be unordered; the input reader stores only relevant
-fields in a temporary SQLite index and discards genotype triples after parsing.
+inferred. N-Triples may be unordered.
+
+The graph is read with SPARQL (`vcf_rdfizer_linking/inputs.py`): one query for
+the records, and a set of declared queries for the assumptions the reader rests
+on (one call per record, one value per join field, and so on), each returning a
+row when the graph breaks it. A file is loaded into a temporary on-disk
+Oxigraph store first, keeping only the join fields (genotype triples are parsed
+and dropped). A graph already served by an endpoint needs no copy:
+`vcf-rdfizer-link run --endpoint <url> --link <ids> -o <file.links.nt>`.
 
 ## 3. Tier 1: a manifest is the implementation
 
@@ -118,8 +128,11 @@ and overlapping features are retained. `vcfl:featureType` defaults to `gene`;
 `vcfl:idAttribute` defaults to `ID`. GFF3 percent escapes are decoded and the
 selected identifier feeds the `{ID}` object template.
 
-Limits are explicit: chromosome names must match exactly (`1` and `chr1` are
-different); there is no contig aliasing or liftover. Symbolic alleles,
+Chromosome names must match exactly (`1` and `chr1` are different) unless the
+manifest declares `vcfl:contigAliases`: a digest-pinned sequence map (§4, allele
+identity) through which both the GFF3 seqids and the records' contigs resolve to
+an accession. `ensembl-genes-grch38` uses one, so Ensembl's `17` meets `chr17`.
+There is no liftover. Symbolic alleles,
 breakends, and spanning-deletion `*` records are skipped and counted in
 `skipped_records`. The runner does not interpret INFO/END or confidence ranges.
 It uses explicit DNA REF spans, including their anchor base, rather than an
@@ -150,6 +163,42 @@ vcf-rdfizer-link dry-run my-gene-linker -i your-small.vcf --limit 100
 
 `check` parses the manifest, verifies/acquires the reference and parses its
 features. Without an input VCF it cannot certify input assembly compatibility.
+
+### Allele identity: `vcfl:AlleleJoin` and the `spdi` linker
+
+A file's record IRIs (`file://x.vcf#record/12`) are scoped to that file, so two
+files holding the same variant share no term. An **allele join** gives them
+one. For each ALT with explicit bases, the runner computes an SPDI expression
+(`sequence:position:deleted:inserted`, 0-based), and emits it through the
+`{SPDI}` object template:
+
+```bash
+vcf-rdfizer --mode link --rdf genome.nt.gz --link spdi --offline -o linked/
+vcf-rdfizer --mode link --rdf clinvar.nt.gz --link spdi --offline -o linked/
+# genome and ClinVar calls for the same variant now share one sameVariantAs object
+```
+
+The reference is a **sequence map** (`vcfl:format vcfl:SequenceMap`), a TSV of
+`accession  length  names`, where `names` lists every contig name that denotes
+the sequence. That is the contig aliasing the interval join does not do: `chr17`
+and `17` both resolve to `NC_000017.11`, because the map says so, not because
+of a naming rule. A contig the map does not list is not linked. A position
+beyond its sequence's length fails the run. The shipped
+[`spdi`](../vcf_rdfizer_data/linkers/spdi/README.md) map covers the 25 GRCh38
+primary-assembly sequences.
+
+The expression is SPDI's *trimmed* form: the shared suffix is removed first,
+then the shared prefix, so a left-aligned indel stays left-aligned. NCBI's
+*canonical* form shifts an indel across its repeat, and that needs the reference
+sequence, which the runner does not read. Identifiers therefore agree across
+files that were **normalised the same way** (`bcftools norm -f <ref> -m -any`).
+The linkset records this as its assertion basis (`allele-expression`), and the
+report does not count these links as verified. On real ClinVar variants,
+identifiers outside repeats equal NCBI's SPDI exactly. Inside a repeat they
+differ from NCBI's contextual form but denote the same allele. That is checked
+against recorded NCBI answers in
+[vcf-rdfizer-testing `plugin-tests/spdi/`](https://github.com/ecrum19/vcf-rdfizer-testing/tree/main/plugin-tests). Symbolic alleles, breakends,
+`*` and `.` are skipped and counted, as for the interval join.
 
 ## 5. Tier 3: a narrow Python resolver
 
@@ -216,7 +265,9 @@ The session implements:
   HTTP-date `Retry-After` honoured. Retries count toward the run ceiling. This
   follows Ensembl's documented
   [rate-limit protocol](https://github.com/Ensembl/ensembl-rest/wiki/Rate-Limits).
-- A 30-second request timeout and 16 MiB response limit. Other HTTP failures,
+- A request timeout (30 s unless the manifest's `vcfl:requestTimeout` says
+  otherwise, 1–600 s: a slow service needs a longer one, not retries) and a
+  16 MiB response limit. Other HTTP failures,
   connection failures, and exhausted budgets abort the linker.
 - `--offline` / `--links-cache-only`: no network, with clear cache-miss errors.
   Verified local GFF3 references remain usable on a cold cache.
@@ -310,8 +361,12 @@ not promised byte-identical.
 The implemented tiers are examples of the extension contract, not completion
 of every feature in the proposal:
 
-- **No allele join or allele normalization.** Tier 3 uses token keys. No
-  ClinVar/gnomAD/CADD matching is implied by this implementation.
+- **An allele join, but no normalisation.** `vcfl:AlleleJoin` expresses each
+  record's alleles as trimmed SPDI and does not left-align or check them
+  against the reference sequence; normalise inputs first. Canonical SPDI and
+  GA4GH VRS identifiers, which need the sequence, are future work. No
+  ClinVar/gnomAD/CADD annotation is implied: matching against ClinVar means
+  linking ClinVar too.
 - **No production gene bundle is shipped.** The synthetic fixture demonstrates
   digest checking, indexing and assembly refusal. Users supply real references.
 - **No `--merge-links`.** Keeping side-graphs separate leaves core validation
@@ -332,6 +387,7 @@ of every feature in the proposal:
 
 [`test/test_linking_unit.py`](../test/test_linking_unit.py) exercises known-answer
 token links, INFO splitting/escaping, interval boundaries and nested features,
+SPDI trimming, contig aliasing and the length guard,
 assembly refusal, digest corruption, unordered and gzip RDF, custom subjects,
 empty inputs, full-mode integration, discovery, authoring commands, API batching,
 cache replay, host pacing, retries, ceilings and failure atomicity.

@@ -60,7 +60,7 @@ helper tables, because that would emit both genotype representations at once.
 
 | Flag | Meaning |
 | --- | --- |
-| `--link` | Comma-separated installed IDs; examples: `rsid-dbsnp`, `gene-demo`, `rsid-ensembl` |
+| `--link` | Comma-separated installed IDs; examples: `rsid-dbsnp`, `gene-demo`, `rsid-ensembl`, `rsid-myvariant` |
 | `--linker-path` | Additional linker directory or parent search directory; repeatable; also `VCF_RDFIZER_LINKER_PATH` |
 | `--links-cache` | Reference/response cache; default `~/.cache/vcf-rdfizer/linkers` |
 | `--offline` / `--links-cache-only` | Disable linker network access; require local reference bytes or cached responses |
@@ -68,7 +68,7 @@ helper tables, because that would emit both genotype representations at once.
 | `--links-contact-email` | Contact address for live resolver User-Agent headers |
 
 The side-graph is `<name>.links.nt`. `gene-demo` contains synthetic intervals;
-`rsid-ensembl` requires a real contact address before a live cache miss. The
+`rsid-ensembl` and `rsid-myvariant` require a real contact address before a live cache miss. The
 companion CLI provides `list`, `keys`, `init`, `check`, `dry-run`, and `run`.
 See [Data linking](datalinking.md) for commands and current limits. There is no
 `--merge-links` in this initial implementation.
@@ -128,6 +128,8 @@ compatibility. Use the three explicit selectors.
 | `--filter-oracle` | `auto`, `bcftools`, `cyvcf2` | `auto` | FILTER-field oracle |
 | `--validation-queries` | query ids, or `core` / `preflight` / `all` | all | Run only these queries. A subset reports `TIMING_ONLY` rather than a validation verdict, because the PASS decision needs the whole set; each selected query is still compared against the VCF oracle, so a disagreement still fails the run. Use it to measure retrieval cost for one question without paying for the rest |
 | `--shacl-shapes` | path | off | Independent structural layer via `pyshacl`; in-memory, so not for cohort scale |
+| `--shacl-max-triples` | N | 50,000,000 | Skip the shape layer, and record the skip, when the decoded graph exceeds N triples; `0` disables the gate. The gate reads the decoded graph, not the artifact it arrived in |
+| `--node-heap-mb` | MB | Node's own | V8 old-space ceiling for the Comunica-backed engines (`comunica`, `hdt`, `cottas`); Node does not size its heap from the machine |
 | `--strict-conformance` | — | off | Promote a missing-token conformance anomaly from report to failure |
 | `--validation-query-timeout` | seconds | 3600 | Per-query timeout, every engine |
 | `--qlever-memory-gb` | N | 4 | QLever index and server memory budget |

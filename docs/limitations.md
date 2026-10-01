@@ -246,8 +246,10 @@ none is currently implemented.
 
 **Data linking is an initial implementation.** Optional plug-ins can produce
 separate linksets through token joins, GFF3 intervals or a guarded live session.
-The gene example is synthetic; allele normalization and automatic plug-in
-validation are not implemented. See [`datalinking.md`](datalinking.md) for the
+The gene example is synthetic. The allele join (`spdi`) expresses alleles as
+the file writes them and does not normalise them against the reference, so
+inputs must be normalised the same way first. Automatic plug-in validation is
+not implemented. See [`datalinking.md`](datalinking.md) for the
 implemented contract and [`datalinking-design.md`](datalinking-design.md) for
 the remaining proposal. The base graph remains a faithful, separate artifact.
 
@@ -268,10 +270,11 @@ record what an artifact was permitted to contain. Three consequences today:
 
 The plan is [`privacy-policy-design.md`](privacy-policy-design.md), which is
 explicit that what it offers is *governed release*, not anonymization. Its first
-slice exists as a demonstrator, [`vcf-rdfizer-policy`](policy-demonstrator.md)
-v0.1.0: ODRL policies on files and on declared graph selections (region and
-variant ship; others are Turtle declarations), verified release views, in
-memory and after conversion. It changes none of the points above for a
+slice exists as [`vcf-rdfizer-policy`](policy-demonstrator.md) v0.2.0: ODRL
+policies on files and on declared graph selections (region, variant and linked
+selectors ship; others are Turtle declarations), verified release views, after
+conversion, in memory or against a SPARQL endpoint (evaluated up to a whole
+genome). It changes none of the points above for a
 graph produced by a normal conversion.
 
 **No clinical claims.** The tool transcribes a VCF. It does not interpret,

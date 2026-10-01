@@ -91,13 +91,16 @@ closing either one will *fail* the mutation harness until
 
 An initial implementation now connects the graph through declarative,
 distributable linker plug-ins, with examples of all three tiers: dbSNP token
-links, a synthetic GFF3 interval bundle, and an Ensembl API resolver.
+links, GFF3 interval bundles (synthetic, and Ensembl's gene annotation), SPDI
+allele identity, and two live API resolvers (Ensembl, MyVariant.info).
 
 Full design, including the three join strategies, the three plugin tiers, the
 network safeguards, the provenance model and the build order, is in
 [`datalinking-design.md`](datalinking-design.md). The implemented contract and
-commands are in [`datalinking.md`](datalinking.md). Allele joins/normalization,
-link merging, and plug-in validation/mutation auto-discovery remain planned;
+commands are in [`datalinking.md`](datalinking.md). The allele join exists
+(`spdi`, over pre-normalised inputs). Normalisation inside the join (canonical
+SPDI, GA4GH VRS), link merging, and plug-in validation/mutation auto-discovery
+remain planned;
 the manifest vocabulary is provisional.
 
 The hardest part is not the plugin system — it is allele normalization
@@ -142,9 +145,9 @@ predicate, sample, genomic region, declared field or pattern), compiled to a
 release plan and enforced at the cheapest available point in the existing
 pipeline — TSV pre-filtering, emitter-time filtering, or a post-hoc pass.
 Full design in [`privacy-policy-design.md`](privacy-policy-design.md). The first
-slice, a v0.1.0 demonstrator over single-sample fixtures, is specified in
-[`policy-demonstrator.md`](policy-demonstrator.md); its §10 maps later versions
-onto the full design's build order.
+slice, now v0.2.0 and evaluated on single-sample real genomes up to a whole
+genome, is specified in [`policy-demonstrator.md`](policy-demonstrator.md); its
+§10 maps later versions onto the full design's build order.
 
 Two findings from that design are worth surfacing here because they affect work
 outside it:

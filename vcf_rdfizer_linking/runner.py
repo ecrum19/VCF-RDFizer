@@ -17,7 +17,7 @@ import time
 from . import Link, LinkKey, LinkerContext
 from .inputs import Source
 from .manifest import VCFL, absolute_iri, template_object
-from .reference import IntervalIndex, acquire_reference, check_assembly
+from .reference import acquire_reference, check_assembly, load_reference_index
 from .session import CachedSession, NetworkPolicy, atomic_bytes
 
 # Re-exported from .reference, which has no rdflib dependency, so the CLI can
@@ -48,6 +48,36 @@ ASSERTION_BASIS = {
     2: "coordinate-interval: matched against a digest-pinned reference",
     3: "service-resolution: resolved against a live service, response digest recorded",
 }
+#: An AlleleJoin is tier 2 as well (it has a pinned reference), but it asserts
+#: something different: the SPDI expression is computed from the record's own
+#: CHROM/POS/REF/ALT through a digest-pinned sequence map. Records normalised
+#: the same way get the same identifier; nothing checks REF against the
+#: reference sequence, so the link is not counted as verified.
+ALLELE_BASIS = ("allele-expression: SPDI computed from CHROM/POS/REF/ALT through a digest-pinned "
+                "sequence map; REF not checked against the reference sequence")
+BASES = re.compile(r"[ACGTN]+")
+
+
+def assertion_basis(manifest):
+    return ALLELE_BASIS if manifest.strategy == "allele" else ASSERTION_BASIS.get(manifest.tier, "unspecified")
+
+
+def minimal_allele(pos, ref, alt):
+    """(0-based position, deleted, inserted) with shared bases trimmed.
+
+    The shared suffix goes first, then the shared prefix, which is the order
+    that keeps a left-aligned VCF indel left-aligned: AAA>AA at POS p is a
+    deletion of the A at 0-based p-1, not of the last A. Returns None when REF
+    equals ALT. This is SPDI's trimmed form, not NCBI's canonical (fully
+    justified) form, which needs the reference sequence.
+    """
+    while ref and alt and ref[-1] == alt[-1]:
+        ref, alt = ref[:-1], alt[:-1]
+    shared = 0
+    while shared < min(len(ref), len(alt)) and ref[shared] == alt[shared]:
+        shared += 1
+    ref, alt = ref[shared:], alt[shared:]
+    return None if not ref and not alt else (pos - 1 + shared, ref, alt)
 
 
 def keys_for(record, manifest):
@@ -62,6 +92,22 @@ def keys_for(record, manifest):
             value = values[0] if values else "."
         return [LinkKey(token=token) for token in dict.fromkeys(value.split(manifest.split_on))
                 if token and token != "." and re.fullmatch(manifest.accept, token)]
+    if manifest.strategy == "allele":
+        # One key per ALT with explicit bases; symbolic, breakend, * and . have
+        # no allele sequence to express.
+        ref = record.ref.upper()
+        if not BASES.fullmatch(ref):
+            return []
+        try:
+            pos = int(record.pos)
+        except ValueError as exc:
+            raise ValueError(f"Invalid POS on {record.record}: {record.pos!r}") from exc
+        keys = []
+        for alt in dict.fromkeys(record.alt.upper().split(",")):
+            allele = minimal_allele(pos, ref, alt) if BASES.fullmatch(alt) else None
+            if allele:
+                keys.append(LinkKey(chrom=record.chrom, start=allele[0], token=f"{allele[1]}:{allele[2]}"))
+        return keys
     # POS and GFF3 intervals are both 1-based closed. Explicit REF spans only;
     # END, symbolic alleles and breakends require a different coordinate policy.
     if not re.fullmatch(r"[ACGTNacgtn]+", record.ref) or any(
@@ -74,6 +120,20 @@ def keys_for(record, manifest):
     if start < 1 or record.chrom in {"", "."}:
         raise ValueError(f"Invalid interval key on {record.record}")
     return [LinkKey(chrom=record.chrom, start=start, end=start + len(record.ref) - 1)]
+
+
+def spdi_links(batch, sequences, manifest):
+    """An SPDI link per key on a mapped sequence; unmapped contigs link nothing."""
+    for key in batch:
+        sequence = sequences.resolve(key.chrom)
+        if sequence is None:
+            continue
+        accession, length = sequence
+        deleted = key.token.split(":", 1)[0]
+        if key.start + len(deleted) > length:
+            raise ValueError(f"{key.chrom}:{key.start + 1} lies beyond {accession} ({length} bp); "
+                             "is the input on the manifest's assembly?")
+        yield Link(key, template_object(manifest, f"{accession}:{key.start}:{key.token}"))
 
 
 def load_resolver(manifest):
@@ -139,8 +199,8 @@ def run_linkers(records, manifests, output: Path | None, *, cache_dir=DEFAULT_CA
                  # not, and nothing checks that the identifier is still correct
                  # for this position and these alleles. Recording the basis
                  # keeps a strong predicate from reading as a verified claim.
-                 "assertion_basis": ASSERTION_BASIS.get(manifest.tier, "unspecified"),
-                 "assertion_verified": manifest.tier == 2,
+                 "assertion_basis": assertion_basis(manifest),
+                 "assertion_verified": manifest.tier == 2 and manifest.strategy == "interval",
                  "status": "pending", "wall_seconds": 0}
         if manifest.tier == 3:
             stats["resolver_sha256"] = hashlib.sha256((manifest.directory / "resolver.py").read_bytes()).hexdigest()
@@ -190,7 +250,10 @@ def run_linkers(records, manifests, output: Path | None, *, cache_dir=DEFAULT_CA
                     try:
                         if manifest.tier == 2:
                             path = acquire_reference(manifest.reference, cache_dir, offline=offline, dry_run=dry_run, stats=current)
-                            reference_index = IntervalIndex(path, manifest.reference)
+                            aliases = manifest.contig_aliases and load_reference_index(acquire_reference(
+                                manifest.contig_aliases, cache_dir, offline=offline, dry_run=dry_run, stats=current),
+                                manifest.contig_aliases)
+                            reference_index = load_reference_index(path, manifest.reference, aliases)
                         if manifest.tier == 3:
                             current["batches"] = (current["unique_keys"] + manifest.batch_size - 1) // manifest.batch_size
                             current["max_requests_per_run"] = manifest.max_requests
@@ -208,6 +271,8 @@ def run_linkers(records, manifests, output: Path | None, *, cache_dir=DEFAULT_CA
                             encoded = dict(zip(batch, raw_keys))
                             if manifest.tier == 1:
                                 links = (Link(key, template_object(manifest, key.token)) for key in batch)
+                            elif manifest.strategy == "allele":
+                                links = spdi_links(batch, reference_index, manifest)
                             elif manifest.tier == 2:
                                 links = (Link(key, template_object(manifest, identifier)) for key in batch for identifier in reference_index.overlaps(key))
                             else:

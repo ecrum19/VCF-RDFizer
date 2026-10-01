@@ -32,6 +32,7 @@ class Profile:
     iri_subtree: bool = False
     unit_query: str = None
     selectors: dict = field(default_factory=dict)   # type IRI -> SelectorType
+    node_space: tuple = ()     # IRI prefixes of the resources the graph mints (for streaming)
 
 
 def variable(prop: str) -> str:
@@ -71,6 +72,7 @@ def load_profile(sources=(), extra_graph=None) -> Profile:
         iri_subtree=bool(one(node, "iriSubtree", lambda v: v.toPython())),
         unit_query=_checked(one(node, "unitQuery"), f"<{node}> vcfp:unitQuery", ("resource", "group")),
         selectors=selectors,
+        node_space=tuple(sorted(str(v) for v in graph.objects(node, rdflib.URIRef(VCFP + "nodeSpace")))),
     )
 
 

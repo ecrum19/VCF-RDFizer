@@ -22,7 +22,9 @@ vcfp:SelectorType a rdfs:Class ;
     rdfs:comment "A kind of selection, declared by a SPARQL SELECT that projects ?resource." .
 vcfp:query a rdf:Property ; rdfs:domain vcfp:SelectorType .
 vcfp:parameter a rdf:Property ; rdfs:domain vcfp:SelectorType ;
-    rdfs:comment "A required property of the selector node, bound to the query variable named after its local name." .
+    rdfs:comment "A required property of the selector node, bound to the query variable named after its local name. An RDF list binds a set of values." .
+vcfp:predicate a rdf:Property ; rdfs:comment "LinkedSelector: the link predicate to follow." .
+vcfp:entities a rdf:Property ; rdfs:comment "LinkedSelector: an RDF list of the entities linked to." .
 vcfp:violations a rdf:Property ; rdfs:domain vcfp:SelectorType ;
     rdfs:comment "A SPARQL SELECT whose rows are reasons the selector cannot be applied; any row stops evaluation." .
 
@@ -35,6 +37,8 @@ vcfp:iriSubtree a rdf:Property ; rdfs:domain vcfp:Profile ;
     rdfs:comment "When true, a withheld resource also withholds every IRI beneath it (after '#' or '/')." .
 vcfp:unitQuery a rdf:Property ; rdfs:domain vcfp:Profile ;
     rdfs:comment "A SPARQL SELECT of the reported units: ?resource and ?group required." .
+vcfp:nodeSpace a rdf:Property ; rdfs:domain vcfp:Profile ;
+    rdfs:comment "An IRI prefix of the resources the graph mints. Streaming evaluation treats an object IRI with this prefix as a node of the graph." .
 
 # --- Release views ---------------------------------------------------------------
 vcfp:ReleaseView a rdfs:Class ;

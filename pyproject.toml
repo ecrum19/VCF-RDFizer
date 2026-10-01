@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vcf-rdfizer"
-version = "3.2.0"
+version = "3.3.0"
 description = "Docker-first VCF to RDF conversion targeting the VCF Core vocabulary, with compressed queryable representations (HDT, COTTAS), semantic validation, and data linking"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -27,6 +27,7 @@ classifiers = [
 dependencies = [
   "rich>=13.7.0",
   "rdflib>=7.0.0",
+  "pyoxigraph>=0.3.18",
 ]
 
 [project.urls]
@@ -52,7 +53,7 @@ include-package-data = true
 
 [tool.setuptools.package-data]
 "vcf_rdfizer_data.rules" = ["default_rules.ttl"]
-"vcf_rdfizer_data.linkers" = ["*/linker.ttl", "*/resolver.py", "*/genes.gff3", "*/README.md"]
+"vcf_rdfizer_data.linkers" = ["*/linker.ttl", "*/resolver.py", "*/genes.gff3", "*/*.tsv", "*/README.md"]
 "vcf_rdfizer_data.policy" = ["*.ttl"]
 # Vendored from the published vocabulary so SHACL validation works from an
 # installed package with no separate checkout. Digests are pinned in
@@ -61,4 +62,23 @@ include-package-data = true
   "VOCABULARY_PROVENANCE.json",
   "shacl/*.shacl.ttl",
   "ontology/*.ttl",
+]
+
+[tool.coverage.run]
+# Measure this project only.
+#
+# Without this, coverage measures whatever the interpreter executes, which
+# includes scripts the tests themselves write into a temporary directory and
+# import -- the linking tests write a resolver.py, run it, and let the
+# TemporaryDirectory clean it up. By the time `coverage xml` runs, that file is
+# gone, and coverage xml fails with "No source for code: .../resolver.py"
+# and exit 1, on any platform.
+#
+# Scoping to the repository is the honest fix rather than ignoring the error:
+# a throwaway script in a temp directory is not this project's code and was
+# never meant to be in the coverage report.
+source = ["."]
+omit = [
+  "*/.venv/*",
+  "*/site-packages/*",
 ]

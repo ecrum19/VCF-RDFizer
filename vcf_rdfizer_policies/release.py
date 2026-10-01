@@ -2,8 +2,9 @@
 
 `evaluate` produces the view (engine.view), a decision for every reporting unit
 the profile names, and a decision for each unit group. `write_release` writes
-them with a manifest. `attach` writes the policies into the data instead, so
-they can be queried alongside it.
+them with a manifest. `evaluate_stream` does the same against a SPARQL endpoint,
+streaming the view straight from the N-Triples inputs to view.nt.gz. `attach`
+writes the policies into the data instead, so they can be queried alongside it.
 """
 
 from dataclasses import dataclass, field
@@ -13,7 +14,7 @@ import json
 from pathlib import Path
 
 from . import DISCLOSURE_MODEL, ODRL, VCFP, VERSION
-from .engine import check_preconditions, evaluation, select, units, view
+from .engine import check_preconditions, evaluation, select, stream_view, units, view
 from .policy import Direct
 
 
@@ -22,6 +23,7 @@ class Release:
     request: object
     view: list = field(default_factory=list)       # released (s, p, o)
     triples_withheld: int = 0
+    triples_released: int = 0                      # counted when the view is streamed, not held
     units: list = field(default_factory=list)      # (unit dict, released, reason)
     groups: dict = field(default_factory=dict)     # group IRI -> (released, reason)
     duties: tuple = ()                             # of the permissions that released something
@@ -31,16 +33,49 @@ def evaluate(graph, rules, request, profile, vocabulary) -> Release:
     decided = evaluation(graph, rules, request, profile, vocabulary)
     release = Release(request)
     release.view, release.triples_withheld = view(graph, decided)
-    for unit in units(graph, profile):
-        release.units.append((unit, *decided.decide(unit["resource"])))
-    for group in sorted({u["group"] for u, _, _ in release.units}, key=str):
-        release.groups[str(group)] = decided.decide(group)
-    released_subjects = {s for s, _, _ in release.view}
+    release.triples_released = len(release.view)
+    _decide_units(release, decided, graph, profile)
+    released_subjects = {str(s) for s, _, _ in release.view}
     release.duties = tuple(sorted({
         duty for rule, owned in decided.binding if rule.kind == "permission"
         and any(decided.partition.contains(owned, s) for s in released_subjects)
         for duty in rule.duties}))
     return release
+
+
+def evaluate_stream(store, sources, rules, request, profile, vocabulary, out_dir: Path, *,
+                    policies, digest) -> Release:
+    """Evaluate against `store` (a SPARQL endpoint over `sources`) and write the release.
+
+    The view is streamed from the N-Triples `sources` to view.nt.gz. Duties are
+    those of the permissions that released a reporting unit or group.
+    """
+    decided = evaluation(store, rules, request, profile, vocabulary)
+    release = Release(request)
+    _decide_units(release, decided, store, profile)
+    out_dir = _new_directory(out_dir)
+    release.triples_released, release.triples_withheld = stream_view(
+        sources, decided, profile.node_space, out_dir / "view.nt.gz")
+    reasons = {why for _, ok, why in release.units if ok} | {why for ok, why in release.groups.values() if ok}
+    release.duties = tuple(sorted({duty for rule, _ in decided.binding if rule.kind == "permission"
+                                   and f"released: {rule.label}" in reasons for duty in rule.duties}))
+    write_reports(release, out_dir, policies=policies, digest=digest)
+    return release
+
+
+def _decide_units(release, decided, source, profile) -> None:
+    for unit in units(source, profile):
+        release.units.append((unit, *decided.decide(unit["resource"])))
+    for group in sorted({u["group"] for u, _, _ in release.units}):
+        release.groups[group] = decided.decide(group)
+
+
+def _new_directory(out_dir: Path) -> Path:
+    out_dir = Path(out_dir)
+    if out_dir.exists() and any(out_dir.iterdir()):
+        raise FileExistsError(f"{out_dir} is not empty; a release is never overwritten")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir
 
 
 def summary(release) -> dict:
@@ -56,7 +91,7 @@ def summary(release) -> dict:
         "groups": counts,
         "records_released": sum(ok for _, ok, _ in release.units),
         "records_withheld": sum(not ok for _, ok, _ in release.units),
-        "triples_released": len(release.view),
+        "triples_released": release.triples_released,
         "triples_withheld": release.triples_withheld,
         "reasons": reasons,
     }
@@ -66,17 +101,17 @@ def write_release(release, out_dir: Path, *, policies, digest: str) -> None:
     """Write view.nt, decisions.csv, summary.json and manifest.ttl into a new directory."""
     import rdflib
 
-    out_dir = Path(out_dir)
-    if out_dir.exists() and any(out_dir.iterdir()):
-        raise FileExistsError(f"{out_dir} is not empty; a release is never overwritten")
-    out_dir.mkdir(parents=True, exist_ok=True)
-
+    out_dir = _new_directory(out_dir)
     graph = rdflib.Graph()
     for triple in release.view:
         graph.add(triple)
     lines = sorted(line for line in graph.serialize(format="nt").splitlines() if line.strip())
     (out_dir / "view.nt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    write_reports(release, out_dir, policies=policies, digest=digest)
 
+
+def write_reports(release, out_dir: Path, *, policies, digest: str) -> None:
+    """decisions.csv, summary.json and manifest.ttl, beside whichever view was written."""
     columns = list(release.units[0][0]) if release.units else ["resource", "group"]
     with (out_dir / "decisions.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
@@ -141,7 +176,7 @@ def attach(graph, policy_graph, rules) -> dict:
     counts = {}
     for rule in rules:
         policy = rdflib.URIRef(rule.policy)
-        chosen = selections[rule.target]
+        chosen = [rdflib.URIRef(r) for r in sorted(selections[rule.target])]
         asset = None if isinstance(rule.target, Direct) else rdflib.URIRef(rule.target.asset)
         for resource in chosen:
             graph.add((resource, has_policy, policy))
