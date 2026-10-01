@@ -236,6 +236,28 @@ class RdfInputs(Case):
         rows = list(read_rdf(self.nt(self.RECORD)))
         self.assertEqual([r.chrom for r in rows if isinstance(r, Record)], ["1"])
 
+    def test_a_syntax_error_on_the_first_line_is_translated_too(self):
+        """Parsing is lazy, so a bad first line fails on the peek, not in bulk_extend.
+
+        Both points translate the parser's SyntaxError; this is the one that
+        only a malformed opening line reaches.
+        """
+        with self.assertRaisesRegex(ValueError, "Not valid N-Triples"):
+            list(read_rdf(self.nt("<file://a.vcf> no brackets .\n" + self.RECORD)))
+
+    def test_the_pre_0_4_parse_signature_still_works(self):
+        """pyoxigraph < 0.4 has no RdfFormat and takes a MIME string instead.
+
+        Hide RdfFormat and the fallback runs for real -- current pyoxigraph still
+        accepts the legacy positional form -- so this is the shim working, not a
+        mock of it.
+        """
+        import pyoxigraph
+
+        with mock.patch.object(pyoxigraph, "RdfFormat", None):
+            rows = list(read_rdf(self.nt(self.RECORD)))
+        self.assertEqual([r.chrom for r in rows if isinstance(r, Record)], ["1"])
+
     def test_refusals(self):
         with self.assertRaisesRegex(ValueError, "existing .nt or .nt.gz"):
             list(read_rdf(self.nt(self.RECORD, "in.ttl")))
