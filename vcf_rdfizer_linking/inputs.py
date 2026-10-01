@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 import gzip
+import itertools
 from pathlib import Path
 import tempfile
 
@@ -173,9 +174,28 @@ def read_rdf(path: Path):
             triples = ox.parse(handle, format=ox.RdfFormat.N_TRIPLES)
         except AttributeError:                      # pyoxigraph < 0.4
             triples = ox.parse(handle, "application/n-triples")
+        # bulk_extend refuses an empty batch on some platforms --
+        # "Invalid argument: ingestion arg list is empty" from the Rust bulk
+        # loader, seen on Linux and not on macOS with the same pyoxigraph
+        # 0.5.11. An input whose triples are all filtered out is legitimate,
+        # though: it is a graph that simply carries no VCF vocabulary, and the
+        # caller should get read_store's "No VCFFile/hasRecord" rather than a
+        # RuntimeError from the loader. So pull one triple first and only load
+        # when there is something to load.
+        #
+        # Parsing is lazy, so a syntax error can surface either on that first
+        # pull or during the bulk load; both are translated.
+        stream = wanted(triples)
         try:
-            store.bulk_extend(wanted(triples))
+            first = next(stream)
+        except StopIteration:
+            first = None
         except SyntaxError as error:
             raise ValueError(f"Not valid N-Triples: {error}") from None
+        if first is not None:
+            try:
+                store.bulk_extend(itertools.chain((first,), stream))
+            except SyntaxError as error:
+                raise ValueError(f"Not valid N-Triples: {error}") from None
         yield from read_store(_OxigraphStore(store))
         del store

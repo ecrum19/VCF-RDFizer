@@ -197,6 +197,45 @@ class RdfInputs(Case):
         rows = list(read_rdf(self.nt(self.RECORD + genotype)))
         self.assertEqual([r.chrom for r in rows if isinstance(r, Record)], ["1"])
 
+    def test_a_graph_with_no_vcf_triples_never_reaches_the_bulk_loader(self):
+        """The empty batch must be refused by us, not by the Rust loader.
+
+        pyoxigraph's bulk_extend rejects an empty batch with "Invalid argument:
+        ingestion arg list is empty" on Linux and accepts it on macOS, same
+        0.5.11. CI caught this and local development could not, so the contract
+        is pinned here rather than left to whichever platform runs the suite:
+        an input whose triples are all filtered out is a graph that simply
+        carries no VCF vocabulary, and the caller is owed read_store's
+        ValueError about it -- not a RuntimeError from the loader.
+        """
+        import pyoxigraph as ox
+
+        batches = []
+        original = ox.Store.bulk_extend
+
+        def spy(self, quads):
+            items = list(quads)
+            batches.append(len(items))
+            return original(self, items)
+
+        with mock.patch.object(ox.Store, "bulk_extend", spy):
+            with self.assertRaises(ValueError) as caught:
+                list(read_rdf(self.nt('<urn:a> <urn:b> "c" .\n')))
+
+        self.assertIn("No VCFFile/hasRecord", str(caught.exception))
+        self.assertNotIn(0, batches,
+                         "bulk_extend was handed an empty batch; on Linux that "
+                         "raises RuntimeError instead of the intended ValueError")
+
+    def test_the_first_kept_triple_is_not_dropped(self):
+        """The empty check pulls one triple off the stream; it must go back.
+
+        Guards the obvious way to get the fix wrong -- loading the remainder
+        and silently losing the triple that was peeked at.
+        """
+        rows = list(read_rdf(self.nt(self.RECORD)))
+        self.assertEqual([r.chrom for r in rows if isinstance(r, Record)], ["1"])
+
     def test_refusals(self):
         with self.assertRaisesRegex(ValueError, "existing .nt or .nt.gz"):
             list(read_rdf(self.nt(self.RECORD, "in.ttl")))
