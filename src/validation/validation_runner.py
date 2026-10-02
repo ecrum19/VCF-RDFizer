@@ -28,6 +28,7 @@ import csv
 import gzip
 import hashlib
 import json
+import multiprocessing
 import os
 import platform
 import re
@@ -434,6 +435,11 @@ VCFC = vocab.VCFC_NAMESPACE
 RDF_TYPE = vocab.RDF_TYPE_URI
 
 
+def _census_iri(name: str) -> str:
+    """A counter key as an IRI: a vcfc local name, or already a full IRI (FALDO)."""
+    return name if "://" in name else f"{VCFC}{name}"
+
+
 def _nonzero(counts: dict[str, int]) -> dict[str, int]:
     return {key: value for key, value in counts.items() if value}
 
@@ -451,6 +457,18 @@ DIGEST_SEPARATOR = "\u001f"
 #: an accidental collision of a *changed* record with its own bucket unlikely
 #: to hide anything, while keeping the result fixed-size for any graph.
 DIGEST_BUCKET_CHARS = 2
+
+
+def digest_qual(value: str) -> str:
+    """QUAL as q11_record_digest.rq hashes it: no trailing fractional zeros.
+
+    The graph types QUAL as xsd:decimal, and engines spell a decimal differently
+    -- QLever canonically ("30.1"), others lexically ("30.10") -- so both sides
+    drop the zeros and the digest compares values. Integers and "." are kept.
+    """
+    if re.search(r"\.[0-9]*0$", value):
+        return re.sub(r"\.?0+$", "", value)
+    return value
 
 
 def record_digest_bucket(fields: list[str]) -> str:
@@ -606,6 +624,106 @@ def _meta_values(raw: str | None) -> list[str]:
     return [item.strip() for item in inner.split(",") if item.strip()]
 
 
+#: FALDO terms are counted by full IRI: CIPOS and CIEND intervals are
+#: faldo:InRangePosition resources, not vcfc ones.
+FALDO_IN_RANGE_POSITION = f"{vocab.FALDO_NAMESPACE}InRangePosition"
+FALDO_BEGIN = f"{vocab.FALDO_NAMESPACE}begin"
+FALDO_END = f"{vocab.FALDO_NAMESPACE}end"
+
+
+def _count_sv_layer(
+    classes: Counter, predicates: Counter, *, alleles: list, info_map: dict,
+    pos: str, version: Any,
+) -> None:
+    """Count the SV carriers ``_emit_sv_layer`` attaches to a record's ALT alleles.
+
+    Every condition is the emitter's: a carrier exists only when the record
+    supplies what its shape needs. A repeated EVENT is one resource in the graph
+    however many alleles name it, so events are counted as distinct triples.
+    Tandem repeats are not modelled yet (see KNOWN_UNMODELLED in the tests).
+    """
+    alts = [allele for allele in alleles if allele.index >= 1]
+    for key, predicate in vocab.SV_FLAG_INFO_KEYS.items():
+        if key in info_map:
+            predicates[predicate] += len(alts)
+    for key, predicate in vocab.SV_ALLELE_INFO_KEYS.items():
+        if info_map.get(key) is not None:
+            predicates[predicate] += min(len(vocab.split_value_items(info_map[key])), len(alts))
+    if info_map.get("SVCLAIM") is not None:
+        claims = vocab.split_value_items(info_map["SVCLAIM"])[: len(alts)]
+        predicates["svClaim"] += sum(
+            1 for claim in claims if claim.strip().upper() in vocab.SV_CLAIMS
+        )
+
+    # gVCF reference blocks: END on a <*>/<NON_REF> allele.
+    end = info_map.get("END")
+    if end is not None and end.lstrip("-").isdigit():
+        blocks = sum(1 for allele in alts if allele.kind == "UnspecifiedAllele")
+        classes["ReferenceBlock"] += blocks
+        predicates["endPosition"] += blocks
+        predicates["isReferenceBlockStart"] += blocks
+        if pos.isdigit():
+            predicates["referenceBlockLength"] += blocks
+
+    event, event_type = info_map.get("EVENT"), info_map.get("EVENTTYPE")
+    if event and event_type and version.event_types:
+        names = vocab.split_value_items(event)
+        types = vocab.split_value_items(event_type)
+        if not version.events_per_alt:
+            names, types = names[:1], types[:1]
+        events, typed, links = set(), set(), set()
+        for offset, name in enumerate(names):
+            code = types[offset] if offset < len(types) else None
+            individual = vocab.EVENT_TYPES.get(code.strip().upper()) if code else None
+            if vocab.is_missing(name) or individual is None:
+                continue
+            if version.events_per_alt and offset >= len(alts):
+                continue
+            events.add(name)
+            typed.add((name, individual))
+            links.add((offset + 1 if version.events_per_alt else 0, name))
+        classes["VariantEvent"] += len(events)
+        predicates["eventType"] += len(typed)
+        predicates["inEvent"] += len(links)
+
+    for key in (*vocab.FALDO_INTERVAL_INFO_KEYS, *vocab.CONFIDENCE_INTERVAL_INFO_KEYS):
+        if info_map.get(key) is None or version.tuple_arity(key) is None:
+            continue
+        items = vocab.split_value_items(info_map[key])
+        for offset in range(len(alts)):
+            pair = offset if version.tuples_per_alt else 0
+            if pair * 2 + 1 >= len(items):
+                break
+            if key in vocab.FALDO_INTERVAL_INFO_KEYS:
+                predicates[vocab.FALDO_INTERVAL_INFO_KEYS[key]] += 1
+                classes[FALDO_IN_RANGE_POSITION] += 1
+                predicates[FALDO_BEGIN] += 1
+                predicates[FALDO_END] += 1
+            else:
+                predicates[vocab.CONFIDENCE_INTERVAL_INFO_KEYS[key]] += 1
+                classes["ConfidenceInterval"] += 1
+                predicates["ciLower"] += 1
+                predicates["ciUpper"] += 1
+
+
+def _count_phase_set(counts: Counter, fields: dict[str, str]) -> None:
+    """Count one sample call's phase set exactly as ``_emit_phase_set`` emits it."""
+    identifier, name = fields.get("PS"), fields.get("PSL")
+    if vocab.is_missing(identifier) and vocab.is_missing(name):
+        return
+    counts["PhaseSet"] += 1
+    counts["inPhaseSet"] += 1
+    if not vocab.is_missing(identifier):
+        counts["phaseSetId"] += 1
+    if not vocab.is_missing(name):
+        counts["phaseSetName"] += 1
+    ordinal = fields.get("PSO")
+    if not vocab.is_missing(ordinal) and ordinal.lstrip("-").isdigit():
+        counts["phaseSetOrdinal"] += 1
+    if not vocab.is_missing(fields.get("PSQ")):
+        counts["phaseSetQuality"] += 1
+
+
 def emitted_record_counters(
     rows: list[list[str]],
     samples: list[str],
@@ -643,6 +761,7 @@ def emitted_record_counters(
     format_items = format_item_alleles = format_tuple_items = 0
     format_item_predicates: Counter[str] = Counter()
     genotypes = genotype_calls = called_alleles = 0
+    phase_set_counts: Counter[str] = Counter()
 
     for row in rows:
         chrom = row[0] if len(row) > 0 else ""
@@ -705,6 +824,11 @@ def emitted_record_counters(
                     predicates["forGenotypeIndex"] += 1
                 elif link.gt_allele_index is not None:
                     predicates["forGTAlleleIndex"] += 1
+        if entries and alt_count:
+            _count_sv_layer(
+                classes, predicates, alleles=alleles, info_map=dict(entries),
+                pos=row[1] if len(row) > 1 else "", version=version,
+            )
 
         if samples:
             format_keys = (row[8].split(":") if len(row) > 8 and row[8] else [])
@@ -746,6 +870,19 @@ def emitted_record_counters(
                                 format_item_predicates["forGenotypeIndex"] += 1
                             elif link.gt_allele_index is not None:
                                 format_item_predicates["forGTAlleleIndex"] += 1
+            # A phase set is emitted per sample call from its non-empty PS/PSL/
+            # PSO/PSQ cells, in the expanded profile only.
+            phase_keys = [
+                (index, key) for index, key in enumerate(format_keys)
+                if key in vocab.PHASE_SET_FORMAT_KEYS
+            ]
+            if phase_keys:
+                for payload in payloads:
+                    fields = payload.split(":") if payload else []
+                    _count_phase_set(phase_set_counts, {
+                        key: fields[index] for index, key in phase_keys
+                        if index < len(fields) and fields[index]
+                    })
             if "GT" in format_keys:
                 gt_index = format_keys.index("GT")
                 for payload in payloads:
@@ -791,6 +928,10 @@ def emitted_record_counters(
         for name in ("hasAlleleCall", "callIndex", "isNoCall"):
             genotype_predicates[name] += genotype_calls
         genotype_predicates["calledAllele"] += called_alleles
+    # Phase sets travel with the expanded sample layer, as genotypes do.
+    if phase_set_counts:
+        genotype_classes["PhaseSet"] += phase_set_counts.pop("PhaseSet")
+        genotype_predicates.update(phase_set_counts)
 
     format_item_classes: Counter[str] = Counter()
     if format_items:
@@ -1070,9 +1211,11 @@ def expected_census(
         # The value items and the SV carriers travel with the structured INFO
         # representation. The allele layer does not -- it is merged below.
         for class_name, count in parser["emittedRecordClasses"].items():
-            classes[f"{VCFC}{class_name}"] = classes.get(f"{VCFC}{class_name}", 0) + count
+            iri = _census_iri(class_name)
+            classes[iri] = classes.get(iri, 0) + count
         for name, count in parser["emittedRecordPredicates"].items():
-            predicates[f"{VCFC}{name}"] = predicates.get(f"{VCFC}{name}", 0) + count
+            iri = _census_iri(name)
+            predicates[iri] = predicates.get(iri, 0) + count
 
     # The allele layer is required by whoever joins to it: the structured INFO
     # value items (Number=A/R/G) or the expanded sample layer's calledAllele.
@@ -1474,7 +1617,9 @@ def parse_vcf(
                 f"file://{source_component}#record/"
                 f"{rml_uri_component(str(total_records))}"
             )
-            digest_buckets[record_digest_bucket([record_iri, *columns[:8]])] += 1
+            digest_buckets[record_digest_bucket(
+                [record_iri, *columns[:5], digest_qual(columns[5]), *columns[6:8]]
+            )] += 1
 
             # Structured INFO counts; `typed_value_kind` states the same rule
             # `_typed_field_object` applies in vcf_rdfizer.py.
@@ -2024,18 +2169,19 @@ def merge_shapes_graph(shapes: list[Path]):
     return graph
 
 
-#: pyshacl loads the whole graph into memory, so the shape layer needs a size
-#: gate. This one is in triples rather than bytes, because what pyshacl pays
-#: for is the graph, not the packaging -- see the comment at its call site for
-#: the failure that motivated it.
+#: pyshacl loads its whole data graph into memory, so shapes validated in one
+#: piece -- those with SPARQL constraints, or with --shacl-batch-triples 0 --
+#: need a size gate; batched shapes do not. It is in triples rather than bytes,
+#: because what pyshacl pays for is the graph, not the packaging -- see the
+#: comment at its call site for the failure that motivated it.
 #:
-#: 50M is chosen to sit above the largest graph the published campaign actually
-#: validated with shapes (17.1M triples, the 100,000-record HG005 slice) and
-#: below the one that exhausted 31 GB (170.9M). It is deliberately not derived
-#: from measured bytes-per-triple: rdflib's footprint depends on term sharing
-#: and IRI length, so a constant here is a conservative guard rather than a
-#: prediction, and it is overridable for a machine that can afford more.
-DEFAULT_SHACL_MAX_TRIPLES = 50_000_000
+#: Measured with the core shapes and RDFS inference on a real genome's graph,
+#: pyshacl peaks at about 2.4 GB per million triples (1.26 GB at 0.5M, 4.72 GB
+#: at 2.0M), so 10M is about 24 GB: it fits a 31 GB host, which 58.2M and
+#: 170.9M did not. The published campaign's largest shape-validated graph was
+#: 0.96M. rdflib's footprint depends on term sharing and IRI length, so this is
+#: a conservative guard rather than a prediction; raise it on a larger machine.
+DEFAULT_SHACL_MAX_TRIPLES = 10_000_000
 
 #: Node's V8 heap ceiling for the Comunica-backed endpoints (comunica, hdt,
 #: cottas -- all three go through ComunicaHttpEndpointMixin).
@@ -2082,11 +2228,123 @@ def shacl_exceeds_limit(triple_count: int | None, limit: int | None) -> bool:
     return triple_count > limit
 
 
+#: Shapes are validated a batch of whole records at a time, so pyshacl's memory
+#: is set by the batch rather than the graph. A batch holds its records' triples
+#: and the file-level ones they point at (header, sample set, definitions), which
+#: is everything a node-level constraint can see, so the verdict is the
+#: whole-graph verdict. 0 validates the graph in one piece, as before.
+#:
+#: Time is linear in the batch (155 s at 0.5M triples, 607 s at 2.0M), so small
+#: batches cost nothing in throughput; 0.5M peaks at about 1.3 GB.
+DEFAULT_SHACL_BATCH_TRIPLES = 500_000
+#: Batches are independent and run in parallel; peak memory is about this many
+#: batches at once, so about 5 GB at the defaults.
+DEFAULT_SHACL_WORKERS = min(4, os.cpu_count() or 1)
+
+#: The record, its call and its sample calls -- and everything minted beneath
+#: them -- carry the record's row in their IRI. Anything else is file-level.
+RECORD_SCOPED_IRI = re.compile(r"#(?:record|call|sample)/([0-9]+)")
+
+
+def shapes_are_node_local(shapes: list[Path]) -> bool:
+    """Whether every constraint judges a node from its own neighbourhood.
+
+    A SPARQL-based constraint can compare records with each other -- unique
+    record indices, nondecreasing POS -- which no batch can decide, so shapes
+    using one are validated in one piece and stay under the size gate.
+    """
+    from rdflib.namespace import SH
+
+    try:
+        graph = merge_shapes_graph([shapes] if isinstance(shapes, Path) else list(shapes))
+    except Exception:  # noqa: BLE001 - unparsable: validated whole, which reports it
+        return False
+    return (None, SH.sparql, None) not in graph
+
+
+def shacl_records_per_batch(
+    records: int | None, triples: int | None, batch_triples: int, node_local: bool,
+) -> int | None:
+    """Records per shape batch, or None to validate the graph in one piece."""
+    if not (batch_triples and node_local and records and triples):
+        return None
+    if triples <= batch_triples:
+        return None
+    return max(1, batch_triples * records // triples)
+
+
+def write_shacl_batches(
+    source: Path, workdir: Path, records_per_batch: int
+) -> tuple[Path, list[Path]]:
+    """Split an N-Triples graph into record batches and one file-level context.
+
+    A triple belongs to the record its subject is scoped to or, failing that,
+    its object's (vcfc:hasRecord points from the file to a record). Lines are
+    buffered and appended per batch, so no more than a few files are open.
+    """
+    context_path = workdir / "context.nt"
+    buffers: dict[int, list[str]] = {}
+    buffered = 0
+
+    def flush() -> None:
+        for index, lines in buffers.items():
+            with (workdir / f"batch-{index:06d}.nt").open("a", encoding="utf-8") as handle:
+                handle.writelines(lines)
+        buffers.clear()
+
+    with source.open(encoding="utf-8") as lines, \
+            context_path.open("w", encoding="utf-8") as context:
+        for line in lines:
+            subject, _, rest = line.partition(" ")
+            match = RECORD_SCOPED_IRI.search(subject)
+            if match is None:
+                obj = rest.partition(" ")[2]
+                if obj.startswith("<"):
+                    match = RECORD_SCOPED_IRI.search(obj.partition(">")[0])
+            if match is None:
+                context.write(line)
+                continue
+            buffers.setdefault((int(match.group(1)) - 1) // records_per_batch, []).append(line)
+            buffered += 1
+            if buffered >= 200_000:
+                flush()
+                buffered = 0
+    flush()
+    return context_path, sorted(workdir.glob("batch-*.nt"))
+
+
+def _validate_shacl_task(task: tuple) -> tuple[bool, str]:
+    """Run pyshacl over one data graph: a file-level context plus an optional batch."""
+    from pyshacl import validate as pyshacl_validate
+    from rdflib import Graph
+
+    data_path, batch_path, shapes, ontology = task
+    data = Graph()
+    data.parse(str(data_path), format="nt")
+    if batch_path is not None:
+        data.parse(str(batch_path), format="nt")
+    shacl_graph = str(shapes[0]) if len(shapes) == 1 else merge_shapes_graph(shapes)
+    conforms, _graph, text = pyshacl_validate(
+        data,
+        shacl_graph=shacl_graph,
+        ont_graph=str(ontology) if ontology is not None else None,
+        **({"shacl_graph_format": "turtle"} if isinstance(shacl_graph, str) else {}),
+        ont_graph_format="turtle" if ontology is not None else None,
+        inference="rdfs" if ontology is not None else "none",
+        advanced=True,
+    )
+    return bool(conforms), text
+
+
 def validate_shacl(
     source: Path,
     shapes: Path | list[Path],
     results_dir: Path,
     ontology: Path | None = None,
+    *,
+    records_per_batch: int | None = None,
+    workers: int = DEFAULT_SHACL_WORKERS,
+    scratch_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Validate the graph against SHACL shapes, if pyshacl is available.
 
@@ -2101,14 +2359,16 @@ def validate_shacl(
     violations. Supplying it with RDFS inference is the configuration the
     vocabulary's own tests/validate_shacl.py uses.
 
-    pyshacl loads the graph into memory, so this is opt-in and unsuitable for a
-    cohort-scale aggregate. It is reported as EXECUTION_FAILED rather than a
-    conformance failure when the tool is missing, so an absent optional
-    dependency can never look like a bad graph.
+    pyshacl loads its data graph into memory, so with ``records_per_batch`` the
+    graph is validated a batch of records at a time (see write_shacl_batches),
+    in up to ``workers`` processes; results repeated across batches, such as a
+    file-level node's, are reported once. It is reported as EXECUTION_FAILED
+    rather than a conformance failure when the tool is missing, so an absent
+    optional dependency can never look like a bad graph.
     """
     report_path = results_dir / "shacl.json"
     try:
-        from pyshacl import validate as pyshacl_validate
+        import pyshacl  # noqa: F401 - presence check; the tasks import it
     except ImportError as error:
         result = {
             "status": "EXECUTION_FAILED",
@@ -2120,22 +2380,25 @@ def validate_shacl(
         return result
 
     started = time.monotonic()
+    shapes_list = [shapes] if isinstance(shapes, Path) else list(shapes)
     try:
-        shapes_list = [shapes] if isinstance(shapes, Path) else list(shapes)
-        shacl_graph = (
-            str(shapes_list[0]) if len(shapes_list) == 1
-            else merge_shapes_graph(shapes_list)
-        )
-        conforms, _graph, text = pyshacl_validate(
-            str(source),
-            shacl_graph=shacl_graph,
-            ont_graph=str(ontology) if ontology is not None else None,
-            data_graph_format="nt",
-            **({"shacl_graph_format": "turtle"} if isinstance(shacl_graph, str) else {}),
-            ont_graph_format="turtle" if ontology is not None else None,
-            inference="rdfs" if ontology is not None else "none",
-            advanced=True,
-        )
+        with tempfile.TemporaryDirectory(
+            dir=scratch_dir or results_dir, prefix="shacl-batches-"
+        ) as work:
+            if records_per_batch:
+                context, batches = write_shacl_batches(source, Path(work), records_per_batch)
+                tasks = [(context, batch, shapes_list, ontology) for batch in batches]
+                tasks = tasks or [(context, None, shapes_list, ontology)]
+            else:
+                tasks = [(source, None, shapes_list, ontology)]
+            workers = max(1, min(workers, len(tasks)))
+            if workers == 1:
+                outcomes = [_validate_shacl_task(task) for task in tasks]
+            else:
+                # One batch per worker process: rdflib does not hand freed
+                # memory back, so a reused worker would hold its largest batch.
+                with multiprocessing.get_context("fork").Pool(workers, maxtasksperchild=1) as pool:
+                    outcomes = pool.map(_validate_shacl_task, tasks)
     except Exception as error:  # noqa: BLE001 - reported, never fatal here
         result = {
             "status": "EXECUTION_FAILED",
@@ -2146,7 +2409,16 @@ def validate_shacl(
         write_json(report_path, result)
         return result
 
-    results = parse_shacl_results(text)
+    conforms = all(ok for ok, _text in outcomes)
+    text = "\n\n".join(text for _ok, text in outcomes)
+    # Each batch's report is parsed on its own, so no block runs into the next
+    # report's header, then results repeated across batches are kept once.
+    results, seen = [], set()
+    for _ok, batch_text in outcomes:
+        for entry in parse_shacl_results(batch_text):
+            if entry["text"] not in seen:
+                seen.add(entry["text"])
+                results.append(entry)
     # Unknown counts as blocking: a result this parser could not classify is a
     # parser bug, and the safe reading of a parser bug is not "conformant".
     violations = [
@@ -2180,6 +2452,9 @@ def validate_shacl(
         "advisorySample": [entry["text"] for entry in advisories][:SHACL_SAMPLE_LIMIT],
         "report": str(log_path),
         "wallSeconds": time.monotonic() - started,
+        "batches": len(tasks),
+        "recordsPerBatch": records_per_batch,
+        "workers": workers,
         "sampleLimitedTo": SHACL_SAMPLE_LIMIT,
         "sample": violations[:SHACL_SAMPLE_LIMIT],
     }
@@ -4043,8 +4318,17 @@ def run_validation(args: argparse.Namespace) -> int:
             shacl_limit = getattr(
                 args, "shacl_max_triples", DEFAULT_SHACL_MAX_TRIPLES
             )
-            if args.shacl_shapes is not None and shacl_exceeds_limit(
-                decoded_triples, shacl_limit
+            records_per_batch = None
+            if args.shacl_shapes is not None:
+                records_per_batch = shacl_records_per_batch(
+                    parser.get("totalRecords"), decoded_triples,
+                    getattr(args, "shacl_batch_triples", DEFAULT_SHACL_BATCH_TRIPLES),
+                    shapes_are_node_local(args.shacl_shapes),
+                )
+            # A batched validation's memory is set by its batch, not the graph,
+            # so only a graph validated in one piece is gated.
+            if args.shacl_shapes is not None and records_per_batch is None and (
+                shacl_exceeds_limit(decoded_triples, shacl_limit)
             ):
                 # An unknown count is refused too (see shacl_exceeds_limit), so
                 # the reason must not assume there is a number to format.
@@ -4073,7 +4357,10 @@ def run_validation(args: argparse.Namespace) -> int:
             if args.shacl_shapes is not None and shacl_skipped is None:
                 progress.emit("progress", completed=0, detail="validating SHACL shapes")
                 shacl_result = validate_shacl(
-                    decoded, args.shacl_shapes, results_dir, args.shacl_ontology
+                    decoded, args.shacl_shapes, results_dir, args.shacl_ontology,
+                    records_per_batch=records_per_batch,
+                    workers=getattr(args, "shacl_workers", DEFAULT_SHACL_WORKERS),
+                    scratch_dir=getattr(args, "scratch_dir", None),
                 )
             if shacl_skipped is not None:
                 shacl_result = shacl_skipped
@@ -4480,14 +4767,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--shacl-batch-triples",
+        type=int,
+        default=DEFAULT_SHACL_BATCH_TRIPLES,
+        help=(
+            "Validate node-level shapes a batch of records at a time, about "
+            "this many triples per batch, so memory follows the batch rather "
+            "than the graph. Shapes with SPARQL constraints compare records and "
+            f"are validated whole (0 always validates whole; default: "
+            f"{DEFAULT_SHACL_BATCH_TRIPLES:,})"
+        ),
+    )
+    parser.add_argument(
+        "--shacl-workers",
+        type=int,
+        default=DEFAULT_SHACL_WORKERS,
+        help=f"Shape batches validated in parallel (default: {DEFAULT_SHACL_WORKERS})",
+    )
+    parser.add_argument(
         "--shacl-max-triples",
         type=int,
         default=DEFAULT_SHACL_MAX_TRIPLES,
         help=(
-            "Skip the shape layer when the decoded graph holds more triples "
-            "than this, recording the skip and its reason (0 disables the "
-            "gate). pyshacl is in-memory, and its cost tracks the graph rather "
-            f"than the artifact it arrived in (default: {DEFAULT_SHACL_MAX_TRIPLES:,})"
+            "Skip shapes validated whole (see --shacl-batch-triples) when the "
+            "decoded graph holds more triples than this, recording the skip and "
+            "its reason (0 disables the gate). pyshacl is in-memory, and its cost "
+            f"tracks the graph, not the artifact (default: {DEFAULT_SHACL_MAX_TRIPLES:,})"
         ),
     )
     parser.add_argument("--filter-oracle", choices=("auto", "bcftools", "cyvcf2"), default="auto")

@@ -98,8 +98,9 @@ a plain literal instead of `xsd:decimal`/`vcfc:Null`; `##fileDate` untyped
 instead of `xsd:date`) and one of which is a contradiction inside the
 vocabulary itself, recorded in [`vcf-coverage.md`](vcf-coverage.md).
 
-SHACL is opt-in because `pyshacl` loads the graph into memory and does not
-scale to a cohort-sized aggregate.
+`pyshacl` loads its data graph into memory, so node-level shapes are validated
+a batch of records at a time (see [`validation.md`](validation.md#shacl));
+shapes with SPARQL constraints compare records and are validated whole.
 
 ### Identity digests, and why they are histograms
 
@@ -113,6 +114,9 @@ own IRI**, then bucket on the first byte of the hash. Two properties matter:
   its order. Bucketing is order-independent by construction, and keeps the
   result at most 256 rows for a graph of any size. A mismatch is localized by
   re-querying only the differing buckets.
+- **A digest compares values, not spellings.** QUAL is an `xsd:decimal`, which
+  QLever returns canonically (`30.1`) and other engines lexically (`30.10`), so
+  `q11` and its oracle both drop trailing fractional zeros before hashing.
 
 Fields are separated by U+001F, which cannot occur in a VCF field, so no shift
 of a field boundary can forge a match.

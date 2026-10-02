@@ -575,8 +575,11 @@ The common record-level queries are used for both graph shapes:
 
 Q9 and Q10 are the completeness check: comparing the graph's inventory against
 what the VCF implies catches a predicate that is missing, one with the wrong
-cardinality, and one that should not be there at all. Q11-Q13 close the
-permutation gap - see
+cardinality, and one that should not be there at all. The inventory covers phase
+sets, the SV carriers (events, confidence intervals, IMPRECISE/NOVEL, SVLEN,
+SVCLAIM) and gVCF reference blocks; tandem repeats, local alleles and base
+modifications are not counted yet, so a file using them fails Q9/Q10. Q11-Q13
+close the permutation gap - see
 [`validation-methodology.md`](validation-methodology.md#identity-digests-and-why-they-are-histograms).
 
 Q9-Q13 assume the shipped RML mapping's predicate inventory and IRI templates.
@@ -645,11 +648,21 @@ and a conforming graph is reported as violations. In a vocabulary checkout the
 bundle sits one level up from the shapes, in `ontology/`, and is found
 automatically; `--shacl-ontology PATH` names it explicitly anywhere else.
 
-It is **on by default for sources at or below 512 MiB**, using shapes vendored
-with the package -- no vocabulary checkout needed. `--no-shacl` turns it off;
-`--shacl-shapes` overrides both the bundled shapes and the size gate. Above the
-gate it is skipped, because `pyshacl` loads the whole graph into memory and a
-cohort-scale aggregate would not fit.
+It is **on by default**, using shapes vendored with the package -- no
+vocabulary checkout needed. `--no-shacl` turns it off; `--shacl-shapes`
+overrides the bundled shapes.
+
+`pyshacl` loads its data graph into memory, so node-level shapes -- the default
+`core` profile -- are validated **a batch of records at a time**: each batch is
+about `--shacl-batch-triples` triples (default 500,000) of whole records plus
+the file-level triples they point at (header, sample set, definitions). Every
+constraint in such a profile judges one node from its neighbourhood, so the
+verdict is the whole-graph verdict; batches run in `--shacl-workers` processes
+(default up to 4), and memory follows the batch, not the graph: about 1.3 GB
+per default batch, so about 5 GB with four workers. Shapes with
+SPARQL constraints compare records with each other, so they are validated whole
+and stay under `--shacl-max-triples` (default 10,000,000), above which they are
+skipped and the skip recorded.
 
 ### Two profiles, and which one catches what
 
@@ -671,8 +684,9 @@ detects none of them.
 
 `full` is not the default because the cost is real and measured: its two extra
 profiles use `sh:sparql` constraints that self-join the graph, so they grow far
-faster than the data. It is gated to sources at or below 16 MiB, where closing
-those four classes is worth two minutes; the core profile's gate is 512 MiB.
+faster than the data, and they compare records, so they are validated whole.
+It is gated to sources at or below 16 MiB, where closing those four classes is
+worth two minutes; the core profile has no size gate.
 
 ```bash
 # Close the four classes the query suite misses, on a fixture-sized input

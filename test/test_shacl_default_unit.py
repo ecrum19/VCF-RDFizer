@@ -77,12 +77,8 @@ class BundledAssetTests(VerboseTestCase):
         )
         self.assertIsNotNone(ontology)
 
-    def test_the_full_profile_has_a_much_smaller_size_gate(self):
-        """It is quadratic-ish in graph size; the core gate would be unusable."""
-        self.assertLess(
-            vcf_rdfizer.FULL_SHACL_MAX_SOURCE_BYTES,
-            vcf_rdfizer.DEFAULT_SHACL_MAX_SOURCE_BYTES,
-        )
+    def test_only_the_full_profile_is_size_gated(self):
+        """It is validated whole and quadratic-ish; core is validated in batches."""
         big = vcf_rdfizer.FULL_SHACL_MAX_SOURCE_BYTES + 1
         self.assertFalse(vcf_rdfizer.shacl_default_applies(big, "full"))
         self.assertTrue(vcf_rdfizer.shacl_default_applies(big, "core"))
@@ -162,31 +158,20 @@ class BundledAssetTests(VerboseTestCase):
 
 
 class SizeGateTests(VerboseTestCase):
-    def test_a_small_source_gets_shapes_by_default(self):
-        self.assertTrue(vcf_rdfizer.shacl_default_applies(10 * 1024 * 1024))
+    def test_the_core_profile_applies_at_any_size(self):
+        """The validator batches it by record, so its memory does not follow the input."""
+        for size in (10 * 1024 * 1024, 200 * 1024 ** 3, None):
+            with self.subTest(size=size):
+                self.assertTrue(vcf_rdfizer.shacl_default_applies(size))
 
-    def test_a_source_at_the_limit_still_gets_shapes(self):
-        self.assertTrue(
-            vcf_rdfizer.shacl_default_applies(
-                vcf_rdfizer.DEFAULT_SHACL_MAX_SOURCE_BYTES
-            )
-        )
+    def test_the_full_profile_applies_up_to_its_gate(self):
+        limit = vcf_rdfizer.FULL_SHACL_MAX_SOURCE_BYTES
+        self.assertTrue(vcf_rdfizer.shacl_default_applies(limit, "full"))
+        self.assertFalse(vcf_rdfizer.shacl_default_applies(limit + 1, "full"))
 
-    def test_a_cohort_scale_source_does_not(self):
-        """pyshacl is in-memory; trying anyway turns a safety net into an OOM."""
-        self.assertFalse(
-            vcf_rdfizer.shacl_default_applies(
-                vcf_rdfizer.DEFAULT_SHACL_MAX_SOURCE_BYTES + 1
-            )
-        )
-        self.assertFalse(vcf_rdfizer.shacl_default_applies(200 * 1024 ** 3))
-
-    def test_an_unknown_size_is_treated_as_too_large(self):
+    def test_an_unknown_size_is_too_large_for_the_full_profile(self):
         """Skipping a check is recoverable; exhausting memory mid-run is not."""
-        self.assertFalse(vcf_rdfizer.shacl_default_applies(None))
-
-    def test_the_gate_is_a_documented_constant_not_a_literal(self):
-        self.assertGreater(vcf_rdfizer.DEFAULT_SHACL_MAX_SOURCE_BYTES, 0)
+        self.assertFalse(vcf_rdfizer.shacl_default_applies(None, "full"))
 
 
 class CliTests(VerboseTestCase):
