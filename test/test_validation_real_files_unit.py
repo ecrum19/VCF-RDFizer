@@ -15,11 +15,14 @@ impossible:
 """
 
 import importlib.util
+import os
 import sys
 import tempfile
+import types
 import unittest
 from collections import Counter
 from pathlib import Path
+from unittest import mock
 
 import vcf_rdfizer
 import vcf_rdfizer_vocab as vocab
@@ -96,6 +99,8 @@ class SvGvcfPhaseSetCensusTests(VerboseTestCase):
          "GT:PS:PSL:PSO:PSQ", "0|1:300:blockA:2:30"],
         ["chr1", "310", ".", "C", "G", "40", "PASS", "DP=5", "GT:PS:PSL", "0|1:.:blockB"],
         ["chr1", "320", ".", "C", "A", "40", "PASS", "DP=5", "GT:PS", "0|1:."],
+        # SV INFO on a record with no ALT: there is no allele to carry it.
+        ["chr1", "500", ".", "A", ".", "10", "PASS", "SVLEN=5;IMPRECISE;CIPOS=-1,1", "GT", "0/0"],
     ]
     PREDICATES = {
         *(VCFC + name for name in (
@@ -176,6 +181,10 @@ class SvGvcfPhaseSetCensusTests(VerboseTestCase):
         _predicates, classes = self.counted("VCFv4.2")
         self.assertNotIn(VCFC + "VariantEvent", classes)
 
+    def test_counter_keys_become_iris(self):
+        self.assertEqual(V._census_iri("inPhaseSet"), VCFC + "inPhaseSet")
+        self.assertEqual(V._census_iri(FALDO + "begin"), FALDO + "begin")
+
 
 class QualDigestTests(VerboseTestCase):
     """Q11 compares QUAL values, not the spelling an engine returns."""
@@ -250,6 +259,21 @@ class ShaclBatchTests(VerboseTestCase):
         self.assertIsNone(rpb(1000, 10_000_000, 2_000_000, False), "SPARQL shapes")
         self.assertIsNone(rpb(None, 10_000_000, 2_000_000, True))
         self.assertIsNone(rpb(1000, None, 2_000_000, True))
+        # The real genome at the default: the 117 batches of its end-to-end run.
+        self.assertEqual(rpb(250_000, 58_231_176, V.DEFAULT_SHACL_BATCH_TRIPLES, True), 2146)
+
+    def test_buffered_lines_are_appended_not_overwritten(self):
+        """Flushing after every line must give the same batches as one flush."""
+        def split(flush_lines):
+            with tempfile.TemporaryDirectory() as td, \
+                    mock.patch.object(V, "SHACL_BATCH_FLUSH_LINES", flush_lines):
+                tmp = Path(td)
+                source = tmp / "g.nt"
+                source.write_text(self.GRAPH, encoding="utf-8")
+                context, batches = V.write_shacl_batches(source, tmp, records_per_batch=2)
+                return context.read_text(), [b.read_text() for b in batches]
+
+        self.assertEqual(split(1), split(V.SHACL_BATCH_FLUSH_LINES))
 
     def test_only_sparql_free_shapes_are_node_local(self):
         core, _ = vcf_rdfizer.resolve_default_shacl_shapes(Path(vcf_rdfizer.__file__).parent, "core")
@@ -291,6 +315,80 @@ class ShaclBatchTests(VerboseTestCase):
                 self.assertEqual(batched["violationCount"], whole["violationCount"])
                 self.assertEqual(sorted(batched["sample"]), sorted(whole["sample"]))
                 self.assertEqual(whole["status"], "PASS" if name == "clean" else "FAIL")
+
+
+def _report_pid(_task):
+    """A shape task that only says which process ran it."""
+    return True, f"pid {os.getpid()}\n"
+
+
+def _report(*results):
+    """A pyshacl text report holding the given (severity, focus node) results."""
+    blocks = "".join(
+        "Validation Result in MinCountConstraintComponent "
+        "(http://www.w3.org/ns/shacl#MinCountConstraintComponent):\n"
+        f"\tSeverity: sh:{severity}\n\tFocus Node: <{node}>\n"
+        "\tResult Path: vcfc:pos\n\tMessage: m\n"
+        for severity, node in results)
+    return f"Validation Report\nConforms: {not results}\nResults ({len(results)}):\n{blocks}"
+
+
+class ShaclBatchMergeTests(VerboseTestCase):
+    """How batch outcomes become one report. The task is stubbed, so no pyshacl is needed."""
+
+    def setUp(self):
+        stub = mock.patch.dict(sys.modules, {"pyshacl": types.ModuleType("pyshacl")})
+        stub.start()
+        self.addCleanup(stub.stop)
+        work = tempfile.TemporaryDirectory()
+        self.addCleanup(work.cleanup)
+        self.tmp = Path(work.name)
+        self.source = self.tmp / "g.nt"
+        self.source.write_text(ShaclBatchTests.GRAPH, encoding="utf-8")
+
+    def validate(self, outcomes, source=None):
+        with mock.patch.object(V, "_validate_shacl_task", side_effect=outcomes) as task:
+            result = V.validate_shacl(source or self.source, [Path("shapes.ttl")], self.tmp,
+                                      records_per_batch=2, workers=1)
+        return result, task
+
+    def test_a_result_repeated_across_batches_is_reported_once(self):
+        """Each batch carries the header, so its warnings recur in every batch."""
+        header = _report(("Warning", "file://s.vcf#header/1"))
+        result, _task = self.validate([(False, header)] * 3)
+        self.assertEqual(result["batches"], 3)
+        self.assertEqual(result["advisoryCount"], 1)
+        self.assertEqual((result["status"], result["conforms"]), ("PASS", False),
+                         "warnings alone do not fail the graph")
+
+    def test_one_violating_batch_fails_the_graph(self):
+        bad = _report(("Violation", "file://s.vcf#record/3"))
+        result, _task = self.validate([(True, _report()), (False, bad), (True, _report())])
+        self.assertEqual((result["status"], result["violationCount"]), ("FAIL", 1))
+        self.assertIn("#record/3", result["sample"][0])
+
+    def test_a_batch_that_cannot_run_is_an_execution_failure(self):
+        result, _task = self.validate([(True, _report()), RuntimeError("parse failed"), (True, _report())])
+        self.assertEqual(result["status"], "EXECUTION_FAILED")
+        self.assertIn("parse failed", result["error"])
+
+    def test_a_graph_without_records_is_validated_as_its_context(self):
+        header_only = self.tmp / "header.nt"
+        header_only.write_text("<file://s.vcf> <urn:p> <file://s.vcf#header/1> .\n", encoding="utf-8")
+        result, task = self.validate([(True, _report())], source=header_only)
+        self.assertEqual(result["batches"], 1)
+        _context, batch, _shapes, _ontology = task.call_args.args[0]
+        self.assertIsNone(batch)
+
+    def test_every_batch_gets_a_fresh_process(self):
+        """rdflib keeps freed memory, so a reused worker would hold its largest batch."""
+        with mock.patch.object(V, "_validate_shacl_task", _report_pid):
+            result = V.validate_shacl(self.source, [Path("shapes.ttl")], self.tmp,
+                                      records_per_batch=1, workers=2)
+        pids = Path(result["report"]).read_text(encoding="utf-8").split()[1::2]
+        self.assertEqual((result["batches"], result["workers"]), (5, 2))
+        self.assertEqual(len(set(pids)), 5)
+        self.assertNotIn(str(os.getpid()), pids)
 
 
 if __name__ == "__main__":

@@ -375,10 +375,11 @@ class RunValidationShaclGateTests(VerboseTestCase):
         """A batch bounds pyshacl's memory, so a large graph still gets shapes."""
         run = self._drive(
             rdf_validation={"status": "PASS", "tripleCount": GRAPH_TRIPLES},
-            shacl_batch_triples=V.DEFAULT_SHACL_BATCH_TRIPLES)
+            shacl_batch_triples=V.DEFAULT_SHACL_BATCH_TRIPLES, shacl_workers=3)
         self.assertRunDidNotError(run)
         run["validate_shacl"].assert_called_once()
         self.assertTrue(run["validate_shacl"].call_args.kwargs["records_per_batch"])
+        self.assertEqual(run["validate_shacl"].call_args.kwargs["workers"], 3)
         self.assertIsNone(run["shacl"], "nothing was skipped, so nothing is recorded")
 
     def test_sparql_shapes_are_still_gated_when_batching_is_on(self):

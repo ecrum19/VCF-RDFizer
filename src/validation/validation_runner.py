@@ -2244,6 +2244,8 @@ DEFAULT_SHACL_WORKERS = min(4, os.cpu_count() or 1)
 #: The record, its call and its sample calls -- and everything minted beneath
 #: them -- carry the record's row in their IRI. Anything else is file-level.
 RECORD_SCOPED_IRI = re.compile(r"#(?:record|call|sample)/([0-9]+)")
+#: Lines held before write_shacl_batches appends them to their batch files.
+SHACL_BATCH_FLUSH_LINES = 200_000
 
 
 def shapes_are_node_local(shapes: list[Path]) -> bool:
@@ -2306,7 +2308,7 @@ def write_shacl_batches(
                 continue
             buffers.setdefault((int(match.group(1)) - 1) // records_per_batch, []).append(line)
             buffered += 1
-            if buffered >= 200_000:
+            if buffered >= SHACL_BATCH_FLUSH_LINES:
                 flush()
                 buffered = 0
     flush()
