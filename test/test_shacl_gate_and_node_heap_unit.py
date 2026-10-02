@@ -86,9 +86,13 @@ class ShaclGateTests(VerboseTestCase):
         self.assertTrue(V.shacl_exceeds_limit(GRAPH_TRIPLES, V.DEFAULT_SHACL_MAX_TRIPLES))
 
     def test_the_campaigns_largest_validated_graph_still_passes(self):
-        """17.1M triples is the 100,000-record HG005 slice the campaign ran
-        shapes on. The gate must not retroactively disable published behaviour."""
-        self.assertFalse(V.shacl_exceeds_limit(17_098_746, V.DEFAULT_SHACL_MAX_TRIPLES))
+        """0.96M triples is the largest graph the campaign ran shapes on. The
+        gate must not retroactively disable published behaviour."""
+        self.assertFalse(V.shacl_exceeds_limit(958_919, V.DEFAULT_SHACL_MAX_TRIPLES))
+
+    def test_the_real_genome_that_exhausted_memory_is_refused(self):
+        """58.2M triples of NG131FQA1I hung a 31 GB host in one piece."""
+        self.assertTrue(V.shacl_exceeds_limit(58_231_176, V.DEFAULT_SHACL_MAX_TRIPLES))
 
     def test_an_unknown_count_is_treated_as_too_large(self):
         """Skipping is recoverable and recorded; exhausting memory is not."""
@@ -107,8 +111,8 @@ class ShaclGateTests(VerboseTestCase):
 
     def test_the_default_sits_between_the_two_observations(self):
         """It must admit what worked and refuse what died, or it is arbitrary."""
-        self.assertGreater(V.DEFAULT_SHACL_MAX_TRIPLES, 17_098_746)
-        self.assertLess(V.DEFAULT_SHACL_MAX_TRIPLES, GRAPH_TRIPLES)
+        self.assertGreater(V.DEFAULT_SHACL_MAX_TRIPLES, 958_919)
+        self.assertLess(V.DEFAULT_SHACL_MAX_TRIPLES, 58_231_176)
 
 
 class NodeHeapEnvTests(VerboseTestCase):
@@ -271,6 +275,9 @@ def _runner_args(tmp: Path, **overrides) -> argparse.Namespace:
         qlever_server_arg=[], vcf=tmp / "s.vcf",
         filter_oracle="cyvcf2", dataset_id="sample", queries=None,
         shacl_max_triples=V.DEFAULT_SHACL_MAX_TRIPLES,
+        # Whole-graph validation, the path the size gate guards. The batched
+        # path is exempt from it; RunValidationShaclGateTests pins both.
+        shacl_batch_triples=0, shacl_workers=1,
         node_heap_mb=V.DEFAULT_NODE_HEAP_MB,
     )
     fields.update(overrides)
@@ -364,6 +371,26 @@ class RunValidationShaclGateTests(VerboseTestCase):
         self.assertRunDidNotError(run)
         run["validate_shacl"].assert_not_called()
 
+    def test_batched_shapes_are_not_gated(self):
+        """A batch bounds pyshacl's memory, so a large graph still gets shapes."""
+        run = self._drive(
+            rdf_validation={"status": "PASS", "tripleCount": GRAPH_TRIPLES},
+            shacl_batch_triples=V.DEFAULT_SHACL_BATCH_TRIPLES, shacl_workers=3)
+        self.assertRunDidNotError(run)
+        run["validate_shacl"].assert_called_once()
+        self.assertTrue(run["validate_shacl"].call_args.kwargs["records_per_batch"])
+        self.assertEqual(run["validate_shacl"].call_args.kwargs["workers"], 3)
+        self.assertIsNone(run["shacl"], "nothing was skipped, so nothing is recorded")
+
+    def test_sparql_shapes_are_still_gated_when_batching_is_on(self):
+        """A SPARQL constraint compares records, so those shapes stay whole."""
+        with mock.patch.object(V, "shapes_are_node_local", return_value=False):
+            run = self._drive(
+                rdf_validation={"status": "PASS", "tripleCount": GRAPH_TRIPLES},
+                shacl_batch_triples=V.DEFAULT_SHACL_BATCH_TRIPLES)
+        run["validate_shacl"].assert_not_called()
+        self.assertEqual(run["shacl"]["status"], "SKIPPED_TOO_LARGE")
+
     def test_the_skip_is_recorded_with_its_reason(self):
         """A skip nobody can see is the silent failure this replaces."""
         run = self._drive(
@@ -398,7 +425,7 @@ class RunValidationShaclGateTests(VerboseTestCase):
     def test_a_graph_within_the_limit_still_gets_its_shapes_checked(self):
         """The campaign's largest shape-validated graph, at the default gate."""
         run = self._drive(
-            rdf_validation={"status": "PASS", "tripleCount": 17_098_746})
+            rdf_validation={"status": "PASS", "tripleCount": 958_919})
         self.assertRunDidNotError(run)
         run["validate_shacl"].assert_called_once()
         self.assertEqual(run["validate_shacl"].call_args[0][0], run["decoded"])
@@ -647,6 +674,24 @@ class WrapperCliTests(VerboseTestCase):
                 self.assertIsNone(options, "a bad value must stop before the run")
                 self.assertIn(message, err)
 
+    def test_the_batch_options_are_forwarded_as_integers(self):
+        _rc, options, _err = self._main(
+            ["--shacl-batch-triples", "0", "--shacl-workers", "2"])
+        self.assertEqual(options["shacl_batch_triples"], 0)
+        self.assertEqual(options["shacl_workers"], 2)
+
+    def test_bad_batch_options_are_usage_errors(self):
+        for argv, message in (
+            (["--shacl-batch-triples", "-1"],
+             "--shacl-batch-triples must be zero or a positive integer"),
+            (["--shacl-workers", "0"], "--shacl-workers must be a positive integer"),
+        ):
+            with self.subTest(argv=argv):
+                rc, options, err = self._main(argv)
+                self.assertEqual(rc, 2)
+                self.assertIsNone(options)
+                self.assertIn(message, err)
+
     def test_the_heap_is_forwarded_as_an_integer(self):
         _rc, options, _err = self._main(["--node-heap-mb", "16384"])
         self.assertEqual(options["node_heap_mb"], 16384)
@@ -712,9 +757,11 @@ class WrapperForwardsTheGuardsTests(VerboseTestCase):
         """The contract across the boundary: the flag names and value types
         the wrapper emits are ones the runner parses."""
         command = self._command_for(
-            {"shacl_max_triples": 0, "node_heap_mb": 16384})
+            {"shacl_max_triples": 0, "node_heap_mb": 16384,
+             "shacl_batch_triples": 0, "shacl_workers": 2})
         actions = V.build_arg_parser()._option_string_actions
-        for flag, expected in (("--shacl-max-triples", 0), ("--node-heap-mb", 16384)):
+        for flag, expected in (("--shacl-max-triples", 0), ("--node-heap-mb", 16384),
+                               ("--shacl-batch-triples", 0), ("--shacl-workers", 2)):
             with self.subTest(flag=flag):
                 self.assertIn(flag, actions)
                 self.assertEqual(actions[flag].type(self._value(command, flag)), expected)

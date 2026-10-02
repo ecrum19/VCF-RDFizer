@@ -4961,11 +4961,6 @@ FULL_SHACL_SHAPES = (
 )
 SHACL_PROFILE_CHOICES = ("core", "full")
 DEFAULT_SHACL_ONTOLOGY = "vcf-core-vocabulary.bundle.ttl"
-#: pyshacl loads the whole graph into memory, so the default is size-gated
-#: rather than unconditional. A fixture or a single-sample graph validates in
-#: seconds; a cohort aggregate would not fit, and silently trying would turn a
-#: safety net into an OOM. Above this, shapes stay available via --shacl-shapes.
-DEFAULT_SHACL_MAX_SOURCE_BYTES = 512 * 1024 * 1024
 
 
 def resolve_bundled_vocabulary_asset(repo_root: Path, relative: str) -> Path | None:
@@ -5006,30 +5001,24 @@ def resolve_default_shacl_shapes(
     return shapes, ontology
 
 
-#: The full profile set is quadratic-ish in graph size, so its gate is not the
-#: core one. 16 MiB of VCF is a fixture or a small single-sample file, which is
-#: where a two-minute structural check is a reasonable trade.
+#: The full profile's SPARQL constraints compare records with each other, so it
+#: is validated whole and grows quadratic-ish with the graph. 16 MiB of VCF is a
+#: fixture or a small single-sample file, where a two-minute check is a
+#: reasonable trade. The core profile has no such gate: the validator checks it
+#: a batch of records at a time, so its memory does not follow the input.
 FULL_SHACL_MAX_SOURCE_BYTES = 16 * 1024 * 1024
-
-
-def shacl_max_source_bytes(profile: str) -> int:
-    """The size gate for one profile set."""
-    return (
-        FULL_SHACL_MAX_SOURCE_BYTES if profile == "full"
-        else DEFAULT_SHACL_MAX_SOURCE_BYTES
-    )
 
 
 def shacl_default_applies(source_bytes: int | None, profile: str = "core") -> bool:
     """Whether to validate shapes by default for a source of this size.
 
-    Size-gated because pyshacl is in-memory. ``None`` means the size could not
-    be read, which is treated as too large: skipping a check is recoverable,
-    exhausting memory mid-run is not.
+    The core profile applies at any size. The full profile is size-gated, and
+    ``None`` -- an unreadable size -- counts as too large: skipping a check is
+    recoverable, exhausting memory mid-run is not.
     """
-    if source_bytes is None:
-        return False
-    return 0 <= source_bytes <= shacl_max_source_bytes(profile)
+    if profile != "full":
+        return True
+    return source_bytes is not None and 0 <= source_bytes <= FULL_SHACL_MAX_SOURCE_BYTES
 
 
 def docker_image_exists(image: str) -> bool:
@@ -5164,6 +5153,17 @@ def parse_positive_int(value: str, *, name: str) -> int:
         raise ValueError(f"{name} must be a positive integer.") from exc
     if parsed <= 0:
         raise ValueError(f"{name} must be a positive integer.")
+    return parsed
+
+
+def parse_non_negative_int(value: str, *, name: str) -> int:
+    """Parse a CLI integer where 0 is meaningful (it disables a limit)."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be an integer") from None
+    if parsed < 0:
+        raise ValueError(f"{name} must be zero or a positive integer")
     return parsed
 
 
@@ -8976,6 +8976,8 @@ def run_validation_mode(
         # only place that knows the decoded graph's size. The size gate here
         # sees the packaged artifact and cannot.
         ("--shacl-max-triples", "shacl_max_triples"),
+        ("--shacl-batch-triples", "shacl_batch_triples"),
+        ("--shacl-workers", "shacl_workers"),
         ("--node-heap-mb", "node_heap_mb"),
     ):
         value = options.get(key)
@@ -9527,8 +9529,8 @@ def main():
         action="store_true",
         help=(
             "Skip the bundled SHACL shape layer, which is otherwise applied by "
-            "default to sources at or below "
-            f"{DEFAULT_SHACL_MAX_SOURCE_BYTES // (1024 * 1024)} MiB. The "
+            "default (core at any size, full up to "
+            f"{FULL_SHACL_MAX_SOURCE_BYTES // (1024 * 1024)} MiB). The "
             "default (core) profile checks structure the aggregate comparisons "
             "do not; --shacl-profile full adds the profiles that catch a "
             "corrupted value. --shacl-shapes overrides both"
@@ -9589,10 +9591,24 @@ def main():
         "--shacl-max-triples",
         default=None,
         help=(
-            "Skip the shape layer when the decoded graph exceeds this many "
-            "triples, recording the skip (0 disables). pyshacl is in-memory "
-            "and its cost tracks the graph, not the artifact it arrived in"
+            "Skip shapes validated whole when the decoded graph exceeds this "
+            "many triples, recording the skip (0 disables). pyshacl is "
+            "in-memory and its cost tracks the graph, not the artifact"
         ),
+    )
+    parser.add_argument(
+        "--shacl-batch-triples",
+        default=None,
+        help=(
+            "Validate node-level shapes in record batches of about this many "
+            "triples, so memory follows the batch, not the graph (0 validates "
+            "whole; default 500,000). SPARQL-based shapes are always whole"
+        ),
+    )
+    parser.add_argument(
+        "--shacl-workers",
+        default=None,
+        help="Shape batches validated in parallel (default: up to 4)",
     )
     parser.add_argument(
         "--node-heap-mb",
@@ -9765,16 +9781,19 @@ def main():
             validation_engine_options["stop_after_query_timeout"] = True
         if args.validation_queries is not None:
             validation_engine_options["queries"] = args.validation_queries
+        # 0 is meaningful for both: no gate, and no batching.
         if args.shacl_max_triples is not None:
-            # 0 is meaningful here: it disables the gate, the way
-            # --validation-time-budget 0 means no ceiling.
-            try:
-                limit = int(args.shacl_max_triples)
-            except (TypeError, ValueError):
-                raise ValueError("--shacl-max-triples must be an integer")
-            if limit < 0:
-                raise ValueError("--shacl-max-triples must be zero or a positive integer")
-            validation_engine_options["shacl_max_triples"] = limit
+            validation_engine_options["shacl_max_triples"] = parse_non_negative_int(
+                args.shacl_max_triples, name="--shacl-max-triples"
+            )
+        if args.shacl_batch_triples is not None:
+            validation_engine_options["shacl_batch_triples"] = parse_non_negative_int(
+                args.shacl_batch_triples, name="--shacl-batch-triples"
+            )
+        if args.shacl_workers is not None:
+            validation_engine_options["shacl_workers"] = parse_positive_int(
+                args.shacl_workers, name="--shacl-workers"
+            )
         if args.node_heap_mb is not None:
             validation_engine_options["node_heap_mb"] = parse_positive_int(
                 args.node_heap_mb, name="--node-heap-mb"
@@ -9822,8 +9841,8 @@ def main():
             # a value that is counted but never read. Four of the ten mutation
             # classes the query suite misses are already covered by the
             # published profile, which no run in the benchmark campaign
-            # enabled. Default it on, size-gated, rather than leaving a
-            # written check permanently unused.
+            # enabled. Default it on (the full profile size-gated) rather than
+            # leaving a written check permanently unused.
             bundled_shapes, bundled_ontology = resolve_default_shacl_shapes(
                 repo_root, args.shacl_profile
             )

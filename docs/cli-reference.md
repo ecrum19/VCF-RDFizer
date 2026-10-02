@@ -127,8 +127,10 @@ compatibility. Use the three explicit selectors.
 | `--validation-engine` | `comunica`, `qlever`, `hdt`, `cottas`, `all`, or a comma-separated list | `comunica` | SPARQL backend(s); a scale and performance decision, never a semantic one. `hdt`/`cottas` query the compressed artifact in place. Several engines answer the whole query set, are cross-checked against each other, and are timed in `benchmark.csv` |
 | `--filter-oracle` | `auto`, `bcftools`, `cyvcf2` | `auto` | FILTER-field oracle |
 | `--validation-queries` | query ids, or `core` / `preflight` / `all` | all | Run only these queries. A subset reports `TIMING_ONLY` rather than a validation verdict, because the PASS decision needs the whole set; each selected query is still compared against the VCF oracle, so a disagreement still fails the run. Use it to measure retrieval cost for one question without paying for the rest |
-| `--shacl-shapes` | path | off | Independent structural layer via `pyshacl`; in-memory, so not for cohort scale |
-| `--shacl-max-triples` | N | 50,000,000 | Skip the shape layer, and record the skip, when the decoded graph exceeds N triples; `0` disables the gate. The gate reads the decoded graph, not the artifact it arrived in |
+| `--shacl-shapes` | path | bundled `core` profile | Independent structural layer via `pyshacl`; replaces the bundled shapes |
+| `--shacl-batch-triples` | N | 500,000 | Validate node-level shapes (the `core` profile) a batch of records of about N triples at a time, so memory follows the batch, not the graph; `0` validates whole. Shapes with SPARQL constraints are always validated whole |
+| `--shacl-workers` | N | up to 4 | Shape batches validated in parallel; peak memory is about N batches |
+| `--shacl-max-triples` | N | 10,000,000 | Skip shapes validated whole, and record the skip, when the decoded graph exceeds N triples; `0` disables the gate. The gate reads the decoded graph, not the artifact it arrived in |
 | `--node-heap-mb` | MB | Node's own | V8 old-space ceiling for the Comunica-backed engines (`comunica`, `hdt`, `cottas`); Node does not size its heap from the machine |
 | `--strict-conformance` | — | off | Promote a missing-token conformance anomaly from report to failure |
 | `--validation-query-timeout` | seconds | 3600 | Per-query timeout, every engine |

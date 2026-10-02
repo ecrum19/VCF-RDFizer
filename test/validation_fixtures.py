@@ -692,7 +692,7 @@ def parser_summary(
         digest[runner.record_digest_bucket([
             record_iri, record.chrom, str(record.pos), record.record_id,
             record.ref, record.alt,
-            record.qual if include_qual else "",
+            runner.digest_qual(record.qual) if include_qual else "",
             record.filter_value, record.info,
         ])] += 1
     summary["q11_record_digest"] = [

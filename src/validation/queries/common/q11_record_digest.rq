@@ -15,6 +15,12 @@ PREFIX vcfc: <https://w3id.org/vcf-core/vocab#>
 # Fields are separated by U+001F (unit separator), written as a SPARQL UCHAR
 # escape. It cannot appear in a VCF field, so no combination of values can be
 # made to collide by shifting a field boundary.
+#
+# QUAL is an xsd:decimal, and engines disagree on how STR() spells one: QLever
+# returns the canonical value ("30.1"), others the lexical form ("30.10"). So
+# trailing zeros after the decimal point are dropped here, and the oracle drops
+# them the same way (digest_qual), making the digest compare values rather than
+# spellings. Nothing else changes: "100" stays "100" and "." stays ".".
 SELECT ?bucket (COUNT(*) AS ?recordCount)
 WHERE {
   ?record a vcfc:VCFRecord ;
@@ -27,6 +33,9 @@ WHERE {
   ?call vcfc:qual ?qual ;
         vcfc:filter ?filter ;
         vcfc:infoRaw ?info .
+  BIND(STR(?qual) AS ?qualText)
+  BIND(IF(REGEX(?qualText, "\\.[0-9]*0$"), REPLACE(?qualText, "\\.?0+$", ""), ?qualText)
+       AS ?qualKey)
   BIND(SUBSTR(SHA256(CONCAT(
     STR(?record),          "\u001F",
     STR(?chrom),           "\u001F",
@@ -34,7 +43,7 @@ WHERE {
     STR(?recordIdLiteral), "\u001F",
     STR(?ref),             "\u001F",
     STR(?alt),             "\u001F",
-    STR(?qual),            "\u001F",
+    ?qualKey,              "\u001F",
     STR(?filter),          "\u001F",
     STR(?info)
   )), 1, 2) AS ?bucket)

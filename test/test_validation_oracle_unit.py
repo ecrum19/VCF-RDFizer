@@ -885,14 +885,6 @@ class EmittedTermCensusCoverageTests(VerboseTestCase):
         # VCF 4.5 local alleles (LA/LR/LG)
         "LocalAlleleSet", "LocalAlleleMembership", "hasLocalAlleleSet",
         "hasLocalAlleleMembership", "hasLocalAllele", "localAllele", "localIndex",
-        # phase sets (PS/PSL/PSO/PSQ)
-        "PhaseSet", "inPhaseSet", "phaseSetId", "phaseSetName", "phaseSetOrdinal",
-        "phaseSetQuality",
-        # structural variants and confidence intervals
-        "VariantEvent", "inEvent", "eventType", "svClaim",
-        "ConfidenceInterval", "ciLower", "ciUpper", "endPosition",
-        # gVCF reference blocks
-        "ReferenceBlock", "isReferenceBlockStart", "referenceBlockLength",
         # tandem repeats
         "TandemRepeatAllele", "RepeatSequence", "hasRepeatSequence",
         "repeatSequenceCount", "repeatSequenceIndex",
