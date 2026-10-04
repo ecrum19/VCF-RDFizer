@@ -182,10 +182,10 @@ vocabulary repository ships one example VCF per version under
 if that coverage is wanted.
 
 **The SV carriers have no mutation.** They are represented and conformant, and
-the census counts the families the fixture exercises, but the fixture contains
-no structural variants, so `emitted_record_counters` is untested against
-breakends, tandem repeats and reference blocks. Adding one SV record to the
-fixture would exercise them through the existing machinery.
+the census counts them -- `test_validation_real_files_unit.py` checks the
+oracle's counts against the emitters' output for events, confidence intervals,
+reference blocks and phase sets -- but no mutation targets them, and tandem
+repeats are not counted yet.
 
 ## How conformance was verified
 
