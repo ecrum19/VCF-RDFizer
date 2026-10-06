@@ -110,8 +110,11 @@ def keys_for(record, manifest):
         return keys
     # POS and GFF3 intervals are both 1-based closed. Explicit REF spans only;
     # END, symbolic alleles and breakends require a different coordinate policy.
+    # `*` (an allele spanning an upstream deletion) and `.` leave the REF span
+    # as written, so they key like any other ALT: skipping them would let a
+    # rule that selects records by their genes miss records inside those genes.
     if not re.fullmatch(r"[ACGTNacgtn]+", record.ref) or any(
-            not re.fullmatch(r"[ACGTNacgtn]+|\.", alt) for alt in record.alt.split(",")):
+            not re.fullmatch(r"[ACGTNacgtn]+|[.*]", alt) for alt in record.alt.split(",")):
         return []
     try:
         start = int(record.pos)

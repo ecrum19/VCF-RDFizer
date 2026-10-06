@@ -132,9 +132,10 @@ Chromosome names must match exactly (`1` and `chr1` are different) unless the
 manifest declares `vcfl:contigAliases`: a digest-pinned sequence map (§4, allele
 identity) through which both the GFF3 seqids and the records' contigs resolve to
 an accession. `ensembl-genes-grch38` uses one, so Ensembl's `17` meets `chr17`.
-There is no liftover. Symbolic alleles,
-breakends, and spanning-deletion `*` records are skipped and counted in
-`skipped_records`. The runner does not interpret INFO/END or confidence ranges.
+There is no liftover. Symbolic alleles and
+breakends are skipped and counted in `skipped_records`; a spanning-deletion
+`*` keeps the record's REF span, so it is linked (it was skipped up to v3.3.0).
+The runner does not interpret INFO/END or confidence ranges.
 It uses explicit DNA REF spans, including their anchor base, rather than an
 inferred biological affected region.
 
@@ -198,7 +199,7 @@ identifiers outside repeats equal NCBI's SPDI exactly. Inside a repeat they
 differ from NCBI's contextual form but denote the same allele. That is checked
 against recorded NCBI answers in
 [vcf-rdfizer-testing `plugin-tests/spdi/`](https://github.com/ecrum19/vcf-rdfizer-testing/tree/main/plugin-tests). Symbolic alleles, breakends,
-`*` and `.` are skipped and counted, as for the interval join.
+`*` and `.` are skipped and counted: they have no allele sequence to express.
 
 ## 5. Tier 3: a narrow Python resolver
 

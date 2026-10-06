@@ -120,6 +120,9 @@ ex:panel a odrl:Asset , vcfp:GraphSelection ;
 
 It fails closed: a graph with no `?predicate` triple at all, because the link
 graph was left out, is refused rather than evaluated as selecting nothing.
+It does not fail closed per record: a record the linker could not key (the
+link report's `skipped_records`) is never selected, so a prohibition on a
+panel does not reach it.
 
 Selector types are read from the profile files, and also from the policy file
 itself, so a policy can bring its own (§8).
