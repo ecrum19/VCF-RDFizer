@@ -7,6 +7,7 @@
 [![Docker Pulls](https://img.shields.io/docker/pulls/ecrum19/vcf-rdfizer)](https://hub.docker.com/r/ecrum19/vcf-rdfizer)
 [![Conda Version](https://img.shields.io/conda/vn/conda-forge/vcf-rdfizer)](https://anaconda.org/conda-forge/vcf-rdfizer)
 [![License](https://img.shields.io/github/license/ecrum19/VCF-RDFizer)](https://github.com/ecrum19/VCF-RDFizer/blob/main/LICENSE)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23237635.svg)](https://doi.org/10.5281/zenodo.23237635)
 
 <p align="center">
   <img src="assets/logo/logo.png" alt="VCF-RDFizer logo" width="220" />
@@ -1135,9 +1136,13 @@ BibTeX:
   year    = {2026},
   version = {3.3.1},
   url     = {https://github.com/ecrum19/VCF-RDFizer},
+  doi     = {10.5281/zenodo.23237635},
   note    = {Computer software}
 }
 ```
+
+Every release is archived on Zenodo. The DOI above, [10.5281/zenodo.23237635](https://doi.org/10.5281/zenodo.23237635), resolves to the latest
+version; each version's own DOI is listed on its Zenodo record.
 
 You can also use the machine-readable citation file: `CITATION.cff`.
 

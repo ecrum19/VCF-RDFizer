@@ -1,0 +1,34 @@
+{
+  "upload_type": "software",
+  "title": "VCF-RDFizer",
+  "description": "<p>VCF-RDFizer converts Variant Call Format (VCF) files to RDF that uses the VCF Core vocabulary (<a href=\"https://w3id.org/vcf-core/vocab\">https://w3id.org/vcf-core/vocab</a>). It is a Docker-first command-line tool that:</p><ol><li>converts a VCF file to N-Triples with RMLStreamer;</li><li>optionally compresses the graph into the queryable HDT and COTTAS representations;</li><li>validates a converted graph against its source VCF with semantic queries and SHACL shapes;</li><li>links variants to external resources in a separate, provenance-tracked graph;</li><li>attaches ODRL data-use policies to files, regions, and variants, and writes the release views that a requester's policies permit.</li></ol><p>The conversion toolchain runs in one pinned Docker image (<code>ecrum19/vcf-rdfizer</code> on Docker Hub). The command-line tool is also distributed on PyPI and conda-forge (<code>vcf-rdfizer</code>).</p>",
+  "creators": [
+    {
+      "name": "Crum, Elias",
+      "affiliation": "Flemish Institute for Technological Research (VITO); IDLab, Ghent University - imec",
+      "orcid": "0009-0005-3991-754X"
+    }
+  ],
+  "license": "mit",
+  "access_right": "open",
+  "language": "eng",
+  "keywords": [
+    "Variant Call Format",
+    "VCF",
+    "RDF",
+    "RML",
+    "SPARQL",
+    "SHACL",
+    "HDT",
+    "ODRL",
+    "bioinformatics",
+    "genomic variation"
+  ],
+  "related_identifiers": [
+    {
+      "identifier": "https://w3id.org/vcf-core/vocab",
+      "relation": "references",
+      "resource_type": "other"
+    }
+  ]
+}
