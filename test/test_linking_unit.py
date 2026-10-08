@@ -148,12 +148,13 @@ class LinkingTests(unittest.TestCase):
         self.assertEqual(list(index.overlaps(LinkKey(chrom="chr1", start=100, end=100))), [])
         row = next(r for r in read_vcf(EXAMPLE) if isinstance(r, Record))
         self.assertEqual(keys_for(replace(row, pos="99", ref="AT"), self.interval), [LinkKey(chrom="1", start=99, end=100)])
-        # `*` and `.` keep the REF span; END, symbolic alleles and breakends do not.
-        for alt in ("*", "G,*", "."):
+        # Every ALT keeps the REF span: `*`, `.`, symbolic alleles and breakends
+        # alike. END and breakend mates are not read.
+        for alt in ("*", "G,*", ".", "<DEL>", "<INS:ME:ALU>", "N]2:20]", "G,<DEL>", "*,<DEL>"):
             self.assertEqual(keys_for(replace(row, pos="99", ref="AT", alt=alt), self.interval),
                              [LinkKey(chrom="1", start=99, end=100)])
-        for alt in ("<DEL>", "N]2:20]", "G,<DEL>", "*,<DEL>"):
-            self.assertEqual(keys_for(replace(row, alt=alt), self.interval), [])
+        # Only a REF that is not bases keys nothing.
+        self.assertEqual(keys_for(replace(row, ref="."), self.interval), [])
 
     def test_nested_gff_features_are_not_missed(self):
         gff = self.root / "nested.gff3"
@@ -696,9 +697,20 @@ class ContigAliasTests(unittest.TestCase):
         # NB72462M has 13 `*` records in cancer genes; unlinked, a rule withholding
         # those genes from research released them.
         linked = self.link(self.manifest(), allele_record("chr17", 150, "AT", "*", row=1),
-                           allele_record("chr17", 199, "C", "T,*", row=2),
-                           allele_record("chr17", 150, "A", "<DEL>", row=3))
+                           allele_record("chr17", 199, "C", "T,*", row=2))
         self.assertEqual(linked, {"1": {"https://example.org/GENE_A"}, "2": {"https://example.org/GENE_A"}})
+
+    def test_a_symbolic_allele_or_breakend_links_by_its_anchor(self):
+        # Experiment 17's arm 2 released 110 structural variants in cancer genes
+        # (<INS:ME:ALU>, <DUP>, <INS>) to a research view: unkeyed, no rule over
+        # gene links reached them. The anchor links; END is not read, so a <DUP>
+        # anchored outside the gene does not.
+        linked = self.link(self.manifest(), allele_record("chr17", 150, "A", "<DEL>", row=1),
+                           allele_record("chr17", 150, "A", "<INS:ME:ALU>", row=2),
+                           allele_record("chr17", 150, "A", "A]chr2:20]", row=3),
+                           allele_record("chr17", 250, "A", "<DUP>", row=4))
+        self.assertEqual(linked, {"1": {"https://example.org/GENE_A"}, "2": {"https://example.org/GENE_A"},
+                                  "3": {"https://example.org/GENE_A"}})
 
     def test_an_unmapped_contig_still_matches_by_name(self):
         linked = self.link(self.manifest(), allele_record("chrUn_x", 10, "A", "G"))

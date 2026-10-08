@@ -108,13 +108,13 @@ def keys_for(record, manifest):
             if allele:
                 keys.append(LinkKey(chrom=record.chrom, start=allele[0], token=f"{allele[1]}:{allele[2]}"))
         return keys
-    # POS and GFF3 intervals are both 1-based closed. Explicit REF spans only;
-    # END, symbolic alleles and breakends require a different coordinate policy.
-    # `*` (an allele spanning an upstream deletion) and `.` leave the REF span
-    # as written, so they key like any other ALT: skipping them would let a
-    # rule that selects records by their genes miss records inside those genes.
-    if not re.fullmatch(r"[ACGTNacgtn]+", record.ref) or any(
-            not re.fullmatch(r"[ACGTNacgtn]+|[.*]", alt) for alt in record.alt.split(",")):
+    # POS and GFF3 intervals are both 1-based closed. A record keys its REF span
+    # whatever its ALT: `*`, `.`, symbolic alleles and breakends all leave the
+    # REF, anchor base included, as written, and skipping them would let a rule
+    # that selects records by their genes miss records inside those genes.
+    # INFO/END and breakend mates are not read, so a structural variant links by
+    # its anchor, not by the whole extent it affects.
+    if not re.fullmatch(r"[ACGTNacgtn]+", record.ref):
         return []
     try:
         start = int(record.pos)

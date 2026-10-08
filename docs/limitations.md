@@ -255,13 +255,17 @@ the remaining proposal. The base graph remains a faithful, separate artifact.
 
 **A rule over links reaches only linked records.** `vcfp:LinkedSelector`
 selects records through their calls' links, so a record a linker could not key
-is never selected: a prohibition on a gene panel does not reach a symbolic
-allele or breakend inside the panel, because the gene linkers key explicit REF
-spans only. The link report counts these records per linker
-(`skipped_records`). Check it before relying on such a prohibition, or add a
-`vcfp:RegionSelector` over the same coordinates. Up to v3.3.0 the gene linkers
-also skipped `*` alleles, which released 13 records in cancer-predisposition
-genes to a research view of one whole genome; v3.3.1 links them.
+is never selected. The gene linkers key every record by its REF span, so a
+structural variant is selected by the genes its anchor lies in, not by every
+gene its END or breakend mate reaches: a prohibition on a gene panel does not
+reach a deletion anchored upstream of the panel. Add a `vcfp:RegionSelector`
+over the same coordinates where that matters. The link report counts the
+records a linker could not key per linker (`skipped_records`). Up to v3.3.0 the
+gene linkers skipped `*` alleles, which released 13 records in
+cancer-predisposition genes to a research view of one whole genome; up to
+v3.3.1 they skipped symbolic alleles and breakends, which released structural
+variants in those genes from 104 cohort genomes to research views: 110 to a
+disease-specific one and 58 to a general one.
 
 **No disclosure control.** Conversion is all-or-nothing: every sample, every
 genotype, every header line and every free-text `Description` goes into the

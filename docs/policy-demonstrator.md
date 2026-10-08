@@ -122,7 +122,8 @@ It fails closed: a graph with no `?predicate` triple at all, because the link
 graph was left out, is refused rather than evaluated as selecting nothing.
 It does not fail closed per record: a record the linker could not key (the
 link report's `skipped_records`) is never selected, so a prohibition on a
-panel does not reach it.
+panel does not reach it. The gene linkers key every record by its REF span, so
+a structural variant is selected by the genes its anchor lies in.
 
 Selector types are read from the profile files, and also from the policy file
 itself, so a policy can bring its own (§8).

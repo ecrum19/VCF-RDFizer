@@ -132,12 +132,14 @@ Chromosome names must match exactly (`1` and `chr1` are different) unless the
 manifest declares `vcfl:contigAliases`: a digest-pinned sequence map (§4, allele
 identity) through which both the GFF3 seqids and the records' contigs resolve to
 an accession. `ensembl-genes-grch38` uses one, so Ensembl's `17` meets `chr17`.
-There is no liftover. Symbolic alleles and
-breakends are skipped and counted in `skipped_records`; a spanning-deletion
-`*` keeps the record's REF span, so it is linked (it was skipped up to v3.3.0).
-The runner does not interpret INFO/END or confidence ranges.
+There is no liftover. A record keys its REF span whatever its ALT: a
+spanning-deletion `*` (skipped up to v3.3.0), a symbolic allele or a breakend
+(skipped up to v3.3.1) is linked by the REF it writes. Only a record whose REF
+is not DNA bases is skipped and counted in `skipped_records`.
+The runner does not interpret INFO/END, breakend mates or confidence ranges.
 It uses explicit DNA REF spans, including their anchor base, rather than an
-inferred biological affected region.
+inferred biological affected region, so a structural variant links to the genes
+its anchor lies in, not to every gene it affects.
 
 References may be HTTPS URLs, local `file:` URLs, or relative IRI references
 such as `<genes.gff3>` resolved beside `linker.ttl`. An absolute URL string is

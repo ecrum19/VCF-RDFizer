@@ -10,9 +10,10 @@ Contig names are resolved through the GRCh38 sequence map
 `17` and a VCF's `chr17` meet. Only `gene` features count (21,581 in release
 116, including all protein-coding genes); `ncRNA_gene` and pseudogenes do not.
 
-A record's span is its REF span whatever its ALT, `*` included. Symbolic
-alleles and breakends, whose extent is END or a mate, are not linked; the
-report counts them in `skipped_records`.
+A record's span is its REF span whatever its ALT: `*`, symbolic alleles and
+breakends included. END and breakend mates are not read, so a structural
+variant links to the genes its anchor lies in. Only a record whose REF is not
+DNA bases is skipped; the report counts it in `skipped_records`.
 
 ```bash
 vcf-rdfizer-link run -i sample.vcf --link ensembl-genes-grch38 -o sample.links.nt
