@@ -3,6 +3,7 @@ message: "If you use VCF-RDFizer in your research, please cite it using the meta
 title: "VCF-RDFizer"
 type: software
 version: "3.3.1"
+doi: "10.5281/zenodo.23237635"
 authors:
   - name: "VCF-RDFizer maintainers"
 repository-code: "https://github.com/ecrum19/VCF-RDFizer"
