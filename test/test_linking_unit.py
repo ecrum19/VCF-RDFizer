@@ -148,7 +148,11 @@ class LinkingTests(unittest.TestCase):
         self.assertEqual(list(index.overlaps(LinkKey(chrom="chr1", start=100, end=100))), [])
         row = next(r for r in read_vcf(EXAMPLE) if isinstance(r, Record))
         self.assertEqual(keys_for(replace(row, pos="99", ref="AT"), self.interval), [LinkKey(chrom="1", start=99, end=100)])
-        for alt in ("<DEL>", "*", "N]2:20]"):
+        # `*` and `.` keep the REF span; END, symbolic alleles and breakends do not.
+        for alt in ("*", "G,*", "."):
+            self.assertEqual(keys_for(replace(row, pos="99", ref="AT", alt=alt), self.interval),
+                             [LinkKey(chrom="1", start=99, end=100)])
+        for alt in ("<DEL>", "N]2:20]", "G,<DEL>", "*,<DEL>"):
             self.assertEqual(keys_for(replace(row, alt=alt), self.interval), [])
 
     def test_nested_gff_features_are_not_missed(self):
@@ -686,6 +690,14 @@ class ContigAliasTests(unittest.TestCase):
     def test_chr17_and_17_both_reach_a_gene_declared_on_17(self):
         linked = self.link(self.manifest(), allele_record("chr17", 150, "A", "G", row=1),
                            allele_record("17", 150, "A", "G", row=2), allele_record("chr17", 250, "A", "G", row=3))
+        self.assertEqual(linked, {"1": {"https://example.org/GENE_A"}, "2": {"https://example.org/GENE_A"}})
+
+    def test_a_spanning_deletion_allele_links_to_the_gene_it_lies_in(self):
+        # NB72462M has 13 `*` records in cancer genes; unlinked, a rule withholding
+        # those genes from research released them.
+        linked = self.link(self.manifest(), allele_record("chr17", 150, "AT", "*", row=1),
+                           allele_record("chr17", 199, "C", "T,*", row=2),
+                           allele_record("chr17", 150, "A", "<DEL>", row=3))
         self.assertEqual(linked, {"1": {"https://example.org/GENE_A"}, "2": {"https://example.org/GENE_A"}})
 
     def test_an_unmapped_contig_still_matches_by_name(self):

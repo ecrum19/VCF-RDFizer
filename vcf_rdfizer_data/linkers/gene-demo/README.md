@@ -13,7 +13,8 @@ vcf-rdfizer-link dry-run my-gene-linker -i sample.vcf --limit 100
 
 Intervals are 1-based closed; keys cover POS through POS + len(REF) - 1. The
 example contains overlapping genes A/B and a gene C on chromosome 2. Exons are
-ignored. Chromosome names match exactly. Symbolic alleles are skipped.
+ignored. Chromosome names match exactly. A `*` ALT keeps the REF span;
+symbolic alleles and breakends are skipped.
 
 For a real reference, change the plug-in ID, reference URL, actual SHA-256,
 assembly and object template. Point `idAttribute` at the GFF3 attribute your

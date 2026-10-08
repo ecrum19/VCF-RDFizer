@@ -97,7 +97,7 @@ inside this directory.
 - `tsv`: VCF -> TSV only (benchmarking)
 - `compress`: compress an existing `.nt` or `.nt.gz`
 - `decompress`: decompress `.nt.gz`, `.nt.br`, `.hdt`, `.cottas`, `.cottas.gz`, or `.cottas.br`
-- `validation`: compare a source VCF with its `.nt` or `.nt.gz` RDF using six semantic SPARQL queries
+- `validation`: compare a source VCF with its `.nt` or `.nt.gz` RDF using thirteen semantic SPARQL queries
 - `index`: only generate or regenerate the query index for an existing `.hdt` or `.cottas`
 
 In `full` mode with multiple VCF inputs, failures are isolated per input:
@@ -1124,7 +1124,7 @@ Safe termination:
 
 If you use VCF-RDFizer in a publication, please cite:
 
-VCF-RDFizer maintainers. (2026). *VCF-RDFizer* (Version 3.3.0) [Computer software]. GitHub. https://github.com/ecrum19/VCF-RDFizer
+VCF-RDFizer maintainers. (2026). *VCF-RDFizer* (Version 3.3.1) [Computer software]. GitHub. https://github.com/ecrum19/VCF-RDFizer
 
 BibTeX:
 
@@ -1133,7 +1133,7 @@ BibTeX:
   author  = {{VCF-RDFizer maintainers}},
   title   = {VCF-RDFizer},
   year    = {2026},
-  version = {3.3.0},
+  version = {3.3.1},
   url     = {https://github.com/ecrum19/VCF-RDFizer},
   note    = {Computer software}
 }
