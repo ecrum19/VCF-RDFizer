@@ -104,6 +104,15 @@ the worst case at one timeout per engine rather than one per query:
  "queriesRun": 1, "queriesPlanned": 27}
 ```
 
+A timeout is recorded as one (`EXECUTION_FAILED`, exit code 124) however it
+arrives. The Comunica-backed engines (`comunica`, `hdt`, `cottas`) answer a
+timeout with HTTP 200 and a response cut short by `!TIMEDOUT!`, so that marker
+is read as a timeout, and no query passes unless its result is well-formed
+SPARQL Results JSON. Comunica replaces its worker after a timeout, so the
+endpoint is restarted before the next query; the restart time is reported as
+`endpointRestartSeconds` on that query and is not counted in its
+`wallSeconds`.
+
 Options for a graph that is genuinely too large:
 
 ```bash
