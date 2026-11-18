@@ -2609,8 +2609,11 @@ class QueryEngine:
         time_path: Path | None = None,
         error: str | None = None,
     ) -> dict[str, Any]:
+        problem = result_problem(raw_path) if returncode == 0 else None
+        if problem is not None and error is None:
+            error = problem
         envelope = {
-            "status": "PASS" if returncode == 0 else "EXECUTION_FAILED",
+            "status": "PASS" if returncode == 0 and problem is None else "EXECUTION_FAILED",
             "engine": self.name,
             "exitCode": returncode,
             "wallSeconds": time.monotonic() - started,
@@ -2681,6 +2684,45 @@ def run_query_process(
         except subprocess.TimeoutExpired:
             _terminate_process_group(process)
             return 124, f"query exceeded {timeout}s"
+
+
+#: What a Comunica endpoint appends to a response when its own per-query
+#: timeout fires. By then the 200 status and the start of the result have been
+#: sent, so the timeout reaches the client as a successful HTTP exchange whose
+#: body is cut short by this marker -- not as an error or a closed socket.
+COMUNICA_TIMEOUT_MARKER = b"!TIMEDOUT!"
+
+
+def ends_with_timeout_marker(payload: bytes) -> bool:
+    return payload.rstrip().endswith(COMUNICA_TIMEOUT_MARKER)
+
+
+def result_problem(raw_path: Path) -> str | None:
+    """Why a result an engine reported as successful is not one, or None.
+
+    An engine's exit status says it stopped, not that it answered. A Comunica
+    endpoint whose own timeout fires still returns HTTP 200 with a truncated
+    body, so trusting the status recorded an hour-long timeout as a passing
+    query. A passing execution must have produced SPARQL Results JSON: a
+    ``results.bindings`` list, or an ASK ``boolean``.
+    """
+    try:
+        payload = raw_path.read_bytes()
+    except OSError as error:
+        return f"engine reported success but its result is unreadable: {error}"
+    if ends_with_timeout_marker(payload):
+        return "engine ended its response with its timeout marker (!TIMEDOUT!)"
+    try:
+        document = json.loads(payload)
+    except ValueError as error:
+        return f"engine reported success but its result is not JSON: {error}"
+    if isinstance(document, dict):
+        if isinstance(document.get("boolean"), bool):
+            return None
+        results = document.get("results")
+        if isinstance(results, dict) and isinstance(results.get("bindings"), list):
+            return None
+    return "engine reported success but its result is not SPARQL Results JSON"
 
 
 def is_timeout_error(error: BaseException) -> bool:
@@ -2778,6 +2820,8 @@ class ComunicaHttpEndpointMixin:
         self.endpoint: str | None = None
         self.warmup_seconds: float | None = None
         self.command: list[str] = []
+        #: Set by a query that timed out; the next query restarts the endpoint.
+        self.restart_pending = False
 
     def _endpoint_source_argument(self) -> str:
         """The source argv entry, in whatever form this engine's binary needs."""
@@ -2956,7 +3000,44 @@ class ComunicaHttpEndpointMixin:
             "command": list(self.command),
         }
 
+    def _restart_after_timeout(self) -> tuple[float, str | None]:
+        """Replace the endpoint a timed-out query left behind.
+
+        When Comunica's timeout fires it kills the worker and its master forks
+        a new one, which refuses connections until it has bound. Queried at
+        once, every remaining query failed in under a millisecond with
+        "Connection refused" -- eight of thirteen lost to one timeout. When the
+        client gives up first, the worker is still busy with the old query.
+        Either way the endpoint cannot be trusted with the next query, so it is
+        restarted, at the cost of one bind and warm-up, which is charged to
+        neither query. Done lazily, so ``--stop-after-query-timeout`` pays
+        nothing for it.
+        """
+        self.restart_pending = False
+        warmup_seconds = self.warmup_seconds
+        started = time.monotonic()
+        self.stop()
+        try:
+            self._start_endpoint()
+        except RuntimeError as error:
+            self.stop()
+            return time.monotonic() - started, str(error)
+        finally:
+            self.warmup_seconds = warmup_seconds
+        return time.monotonic() - started, None
+
     def execute(self, query_id: str, query_path: Path) -> dict[str, Any]:
+        restart: dict[str, Any] = {}
+        if self.restart_pending:
+            seconds, failure = self._restart_after_timeout()
+            restart["endpointRestartSeconds"] = seconds
+            if failure is not None:
+                restart["endpointRestartError"] = failure
+        envelope = self._execute(query_id, query_path)
+        envelope.update(restart)
+        return envelope
+
+    def _execute(self, query_id: str, query_path: Path) -> dict[str, Any]:
         raw_path = self.raw_dir / f"{query_id}.sparql.json"
         stderr_path = self.raw_dir / f"{query_id}.stderr.txt"
         started = time.monotonic()
@@ -2979,6 +3060,7 @@ class ComunicaHttpEndpointMixin:
             # 124 is the timeout convention the query loop keys on; anything
             # else here really is an execution failure.
             timed_out = is_timeout_error(error)
+            self.restart_pending = timed_out
             message = (
                 f"query exceeded {self.query_timeout}s" if timed_out else str(error)
             )
@@ -2987,7 +3069,19 @@ class ComunicaHttpEndpointMixin:
                 started=started, raw_path=raw_path, stderr_path=stderr_path,
                 error=message,
             )
+        # The truncated body is kept as the evidence of what was received.
         raw_path.write_bytes(payload)
+        if ends_with_timeout_marker(payload):
+            self.restart_pending = True
+            message = (
+                f"query exceeded {self.query_timeout}s (the endpoint ended its "
+                f"response with {COMUNICA_TIMEOUT_MARKER.decode()})"
+            )
+            stderr_path.write_text(message, encoding="utf-8")
+            return self._envelope(
+                query_id, query_path, returncode=124, started=started,
+                raw_path=raw_path, stderr_path=stderr_path, error=message,
+            )
         stderr_path.write_bytes(b"")
         return self._envelope(
             query_id, query_path, returncode=0, started=started,
