@@ -5,9 +5,9 @@
 [![PyPI version](https://img.shields.io/pypi/v/vcf-rdfizer)](https://pypi.org/project/vcf-rdfizer/)
 [![Python versions](https://img.shields.io/pypi/pyversions/vcf-rdfizer)](https://pypi.org/project/vcf-rdfizer/)
 [![Docker Pulls](https://img.shields.io/docker/pulls/ecrum19/vcf-rdfizer)](https://hub.docker.com/r/ecrum19/vcf-rdfizer)
-[![Conda Version](https://img.shields.io/conda/vn/conda-forge/vcf-rdfizer)](https://anaconda.org/conda-forge/vcf-rdfizer)
+[![Conda Version](https://img.shields.io/conda/vn/conda-forge/vcf-rdfizer?cacheSeconds=86400)](https://anaconda.org/conda-forge/vcf-rdfizer)
 [![License](https://img.shields.io/github/license/ecrum19/VCF-RDFizer)](https://github.com/ecrum19/VCF-RDFizer/blob/main/LICENSE)
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23237635.svg)](https://doi.org/10.5281/zenodo.23237635)
+[![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.23237635-blue)](https://doi.org/10.5281/zenodo.23237635)
 
 <p align="center">
   <img src="assets/logo/logo.png" alt="VCF-RDFizer logo" width="220" />
