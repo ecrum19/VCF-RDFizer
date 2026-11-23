@@ -2744,6 +2744,25 @@ def is_timeout_error(error: BaseException) -> bool:
     return False
 
 
+def is_endpoint_lost_error(error: BaseException) -> bool:
+    """Whether a query failed because the endpoint went away mid-exchange.
+
+    A refused or reset connection, or a response cut off before its declared
+    length (``IncompleteRead``), means the process serving the query is gone or
+    being replaced -- a crashed Node worker shows up exactly like that. An
+    ``HTTPError``, or a URLError whose reason is not a socket error, means the
+    endpoint answered, so the endpoint itself is still fine.
+    """
+    import http.client
+    import urllib.error
+
+    if isinstance(error, urllib.error.HTTPError):
+        return False
+    if isinstance(error, urllib.error.URLError):
+        return isinstance(error.reason, OSError)
+    return isinstance(error, (ConnectionError, http.client.IncompleteRead))
+
+
 def _terminate_process_group(process: subprocess.Popen) -> None:
     """Signal a process group, escalating to SIGKILL, and reap the leader."""
     for signal_number, grace in ((signal.SIGTERM, 10), (signal.SIGKILL, 5)):
@@ -2820,8 +2839,9 @@ class ComunicaHttpEndpointMixin:
         self.endpoint: str | None = None
         self.warmup_seconds: float | None = None
         self.command: list[str] = []
-        #: Set by a query that timed out; the next query restarts the endpoint.
-        self.restart_pending = False
+        #: The query that timed out or lost the endpoint, if any; the next
+        #: query restarts the endpoint first.
+        self.restart_after: str | None = None
 
     def _endpoint_source_argument(self) -> str:
         """The source argv entry, in whatever form this engine's binary needs."""
@@ -2847,7 +2867,7 @@ class ComunicaHttpEndpointMixin:
             )
         return self.executable
 
-    def _start_endpoint(self) -> None:
+    def _start_endpoint(self, *, restart_after: str | None = None) -> None:
         if not self.executable:
             self._require_endpoint_binary()
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -2863,9 +2883,19 @@ class ComunicaHttpEndpointMixin:
             "-t", str(self.query_timeout),
         ]
         server_log = self.log_dir / f"{self.name}-server.log"
+        if restart_after is None:
+            log_handle = server_log.open("wb")
+        else:
+            # Appended, not truncated: the log of the endpoint being replaced
+            # holds the evidence of why (a timeout, or a crash's stack trace).
+            log_handle = server_log.open("ab")
+            log_handle.write(
+                f"\n=== endpoint restarted after {restart_after} ===\n".encode("utf-8")
+            )
+            log_handle.flush()
         self.server = subprocess.Popen(
             self.command,
-            stdout=server_log.open("wb"),
+            stdout=log_handle,
             stderr=subprocess.STDOUT,
             start_new_session=True,
             env=node_endpoint_env(getattr(self, "node_heap_mb", None)),
@@ -3000,25 +3030,28 @@ class ComunicaHttpEndpointMixin:
             "command": list(self.command),
         }
 
-    def _restart_after_timeout(self) -> tuple[float, str | None]:
-        """Replace the endpoint a timed-out query left behind.
+    def _restart_endpoint(self) -> tuple[float, str | None]:
+        """Replace the endpoint a timed-out or crashed query left behind.
 
         When Comunica's timeout fires it kills the worker and its master forks
         a new one, which refuses connections until it has bound. Queried at
         once, every remaining query failed in under a millisecond with
         "Connection refused" -- eight of thirteen lost to one timeout. When the
-        client gives up first, the worker is still busy with the old query.
-        Either way the endpoint cannot be trusted with the next query, so it is
-        restarted, at the cost of one bind and warm-up, which is charged to
-        neither query. Done lazily, so ``--stop-after-query-timeout`` pays
-        nothing for it.
+        client gives up first, the worker is still busy with the old query. A
+        crashed worker (vcf-bench-3, COTTAS, q06: a V8 fatal error during
+        garbage collection) leaves the same refusals behind it.
+        In every case the endpoint cannot be trusted with the next query, so it
+        is restarted, at the cost of one bind and warm-up, which is charged to
+        neither query. The query that failed is not retried: its failure is the
+        result. Done lazily, so ``--stop-after-query-timeout`` pays nothing for
+        it.
         """
-        self.restart_pending = False
+        restart_after, self.restart_after = self.restart_after, None
         warmup_seconds = self.warmup_seconds
         started = time.monotonic()
         self.stop()
         try:
-            self._start_endpoint()
+            self._start_endpoint(restart_after=restart_after)
         except RuntimeError as error:
             self.stop()
             return time.monotonic() - started, str(error)
@@ -3028,8 +3061,8 @@ class ComunicaHttpEndpointMixin:
 
     def execute(self, query_id: str, query_path: Path) -> dict[str, Any]:
         restart: dict[str, Any] = {}
-        if self.restart_pending:
-            seconds, failure = self._restart_after_timeout()
+        if self.restart_after is not None:
+            seconds, failure = self._restart_endpoint()
             restart["endpointRestartSeconds"] = seconds
             if failure is not None:
                 restart["endpointRestartError"] = failure
@@ -3060,10 +3093,19 @@ class ComunicaHttpEndpointMixin:
             # 124 is the timeout convention the query loop keys on; anything
             # else here really is an execution failure.
             timed_out = is_timeout_error(error)
-            self.restart_pending = timed_out
-            message = (
-                f"query exceeded {self.query_timeout}s" if timed_out else str(error)
-            )
+            endpoint_lost = not timed_out and is_endpoint_lost_error(error)
+            if timed_out or endpoint_lost:
+                self.restart_after = query_id
+            if timed_out:
+                message = f"query exceeded {self.query_timeout}s"
+            elif endpoint_lost:
+                message = (
+                    f"{self.name} endpoint was lost during the query ({error}); "
+                    f"it is restarted before the next query. See "
+                    f"{self.name}-server.log for the cause"
+                )
+            else:
+                message = str(error)
             return self._envelope(
                 query_id, query_path, returncode=124 if timed_out else 1,
                 started=started, raw_path=raw_path, stderr_path=stderr_path,
@@ -3072,7 +3114,7 @@ class ComunicaHttpEndpointMixin:
         # The truncated body is kept as the evidence of what was received.
         raw_path.write_bytes(payload)
         if ends_with_timeout_marker(payload):
-            self.restart_pending = True
+            self.restart_after = query_id
             message = (
                 f"query exceeded {self.query_timeout}s (the endpoint ended its "
                 f"response with {COMUNICA_TIMEOUT_MARKER.decode()})"

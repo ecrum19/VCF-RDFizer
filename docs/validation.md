@@ -113,6 +113,15 @@ endpoint is restarted before the next query; the restart time is reported as
 `endpointRestartSeconds` on that query and is not counted in its
 `wallSeconds`.
 
+A crash is handled the same way. When the endpoint is lost during a query (the
+connection is refused, reset, or the response is cut off, as when a Node worker
+dies), that query fails with exit code 1 and is not retried, and the endpoint
+is restarted before the next one, so the suite resumes after the crashed query.
+A query the endpoint answers with an error does not restart it. The server log
+(`<engine>-server.log`) is appended to across restarts, with a
+`=== endpoint restarted after <query> ===` line, so the crash's own output is
+kept.
+
 Options for a graph that is genuinely too large:
 
 ```bash
