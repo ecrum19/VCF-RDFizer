@@ -12,10 +12,17 @@ These tests pin both halves: the marker is a timeout (exit 124, not a pass),
 any exit-0 result that is not SPARQL Results JSON fails, and the endpoint is
 restarted before the next query so one timeout costs one query, not the rest
 of the suite.
+
+A crash is handled the same way. In the same run the COTTAS endpoint's worker
+died during q06 (a V8 fatal error during garbage collection, SIGTRAP): q06 got
+``IncompleteRead(70 bytes read)``, q07 a reset connection, and q08-q13 were
+refused. The crashed query is a failure; the endpoint is restarted and the
+suite resumes with the next query.
 """
 
 import argparse
 import copy
+import http.client
 import importlib.util
 import json
 import tempfile
@@ -58,17 +65,23 @@ class FakeComunica:
     again -- what the real master does while it forks a replacement worker.
     """
 
-    def __init__(self, *, timeouts=(), answers=None, restartable=True):
+    def __init__(self, *, timeouts=(), crashes=(), answers=None, restartable=True):
         self.timeouts = set(timeouts)
+        self.crashes = set(crashes)
         self.answers = answers or {}
         self.restartable = restartable
         self.alive = False
         self.starts = 0
         self.queries = []
+        self.log = None
 
-    def popen(self, *_args, **_kwargs):
+    def popen(self, *_args, **kwargs):
         self.starts += 1
         self.alive = self.starts == 1 or self.restartable
+        self.log = kwargs.get("stdout")
+        if self.log is not None:
+            self.log.write(f"Server running (start {self.starts})\n".encode("utf-8"))
+            self.log.flush()
         process = mock.MagicMock()
         process.poll.return_value = None
         return process
@@ -77,9 +90,16 @@ class FakeComunica:
         if not self.alive:
             raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
         query_id = query.splitlines()[0].lstrip("# ").strip()
-        if query_id not in self.answers and query_id not in self.timeouts:
+        if query_id not in set(self.answers) | self.timeouts | self.crashes:
             return EMPTY_RESULT  # bind and warm-up probes
         self.queries.append(query_id)
+        if query_id in self.crashes:
+            # What the real worker left: a stack trace in the log, and a
+            # response cut off before its declared length.
+            self.alive = False
+            self.log.write(b"# Fatal error in , line 0\nWorker 69 died with SIGTRAP.\n")
+            self.log.flush()
+            raise http.client.IncompleteRead(b"x" * 70)
         if query_id in self.timeouts:
             self.alive = False
             return RECORDED_TIMEOUT_BODY
@@ -186,7 +206,7 @@ class EngineTimeoutMarkerTests(VerboseTestCase):
         self.assertEqual(fake.starts, 2)
 
     def test_an_ordinary_failure_does_not_restart_the_endpoint(self):
-        """Only a timeout leaves the worker in doubt; a refused query does not."""
+        """A query the endpoint answers with a rejection leaves the endpoint fine."""
         fake = FakeComunica(answers={"q06": {"results": {"bindings": []}}})
         original = fake.post
 
@@ -214,6 +234,97 @@ class EngineTimeoutMarkerTests(VerboseTestCase):
         self.assertEqual(later["status"], "EXECUTION_FAILED")
         self.assertIn("not running", later["error"])
         self.assertNotIn("endpointRestartSeconds", later)
+
+    def test_a_crash_fails_that_query_and_the_suite_resumes_after_it(self):
+        """vcf-bench-3, COTTAS: one crash in q06 cost q06-q13; now it costs q06."""
+        answer = {"results": {"bindings": [{"n": {"value": "1"}}]}}
+        fake = FakeComunica(
+            crashes={"q06"}, answers={q: answer for q in ("q05", "q07", "q08")}
+        )
+        _engine, _warmup, results, _raws = self._run(fake, ["q05", "q06", "q07", "q08"])
+        before, crashed, after, later = results
+
+        self.assertEqual(before["status"], "PASS")
+        self.assertEqual(crashed["status"], "EXECUTION_FAILED")
+        # A crash is not a timeout: exit 1, so --stop-after-query-timeout
+        # does not treat it as one.
+        self.assertEqual(crashed["exitCode"], 1)
+        self.assertIn("endpoint was lost", crashed["error"])
+        self.assertIn("IncompleteRead", crashed["error"])
+        self.assertEqual(after["status"], "PASS")
+        self.assertEqual(later["status"], "PASS")
+        # The crashed query is not retried, and every later query runs.
+        self.assertEqual(fake.queries, ["q05", "q06", "q07", "q08"])
+        self.assertEqual(fake.starts, 2)
+        self.assertIn("endpointRestartSeconds", after)
+        self.assertNotIn("endpointRestartSeconds", later)
+
+    def test_a_refused_or_reset_connection_also_restarts_the_endpoint(self):
+        """What the queries after the crash saw before the restart existed."""
+        answer = {"results": {"bindings": []}}
+        for error in (
+            urllib.error.URLError(ConnectionRefusedError(111, "Connection refused")),
+            ConnectionResetError(104, "Connection reset by peer"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                fake = FakeComunica(answers={"q08": answer})
+                original = fake.post
+
+                def post(engine, endpoint, query, *, timeout, error=error):
+                    if query.startswith("# q07"):
+                        raise error
+                    return original(engine, endpoint, query, timeout=timeout)
+
+                fake.post = post
+                _engine, _warmup, (lost, after), _raws = self._run(fake, ["q07", "q08"])
+                self.assertEqual(lost["exitCode"], 1)
+                self.assertIn("endpoint was lost", lost["error"])
+                self.assertEqual(after["status"], "PASS")
+                self.assertEqual(fake.starts, 2)
+
+    def test_the_restart_keeps_the_crash_in_the_server_log(self):
+        """The stack trace is the only record of why the endpoint died."""
+        answer = {"results": {"bindings": []}}
+        fake = FakeComunica(crashes={"q06"}, answers={"q07": answer})
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            source = tmp_path / "cohort.nt"
+            source.write_bytes(b"<s> <p> <o> .\n")
+            engine = V.build_engine(
+                "comunica", source, raw_dir=tmp_path, scratch=tmp_path,
+                options={"query_timeout": 3600},
+            )
+            patches = fake.patches()
+            for patch in patches:
+                patch.start()
+            try:
+                engine.start()
+                for qid in ("q06", "q07"):
+                    engine.execute(qid, query_file(tmp_path, qid))
+                engine.stop()
+            finally:
+                for patch in reversed(patches):
+                    patch.stop()
+            log = (engine.log_dir / "comunica-server.log").read_text(encoding="utf-8")
+        self.assertIn("Server running (start 1)", log)
+        self.assertIn("Worker 69 died with SIGTRAP", log)
+        self.assertIn("=== endpoint restarted after q06 ===", log)
+        self.assertIn("Server running (start 2)", log)
+        self.assertLess(log.index("SIGTRAP"), log.index("restarted after q06"))
+
+    def test_only_a_lost_connection_counts_as_a_lost_endpoint(self):
+        self.assertTrue(V.is_endpoint_lost_error(http.client.IncompleteRead(b"", 10)))
+        self.assertTrue(V.is_endpoint_lost_error(ConnectionResetError()))
+        self.assertTrue(V.is_endpoint_lost_error(http.client.RemoteDisconnected()))
+        self.assertTrue(V.is_endpoint_lost_error(
+            urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+        ))
+        # The endpoint answered: its verdict on the query is the result.
+        self.assertFalse(V.is_endpoint_lost_error(
+            urllib.error.HTTPError("http://x", 500, "error", {}, None)
+        ))
+        self.assertFalse(V.is_endpoint_lost_error(urllib.error.URLError("query rejected")))
+        self.assertFalse(V.is_endpoint_lost_error(ValueError("bad JSON")))
 
     def test_a_marker_mid_stream_is_still_a_timeout(self):
         """Comunica appends the marker to whatever it had already streamed."""
