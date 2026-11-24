@@ -753,12 +753,24 @@ things, and the split decides what a run can detect:
 | `full` | `+ vcf-core-consistency`, `+ vcf-core-vocabulary-sparql` | Uniqueness (*"Record indices must be unique"*, *"Sample names and sample indices must be unique"*) and value agreement (`vcfc:alleleValue` against `REF`/`ALT`) | **+33.7 s, +73.2 s** in pyshacl |
 
 The distinction matters for what you can claim. The mutation-score experiment
-injected 113 corruptions; the query suite caught 96 (0.850), and 7 of the 17 it
-missed fall into four classes -- `corrupt_allele_value`, `corrupt_record_index`,
-`corrupt_value_item_allele` and `corrupt_sample_index_expanded`. **Those are
-covered by `full`, not by the default.** The core profile constrains how many
-`sampleIndex` values a sample has, not whether two samples share one, so it
-detects none of them.
+injects 113 corruptions, and the query suite catches 96 (0.850). Of the 17 it
+misses, the core profile detects none: it constrains how many `sampleIndex`
+values a sample has, not whether two samples share one. The `full` profile
+detects 10, with pyshacl and with the SPARQL constraints on QLever alike:
+`corrupt_allele_value`, `corrupt_attribute_value`, `corrupt_record_index` and
+`wrong_declaration_owner` in both representations, and `corrupt_called_allele`
+and `corrupt_sample_index_expanded` in the expanded one. Seven stay undetected:
+`corrupt_allele_kind`, `corrupt_contig_count` and `corrupt_value_item_allele`
+in both representations, and `flip_phasing_status` in the expanded one.
+
+A shape detection counts only when a mutation adds a blocking result its
+unmutated control does not have. The condensed control passes the `full`
+profile. The expanded one fails a single check, the phase indicator of a
+haploid call, which is a known disagreement between the converter and the
+shape ([shacl-engines.md](shacl-engines.md#issues-found-in-the-shapes)).
+`VCF_RDFIZER_MUTATION_SHACL=core|full` folds the shape layer into the
+harness, and `VCF_RDFIZER_MUTATION_SHACL_ENGINE=pyshacl|qlever` picks where its
+SPARQL constraints run.
 
 `full` is not the default. Under pyshacl its two extra profiles took 33.7 s
 and 73.2 s on a 2,000-triple graph, and it is gated to sources at or below

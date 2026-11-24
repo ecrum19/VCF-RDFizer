@@ -3459,8 +3459,9 @@ class ShaclQleverIndex(QleverEngine):
         self.streamed: dict[str, int] = {}
 
     def index_command(self, index_builder: str) -> list[str]:
-        # No -f: qlever-index reads the knowledge graph from stdin.
-        return [index_builder, "-i", str(self.index_base), "-F", "nt",
+        # "-f -" reads the knowledge graph from stdin. Leaving -f out, which
+        # its --help offers, fails an assertion in this QLever build.
+        return [index_builder, "-i", str(self.index_base), "-f", "-", "-F", "nt",
                 "-m", f"{self.memory_gb}G", *self.extra_index_args]
 
     def start(self) -> None:

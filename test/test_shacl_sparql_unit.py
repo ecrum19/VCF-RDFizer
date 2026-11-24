@@ -492,7 +492,7 @@ class QleverLayerTests(VerboseTestCase):
         index = V.ShaclQleverIndex([Path("/x/g.nt.gz")], None, raw_dir=Path("/x/raw"),
                                    scratch=Path("/x"), options={"memory_gb": 3})
         command = index.index_command("qlever-index")
-        self.assertNotIn("-f", command)
+        self.assertEqual(command[command.index("-f") + 1], "-")
         self.assertEqual(command[-2:], ["-m", "3G"])
 
 
