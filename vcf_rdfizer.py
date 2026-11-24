@@ -4950,16 +4950,23 @@ DEFAULT_SHACL_SHAPES = ("vcf-core-vocabulary.shacl.ttl",)
 #:
 #: They are NOT default, and the reason is measured rather than assumed: on a
 #: 2,000-triple graph the consistency profile took 33.7 s and the SPARQL
-#: profile 73.2 s, against 1.7 s for the core one. Their sh:sparql constraints
-#: self-join the graph, so the cost grows far faster than the data. Opt in with
-#: --shacl-profile full on a fixture-sized graph, where closing those classes
-#: is worth two minutes.
+#: profile 73.2 s, against 1.7 s for the core one, because pyshacl evaluates
+#: each sh:sparql constraint once per focus node. Opt in with --shacl-profile
+#: full. Its SPARQL constraints then run once each over the whole graph on
+#: QLever (see shacl_sparql in the validator), which took 121 s for all 40 on a
+#: 17.1M-triple graph.
 FULL_SHACL_SHAPES = (
     "vcf-core-vocabulary.shacl.ttl",
     "vcf-core-consistency.shacl.ttl",
     "vcf-core-vocabulary-sparql.shacl.ttl",
 )
 SHACL_PROFILE_CHOICES = ("core", "full")
+#: Where the sh:sparql constraints run; mirrors the runner's option of the same
+#: name. qlever runs each once over the whole graph on an on-disk index, so the
+#: full profile is not size-gated; pyshacl is the in-memory path of every
+#: release up to 3.3.2.
+SHACL_SPARQL_ENGINE_CHOICES = ("qlever", "pyshacl")
+DEFAULT_SHACL_SPARQL_ENGINE = "qlever"
 DEFAULT_SHACL_ONTOLOGY = "vcf-core-vocabulary.bundle.ttl"
 
 
@@ -5001,22 +5008,26 @@ def resolve_default_shacl_shapes(
     return shapes, ontology
 
 
-#: The full profile's SPARQL constraints compare records with each other, so it
-#: is validated whole and grows quadratic-ish with the graph. 16 MiB of VCF is a
-#: fixture or a small single-sample file, where a two-minute check is a
-#: reasonable trade. The core profile has no such gate: the validator checks it
-#: a batch of records at a time, so its memory does not follow the input.
+#: The full profile's SPARQL constraints compare records with each other, so
+#: pyshacl validates them whole and in memory. Under --shacl-sparql-engine
+#: pyshacl the profile is gated here: 16 MiB of VCF is a fixture or a small
+#: single-sample file, where a two-minute check is a reasonable trade. On QLever
+#: (the default) there is no gate, and neither is there for the core profile,
+#: which the validator checks a batch of records at a time.
 FULL_SHACL_MAX_SOURCE_BYTES = 16 * 1024 * 1024
 
 
-def shacl_default_applies(source_bytes: int | None, profile: str = "core") -> bool:
+def shacl_default_applies(
+    source_bytes: int | None, profile: str = "core", sparql_engine: str = "pyshacl",
+) -> bool:
     """Whether to validate shapes by default for a source of this size.
 
-    The core profile applies at any size. The full profile is size-gated, and
-    ``None`` -- an unreadable size -- counts as too large: skipping a check is
-    recoverable, exhausting memory mid-run is not.
+    The core profile applies at any size. So does the full profile when its
+    SPARQL constraints run on QLever, which indexes the graph on disk. With
+    pyshacl it is size-gated, and ``None`` -- an unreadable size -- counts as
+    too large: skipping a check is recoverable, exhausting memory mid-run is not.
     """
-    if profile != "full":
+    if profile != "full" or sparql_engine == "qlever":
         return True
     return source_bytes is not None and 0 <= source_bytes <= FULL_SHACL_MAX_SOURCE_BYTES
 
@@ -8978,6 +8989,7 @@ def run_validation_mode(
         ("--shacl-max-triples", "shacl_max_triples"),
         ("--shacl-batch-triples", "shacl_batch_triples"),
         ("--shacl-workers", "shacl_workers"),
+        ("--shacl-sparql-engine", "shacl_sparql_engine"),
         ("--node-heap-mb", "node_heap_mb"),
     ):
         value = options.get(key)
@@ -9518,9 +9530,10 @@ def main():
             "and SPARQL profiles, which are the ones that catch a corrupted "
             "value -- duplicate record or sample indices, an alleleValue that "
             "disagrees with ALT -- and are the four mutation classes the query "
-            "suite misses. full is measurably expensive: on a 2,000-triple "
-            "graph its profiles took 33.7 s and 73.2 s against 1.7 s for core, "
-            "so it is gated to sources at or below "
+            "suite misses. Its SPARQL constraints run once each over the whole "
+            "graph on QLever (see --shacl-sparql-engine), so it applies at any "
+            "size. With --shacl-sparql-engine pyshacl they run in memory, and "
+            "full is gated to sources at or below "
             f"{FULL_SHACL_MAX_SOURCE_BYTES // (1024 * 1024)} MiB"
         ),
     )
@@ -9529,8 +9542,8 @@ def main():
         action="store_true",
         help=(
             "Skip the bundled SHACL shape layer, which is otherwise applied by "
-            "default (core at any size, full up to "
-            f"{FULL_SHACL_MAX_SOURCE_BYTES // (1024 * 1024)} MiB). The "
+            "default (core at any size, and full at any size on QLever or up to "
+            f"{FULL_SHACL_MAX_SOURCE_BYTES // (1024 * 1024)} MiB in pyshacl). The "
             "default (core) profile checks structure the aggregate comparisons "
             "do not; --shacl-profile full adds the profiles that catch a "
             "corrupted value. --shacl-shapes overrides both"
@@ -9603,6 +9616,19 @@ def main():
             "Validate node-level shapes in record batches of about this many "
             "triples, so memory follows the batch, not the graph (0 validates "
             "whole; default 500,000). SPARQL-based shapes are always whole"
+        ),
+    )
+    parser.add_argument(
+        "--shacl-sparql-engine",
+        choices=SHACL_SPARQL_ENGINE_CHOICES,
+        default=DEFAULT_SHACL_SPARQL_ENGINE,
+        help=(
+            "Where the full profile's sh:sparql constraints run. qlever "
+            "(default) runs each once over the whole graph on a QLever index, "
+            "so --shacl-profile full applies at any size. pyshacl validates "
+            "them in memory with the other shapes, as releases up to 3.3.2 "
+            "did, which gates the full profile to sources at or below "
+            f"{FULL_SHACL_MAX_SOURCE_BYTES // (1024 * 1024)} MiB"
         ),
     )
     parser.add_argument(
@@ -9794,6 +9820,7 @@ def main():
             validation_engine_options["shacl_workers"] = parse_positive_int(
                 args.shacl_workers, name="--shacl-workers"
             )
+        validation_engine_options["shacl_sparql_engine"] = args.shacl_sparql_engine
         if args.node_heap_mb is not None:
             validation_engine_options["node_heap_mb"] = parse_positive_int(
                 args.node_heap_mb, name="--node-heap-mb"
@@ -9856,7 +9883,9 @@ def main():
                         source_bytes = source_for_size.stat().st_size
                 except (OSError, TypeError):
                     source_bytes = None
-                if shacl_default_applies(source_bytes, args.shacl_profile):
+                if shacl_default_applies(
+                    source_bytes, args.shacl_profile, args.shacl_sparql_engine
+                ):
                     shacl_shapes_path = bundled_shapes
                     shacl_ontology_path = bundled_ontology
 

@@ -677,10 +677,70 @@ the file-level triples they point at (header, sample set, definitions). Every
 constraint in such a profile judges one node from its neighbourhood, so the
 verdict is the whole-graph verdict; batches run in `--shacl-workers` processes
 (default up to 4), and memory follows the batch, not the graph: about 1.3 GB
-per default batch, so about 5 GB with four workers. Shapes with
-SPARQL constraints compare records with each other, so they are validated whole
-and stay under `--shacl-max-triples` (default 10,000,000), above which they are
-skipped and the skip recorded.
+per default batch, so about 5 GB with four workers.
+
+### SPARQL constraints run once over the whole graph
+
+The `sh:sparql` constraints of the `full` profile compare records with each
+other, so no batch can decide them. pyshacl evaluates each one once per focus
+node, in memory, which is why `full` used to be validated whole and gated.
+The validator now splits the shapes. pyshacl validates everything
+except the `sh:sparql` constraints, in batches as above. Each SPARQL constraint
+then runs **once over the whole graph on a QLever index**: `$this` is left
+unbound and the shape's target is added as a pattern, so the answers are the
+violating focus nodes. Memory follows QLever's index, not the graph, and there
+is no size gate.
+
+The index holds the graph, the vocabulary, and the RDFS consequences pyshacl
+would infer from them: the types implied by `rdfs:domain`, `rdfs:range`,
+`rdfs:subClassOf` and `rdfs:subPropertyOf`. Targets and type patterns therefore
+see what they see under pyshacl. The results join pyshacl's in one report, with
+the same severities, so the verdict and `shacl.json` keep their shape.
+`shacl.json` gains a `sparqlConstraints` block with each constraint's outcome,
+focus-node count and time, and every query run is kept in
+`shacl-sparql/` so a result can be re-run by hand. A constraint that times out
+or fails makes the shape layer `EXECUTION_FAILED` unless a violation was found
+elsewhere: an unrun check is never reported as a pass.
+
+Four published constraints cannot run whole on a large graph as written, in any
+engine. Each is replaced by a query that decides the same thing in linear time:
+
+| Constraint | Published query | Equivalent |
+| --- | --- | --- |
+| POS non-decreasing within a CHROM | every pair of records | adjacent records, plus the boundaries between blocks of one CHROM |
+| Records of one CHROM are contiguous | every triple of records | count the blocks each CHROM starts |
+| Non-missing record IDs are unique | pairs on the ID before dropping `.` | group by ID |
+| Field cardinality (INFO and FORMAT) | sample OPTIONALs outside the FORMAT branch, so an INFO value matches every sample | the OPTIONALs inside the FORMAT branch |
+
+Each equivalent is pinned to the exact published query by digest, so a
+vocabulary update that changes one falls back to the published text. The unit
+tests run each published query and its equivalent on every fault-injection
+graph and on 300 random record arrangements, and they agree on all of them.
+The vocabulary's own shapes are unchanged.
+
+Against pyshacl, on the 113 fault-injection graphs and both controls with the
+`full` profile, the two paths give the same verdict on all 115 and identical
+results on 113. On the two `retype_pos_as_string` graphs pyshacl reports one
+more result, from the contig-length check: rdflib compares the string POS with
+a number, where SPARQL treats the comparison as an error. Both paths fail those
+graphs. The QLever path took 338 s for the 115 graphs, against 1,318 s.
+
+On HG005 slices validated end to end with the `full` profile:
+
+| Triples | RDFS typing | QLever index | 40 SPARQL constraints | Whole shape layer |
+| ---: | ---: | ---: | ---: | ---: |
+| 0.52M | 1 s | 3 s | 4 s | 148 s |
+| 2.1M | 3 s | 10 s | 12 s | 189 s |
+| 17.1M | 26 s | 75 s | 121 s | 1,581 s |
+
+Almost all of the shape layer is pyshacl's record batches (four workers). The
+17.1M-triple run peaked at 5.5 GB. pyshacl alone had not finished the `full`
+profile on the 0.52M-triple slice after 2.5 hours.
+
+`--shacl-sparql-engine pyshacl` restores the in-memory path of releases up to
+3.3.2. The constraints are then validated whole with the other shapes and stay
+under `--shacl-max-triples` (default 10,000,000), above which they are skipped
+and the skip recorded.
 
 ### Two profiles, and which one catches what
 
@@ -690,7 +750,7 @@ things, and the split decides what a run can detect:
 | `--shacl-profile` | Files | Checks | Cost on a 2,000-triple graph |
 | --- | --- | --- | --- |
 | `core` (default) | `vcf-core-vocabulary` | Cardinality and datatype: `vcfc:sampleIndex` exists once and is an integer >= 1 | **1.7 s** |
-| `full` | `+ vcf-core-consistency`, `+ vcf-core-vocabulary-sparql` | Uniqueness (*"Record indices must be unique"*, *"Sample names and sample indices must be unique"*) and value agreement (`vcfc:alleleValue` against `REF`/`ALT`) | **+33.7 s, +73.2 s** |
+| `full` | `+ vcf-core-consistency`, `+ vcf-core-vocabulary-sparql` | Uniqueness (*"Record indices must be unique"*, *"Sample names and sample indices must be unique"*) and value agreement (`vcfc:alleleValue` against `REF`/`ALT`) | **+33.7 s, +73.2 s** in pyshacl |
 
 The distinction matters for what you can claim. The mutation-score experiment
 injected 113 corruptions; the query suite caught 96 (0.850), and 7 of the 17 it
@@ -700,11 +760,10 @@ covered by `full`, not by the default.** The core profile constrains how many
 `sampleIndex` values a sample has, not whether two samples share one, so it
 detects none of them.
 
-`full` is not the default because the cost is real and measured: its two extra
-profiles use `sh:sparql` constraints that self-join the graph, so they grow far
-faster than the data, and they compare records, so they are validated whole.
-It is gated to sources at or below 16 MiB, where closing those four classes is
-worth two minutes; the core profile has no size gate.
+`full` is not the default. Under pyshacl its two extra profiles took 33.7 s
+and 73.2 s on a 2,000-triple graph, and it is gated to sources at or below
+16 MiB. With the SPARQL constraints on QLever (the default) it applies at any
+size.
 
 ```bash
 # Close the four classes the query suite misses, on a fixture-sized input

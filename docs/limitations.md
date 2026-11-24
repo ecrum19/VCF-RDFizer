@@ -209,8 +209,13 @@ catalogue growing means nothing.
 undetected. **Header line values are not compared** — only how many lines carry
 each key, their types, and the structured attributes lifted out of them.
 
-**SHACL is opt-in and does not scale.** `pyshacl` loads the whole graph into
-memory, so it is for a single-sample graph or a sample of a cohort.
+**The `full` shape profile is opt-in.** The `core` profile is on by default.
+pyshacl validates the node-local shapes a batch of records at a time, and the
+`full` profile's SPARQL constraints run once each over a QLever index, so
+neither holds the graph in memory. That index carries the RDFS typing that
+shapes target (domain, range, subclass and subproperty), not the full RDFS
+closure pyshacl computes. Four published SPARQL constraints run as linear
+equivalents rather than as written ([validation.md](validation.md#sparql-constraints-run-once-over-the-whole-graph)).
 
 **QLever's argv is a moving target.** Its CLI has changed across releases; the
 `QLEVER_*_COMMAND` environment overrides exist because of that, and the exact

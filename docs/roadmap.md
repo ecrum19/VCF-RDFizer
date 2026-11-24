@@ -164,6 +164,26 @@ The honest framing, which the design keeps throughout: this is *governed
 release*, not anonymization. Genotypes identify people, and no access-control
 layer changes that.
 
+### 8. A native SHACL engine (Rudof)
+
+pyshacl validates the node-local shapes a batch of records at a time, and the
+`full` profile's SPARQL constraints run once each over a QLever index. pyshacl
+stays because every published result was produced with it. Rudof 0.3.39, a Rust
+engine, was evaluated as its replacement. Given RDFS typing and declared
+prefixes, it reaches pyshacl's verdict on every fault-injection graph with the
+core profile, and on 113 of 115 with the full one, where the two differences are
+explained. It is about 24 times faster on the core profile, with the same
+memory per triple.
+
+Porting means running Rudof on the record batches, keeping the SPARQL
+constraints on QLever, and shipping its binary in the image. Three Rudof issues
+need reporting upstream first: right-associative `a - b + c`, a blank-node
+`$this` pre-bound with `VALUES`, and `xsd:int` not compared with `xsd:integer`.
+The evaluation also found issues in the published shapes (no `sh:prefixes`,
+four constraints that grow faster than the graph) and a validation fixture that
+fails the `full` profile. Measurements, issues and the porting steps:
+[`shacl-engines.md`](shacl-engines.md).
+
 ## Deliberately not planned
 
 Stated so the absence reads as a decision rather than an oversight.
