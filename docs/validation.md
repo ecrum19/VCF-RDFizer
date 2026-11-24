@@ -707,15 +707,15 @@ engine. Each is replaced by a query that decides the same thing in linear time:
 
 | Constraint | Published query | Equivalent |
 | --- | --- | --- |
-| POS non-decreasing within a CHROM | every pair of records | adjacent records, plus the boundaries between blocks of one CHROM |
-| Records of one CHROM are contiguous | every triple of records | count the blocks each CHROM starts |
+| POS non-decreasing within a CHROM | every pair of records | neighbouring records, plus the boundaries between runs of one CHROM |
+| Records of one CHROM are contiguous | every triple of records | each CHROM's index range, then any other CHROM inside it |
 | Non-missing record IDs are unique | pairs on the ID before dropping `.` | group by ID |
 | Field cardinality (INFO and FORMAT) | sample OPTIONALs outside the FORMAT branch, so an INFO value matches every sample | the OPTIONALs inside the FORMAT branch |
 
 Each equivalent is pinned to the exact published query by digest, so a
 vocabulary update that changes one falls back to the published text. The unit
 tests run each published query and its equivalent on every fault-injection
-graph and on 300 random record arrangements, and they agree on all of them.
+graph and on 600 random record arrangements, a third of them with gaps or repeats in the record indices, and they agree on all of them.
 The vocabulary's own shapes are unchanged.
 
 Against pyshacl, on the 113 fault-injection graphs and both controls with the

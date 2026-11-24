@@ -25,7 +25,7 @@ On 100 and 300 HG005 records, Rudof took 5.1 s and 122 s for the full profile,
 close to the cube of the record count. On 3,000 records (0.52M triples) Rudof
 did not finish it in four hours, and pyshacl had not after 2.5 hours. The validator now replaces the four
 with linear equivalents, which agree with the published queries on every
-fault-injection graph and on 300 random record arrangements
+fault-injection graph and on 600 random record arrangements
 (`test/test_shacl_sparql_unit.py`).
 
 ## Rudof
@@ -114,9 +114,16 @@ For the vocabulary ([vcf-rdfizer-vocabulary](https://github.com/ecrum19/vcf-rdfi
 2. **The four constraints above.** Publishing the linear equivalents would let
    the validator drop its pinned replacements (`SCALABLE_EQUIVALENTS` in
    `src/validation/shacl_sparql.py`).
-3. **The validation fixture fails the full profile.** Its records go chr20,
-   chr21, chr20, so both ordering constraints fire on the clean controls, and
-   the expanded control also gets a `/` phase indicator on a haploid genotype.
-   A mutation that only adds a result already present in the control is not a
-   detection, so the full profile's detection count must be measured against
-   the controls. Either the fixture or the shapes need to change.
+3. **The haploid phase indicator.** For a GT with no separator, such as a
+   haploid `0`, the converter writes `vcfc:phaseIndicator "/"` (its default),
+   while `vcfc:GenotypeAlleleAgreementShape` expects `|`: it reads the first
+   allele as phased unless the GT contains `/`, which appears to follow
+   VCF 4.4's implicit-phasing rule. The expanded validation fixture has such a call, so its
+   clean control fails the full profile on that one check. Fixing the
+   converter changes the RDF of every haploid call (chrX and chrY in male
+   samples, mitochondrial calls). Fixing the shape needs a vocabulary release.
+   Until one is chosen, the mutation harness counts a shape detection only when
+   a mutation adds a violation its control does not have.
+
+The validation fixture was also unsorted (chr20, chr21, chr20), so both
+ordering constraints fired on the clean controls. It is now sorted.

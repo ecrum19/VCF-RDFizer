@@ -108,10 +108,10 @@ class EquivalentTests(VerboseTestCase):
         _rest, constraints = _full_profile()
         used = sorted(c.equivalent for c in constraints if c.equivalent)
         self.assertEqual(used, [
-            "chrom-contiguous-block-starts",
+            "chrom-contiguous-index-ranges",
             "field-cardinality-sample-optionals-in-format-branch",
             "field-cardinality-sample-optionals-in-format-branch",
-            "pos-nondecreasing-neighbours-and-blocks",
+            "pos-nondecreasing-neighbours-and-segments",
             "record-id-unique-grouped",
         ])
 
@@ -249,6 +249,22 @@ class TypingTests(VerboseTestCase):
             count = S.write_rdfs_typing(Path(td) / "d.nt", vocabulary, Path(td) / "t.nt")
         self.assertEqual(count, 5)
 
+    def test_a_compressed_graph_streams_with_its_typing_interleaved(self):
+        import gzip
+        import io
+
+        vocabulary = S.Vocabulary(rdflib.Graph().parse(data=self.VOCABULARY, format="turtle"))
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "g.nt.gz"
+            with gzip.open(source, "wt", encoding="utf-8") as handle:
+                handle.write("<http://example.org/s> <http://example.org/has> <http://example.org/o> .\n\n")
+            out = io.StringIO()
+            counts = S.stream_with_typing([source], vocabulary, out)
+        lines = out.getvalue().splitlines()
+        self.assertEqual(counts, {"inputTriples": 1, "rdfsTypingTriples": 5})
+        self.assertEqual(lines[0], "<http://example.org/s> <http://example.org/has> <http://example.org/o> .")
+        self.assertEqual(len(lines), 6)
+
     def test_the_bundled_vocabulary_types_a_record(self):
         vocabulary = S.Vocabulary(rdflib.Graph().parse(str(ONTOLOGY), format="turtle"))
         self.assertIn("https://w3id.org/vcf-core/vocab#VCFRecord",
@@ -324,10 +340,15 @@ class EquivalenceOnRandomRecordsTests(VerboseTestCase):
         vcfc = "https://w3id.org/vcf-core/vocab#"
         rng = random.Random(20261124)
         seen = {id(c): set() for c, _p, _s in pairs}
-        for case in range(300):
+        for case in range(600):
             lines = [f"<file://f> <{S.RDF}type> <{vcfc}VCFFile> ."]
-            for index in range(1, rng.randint(1, 8) + 1):
-                record = f"<file://f#record/{index}>"
+            # Mostly consecutive indices, with the gaps and repeats a broken
+            # graph can have one case in three.
+            steps = [1] if case % 3 else [0, 1, 1, 1, 2, 3]
+            index = 0
+            for row in range(1, rng.randint(1, 8) + 1):
+                index += rng.choice(steps) if row > 1 else 1
+                record = f"<file://f#record/{row}>"
                 lines += [
                     f"<file://f> <{vcfc}hasRecord> {record} .",
                     f'{record} <{vcfc}recordIndex> "{index}"^^<{S.XSD}integer> .',
@@ -369,8 +390,9 @@ class _FakeIndex:
 
     instances: list["_FakeIndex"] = []
 
-    def __init__(self, source, extras, *, raw_dir, scratch, options):
-        self.extras, self.query_timeout = extras, 5
+    def __init__(self, sources, vocabulary, *, raw_dir, scratch, options):
+        self.sources, self.vocabulary, self.query_timeout = sources, vocabulary, 5
+        self.streamed = {"inputTriples": 1, "rdfsTypingTriples": 0}
         self.index_seconds = self.setup_seconds = 0.1
         self.stopped = False
         _FakeIndex.instances.append(self)
@@ -454,9 +476,24 @@ class QleverLayerTests(VerboseTestCase):
         self.assertTrue(_FakeIndex.instances[0].stopped)
 
     def test_the_vocabulary_and_its_typing_are_indexed(self):
-        self._run({}, ontology=ONTOLOGY)
-        names = [path.name for path in _FakeIndex.instances[0].extras]
-        self.assertEqual(names, ["rdfs-typing-data.nt", "rdfs-typing-vocabulary.nt", "vocabulary.nt"])
+        report, _ = self._run({}, ontology=ONTOLOGY)
+        index = _FakeIndex.instances[0]
+        self.assertEqual([path.name for path in index.sources], ["g.nt", "vocabulary.nt"])
+        self.assertIsInstance(index.vocabulary, S.Vocabulary)
+        self.assertEqual(report["inputTriples"], 1)
+
+    def test_without_a_vocabulary_nothing_is_typed(self):
+        self._run({})
+        index = _FakeIndex.instances[0]
+        self.assertEqual([path.name for path in index.sources], ["g.nt"])
+        self.assertIsNone(index.vocabulary)
+
+    def test_the_index_builder_reads_stdin(self):
+        index = V.ShaclQleverIndex([Path("/x/g.nt.gz")], None, raw_dir=Path("/x/raw"),
+                                   scratch=Path("/x"), options={"memory_gb": 3})
+        command = index.index_command("qlever-index")
+        self.assertNotIn("-f", command)
+        self.assertEqual(command[-2:], ["-m", "3G"])
 
 
 class ValidateShaclSplitTests(VerboseTestCase):

@@ -74,13 +74,15 @@ def normalized_digest(query: str) -> str:
 # --- The four scalable equivalents -------------------------------------------
 
 #: POS non-decreasing within a CHROM. Published: every pair of records of a file
-#: (O(n^2)). Split the records into blocks of consecutive records with one CHROM.
-#: A pair breaks the order exactly when (a) two adjacent records of one block
-#: decrease, or, with no such pair, (b) a block ends above where a later block
-#: of the same CHROM starts: every block is then sorted, so its end is its
-#: largest POS and the later block's start its smallest. Both branches look only
-#: at neighbours and block boundaries. (b) compares boundaries of one CHROM, of
-#: which a sorted file has none and a grouped one has one per CHROM.
+#: (O(n^2)). Call a segment a run of records of one CHROM at consecutive record
+#: indices. A pair breaks the order exactly when (a) two neighbours of a segment
+#: (index i and i + 1) decrease, or, with no such pair, (b) a segment ends above
+#: where a later segment of the same CHROM starts: every segment is then
+#: sorted, so its end is its largest POS and the later start its smallest. A
+#: segment ends where no record of its CHROM sits at index i + 1, and starts
+#: where none sits at i - 1, so gaps and repeats in the indices are handled.
+#: Both branches report only genuine violating pairs, and (b) compares segment
+#: boundaries, of which a sorted file has one pair per CHROM.
 _NONDECREASING = """
       SELECT $this WHERE {
         {
@@ -91,41 +93,46 @@ _NONDECREASING = """
           $this vcfc:hasRecord ?later .
           FILTER (?earlierPos > ?laterPos)
         } UNION {
-          $this vcfc:hasRecord ?end .
-          ?end vcfc:recordIndex ?endIndex ; vcfc:chrom ?chrom ; vcfc:pos ?endPos .
-          BIND (?endIndex + 1 AS ?afterIndex)
-          ?after vcfc:recordIndex ?afterIndex ; vcfc:chrom ?afterChrom .
-          $this vcfc:hasRecord ?after .
-          FILTER (?afterChrom != ?chrom)
-          $this vcfc:hasRecord ?start .
-          ?start vcfc:recordIndex ?startIndex ; vcfc:chrom ?chrom ; vcfc:pos ?startPos .
+          {
+            $this vcfc:hasRecord ?end .
+            ?end vcfc:recordIndex ?endIndex ; vcfc:chrom ?chrom ; vcfc:pos ?endPos .
+            BIND (?endIndex + 1 AS ?afterIndex)
+            OPTIONAL {
+              ?after vcfc:recordIndex ?afterIndex ; vcfc:chrom ?chrom .
+              $this vcfc:hasRecord ?after .
+            }
+            FILTER (!BOUND(?after))
+          }
+          {
+            $this vcfc:hasRecord ?start .
+            ?start vcfc:recordIndex ?startIndex ; vcfc:chrom ?chrom ; vcfc:pos ?startPos .
+            BIND (?startIndex - 1 AS ?beforeIndex)
+            OPTIONAL {
+              ?before vcfc:recordIndex ?beforeIndex ; vcfc:chrom ?chrom .
+              $this vcfc:hasRecord ?before .
+            }
+            FILTER (!BOUND(?before))
+          }
           FILTER (?endIndex < ?startIndex && ?endPos > ?startPos)
-          BIND (?startIndex - 1 AS ?beforeIndex)
-          ?before vcfc:recordIndex ?beforeIndex ; vcfc:chrom ?beforeChrom .
-          $this vcfc:hasRecord ?before .
-          FILTER (?beforeChrom != ?chrom)
         }
       }
 """
 
-#: Records of one CHROM form a contiguous block. Published: every triple of
-#: records (O(n^3)). A CHROM is contiguous exactly when it starts one block, and
-#: a block starts at a record whose predecessor is absent or has another CHROM.
+#: Records of one CHROM are contiguous. Published: every triple of records
+#: (O(n^3)). A CHROM is broken exactly when a record of another CHROM has an
+#: index strictly between that CHROM's lowest and highest record index, which
+#: needs one pass for the ranges and one join of records with CHROMs.
 _CONTIGUOUS = """
       SELECT $this WHERE {
         {
-          SELECT $this ?chrom (COUNT(?start) AS ?blocks) WHERE {
-            $this vcfc:hasRecord ?start .
-            ?start vcfc:recordIndex ?startIndex ; vcfc:chrom ?chrom .
-            BIND (?startIndex - 1 AS ?previousIndex)
-            OPTIONAL {
-              ?previous vcfc:recordIndex ?previousIndex ; vcfc:chrom ?previousChrom .
-              $this vcfc:hasRecord ?previous .
-            }
-            FILTER (!BOUND(?previousChrom) || ?previousChrom != ?chrom)
+          SELECT $this ?chrom (MIN(?index) AS ?low) (MAX(?index) AS ?high) WHERE {
+            $this vcfc:hasRecord ?record .
+            ?record vcfc:recordIndex ?index ; vcfc:chrom ?chrom .
           } GROUP BY $this ?chrom
         }
-        FILTER (?blocks > 1)
+        $this vcfc:hasRecord ?middle .
+        ?middle vcfc:recordIndex ?middleIndex ; vcfc:chrom ?otherChrom .
+        FILTER (?otherChrom != ?chrom && ?middleIndex > ?low && ?middleIndex < ?high)
       }
 """
 
@@ -165,9 +172,9 @@ def _cardinality(query: str) -> str:
 #: digest of the published query -> (name, rewrite). See the module docstring.
 SCALABLE_EQUIVALENTS: dict[str, tuple[str, Callable[[str], str]]] = {
     "1aa29f335c416592f23e2c628395fb6214e3173287d0e96236a552076a3026db":
-        ("pos-nondecreasing-neighbours-and-blocks", lambda _query: _NONDECREASING),
+        ("pos-nondecreasing-neighbours-and-segments", lambda _query: _NONDECREASING),
     "43088a7c2d337058f9654350ac9b56008849481fad0b54551effe6382e73f94a":
-        ("chrom-contiguous-block-starts", lambda _query: _CONTIGUOUS),
+        ("chrom-contiguous-index-ranges", lambda _query: _CONTIGUOUS),
     "b7e4d64c2b3b032886335a7ced7ed4720f7544117fe20c8d7e0479a0e1b57715":
         ("record-id-unique-grouped", lambda _query: _DUPLICATE_ID),
     "be87ec3498bdecd2146bb06b6bcfa3015872b7e2da46e500046647471d977ac3":
@@ -470,57 +477,98 @@ def _transitive(parents: dict[str, set[str]]) -> dict[str, set[str]]:
 TYPING_RECENT_OBJECTS = 1_000_000
 
 
-def write_rdfs_typing(source: Path, vocabulary: Vocabulary, target: Path) -> int:
-    """Write the RDFS consequences of an N-Triples graph that SHACL can see.
+class RdfsTyping:
+    """The RDFS consequences of N-Triples lines that SHACL can see, line by line.
 
     For each triple: the superproperty triples it implies (rdfs7), its
     subject's domain types and its object's range types (rdfs2, rdfs3), and,
     for an rdf:type triple, the superclasses (rdfs9). Literal-subject and
     resource-level entailments (rdfs4, rdfs8 ...) are left out: no shape
-    targets them. Returns the number of lines written.
+    targets them. It keeps only the current subject and a bounded set of recent
+    objects, so it streams at any graph size. A type it cannot tell is already
+    known is written again, and QLever drops the duplicate at index time.
     """
-    written = 0
-    type_iri = f"{RDF}type"
-    subject_seen: set[str] = set()
-    current_subject: str | None = None
-    recent: dict[str, None] = {}
-    with source.open(encoding="utf-8") as lines, target.open("w", encoding="utf-8") as out:
+
+    def __init__(self, vocabulary: Vocabulary) -> None:
+        self.vocabulary = vocabulary
+        self.subject: str | None = None
+        self.subject_types: set[str] = set()
+        self.recent: dict[str, None] = {}
+        self.written = 0
+
+    def consequences(self, line: str) -> list[str]:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            return []
+        subject, _, rest = line.partition(" ")
+        predicate, _, obj = rest.lstrip().partition(" ")
+        obj = obj.strip()
+        if obj.endswith("."):
+            obj = obj[:-1].rstrip()
+        if not predicate.startswith("<"):
+            return []
+        prop = predicate[1:-1]
+        vocabulary = self.vocabulary
+        if subject != self.subject:
+            self.subject, self.subject_types = subject, set()
+        out: list[str] = []
+        types: set[str] = set(vocabulary.domains.get(prop, ()))
+        if prop == f"{RDF}type" and obj.startswith("<"):
+            # The stated type itself is already in the data.
+            self.subject_types.add(obj[1:-1])
+            types |= vocabulary.superclasses.get(obj[1:-1], set())
+        out.extend(f"{subject} {RDF_TYPE} <{cls}> .\n" for cls in types - self.subject_types)
+        self.subject_types |= types
+        out.extend(f"{subject} <{parent}> {obj} .\n"
+                   for parent in vocabulary.superproperties.get(prop, ()))
+        ranges = vocabulary.ranges.get(prop)
+        if ranges and (obj.startswith("<") or obj.startswith("_:")):
+            key = obj + predicate
+            if key not in self.recent:
+                if len(self.recent) >= TYPING_RECENT_OBJECTS:
+                    self.recent.clear()
+                self.recent[key] = None
+                out.extend(f"{obj} {RDF_TYPE} <{cls}> .\n" for cls in ranges)
+        self.written += len(out)
+        return out
+
+
+def open_ntriples(path: Path):
+    """Read N-Triples, gzip-compressed or not, as text."""
+    import gzip
+
+    if path.suffix == ".gz":
+        return gzip.open(path, "rt", encoding="utf-8")
+    return path.open(encoding="utf-8")
+
+
+def write_rdfs_typing(source: Path, vocabulary: Vocabulary, target: Path) -> int:
+    """Write :class:`RdfsTyping` for a whole file. Returns the lines written."""
+    typing = RdfsTyping(vocabulary)
+    with open_ntriples(source) as lines, target.open("w", encoding="utf-8") as out:
         for line in lines:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            subject, _, rest = line.partition(" ")
-            predicate, _, obj = rest.lstrip().partition(" ")
-            obj = obj.strip()
-            if obj.endswith("."):
-                obj = obj[:-1].rstrip()
-            if not predicate.startswith("<"):
-                continue
-            prop = predicate[1:-1]
-            if subject != current_subject:
-                current_subject, subject_seen = subject, set()
-            types: set[str] = set(vocabulary.domains.get(prop, ()))
-            if prop == type_iri and obj.startswith("<"):
-                types |= vocabulary.superclasses.get(obj[1:-1], set())
-            for cls in types - subject_seen:
-                out.write(f"{subject} {RDF_TYPE} <{cls}> .\n")
-                written += 1
-            subject_seen |= types
-            for parent in vocabulary.superproperties.get(prop, ()):
-                out.write(f"{subject} <{parent}> {obj} .\n")
-                written += 1
-            ranges = vocabulary.ranges.get(prop)
-            if ranges and (obj.startswith("<") or obj.startswith("_:")):
-                key = obj + predicate
-                if key in recent:
+            out.writelines(typing.consequences(line))
+    return typing.written
+
+
+def stream_with_typing(sources: Iterable[Path], vocabulary: Vocabulary | None, out) -> dict[str, int]:
+    """Write each source's lines to ``out``, each followed by its RDFS typing.
+
+    This is what QLever's index builder reads on stdin, so neither a decoded
+    graph nor a typing file has to exist on disk. Returns line counts.
+    """
+    typing = RdfsTyping(vocabulary) if vocabulary is not None else None
+    lines_in = 0
+    for source in sources:
+        with open_ntriples(source) as lines:
+            for line in lines:
+                if not line.strip():
                     continue
-                if len(recent) >= TYPING_RECENT_OBJECTS:
-                    recent.clear()
-                recent[key] = None
-                for cls in ranges:
-                    out.write(f"{obj} {RDF_TYPE} <{cls}> .\n")
-                    written += 1
-    return written
+                lines_in += 1
+                out.write(line if line.endswith("\n") else line + "\n")
+                if typing is not None:
+                    out.writelines(typing.consequences(line))
+    return {"inputTriples": lines_in, "rdfsTypingTriples": typing.written if typing else 0}
 
 
 # --- Results ------------------------------------------------------------------

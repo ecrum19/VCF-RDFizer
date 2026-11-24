@@ -27,6 +27,7 @@ import argparse
 import csv
 import gzip
 import hashlib
+import io
 import json
 import multiprocessing
 import os
@@ -3438,26 +3439,63 @@ class ShaclQleverIndex(QleverEngine):
     """A QLever index over the data graph plus the vocabulary and its RDFS typing.
 
     Separate from the query engine's index, whose answers are compared against
-    the VCF and must not see the vocabulary's triples. Its index command is
-    always the default one, since it needs several input files, and its
-    directory is its own.
+    the VCF and must not see the vocabulary's triples. The index builder reads
+    the graph on stdin, each triple followed by its RDFS typing
+    (shacl_sparql.stream_with_typing), so a gzip-compressed graph is indexed
+    without being decoded to disk and no typing file is written. Its index
+    command is always the default one and its directory is its own.
     """
 
     name = "qlever-shacl"
 
-    def __init__(self, source: Path, extra_sources: list[Path], *, raw_dir: Path,
+    def __init__(self, sources: list[Path], vocabulary, *, raw_dir: Path,
                  scratch: Path, options: dict[str, Any]):
-        super().__init__(source, raw_dir=raw_dir, scratch=scratch, options=options)
-        self.extra_sources = list(extra_sources)
+        super().__init__(sources[0], raw_dir=raw_dir, scratch=scratch, options=options)
+        self.sources = list(sources)
+        self.vocabulary = vocabulary
         self.index_dir = scratch / "qlever-shacl-index"
         self.index_base = self.index_dir / "shacl"
         self.log_dir = raw_dir
+        self.streamed: dict[str, int] = {}
 
     def index_command(self, index_builder: str) -> list[str]:
-        command = [index_builder, "-i", str(self.index_base), "-f", str(self.source), "-F", "nt"]
-        for extra in self.extra_sources:
-            command += ["-f", str(extra), "-F", "nt"]
-        return command + ["-m", f"{self.memory_gb}G", *self.extra_index_args]
+        # No -f: qlever-index reads the knowledge graph from stdin.
+        return [index_builder, "-i", str(self.index_base), "-F", "nt",
+                "-m", f"{self.memory_gb}G", *self.extra_index_args]
+
+    def start(self) -> None:
+        index_builder = self._binary("QLEVER_INDEX_BUILDER_BIN", "qlever-index")
+        server_main = self._binary("QLEVER_SERVER_BIN", "qlever-server")
+        self.index_dir.mkdir(parents=True, exist_ok=True)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.server_binary = server_main
+        self.commands["index"] = self.index_command(index_builder)
+        self.commands["server"] = self.server_command(server_main)
+        environment = self._environment()
+        started = time.monotonic()
+        log_path = self.log_dir / "qlever-index.log"
+        with log_path.open("wb") as log:
+            process = subprocess.Popen(
+                self.commands["index"], stdin=subprocess.PIPE, stdout=log,
+                stderr=subprocess.STDOUT, env=environment,
+            )
+            try:
+                with io.TextIOWrapper(process.stdin, encoding="utf-8") as feed:
+                    self.streamed = shacl_sparql.stream_with_typing(
+                        self.sources, self.vocabulary, feed)
+            except BrokenPipeError:
+                pass  # the builder died; its exit code and log say why
+            returncode = process.wait()
+        if returncode != 0:
+            tail = log_path.read_text(encoding="utf-8", errors="replace")[-2000:]
+            raise RuntimeError(f"qlever-index exited with code {returncode}. Log tail: {tail}")
+        self.index_seconds = time.monotonic() - started
+        server_log = self.log_dir / "qlever-server.log"
+        self.server = subprocess.Popen(
+            self.commands["server"], stdout=server_log.open("wb"),
+            stderr=subprocess.STDOUT, env=environment,
+        )
+        self._await_ready(server_log)
 
 
 def validate_shacl_sparql_qlever(
@@ -3472,14 +3510,14 @@ def validate_shacl_sparql_qlever(
     """Run each SPARQL constraint once over the whole graph on QLever.
 
     The index holds the data, the vocabulary and the RDFS typing pyshacl would
-    infer from them (shacl_sparql.write_rdfs_typing), so targets and type
-    patterns see what they see under pyshacl. Every query is written to
-    ``raw_dir`` with its outcome, so a result can be re-run by hand.
+    infer from them (shacl_sparql.RdfsTyping), so targets and type patterns see
+    what they see under pyshacl. ``source`` may be gzip-compressed N-Triples.
+    Every query is written to ``raw_dir`` with its outcome, so a result can be
+    re-run by hand.
     """
     raw_dir.mkdir(parents=True, exist_ok=True)
     report: dict[str, Any] = {"engine": "qlever", "constraintCount": len(constraints)}
-    extras: list[Path] = []
-    typing_started = time.monotonic()
+    sources, vocabulary = [source], None
     if ontology is not None:
         from rdflib import Graph
 
@@ -3487,20 +3525,15 @@ def validate_shacl_sparql_qlever(
         vocabulary_nt = work / "vocabulary.nt"
         vocabulary_graph.serialize(str(vocabulary_nt), format="nt", encoding="utf-8")
         vocabulary = shacl_sparql.Vocabulary(vocabulary_graph)
-        typing_lines = 0
-        for name, path in (("data", source), ("vocabulary", vocabulary_nt)):
-            target = work / f"rdfs-typing-{name}.nt"
-            typing_lines += shacl_sparql.write_rdfs_typing(path, vocabulary, target)
-            extras.append(target)
-        extras.append(vocabulary_nt)
-        report["rdfsTypingTriples"] = typing_lines
-    report["typingSeconds"] = time.monotonic() - typing_started
+        sources.append(vocabulary_nt)
 
-    index = ShaclQleverIndex(source, extras, raw_dir=raw_dir, scratch=work, options=options)
+    index = ShaclQleverIndex(sources, vocabulary, raw_dir=raw_dir, scratch=work, options=options)
     rows: list[dict[str, Any]] = []
     texts: list[str] = []
     try:
         index.prepare()
+        report.update(index.streamed)
+        # Typing is computed while the index builder reads, so it is in here.
         report["indexSeconds"] = index.index_seconds
         report["setupSeconds"] = index.setup_seconds
         report["index"] = {key: value for key, value in index.describe().items()
