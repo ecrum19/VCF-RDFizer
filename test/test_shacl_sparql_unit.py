@@ -38,7 +38,7 @@ SHACL = REPO / "vcf_rdfizer_data" / "shacl"
 ONTOLOGY = REPO / "vcf_rdfizer_data" / "ontology" / "vcf-core-vocabulary.bundle.ttl"
 FULL = [SHACL / name for name in (
     "vcf-core-vocabulary.shacl.ttl", "vcf-core-consistency.shacl.ttl",
-    "vcf-core-vocabulary-sparql.shacl.ttl")]
+    "vcf-core-vocabulary-sparql.shacl.ttl", "vcf-rdfizer-agreement.shacl.ttl")]
 
 RUNNER_PATH = REPO / "src" / "validation" / "validation_runner.py"
 _spec = importlib.util.spec_from_file_location("validation_runner_shacl_sparql", RUNNER_PATH)
@@ -53,9 +53,17 @@ def _full_profile():
 
 
 class SplitTests(VerboseTestCase):
-    def test_the_full_profile_has_forty_sparql_constraints(self):
+    def test_the_full_profile_has_forty_four_sparql_constraints(self):
+        """VCF Core's 40, and VCF-RDFizer's four agreement checks."""
         _rest, constraints = _full_profile()
-        self.assertEqual(len(constraints), 40)
+        self.assertEqual(len(constraints), 44)
+        self.assertEqual(sum("vcf-rdfizer/shapes#" in c.shape for c in constraints), 4)
+
+    def test_the_profile_is_the_wrappers(self):
+        import vcf_rdfizer
+
+        shapes, _ontology = vcf_rdfizer.resolve_default_shacl_shapes(REPO, "full")
+        self.assertEqual([path.name for path in shapes], [path.name for path in FULL])
 
     def test_pyshacl_keeps_everything_but_the_sparql_constraints(self):
         rest, _constraints = _full_profile()
@@ -158,6 +166,13 @@ class WholeGraphQueryTests(VerboseTestCase):
             'SELECT $this WHERE { $this <http://e/p> ?o FILTER (?o != "}{") }', ["?this a <http://e/C> ."])
         prepareQuery(query)
         self.assertIn('"}{"', query)
+
+    def test_a_hash_inside_an_iri_is_not_a_comment(self):
+        query = S.whole_graph_query(
+            "SELECT $this WHERE { FILTER NOT EXISTS { $this <http://e/v#p> ?o } "
+            "?x <http://e/v#q> ?y . FILTER (?x < ?y) }", ["?this a <http://e/v#C> ."])
+        prepareQuery(query)
+        self.assertTrue(query.rstrip().endswith("FILTER (?x < ?y) }\n}"))
 
     def test_a_prebound_variable_other_than_this_is_unsupported(self):
         constraint = S.prepare(S.SparqlConstraint(
@@ -367,6 +382,96 @@ class EquivalenceOnRandomRecordsTests(VerboseTestCase):
         self.assertTrue(all(outcomes == {True, False} for outcomes in seen.values()))
 
 
+class AgreementShapeTests(VerboseTestCase):
+    """VCF-RDFizer's four agreement checks, on the fixture graphs.
+
+    They read the four derived values no VCF Core shape reads, so each of the
+    seven faults the other profiles miss must be caught by exactly its check,
+    and neither control may fail any of them.
+    """
+
+    CAUGHT_BY = {
+        "corrupt_allele_kind": "AlleleKindAgreementShape",
+        "corrupt_contig_count": "ContigCountAgreementShape",
+        "corrupt_value_item_allele": "ValueItemAlleleAgreementShape",
+        "flip_phasing_status": "PhasingStatusAgreementShape",
+    }
+
+    def test_each_fault_is_caught_by_its_check_and_the_controls_pass(self):
+        from test import validation_fixtures as fixtures
+        from test import validation_mutations as mutations
+
+        _rest, constraints = S.split_shapes([SHACL / "vcf-rdfizer-agreement.shacl.ttl"])
+        self.assertEqual(len(constraints), 4)
+        for representation in ("expanded", "condensed"):
+            base = fixtures.build_graph(representation)
+            by_id = {m.id: m for m in mutations.for_representation(representation)}
+            cases = [("control", base)] + [
+                (mutation_id, by_id[mutation_id].apply(base))
+                for mutation_id in self.CAUGHT_BY if mutation_id in by_id]
+            for name, text in cases:
+                graph = rdflib.Graph().parse(data=text, format="nt")
+                fired = {c.shape.rsplit("#", 1)[1] for c in constraints if list(graph.query(c.query))}
+                with self.subTest(representation=representation, graph=name):
+                    expected = set() if name == "control" else {self.CAUGHT_BY[name]}
+                    self.assertEqual(fired, expected)
+
+    def test_a_missing_contig_list_still_counts_as_zero(self):
+        _rest, constraints = S.split_shapes([SHACL / "vcf-rdfizer-agreement.shacl.ttl"])
+        (check,) = [c for c in constraints if c.shape.endswith("ContigCountAgreementShape")]
+        graph = rdflib.Graph().parse(data=(
+            '<file://f> <https://w3id.org/vcf-core/vocab#contigCount> '
+            '"2"^^<http://www.w3.org/2001/XMLSchema#integer> .\n'), format="nt")
+        self.assertEqual([str(row[0]) for row in graph.query(check.query)], ["file://f"])
+
+
+class PartitionTests(VerboseTestCase):
+    """The cardinality check runs in parts, one per CHROM, plus records with none."""
+
+    def _cardinality(self):
+        _rest, constraints = _full_profile()
+        return [c for c in constraints if c.partition]
+
+    def test_only_the_cardinality_checks_are_partitioned(self):
+        partitioned = self._cardinality()
+        self.assertEqual(len(partitioned), 2)
+        self.assertTrue(all(c.partition == ("?record", "https://w3id.org/vcf-core/vocab#chrom")
+                            for c in partitioned))
+
+    def test_the_parts_together_find_what_the_whole_query_finds(self):
+        """On every fault-injection graph, including the cardinality faults."""
+        checked = 0
+        for name, graph in _typed_fixture_graphs():
+            for constraint in self._cardinality():
+                terms = sorted(S.sparql_term(json.loads(graph.query(
+                    S.partition_values_query(constraint)).serialize(format="json"))
+                    ["results"]["bindings"][i]["part"])
+                    for i in range(len(graph.query(S.partition_values_query(constraint)))))
+                parts = S.partition_queries(constraint, terms)
+                self.assertEqual(len(parts), len(terms) + 1)
+                found = set()
+                for _term, query in parts:
+                    found |= {str(row[0]) for row in graph.query(query)}
+                with self.subTest(graph=name, shape=constraint.shape):
+                    self.assertEqual(found, {str(row[0]) for row in graph.query(constraint.query)})
+                checked += 1
+        self.assertGreater(checked, 200)
+
+    def test_a_record_without_a_chrom_is_still_checked(self):
+        (constraint, *_rest) = self._cardinality()
+        last_term, last_query = S.partition_queries(constraint, ['"1"'])[-1]
+        self.assertEqual(last_term, "(none)")
+        self.assertIn("FILTER NOT EXISTS { ?record <https://w3id.org/vcf-core/vocab#chrom> ?partValue }",
+                      last_query)
+        prepareQuery(last_query)
+
+    def test_terms_are_written_back_as_sparql(self):
+        self.assertEqual(S.sparql_term({"type": "literal", "value": 'a"b'}), '"a\\"b"')
+        self.assertEqual(S.sparql_term({"type": "literal", "value": "1", "datatype": "http://x"}),
+                         '"1"^^<http://x>')
+        self.assertEqual(S.sparql_term({"type": "uri", "value": "http://x"}), "<http://x>")
+
+
 class ReportTests(VerboseTestCase):
     def test_focus_nodes_are_terms(self):
         document = {"results": {"bindings": [
@@ -522,7 +627,7 @@ class ValidateShaclSplitTests(VerboseTestCase):
         result, seen, layer = self._validate({"status": "PASS", "constraints": [], "resultTexts": []})
         self.assertNotIn((None, SH.sparql, None), seen["graph"])
         layer.assert_called_once()
-        self.assertEqual(len(layer.call_args[0][1]), 40)
+        self.assertEqual(len(layer.call_args[0][1]), 44)
         self.assertEqual(result["status"], "PASS")
         self.assertEqual(result["sparqlEngine"], "qlever")
         self.assertNotIn("resultTexts", result["sparqlConstraints"])

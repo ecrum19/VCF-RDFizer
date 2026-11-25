@@ -4959,6 +4959,10 @@ FULL_SHACL_SHAPES = (
     "vcf-core-vocabulary.shacl.ttl",
     "vcf-core-consistency.shacl.ttl",
     "vcf-core-vocabulary-sparql.shacl.ttl",
+    # VCF-RDFizer's own agreement checks for four derived values no VCF Core
+    # shape reads (alleleKind, contigCount, forAllele, phasingStatus). Not
+    # vendored: see the file's header.
+    "vcf-rdfizer-agreement.shacl.ttl",
 )
 SHACL_PROFILE_CHOICES = ("core", "full")
 #: Where the sh:sparql constraints run; mirrors the runner's option of the same

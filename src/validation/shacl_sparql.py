@@ -64,6 +64,11 @@ class SparqlConstraint:
     equivalent: str | None = None
     query: str | None = field(default=None, repr=False)
     unsupported: str | None = None
+    #: For an equivalent run in parts: the variable to partition on, the
+    #: property whose values name the parts, and the text the parts are built
+    #: from (see :func:`partition_queries`).
+    partition: tuple[str, str] | None = None
+    partition_text: str | None = field(default=None, repr=False)
 
 
 def normalized_digest(query: str) -> str:
@@ -179,6 +184,17 @@ SCALABLE_EQUIVALENTS: dict[str, tuple[str, Callable[[str], str]]] = {
         ("record-id-unique-grouped", lambda _query: _DUPLICATE_ID),
     "be87ec3498bdecd2146bb06b6bcfa3015872b7e2da46e500046647471d977ac3":
         ("field-cardinality-sample-optionals-in-format-branch", _cardinality),
+}
+
+
+#: Equivalents run in parts, one per value of a property of one of their
+#: variables, because their intermediate results outgrow QLever's memory on a
+#: complete VCF graph (657M triples, over 20 GB). The cardinality check judges
+#: each field value against its own record, and every value belongs to exactly
+#: one record, so splitting by the record's CHROM is exact.
+PARTITIONED_EQUIVALENTS: dict[str, tuple[str, str]] = {
+    "field-cardinality-sample-optionals-in-format-branch":
+        ("?record", "https://w3id.org/vcf-core/vocab#chrom"),
 }
 
 
@@ -329,6 +345,9 @@ def _skip_string(text: str, index: int) -> int:
     return index
 
 
+_IRI_REF = re.compile(r'<[^<>"{}|^`\\\x00-\x20]*>')
+
+
 def outer_group(query: str) -> tuple[int, int]:
     """Offsets of the outer SELECT's WHERE group: its '{' and its matching '}'."""
     start = re.search(r"\bSELECT\b", query, re.IGNORECASE)
@@ -340,6 +359,13 @@ def outer_group(query: str) -> tuple[int, int]:
         if char in "\"'":
             index = _skip_string(query, index)
             continue
+        if char == "<":
+            # An IRI may hold '#', which would otherwise start a comment. A
+            # less-than operator is followed by a space, so it is no IRI.
+            iri = _IRI_REF.match(query, index)
+            if iri:
+                index = iri.end()
+                continue
         if char == "#":
             newline = query.find("\n", index)
             index = len(query) if newline < 0 else newline + 1
@@ -392,7 +418,50 @@ def prepare(constraint: SparqlConstraint) -> SparqlConstraint:
         constraint.query = whole_graph_query(text, constraint.targets)
     except ValueError as error:
         constraint.unsupported = str(error)
+        return constraint
+    if constraint.equivalent in PARTITIONED_EQUIVALENTS:
+        constraint.partition = PARTITIONED_EQUIVALENTS[constraint.equivalent]
+        constraint.partition_text = text
     return constraint
+
+
+def partition_values_query(constraint: SparqlConstraint) -> str:
+    """The distinct values that name a partitioned constraint's parts."""
+    _variable, prop = constraint.partition
+    return f"SELECT DISTINCT ?part WHERE {{ ?partSubject <{prop}> ?part }}"
+
+
+def sparql_term(binding: dict) -> str:
+    """A SPARQL Results JSON term, written back as a SPARQL term."""
+    value = binding["value"]
+    if binding["type"] == "uri":
+        return f"<{value}>"
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r")
+    if binding.get("xml:lang"):
+        return f'"{escaped}"@{binding["xml:lang"]}'
+    if binding.get("datatype"):
+        return f'"{escaped}"^^<{binding["datatype"]}>'
+    return f'"{escaped}"'
+
+
+def partition_queries(constraint: SparqlConstraint, terms: list[str]) -> list[tuple[str, str]]:
+    """One whole-graph query per part, and one for subjects with no part value.
+
+    Each part pins the partition variable to one value of the property, at the
+    top of the WHERE group, so the engine starts from that slice. The last part
+    keeps the subjects that have no value at all, so the parts cover the graph.
+    """
+    variable, prop = constraint.partition
+    text = constraint.partition_text
+    opening, _closing = outer_group(text)
+    queries = []
+    for term in terms:
+        pinned = f"{text[:opening + 1]}\n  {variable} <{prop}> {term} .{text[opening + 1:]}"
+        queries.append((term, whole_graph_query(pinned, constraint.targets)))
+    unvalued = (f"{text[:opening + 1]}\n  FILTER NOT EXISTS {{ {variable} <{prop}> ?partValue }}"
+                f"{text[opening + 1:]}")
+    queries.append(("(none)", whole_graph_query(unvalued, constraint.targets)))
+    return queries
 
 
 # --- RDFS typing for the index ------------------------------------------------

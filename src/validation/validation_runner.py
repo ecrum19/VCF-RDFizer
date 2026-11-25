@@ -3549,11 +3549,28 @@ def validate_shacl_sparql_qlever(
                 row.update(status="UNSUPPORTED", error=constraint.unsupported)
                 rows.append(row)
                 continue
-            (raw_dir / f"{row['id']}.rq").write_text(constraint.query, encoding="utf-8")
             started = time.monotonic()
             try:
-                document = json.loads(index._post(constraint.query, timeout=index.query_timeout))
-                nodes = shacl_sparql.focus_nodes(document)
+                if constraint.partition:
+                    # Run in parts (shacl_sparql.PARTITIONED_EQUIVALENTS); the
+                    # focus nodes of all parts together are the constraint's.
+                    values = json.loads(index._post(
+                        shacl_sparql.partition_values_query(constraint), timeout=index.query_timeout))
+                    terms = sorted(shacl_sparql.sparql_term(binding["part"])
+                                   for binding in values["results"]["bindings"] if "part" in binding)
+                    parts = shacl_sparql.partition_queries(constraint, terms)
+                    (raw_dir / f"{row['id']}.rq").write_text(
+                        "\n\n".join(f"# part {term}\n{query}" for term, query in parts), encoding="utf-8")
+                    found: set[str] = set()
+                    for _term, query in parts:
+                        found.update(shacl_sparql.focus_nodes(
+                            json.loads(index._post(query, timeout=index.query_timeout))))
+                    nodes = sorted(found)
+                    row["parts"] = len(parts)
+                else:
+                    (raw_dir / f"{row['id']}.rq").write_text(constraint.query, encoding="utf-8")
+                    document = json.loads(index._post(constraint.query, timeout=index.query_timeout))
+                    nodes = shacl_sparql.focus_nodes(document)
                 row.update(status="PASS", focusNodes=len(nodes))
                 texts.extend(shacl_sparql.result_text(constraint, node) for node in nodes)
             except Exception as error:  # noqa: BLE001 - recorded per constraint
