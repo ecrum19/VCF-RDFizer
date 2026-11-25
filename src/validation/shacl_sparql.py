@@ -2,7 +2,7 @@
 
 A SHACL engine evaluates a SPARQL-based constraint once per focus node, with
 ``$this`` pre-bound. pyshacl does that over an in-memory graph, so the full
-shape profile -- whose 40 ``sh:sparql`` constraints compare records with each
+shape profile -- whose ``sh:sparql`` constraints compare records with each
 other -- could only be validated whole and only up to ``--shacl-max-triples``.
 
 Here every constraint runs once over the whole graph instead: ``$this`` is left

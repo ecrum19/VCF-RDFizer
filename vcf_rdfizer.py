@@ -4953,8 +4953,8 @@ DEFAULT_SHACL_SHAPES = ("vcf-core-vocabulary.shacl.ttl",)
 #: profile 73.2 s, against 1.7 s for the core one, because pyshacl evaluates
 #: each sh:sparql constraint once per focus node. Opt in with --shacl-profile
 #: full. Its SPARQL constraints then run once each over the whole graph on
-#: QLever (see shacl_sparql in the validator), which took 121 s for all 40 on a
-#: 17.1M-triple graph.
+#: QLever (see shacl_sparql in the validator), which took 158 s for all 44 on a
+#: 17.1M-triple graph and 131 min on the complete 657.4M-triple HG005 graph.
 FULL_SHACL_SHAPES = (
     "vcf-core-vocabulary.shacl.ttl",
     "vcf-core-consistency.shacl.ttl",

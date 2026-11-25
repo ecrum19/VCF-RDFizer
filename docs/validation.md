@@ -702,6 +702,15 @@ focus-node count and time, and every query run is kept in
 or fails makes the shape layer `EXECUTION_FAILED` unless a violation was found
 elsewhere: an unrun check is never reported as a pass.
 
+The `full` profile also carries VCF-RDFizer's own
+`vcf-rdfizer-agreement.shacl.ttl`: four SPARQL checks for derived values no VCF
+Core shape reads. `vcfc:alleleKind` must agree with the allele's lexical form,
+`vcfc:contigCount` with the number of `##contig` lines, `vcfc:forAllele` with
+the item's position for Number=A and Number=R fields, and `vcfc:phasingStatus`
+with the GT string. Each mirrors the converter's own rule and tests only what
+that rule always produces, so a correct conversion cannot fail it. They live
+here rather than in the vendored vocabulary, which is unchanged.
+
 Four published constraints cannot run whole on a large graph as written, in any
 engine. Each is replaced by a query that decides the same thing in linear time:
 
@@ -711,6 +720,12 @@ engine. Each is replaced by a query that decides the same thing in linear time:
 | Records of one CHROM are contiguous | every triple of records | each CHROM's index range, then any other CHROM inside it |
 | Non-missing record IDs are unique | pairs on the ID before dropping `.` | group by ID |
 | Field cardinality (INFO and FORMAT) | sample OPTIONALs outside the FORMAT branch, so an INFO value matches every sample | the OPTIONALs inside the FORMAT branch |
+
+The field-cardinality equivalent also runs in parts, one per record CHROM plus
+one for records with none: on the complete HG005 VCF graph its intermediate
+results outgrew QLever's 20 GB when run whole, and in 23 parts each check
+finished in 33 min. Every field value belongs to one record, so the parts
+together are exactly the whole.
 
 Each equivalent is pinned to the exact published query by digest, so a
 vocabulary update that changes one falls back to the published text. The unit
@@ -725,17 +740,27 @@ more result, from the contig-length check: rdflib compares the string POS with
 a number, where SPARQL treats the comparison as an error. Both paths fail those
 graphs. The QLever path took 338 s for the 115 graphs, against 1,318 s.
 
-On HG005 slices validated end to end with the `full` profile:
+On HG005 slices validated end to end with the `full` profile, and on the
+complete HG005 VCF graph (SPARQL constraints only), all on vcf-bench-3 with
+QLever given 12 GB for the slices and 20 GB for the complete graph:
 
-| Triples | RDFS typing | QLever index | 40 SPARQL constraints | Whole shape layer |
-| ---: | ---: | ---: | ---: | ---: |
-| 0.52M | 1 s | 3 s | 4 s | 148 s |
-| 2.1M | 3 s | 10 s | 12 s | 189 s |
-| 17.1M | 26 s | 75 s | 121 s | 1,581 s |
+| Triples | QLever index (with RDFS typing) | 44 SPARQL constraints | Whole shape layer |
+| ---: | ---: | ---: | ---: |
+| 0.52M | 2 s | 6 s | 145 s |
+| 2.1M | 8 s | 16 s | 188 s |
+| 17.1M | 65 s | 158 s | 1,550 s |
+| 657.4M | 47 min | 131 min | not run |
 
-Almost all of the shape layer is pyshacl's record batches (four workers). The
-17.1M-triple run peaked at 5.5 GB. pyshacl alone had not finished the `full`
-profile on the 0.52M-triple slice after 2.5 hours.
+The index streams the graph and its typing straight from the `.nt.gz`, so no
+decoded copy is written. On the slices almost all of the shape layer is
+pyshacl's record batches (four workers), and the 17.1M-triple run peaked at
+5.4 GB. On the complete graph all 44 constraints ran, with no violations and
+one Warning (VCF 4.5 recommends reference metadata), in 2 h 58 min at a peak
+of 21.4 GB. The two cardinality checks took 33 min each in 23 parts, the
+`vcfc:forAllele` agreement check 21 min, and the two lexical checks 15 min each.
+pyshacl's node-local batches were not run at that size: they need a decoded
+copy of the graph, which that host's disk does not hold. pyshacl alone had not
+finished the `full` profile on the 0.52M-triple slice after 2.5 hours.
 
 `--shacl-sparql-engine pyshacl` restores the in-memory path of releases up to
 3.3.2. The constraints are then validated whole with the other shapes and stay
@@ -750,24 +775,23 @@ things, and the split decides what a run can detect:
 | `--shacl-profile` | Files | Checks | Cost on a 2,000-triple graph |
 | --- | --- | --- | --- |
 | `core` (default) | `vcf-core-vocabulary` | Cardinality and datatype: `vcfc:sampleIndex` exists once and is an integer >= 1 | **1.7 s** |
-| `full` | `+ vcf-core-consistency`, `+ vcf-core-vocabulary-sparql` | Uniqueness (*"Record indices must be unique"*, *"Sample names and sample indices must be unique"*) and value agreement (`vcfc:alleleValue` against `REF`/`ALT`) | **+33.7 s, +73.2 s** in pyshacl |
+| `full` | `+ vcf-core-consistency`, `+ vcf-core-vocabulary-sparql`, `+ vcf-rdfizer-agreement` | Uniqueness (*"Record indices must be unique"*, *"Sample names and sample indices must be unique"*) and value agreement (`vcfc:alleleValue` against `REF`/`ALT`) | **+33.7 s, +73.2 s** in pyshacl |
 
 The distinction matters for what you can claim. The mutation-score experiment
 injects 113 corruptions, and the query suite catches 96 (0.850). Of the 17 it
 misses, the core profile detects none: it constrains how many `sampleIndex`
 values a sample has, not whether two samples share one. The `full` profile
-detects 10, with pyshacl and with the SPARQL constraints on QLever alike:
-`corrupt_allele_value`, `corrupt_attribute_value`, `corrupt_record_index` and
-`wrong_declaration_owner` in both representations, and `corrupt_called_allele`
-and `corrupt_sample_index_expanded` in the expanded one. Seven stay undetected:
-`corrupt_allele_kind`, `corrupt_contig_count` and `corrupt_value_item_allele`
-in both representations, and `flip_phasing_status` in the expanded one.
+detects all 17, with pyshacl and with the SPARQL constraints on QLever alike,
+for a score of 113/113. VCF Core's profiles catch 10 of them. The other seven
+change one of the four derived values only VCF-RDFizer's agreement checks read:
+`corrupt_allele_kind`, `corrupt_contig_count` and `corrupt_value_item_allele` in
+both representations, and `flip_phasing_status` in the expanded one.
 
 A shape detection counts only when a mutation adds a blocking result its
 unmutated control does not have. The condensed control passes the `full`
 profile. The expanded one fails a single check, the phase indicator of a
-haploid call, which is a known disagreement between the converter and the
-shape ([shacl-engines.md](shacl-engines.md#issues-found-in-the-shapes)).
+haploid call, which is a converter bug held for the release after the paper
+([shacl-engines.md](shacl-engines.md#issues-found-in-the-shapes)).
 `VCF_RDFIZER_MUTATION_SHACL=core|full` folds the shape layer into the
 harness, and `VCF_RDFIZER_MUTATION_SHACL_ENGINE=pyshacl|qlever` picks where its
 SPARQL constraints run.

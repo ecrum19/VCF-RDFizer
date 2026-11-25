@@ -12,7 +12,7 @@ pyshacl with a native engine would take. That replacement is future work
 
 The full profile was gated at 10M triples because pyshacl holds the graph in
 memory. Measuring it showed a second, larger problem, independent of the
-engine: four of its 40 SPARQL constraints grow faster than the graph.
+engine: four of VCF Core's 40 SPARQL constraints grow faster than the graph.
 
 | Constraint | As published | Cost |
 | --- | --- | --- |
@@ -114,16 +114,25 @@ For the vocabulary ([vcf-rdfizer-vocabulary](https://github.com/ecrum19/vcf-rdfi
 2. **The four constraints above.** Publishing the linear equivalents would let
    the validator drop its pinned replacements (`SCALABLE_EQUIVALENTS` in
    `src/validation/shacl_sparql.py`).
-3. **The haploid phase indicator.** For a GT with no separator, such as a
-   haploid `0`, the converter writes `vcfc:phaseIndicator "/"` (its default),
-   while `vcfc:GenotypeAlleleAgreementShape` expects `|`: it reads the first
-   allele as phased unless the GT contains `/`, which appears to follow
-   VCF 4.4's implicit-phasing rule. The expanded validation fixture has such a call, so its
-   clean control fails the full profile on that one check. Fixing the
-   converter changes the RDF of every haploid call (chrX and chrY in male
-   samples, mitochondrial calls). Fixing the shape needs a vocabulary release.
-   Until one is chosen, the mutation harness counts a shape detection only when
-   a mutation adds a violation its control does not have.
+3. **Four derived values no shape reads.** `vcfc:alleleKind`,
+   `vcfc:contigCount`, `vcfc:forAllele` and `vcfc:phasingStatus` were checked
+   by nothing, so seven injected faults went undetected by every profile.
+   VCF-RDFizer now checks them in `vcf-rdfizer-agreement.shacl.ttl`, a
+   candidate for the vocabulary.
+4. **The haploid phase indicator (a converter fix, after the paper).** For a GT
+   with no separator, such as a haploid `0`, the converter writes
+   `vcfc:phaseIndicator "/"` and `vcfc:phasingStatus vcfc:Unphased`.
+   `vcfc:GenotypeAlleleAgreementShape` expects `|`, and VCF 4.4 agrees: an
+   omitted first indicator is `/` if any other indicator is `/` and `|`
+   otherwise (section 1.6.2), and its BCF section calls a bare haploid allele
+   implicitly phased. So the converter is the side to fix, in
+   `vcf_rdfizer_vocab.parse_genotype` (both the indicator and the phasing
+   status, with `PhasingStatusAgreementShape` following). The fix changes the
+   RDF of every haploid call (chrX and chrY in male samples, mitochondrial
+   calls), so it is held for the release after the paper. Until then the
+   expanded fixture's clean control fails the full profile on that one check,
+   and the mutation harness counts a shape detection only when a mutation adds
+   a violation its control does not have.
 
 The validation fixture was also unsorted (chr20, chr21, chr20), so both
 ordering constraints fired on the clean controls. It is now sorted.

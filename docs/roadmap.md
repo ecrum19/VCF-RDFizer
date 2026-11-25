@@ -180,9 +180,10 @@ constraints on QLever, and shipping its binary in the image. Three Rudof issues
 need reporting upstream first: right-associative `a - b + c`, a blank-node
 `$this` pre-bound with `VALUES`, and `xsd:int` not compared with `xsd:integer`.
 The evaluation also found issues in the published shapes (no `sh:prefixes`,
-four constraints that grow faster than the graph) and a disagreement between
-the converter and the genotype shape on the phase indicator of a haploid call,
-which makes the expanded fixture fail the `full` profile. Measurements, issues and the porting steps:
+four constraints that grow faster than the graph) and a converter bug: a haploid call gets
+the phase indicator `/` where VCF 4.4 implies `|`, which makes the expanded
+fixture fail the `full` profile. The fix changes conversion, so it follows the
+paper's submission. Measurements, issues and the porting steps:
 [`shacl-engines.md`](shacl-engines.md).
 
 ## Deliberately not planned
