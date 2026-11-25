@@ -87,6 +87,11 @@ def evaluate(engine_name: str, representation: str, source: Path, scratch: Path)
                         encoding="utf-8", errors="replace")[:400],
                     "body": body,
                 }
+                # A Comunica endpoint reports only "An internal server error
+                # occurred." in the body. The cause is in its own log.
+                for log in sorted(raw_dir.glob("**/*-server.log")):
+                    tail = log.read_text(encoding="utf-8", errors="replace")[-1500:]
+                    print(f"--- {engine_name}/{representation} {query_id}: tail of {log.name} ---\n{tail}")
                 continue
             raw = Path(execution["rawResult"])
             if query_id in V.QUERY_SCHEMAS:
