@@ -77,9 +77,15 @@ def evaluate(engine_name: str, representation: str, source: Path, scratch: Path)
         for query_id in V.PREFLIGHT_QUERIES + V.PREFLIGHT_COUNT_QUERIES + V.CORE_QUERIES:
             execution = engine.execute(query_id, V.query_path(V.QUERY_ROOT / representation, query_id))
             if execution["status"] != "PASS":
+                # An endpoint that answers HTTP 200 with a body that is not
+                # SPARQL Results JSON leaves stderr empty: the reason is in the
+                # envelope's error, and the body shows what came back.
+                raw = Path(execution["rawResult"])
+                body = raw.read_bytes()[-400:].decode("utf-8", "replace") if raw.exists() else ""
                 results[query_id] = {
-                    "__executionFailed__": Path(execution["stderr"]).read_text(
-                        encoding="utf-8", errors="replace")[:400]
+                    "__executionFailed__": execution.get("error") or Path(execution["stderr"]).read_text(
+                        encoding="utf-8", errors="replace")[:400],
+                    "body": body,
                 }
                 continue
             raw = Path(execution["rawResult"])
