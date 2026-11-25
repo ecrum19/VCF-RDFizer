@@ -132,7 +132,8 @@ For the vocabulary ([vcf-rdfizer-vocabulary](https://github.com/ecrum19/vcf-rdfi
    calls), so it is held for the release after the paper. Until then the
    expanded fixture's clean control fails the full profile on that one check,
    and the mutation harness counts a shape detection only when a mutation adds
-   a violation its control does not have.
+   a violation its control does not have. The steps are in
+   [roadmap item 9](roadmap.md#9-fixes-held-until-after-the-papers-submission).
 
 The validation fixture was also unsorted (chr20, chr21, chr20), so both
 ordering constraints fired on the clean controls. It is now sorted.
