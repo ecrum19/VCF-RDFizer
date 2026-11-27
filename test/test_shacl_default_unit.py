@@ -282,7 +282,9 @@ class SeverityTests(VerboseTestCase):
         ).read_text(encoding="utf-8")
         self.assertIn('"advisoryCount"', source)
         self.assertIn('"advisoryKinds"', source)
-        self.assertIn('"status": "PASS" if not violations else "FAIL"', source)
+        self.assertIn(
+            'status = "FAIL" if violations else ("EXECUTION_FAILED" if incomplete else "PASS")',
+            source)
 
 
 

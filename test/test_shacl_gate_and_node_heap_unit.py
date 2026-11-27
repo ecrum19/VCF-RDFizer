@@ -382,14 +382,29 @@ class RunValidationShaclGateTests(VerboseTestCase):
         self.assertEqual(run["validate_shacl"].call_args.kwargs["workers"], 3)
         self.assertIsNone(run["shacl"], "nothing was skipped, so nothing is recorded")
 
-    def test_sparql_shapes_are_still_gated_when_batching_is_on(self):
-        """A SPARQL constraint compares records, so those shapes stay whole."""
+    def test_sparql_shapes_in_pyshacl_are_still_gated_when_batching_is_on(self):
+        """In pyshacl a SPARQL constraint compares records, so those shapes stay whole."""
+        with mock.patch.object(V, "shapes_are_node_local", return_value=False):
+            run = self._drive(
+                rdf_validation={"status": "PASS", "tripleCount": GRAPH_TRIPLES},
+                shacl_batch_triples=V.DEFAULT_SHACL_BATCH_TRIPLES,
+                shacl_sparql_engine="pyshacl")
+        run["validate_shacl"].assert_not_called()
+        self.assertEqual(run["shacl"]["status"], "SKIPPED_TOO_LARGE")
+
+    def test_sparql_shapes_on_qlever_are_batched_and_not_gated(self):
+        """On QLever the SPARQL constraints leave pyshacl, so the rest is batched."""
         with mock.patch.object(V, "shapes_are_node_local", return_value=False):
             run = self._drive(
                 rdf_validation={"status": "PASS", "tripleCount": GRAPH_TRIPLES},
                 shacl_batch_triples=V.DEFAULT_SHACL_BATCH_TRIPLES)
-        run["validate_shacl"].assert_not_called()
-        self.assertEqual(run["shacl"]["status"], "SKIPPED_TOO_LARGE")
+        self.assertRunDidNotError(run)
+        run["validate_shacl"].assert_called_once()
+        kwargs = run["validate_shacl"].call_args.kwargs
+        self.assertTrue(kwargs["records_per_batch"])
+        self.assertEqual(kwargs["sparql_engine"], "qlever")
+        self.assertEqual(kwargs["qlever_options"]["port"], 7019)
+        self.assertEqual(kwargs["qlever_options"]["query_timeout"], 60)
 
     def test_the_skip_is_recorded_with_its_reason(self):
         """A skip nobody can see is the silent failure this replaces."""

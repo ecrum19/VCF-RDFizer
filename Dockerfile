@@ -189,12 +189,25 @@ ARG COMUNICA_COTTAS_VERSION
 # The HDT engine compiles native bindings, so a toolchain is needed at install
 # time but not afterwards; it is purged in the same layer to keep it out of the
 # image. `python3` is already present and is what node-gyp needs.
+#
+# The COTTAS engine is installed from a lockfile instead. It depends on
+# Comunica's packages by semver range, and Comunica 5.5.0 (2026-11-24) broke it:
+# a pattern inside an OPTIONAL with a FILTER is left without a source ("requires
+# an operation with source annotation"), so the expanded genotype queries fail.
+# docker/comunica-cottas pins every @comunica package at the 5.4.0 tree the
+# v3.3.2 image resolved, and a global install would ignore those overrides.
+COPY docker/comunica-cottas/package.json docker/comunica-cottas/package-lock.json /opt/comunica-cottas/
 RUN apt-get update \
   && apt-get install -y --no-install-recommends build-essential \
   && npm install --global \
     "@comunica/query-sparql-file@${COMUNICA_VERSION}" \
     "@comunica/query-sparql-hdt@${COMUNICA_HDT_VERSION}" \
-    "@elias.crum/query-sparql-cottas@${COMUNICA_COTTAS_VERSION}" \
+  && grep -q "\"@elias.crum/query-sparql-cottas\": \"${COMUNICA_COTTAS_VERSION}\"" /opt/comunica-cottas/package.json \
+  && cd /opt/comunica-cottas \
+  && npm ci --omit=dev --no-audit --no-fund \
+  && ln -s /opt/comunica-cottas/node_modules/.bin/comunica-sparql-cottas /usr/local/bin/comunica-sparql-cottas \
+  && ln -s /opt/comunica-cottas/node_modules/.bin/comunica-sparql-cottas-http /usr/local/bin/comunica-sparql-cottas-http \
+  && npm cache clean --force \
   && apt-get purge -y --auto-remove build-essential \
   && rm -rf /var/lib/apt/lists/*
 

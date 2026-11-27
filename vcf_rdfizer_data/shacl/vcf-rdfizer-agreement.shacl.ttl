@@ -1,0 +1,96 @@
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix vcfc: <https://w3id.org/vcf-core/vocab#> .
+@prefix vcfr: <https://w3id.org/vcf-rdfizer/shapes#> .
+
+# Agreement checks VCF-RDFizer adds to the full shape profile.
+#
+# Each checks one derived value against the source text it was derived from, for
+# four properties no shape in the VCF Core profiles reads: vcfc:alleleKind,
+# vcfc:contigCount, vcfc:forAllele and vcfc:phasingStatus. They mirror the
+# converter's own rules (vcf_rdfizer_vocab.classify_allele, value_item_link and
+# parse_genotype), and each tests only what those rules always produce, so a
+# correct conversion cannot fail them. They are VCF-RDFizer's, not VCF Core's:
+# the vendored vocabulary is unchanged, and these can move into a later
+# vocabulary release.
+
+vcfr:AlleleKindAgreementShape a sh:NodeShape ;
+  sh:targetSubjectsOf vcfc:alleleKind ;
+  sh:sparql [
+    sh:message "An allele's kind must agree with its lexical form (missing, overlapping deletion, symbolic, unspecified, breakend or base sequence)."@en ;
+    sh:select """
+PREFIX vcfc: <https://w3id.org/vcf-core/vocab#>
+SELECT $this WHERE {
+  $this vcfc:alleleKind ?kind ; vcfc:alleleValue ?raw .
+  BIND (STR(?raw) AS ?value)
+  BIND (?value IN ("<*>", "<NON_REF>") AS ?unspecified)
+  BIND (REGEX(?value, "^<.+>$") AS ?bracketed)
+  FILTER (
+       (?value = "." && ?kind != vcfc:MissingAllele)
+    || (?kind = vcfc:MissingAllele && ?value != ".")
+    || (?value = "*" && ?kind != vcfc:OverlappingDeletionAllele)
+    || (?kind = vcfc:OverlappingDeletionAllele && ?value != "*")
+    || (?unspecified && ?kind != vcfc:UnspecifiedAllele)
+    || (?kind = vcfc:UnspecifiedAllele && !?unspecified)
+    || (?bracketed && !?unspecified && ?kind != vcfc:SymbolicAllele)
+    || (?kind = vcfc:SymbolicAllele && (!?bracketed || ?unspecified))
+    || (REGEX(?value, "^[ACGTNacgtn]+$") && ?kind != vcfc:BaseSequenceAllele)
+    || (?kind = vcfc:BreakendAllele
+        && !(CONTAINS(?value, "[") || CONTAINS(?value, "]") || STRSTARTS(?value, ".") || STRENDS(?value, ".")))
+  )
+}
+"""
+  ] .
+
+vcfr:ContigCountAgreementShape a sh:NodeShape ;
+  sh:targetSubjectsOf vcfc:contigCount ;
+  sh:sparql [
+    sh:message "A file's contig count must equal its number of identified ##contig header lines."@en ;
+    sh:select """
+PREFIX vcfc: <https://w3id.org/vcf-core/vocab#>
+SELECT $this WHERE {
+  $this vcfc:contigCount ?declared .
+  OPTIONAL {
+    SELECT $this (COUNT(DISTINCT ?line) AS ?counted) WHERE {
+      $this vcfc:hasHeader/vcfc:hasHeaderLine ?line .
+      ?line a vcfc:ContigHeaderLine ; vcfc:contigId ?identifier .
+    } GROUP BY $this
+  }
+  FILTER (?declared != COALESCE(?counted, 0))
+}
+"""
+  ] .
+
+vcfr:ValueItemAlleleAgreementShape a sh:NodeShape ;
+  sh:targetSubjectsOf vcfc:forAllele ;
+  sh:sparql [
+    sh:message "A Number=A or Number=R value item must point at the allele its position names: ALT i + 1 for item i of Number=A, allele i for Number=R."@en ;
+    sh:select """
+PREFIX vcfc: <https://w3id.org/vcf-core/vocab#>
+SELECT $this WHERE {
+  $this vcfc:forAllele ?allele ; vcfc:valueIndex ?item .
+  ?field vcfc:hasValueItem $this ; vcfc:declaredBy ?declaration .
+  ?declaration vcfc:fieldNumber ?number ; vcfc:fieldId ?key .
+  ?allele vcfc:alleleIndex ?alleleIndex .
+  # Tuple keys carry several items per allele (VCF 4.4 CIPOS and kin), so
+  # their position is not the allele index.
+  FILTER (STR(?number) IN ("A", "R") && !(STR(?key) IN ("CIPOS", "CIEND", "CILEN", "CICN")))
+  FILTER (?alleleIndex != IF(STR(?number) = "A", ?item + 1, ?item))
+}
+"""
+  ] .
+
+vcfr:PhasingStatusAgreementShape a sh:NodeShape ;
+  sh:targetSubjectsOf vcfc:phasingStatus ;
+  sh:sparql [
+    sh:message "A genotype's phasing status must agree with its GT string: mixed if it holds both '|' and '/', phased if it holds only '|', unphased otherwise."@en ;
+    sh:select """
+PREFIX vcfc: <https://w3id.org/vcf-core/vocab#>
+SELECT $this WHERE {
+  $this vcfc:phasingStatus ?status ; vcfc:genotypeString ?raw .
+  BIND (CONTAINS(STR(?raw), "|") AS ?pipe)
+  BIND (CONTAINS(STR(?raw), "/") AS ?slash)
+  BIND (IF(?pipe && ?slash, vcfc:MixedPhasing, IF(?pipe, vcfc:Phased, vcfc:Unphased)) AS ?expected)
+  FILTER (?status != ?expected)
+}
+"""
+  ] .

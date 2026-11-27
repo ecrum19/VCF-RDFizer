@@ -27,6 +27,7 @@ import argparse
 import csv
 import gzip
 import hashlib
+import io
 import json
 import multiprocessing
 import os
@@ -430,6 +431,12 @@ except ImportError:
             sys.path.insert(0, str(candidate))
             break
     import vcf_rdfizer_vocab as vocab
+
+# The SHACL-SPARQL layer sits next to this runner in both layouts. A test that
+# loads the runner from its path does not put that directory on sys.path.
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+import shacl_sparql  # noqa: E402
 
 VCFC = vocab.VCFC_NAMESPACE
 RDF_TYPE = vocab.RDF_TYPE_URI
@@ -2169,9 +2176,17 @@ def merge_shapes_graph(shapes: list[Path]):
     return graph
 
 
+#: Where the SPARQL-based constraints run. ``qlever`` runs each once over the
+#: whole graph on a QLever index (see shacl_sparql), so they no longer hold the
+#: graph in memory and no longer need the size gate. ``pyshacl`` validates them
+#: with the rest of the shapes, whole and gated, as every release before did.
+SHACL_SPARQL_ENGINES = ("qlever", "pyshacl")
+DEFAULT_SHACL_SPARQL_ENGINE = "qlever"
+
 #: pyshacl loads its whole data graph into memory, so shapes validated in one
-#: piece -- those with SPARQL constraints, or with --shacl-batch-triples 0 --
-#: need a size gate; batched shapes do not. It is in triples rather than bytes,
+#: piece -- those with SPARQL constraints under --shacl-sparql-engine pyshacl,
+#: or any with --shacl-batch-triples 0 -- need a size gate; batched shapes do
+#: not. It is in triples rather than bytes,
 #: because what pyshacl pays for is the graph, not the packaging -- see the
 #: comment at its call site for the failure that motivated it.
 #:
@@ -2347,8 +2362,16 @@ def validate_shacl(
     records_per_batch: int | None = None,
     workers: int = DEFAULT_SHACL_WORKERS,
     scratch_dir: Path | None = None,
+    sparql_engine: str = "pyshacl",
+    qlever_options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Validate the graph against SHACL shapes, if pyshacl is available.
+
+    With ``sparql_engine="qlever"`` the shapes are split first: pyshacl
+    validates everything except the ``sh:sparql`` constraints, exactly as
+    below, and those constraints run once each over the whole graph on a QLever
+    index (validate_shacl_sparql_qlever). Both halves report into the same
+    result list, so the verdict and the report keep their shape.
 
     This is an independent structural layer: it checks the shapes the
     vocabulary publishes, rather than comparing counts against the VCF, so it
@@ -2383,16 +2406,26 @@ def validate_shacl(
 
     started = time.monotonic()
     shapes_list = [shapes] if isinstance(shapes, Path) else list(shapes)
+    sparql_report: dict[str, Any] | None = None
     try:
         with tempfile.TemporaryDirectory(
             dir=scratch_dir or results_dir, prefix="shacl-batches-"
         ) as work:
+            node_shapes = shapes_list
+            constraints: list[shacl_sparql.SparqlConstraint] = []
+            if sparql_engine == "qlever":
+                rest, constraints = shacl_sparql.split_shapes(shapes_list)
+                if constraints:
+                    node_shapes = [Path(work) / "node-local-shapes.ttl"]
+                    rest.serialize(str(node_shapes[0]), format="turtle")
             if records_per_batch:
-                context, batches = write_shacl_batches(source, Path(work), records_per_batch)
-                tasks = [(context, batch, shapes_list, ontology) for batch in batches]
-                tasks = tasks or [(context, None, shapes_list, ontology)]
+                batch_dir = Path(work) / "batches"
+                batch_dir.mkdir()
+                context, batches = write_shacl_batches(source, batch_dir, records_per_batch)
+                tasks = [(context, batch, node_shapes, ontology) for batch in batches]
+                tasks = tasks or [(context, None, node_shapes, ontology)]
             else:
-                tasks = [(source, None, shapes_list, ontology)]
+                tasks = [(source, None, node_shapes, ontology)]
             workers = max(1, min(workers, len(tasks)))
             if workers == 1:
                 outcomes = [_validate_shacl_task(task) for task in tasks]
@@ -2401,6 +2434,12 @@ def validate_shacl(
                 # memory back, so a reused worker would hold its largest batch.
                 with multiprocessing.get_context("fork").Pool(workers, maxtasksperchild=1) as pool:
                     outcomes = pool.map(_validate_shacl_task, tasks)
+            if constraints:
+                sparql_report = validate_shacl_sparql_qlever(
+                    source, constraints, ontology,
+                    work=Path(work), raw_dir=results_dir / "shacl-sparql",
+                    options=qlever_options or {},
+                )
     except Exception as error:  # noqa: BLE001 - reported, never fatal here
         result = {
             "status": "EXECUTION_FAILED",
@@ -2411,12 +2450,13 @@ def validate_shacl(
         write_json(report_path, result)
         return result
 
-    conforms = all(ok for ok, _text in outcomes)
-    text = "\n\n".join(text for _ok, text in outcomes)
+    sparql_texts = list((sparql_report or {}).pop("resultTexts", []))
+    conforms = all(ok for ok, _text in outcomes) and not sparql_texts
+    text = "\n\n".join([text for _ok, text in outcomes] + sparql_texts)
     # Each batch's report is parsed on its own, so no block runs into the next
     # report's header, then results repeated across batches are kept once.
     results, seen = [], set()
-    for _ok, batch_text in outcomes:
+    for batch_text in [text for _ok, text in outcomes] + sparql_texts:
         for entry in parse_shacl_results(batch_text):
             if entry["text"] not in seen:
                 seen.add(entry["text"])
@@ -2439,8 +2479,13 @@ def validate_shacl(
     })
     log_path = results_dir / "shacl-report.txt"
     log_path.write_text(text, encoding="utf-8")
+    # A constraint that did not run must not read as one that passed. A
+    # violation found elsewhere still decides the verdict, because it is
+    # certain whatever the unrun constraint would have said.
+    incomplete = sparql_report is not None and sparql_report["status"] != "PASS"
+    status = "FAIL" if violations else ("EXECUTION_FAILED" if incomplete else "PASS")
     result = {
-        "status": "PASS" if not violations else "FAIL",
+        "status": status,
         # Kept verbatim: it is pyshacl's own verdict, and it is NOT the verdict
         # this run acts on. A graph with warnings only is conforms=False here
         # and status=PASS, which is the distinction the severities encode.
@@ -2459,7 +2504,15 @@ def validate_shacl(
         "workers": workers,
         "sampleLimitedTo": SHACL_SAMPLE_LIMIT,
         "sample": violations[:SHACL_SAMPLE_LIMIT],
+        "sparqlEngine": sparql_engine,
     }
+    if sparql_report is not None:
+        result["sparqlConstraints"] = sparql_report
+        if incomplete:
+            result["error"] = sparql_report.get("error") or (
+                "SPARQL constraints did not all run: "
+                + ", ".join(f"{item['id']} {item['status']}" for item in sparql_report["constraints"]
+                            if item["status"] != "PASS"))
     write_json(report_path, result)
     return result
 
@@ -3380,6 +3433,167 @@ class QleverEngine(QueryEngine):
         # The index is large and container-local; remove it as soon as the
         # queries are done rather than waiting for the scratch teardown.
         shutil.rmtree(self.index_dir, ignore_errors=True)
+
+
+class ShaclQleverIndex(QleverEngine):
+    """A QLever index over the data graph plus the vocabulary and its RDFS typing.
+
+    Separate from the query engine's index, whose answers are compared against
+    the VCF and must not see the vocabulary's triples. The index builder reads
+    the graph on stdin, each triple followed by its RDFS typing
+    (shacl_sparql.stream_with_typing), so a gzip-compressed graph is indexed
+    without being decoded to disk and no typing file is written. Its index
+    command is always the default one and its directory is its own.
+    """
+
+    name = "qlever-shacl"
+
+    def __init__(self, sources: list[Path], vocabulary, *, raw_dir: Path,
+                 scratch: Path, options: dict[str, Any]):
+        super().__init__(sources[0], raw_dir=raw_dir, scratch=scratch, options=options)
+        self.sources = list(sources)
+        self.vocabulary = vocabulary
+        self.index_dir = scratch / "qlever-shacl-index"
+        self.index_base = self.index_dir / "shacl"
+        self.log_dir = raw_dir
+        self.streamed: dict[str, int] = {}
+
+    def index_command(self, index_builder: str) -> list[str]:
+        # "-f -" reads the knowledge graph from stdin. Leaving -f out, which
+        # its --help offers, fails an assertion in this QLever build.
+        return [index_builder, "-i", str(self.index_base), "-f", "-", "-F", "nt",
+                "-m", f"{self.memory_gb}G", *self.extra_index_args]
+
+    def start(self) -> None:
+        index_builder = self._binary("QLEVER_INDEX_BUILDER_BIN", "qlever-index")
+        server_main = self._binary("QLEVER_SERVER_BIN", "qlever-server")
+        self.index_dir.mkdir(parents=True, exist_ok=True)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.server_binary = server_main
+        self.commands["index"] = self.index_command(index_builder)
+        self.commands["server"] = self.server_command(server_main)
+        environment = self._environment()
+        started = time.monotonic()
+        log_path = self.log_dir / "qlever-index.log"
+        with log_path.open("wb") as log:
+            process = subprocess.Popen(
+                self.commands["index"], stdin=subprocess.PIPE, stdout=log,
+                stderr=subprocess.STDOUT, env=environment,
+            )
+            try:
+                with io.TextIOWrapper(process.stdin, encoding="utf-8") as feed:
+                    self.streamed = shacl_sparql.stream_with_typing(
+                        self.sources, self.vocabulary, feed)
+            except BrokenPipeError:
+                pass  # the builder died; its exit code and log say why
+            returncode = process.wait()
+        if returncode != 0:
+            tail = log_path.read_text(encoding="utf-8", errors="replace")[-2000:]
+            raise RuntimeError(f"qlever-index exited with code {returncode}. Log tail: {tail}")
+        self.index_seconds = time.monotonic() - started
+        server_log = self.log_dir / "qlever-server.log"
+        self.server = subprocess.Popen(
+            self.commands["server"], stdout=server_log.open("wb"),
+            stderr=subprocess.STDOUT, env=environment,
+        )
+        self._await_ready(server_log)
+
+
+def validate_shacl_sparql_qlever(
+    source: Path,
+    constraints: list[shacl_sparql.SparqlConstraint],
+    ontology: Path | None,
+    *,
+    work: Path,
+    raw_dir: Path,
+    options: dict[str, Any],
+) -> dict[str, Any]:
+    """Run each SPARQL constraint once over the whole graph on QLever.
+
+    The index holds the data, the vocabulary and the RDFS typing pyshacl would
+    infer from them (shacl_sparql.RdfsTyping), so targets and type patterns see
+    what they see under pyshacl. ``source`` may be gzip-compressed N-Triples.
+    Every query is written to ``raw_dir`` with its outcome, so a result can be
+    re-run by hand.
+    """
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    report: dict[str, Any] = {"engine": "qlever", "constraintCount": len(constraints)}
+    sources, vocabulary = [source], None
+    if ontology is not None:
+        from rdflib import Graph
+
+        vocabulary_graph = Graph().parse(str(ontology), format="turtle")
+        vocabulary_nt = work / "vocabulary.nt"
+        vocabulary_graph.serialize(str(vocabulary_nt), format="nt", encoding="utf-8")
+        vocabulary = shacl_sparql.Vocabulary(vocabulary_graph)
+        sources.append(vocabulary_nt)
+
+    index = ShaclQleverIndex(sources, vocabulary, raw_dir=raw_dir, scratch=work, options=options)
+    rows: list[dict[str, Any]] = []
+    texts: list[str] = []
+    try:
+        index.prepare()
+        report.update(index.streamed)
+        # Typing is computed while the index builder reads, so it is in here.
+        report["indexSeconds"] = index.index_seconds
+        report["setupSeconds"] = index.setup_seconds
+        report["index"] = {key: value for key, value in index.describe().items()
+                           if key in ("memoryLimitGb", "commands", "buildStatus")}
+        queries_started = time.monotonic()
+        for number, constraint in enumerate(constraints):
+            row: dict[str, Any] = {
+                "id": f"c{number:02d}", "shape": constraint.shape, "message": constraint.message,
+                "severity": constraint.severity, "equivalent": constraint.equivalent,
+            }
+            if constraint.unsupported:
+                row.update(status="UNSUPPORTED", error=constraint.unsupported)
+                rows.append(row)
+                continue
+            started = time.monotonic()
+            try:
+                if constraint.partition:
+                    # Run in parts (shacl_sparql.PARTITIONED_EQUIVALENTS); the
+                    # focus nodes of all parts together are the constraint's.
+                    values = json.loads(index._post(
+                        shacl_sparql.partition_values_query(constraint), timeout=index.query_timeout))
+                    terms = sorted(shacl_sparql.sparql_term(binding["part"])
+                                   for binding in values["results"]["bindings"] if "part" in binding)
+                    parts = shacl_sparql.partition_queries(constraint, terms)
+                    (raw_dir / f"{row['id']}.rq").write_text(
+                        "\n\n".join(f"# part {term}\n{query}" for term, query in parts), encoding="utf-8")
+                    found: set[str] = set()
+                    for _term, query in parts:
+                        found.update(shacl_sparql.focus_nodes(
+                            json.loads(index._post(query, timeout=index.query_timeout))))
+                    nodes = sorted(found)
+                    row["parts"] = len(parts)
+                else:
+                    (raw_dir / f"{row['id']}.rq").write_text(constraint.query, encoding="utf-8")
+                    document = json.loads(index._post(constraint.query, timeout=index.query_timeout))
+                    nodes = shacl_sparql.focus_nodes(document)
+                row.update(status="PASS", focusNodes=len(nodes))
+                texts.extend(shacl_sparql.result_text(constraint, node) for node in nodes)
+            except Exception as error:  # noqa: BLE001 - recorded per constraint
+                detail = error.read().decode("utf-8", "replace")[:2000] if hasattr(error, "read") else str(error)
+                row.update(status="TIMEOUT" if is_timeout_error(error) else "EXECUTION_FAILED",
+                           error=detail)
+            row["wallSeconds"] = time.monotonic() - started
+            rows.append(row)
+        report["querySeconds"] = time.monotonic() - queries_started
+    except (RuntimeError, OSError) as error:
+        report.update(status="EXECUTION_FAILED", error=(
+            f"the QLever index for the SPARQL constraints could not be prepared: {error}. "
+            f"--shacl-sparql-engine pyshacl validates them in memory instead, up to "
+            f"--shacl-max-triples"))
+    finally:
+        index.stop()
+    report["constraints"] = rows
+    report.setdefault("status", "PASS" if all(row["status"] == "PASS" for row in rows)
+                      and len(rows) == len(constraints) else "EXECUTION_FAILED")
+    report["rewritten"] = sorted({row["equivalent"] for row in rows if row.get("equivalent")})
+    write_json(raw_dir / "constraints.json", rows)
+    report["resultTexts"] = texts
+    return report
 
 
 class NativeArtifactEngine(QueryEngine):
@@ -4457,11 +4671,14 @@ def run_validation(args: argparse.Namespace) -> int:
                 args, "shacl_max_triples", DEFAULT_SHACL_MAX_TRIPLES
             )
             records_per_batch = None
+            sparql_engine = getattr(args, "shacl_sparql_engine", DEFAULT_SHACL_SPARQL_ENGINE)
             if args.shacl_shapes is not None:
+                # On QLever the SPARQL constraints leave pyshacl's share, and
+                # what remains judges each node from its neighbourhood.
                 records_per_batch = shacl_records_per_batch(
                     parser.get("totalRecords"), decoded_triples,
                     getattr(args, "shacl_batch_triples", DEFAULT_SHACL_BATCH_TRIPLES),
-                    shapes_are_node_local(args.shacl_shapes),
+                    sparql_engine == "qlever" or shapes_are_node_local(args.shacl_shapes),
                 )
             # A batched validation's memory is set by its batch, not the graph,
             # so only a graph validated in one piece is gated.
@@ -4499,6 +4716,15 @@ def run_validation(args: argparse.Namespace) -> int:
                     records_per_batch=records_per_batch,
                     workers=getattr(args, "shacl_workers", DEFAULT_SHACL_WORKERS),
                     scratch_dir=getattr(args, "scratch_dir", None),
+                    sparql_engine=sparql_engine,
+                    qlever_options={
+                        "port": args.qlever_port,
+                        "memory_gb": args.qlever_memory_gb,
+                        "startup_timeout": args.qlever_startup_timeout,
+                        "query_timeout": args.query_timeout,
+                        "extra_index_args": list(args.qlever_index_arg),
+                        "extra_server_args": list(args.qlever_server_arg),
+                    },
                 )
             if shacl_skipped is not None:
                 shacl_result = shacl_skipped
@@ -4911,9 +5137,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Validate node-level shapes a batch of records at a time, about "
             "this many triples per batch, so memory follows the batch rather "
-            "than the graph. Shapes with SPARQL constraints compare records and "
-            f"are validated whole (0 always validates whole; default: "
+            "than the graph. SPARQL constraints compare records, so they run "
+            "whole: on QLever by default, or in pyshacl with the rest under "
+            "--shacl-sparql-engine pyshacl (0 always validates whole; default: "
             f"{DEFAULT_SHACL_BATCH_TRIPLES:,})"
+        ),
+    )
+    parser.add_argument(
+        "--shacl-sparql-engine",
+        choices=SHACL_SPARQL_ENGINES,
+        default=DEFAULT_SHACL_SPARQL_ENGINE,
+        help=(
+            "Where sh:sparql constraints run. qlever (default) runs each once "
+            "over the whole graph on a QLever index of the graph, the "
+            "vocabulary and its RDFS typing, so they scale with the index "
+            "rather than memory and are not size-gated. pyshacl validates them "
+            "in memory with the other shapes, under --shacl-max-triples"
         ),
     )
     parser.add_argument(

@@ -166,9 +166,9 @@ MUTATIONS: tuple[Mutation, ...] = (
         description="Swap REF and ALT between two transition SNVs in the same window.",
         vcf_element="record identity",
         apply=lambda t: swap_objects(
-            swap_objects(t, subject_a=f"{FILE}#record/1", subject_b=f"{FILE}#record/6",
+            swap_objects(t, subject_a=f"{FILE}#record/1", subject_b=f"{FILE}#record/3",
                          predicate=f"{VCFC}ref"),
-            subject_a=f"{FILE}#record/1", subject_b=f"{FILE}#record/6",
+            subject_a=f"{FILE}#record/1", subject_b=f"{FILE}#record/3",
             predicate=f"{VCFC}alt"),
         expected_detected_by="q11_record_digest",
     ),
@@ -272,7 +272,7 @@ MUTATIONS: tuple[Mutation, ...] = (
         description="Change a FILTER value while keeping its broad status class.",
         vcf_element="FILTER",
         apply=lambda t: replace_object(
-            t, subject=f"{FILE}#call/3", predicate=f"{VCFC}filter", new_object='"q20"'),
+            t, subject=f"{FILE}#call/4", predicate=f"{VCFC}filter", new_object='"q20"'),
         expected_detected_by="q04_filter_distribution",
     ),
     Mutation(
@@ -530,7 +530,7 @@ MUTATIONS: tuple[Mutation, ...] = (
         description="Remove one ALT allele resource from a multi-allelic record.",
         vcf_element="allele layer",
         apply=lambda t: drop_matching(
-            t, subject=f"{FILE}#record/4/allele/2", limit=None),
+            t, subject=f"{FILE}#record/5/allele/2", limit=None),
         expected_detected_by="q09_predicate_census, q10_class_census",
     ),
     Mutation(
@@ -575,7 +575,7 @@ MUTATIONS: tuple[Mutation, ...] = (
         description="Remove one parsed item of a Number=A INFO value.",
         vcf_element="indexed values",
         apply=lambda t: drop_matching(
-            t, subject=f"{FILE}#call/4/info/AC/value/1", limit=None),
+            t, subject=f"{FILE}#call/5/info/AC/value/1", limit=None),
         expected_detected_by="q09_predicate_census, q10_class_census",
     ),
     Mutation(
@@ -583,8 +583,8 @@ MUTATIONS: tuple[Mutation, ...] = (
         description="Point a Number=A value item at the wrong ALT allele.",
         vcf_element="indexed values",
         apply=lambda t: replace_object(
-            t, subject=f"{FILE}#call/4/info/AC/value/0", predicate=f"{VCFC}forAllele",
-            new_object=f"<{FILE}#record/4/allele/2>"),
+            t, subject=f"{FILE}#call/5/info/AC/value/0", predicate=f"{VCFC}forAllele",
+            new_object=f"<{FILE}#record/5/allele/2>"),
         expected_detected_by="nothing yet",
         known_undetected=(
             "forAllele is counted but the join is not checked. The vocabulary's "

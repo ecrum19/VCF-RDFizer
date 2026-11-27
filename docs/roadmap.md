@@ -74,9 +74,10 @@ Small change; it makes the custom-mapping extension point actually usable.
 
 From [`vcf-coverage.md`](vcf-coverage.md#remaining-gaps):
 
-- **`vcfc:contigCount` is counted, not read.** A wrong derived contig total is
-  undetected. Needs the value in a comparison, not just the predicate in the
-  census.
+- **`vcfc:contigCount` is counted, not read.** No source-comparison query
+  compares the derived contig total. Since v3.3.3 the `full` shape profile
+  catches a wrong one (`vcfr:ContigCountAgreementShape`), but the default
+  profile and the queries still do not.
 - **Header line values are not compared.** `q08` compares how many lines carry
   each key and `q10` their types; `vcfc:headerValue` itself is only counted. The
   structured attributes that matter are already covered.
@@ -84,6 +85,67 @@ From [`vcf-coverage.md`](vcf-coverage.md#remaining-gaps):
 Both are query-set additions with matching mutation-catalogue entries, so
 closing either one will *fail* the mutation harness until
 [`vcf-coverage.md`](vcf-coverage.md) is updated — by design.
+
+### 9. Fixes held until after the paper's submission
+
+Found while validating the v3.3.3 results. Each was left alone so that what the
+paper reports stays reproducible, and each is small. The first changes
+conversion, so it needs its own release note.
+
+- **Haploid genotypes get the wrong phasing.** `parse_genotype` in
+  `vcf_rdfizer_vocab.py` gives a bare haploid call such as `0` the indicator `/`
+  and `vcfc:Unphased`. VCF 4.4 (p. 11) defines an omitted first indicator as `/`
+  only if another indicator is `/`, and `|` otherwise, and its BCF section calls
+  a haploid `0` implicitly phased. So the call should get `|` and
+  `vcfc:Phased`. Today the expanded fault-injection control fails one `full`
+  constraint, `vcfc:GenotypeAlleleAgreementShape`, on record 6. The fix:
+  - **Converter:** change the default indicator and the haploid branch of
+    `is_phased`.
+  - **Agreement constraint:** change `vcfr:PhasingStatusAgreementShape`
+    (`vcf-rdfizer-agreement.shacl.ttl`) in the same commit. It mirrors today's
+    rule and expects `vcfc:Unphased` when the GT holds no separator, so a fixed
+    converter would fail it.
+  - **Tests:** update the fixture's expected values and the mutation harness's
+    `flip_phasing_status` case.
+  - **Result:** the change alters the RDF of every haploid call, for example
+    chrX and chrY in male samples and mitochondrial calls. The release note
+    should say so, and that the complete HG005 VCF (autosomes only) is
+    unaffected.
+- **The COTTAS engine breaks with Comunica 5.5.0.**
+  `@elias.crum/query-sparql-cottas@0.1.0` depends on Comunica's packages by
+  semver range. A fresh image build picked up Comunica 5.5.0 (2026-11-24), with
+  which a pattern inside an OPTIONAL with a FILTER gets no source ("requires an
+  operation with source annotation"). The expanded `preflight_sample_gt_inventory`
+  and `q05` queries then fail on COTTAS. The image now installs the engine from
+  `docker/comunica-cottas`, which pins every `@comunica` package at the 5.4.0
+  tree of the v3.3.2 image. The real fix belongs in `comunica-feature-cottas`:
+  - **Upstream:** release a version that works with 5.5.0, or pins its range,
+    then drop the pin here.
+  - **The other engines:** the file and HDT engines are still installed
+    globally with ranged dependencies, so the same thing can happen to them. A
+    lockfile for those as well would make the image build reproducible.
+- **The QLever version in validation reports is an error message.**
+  `tool_version` runs the QLever binary without its library path, so the
+  report's `version` field holds a libjemalloc load error instead of a version.
+  The SHACL report already leaves the field out. Fix `tool_version` for QLever,
+  for example by running it with `LD_LIBRARY_PATH=/opt/qlever/lib` or reading
+  the version from the image's build metadata.
+- **The published shapes need three changes upstream** (the
+  `vcf-rdfizer-vocabulary` repository, then re-vendored with new digests):
+  - **Prefixes:** declare `sh:prefixes`. The SPARQL constraints use `vcfc:`
+    without declaring it, which SHACL requires. pyshacl fills it in, Rudof does
+    not, and the QLever path injects it.
+  - **Equivalent queries:** publish the four that VCF-RDFizer substitutes by
+    digest (record order, contig contiguity, duplicate IDs, field cardinality),
+    so every engine gets the scalable form.
+  - **Agreement constraints:** move the four `vcfr:` constraints into a
+    vocabulary release, since they check VCF Core properties.
+- **Report the three Rudof bugs** listed under item 8.
+- **The `full` profile's node-local shapes were not run on the complete HG005
+  VCF.** The SPARQL constraints were, on QLever, with no violations. pyshacl's
+  record batches need a decoded copy of the graph on disk, which vcf-bench-3
+  could not hold for 657.4M triples. Writing the batches compressed, or
+  streaming them, would remove that limit.
 
 ## New capability
 
@@ -163,6 +225,25 @@ outside it:
 The honest framing, which the design keeps throughout: this is *governed
 release*, not anonymization. Genotypes identify people, and no access-control
 layer changes that.
+
+### 8. A native SHACL engine (Rudof)
+
+pyshacl validates the node-local shapes a batch of records at a time, and the
+`full` profile's SPARQL constraints run once each over a QLever index. pyshacl
+stays because every published result was produced with it. Rudof 0.3.39, a Rust
+engine, was evaluated as its replacement. Given RDFS typing and declared
+prefixes, it reaches pyshacl's verdict on every fault-injection graph with the
+core profile, and on 113 of 115 with the full one, where the two differences are
+explained. It is about 24 times faster on the core profile, with the same
+memory per triple.
+
+Porting means running Rudof on the record batches, keeping the SPARQL
+constraints on QLever, and shipping its binary in the image. Three Rudof issues
+need reporting upstream first: right-associative `a - b + c`, a blank-node
+`$this` pre-bound with `VALUES`, and `xsd:int` not compared with `xsd:integer`.
+The evaluation also found issues in the published shapes and a converter bug,
+both listed under item 9. Measurements, issues and the porting steps:
+[`shacl-engines.md`](shacl-engines.md).
 
 ## Deliberately not planned
 

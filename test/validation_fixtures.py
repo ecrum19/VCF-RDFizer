@@ -98,20 +98,23 @@ RECORDS: tuple[FixtureRecord, ...] = (
     # these two is invisible to every aggregate query.
     FixtureRecord("2", "20", 300, ".", "A", "C", "99", "PASS", "AC=2",
                   ("GT", "DP"), ("1/1:41", "0/1:35")),
+    # A second transition SNV sharing record 1's contig and 1 Mb window. A
+    # REF/ALT permutation between records 1 and 3 leaves every aggregate
+    # identical, which is the blind spot the record digest is meant to close.
+    # It sits between records 2 and 4 so the file is sorted: each CHROM forms
+    # one block and POS never decreases within it, as the full shape profile
+    # requires of a clean graph.
+    FixtureRecord("3", "20", 800, ".", "C", "T", "60", "PASS", "AC=1",
+                  ("GT", "DP"), ("0/1:33", "0/1:31")),
     # Deletion shape in a different window, failing FILTER, missing genotype.
-    FixtureRecord("3", "20", 2000200, "rs200", "AAT", "A", "12.5", "q10", "AC=1",
+    FixtureRecord("4", "20", 2000200, "rs200", "AAT", "A", "12.5", "q10", "AC=1",
                   ("GT", "DP"), ("0/1:15", "./.:0")),
     # Multi-allelic: excluded from q06, classified MULTIALLELIC by q02.
-    FixtureRecord("4", "21", 500, ".", "C", "T,G", ".", "PASS", "AC=1,1",
+    FixtureRecord("5", "21", 500, ".", "C", "T,G", ".", "PASS", "AC=1,1",
                   ("GT", "DP"), ("1/2:22", "0/1:19")),
     # No ALT, haploid genotype: exercises NO_ALT and HAPLOID_* branches.
-    FixtureRecord("5", "21", 900, ".", "G", ".", "7", "q10", "DB",
+    FixtureRecord("6", "21", 900, ".", "G", ".", "7", "q10", "DB",
                   ("GT", "DP"), ("0:11", "1:9")),
-    # A second transition SNV sharing record 1's contig and 1 Mb window. A
-    # REF/ALT permutation between records 1 and 6 leaves every aggregate
-    # identical, which is the blind spot the record digest is meant to close.
-    FixtureRecord("6", "20", 800, ".", "C", "T", "60", "PASS", "AC=1",
-                  ("GT", "DP"), ("0/1:33", "0/1:31")),
 )
 
 TRANSITIONS = {("A", "G"), ("G", "A"), ("C", "T"), ("T", "C")}

@@ -2,7 +2,7 @@ cff-version: 1.2.0
 message: "If you use VCF-RDFizer in your research, please cite it using the metadata below."
 title: "VCF-RDFizer"
 type: software
-version: "3.3.2"
+version: "3.3.3"
 doi: "10.5281/zenodo.23237635"
 authors:
   - name: "VCF-RDFizer maintainers"

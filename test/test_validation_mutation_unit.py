@@ -21,6 +21,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -94,6 +95,61 @@ def shacl_profile_paths() -> list[Path] | None:
     return shapes
 
 
+def shacl_sparql_engine() -> str:
+    """Where the profile's SPARQL constraints run: VCF_RDFIZER_MUTATION_SHACL_ENGINE.
+
+    ``pyshacl`` (default) needs nothing beyond pyshacl, so it runs on any host.
+    ``qlever`` is the validator's default path and needs the image's QLever.
+    """
+    engine = os.environ.get("VCF_RDFIZER_MUTATION_SHACL_ENGINE", "").strip().lower()
+    return engine if engine in V.SHACL_SPARQL_ENGINES else "pyshacl"
+
+
+_SHACL_FIELD = re.compile(r"^\s*(Severity|Focus Node|Source Shape|Result Path|Message):\s*(.*)$")
+
+
+def _shacl_term(value: str) -> str:
+    """One spelling per term: IRIs without brackets, every blank node alike."""
+    value = value.strip()
+    if value.startswith("<") and value.endswith(">"):
+        return value[1:-1]
+    prefix, colon, local = value.partition(":")
+    namespaces = {"vcfc": V.VCFC, "sh": "http://www.w3.org/ns/shacl#",
+                  "xsd": "http://www.w3.org/2001/XMLSchema#"}
+    if colon and prefix in namespaces:
+        return namespaces[prefix] + local
+    if value.startswith("_:") or re.fullmatch(r"[A-Za-z]?[0-9a-f]{16,}", value):
+        return "_:b"
+    return value
+
+
+def shacl_violation_keys(report_text: str) -> list[tuple[str, ...]]:
+    """The blocking results of a SHACL report, comparable across graphs and runs.
+
+    Keyed by constraint component, focus node, source shape, path and message.
+    The value is left out on purpose: a mutation that only changes the value of
+    a check the control already fails has not been detected by that check.
+    """
+    keys = set()
+    for entry in V.parse_shacl_results(report_text):
+        if entry["severity"] not in ("Violation", "Unknown"):
+            continue
+        lines = entry["text"].splitlines()
+        fields: dict[str, str] = {}
+        for line in lines[1:]:
+            match = _SHACL_FIELD.match(line)
+            if match and match.group(1) not in fields:
+                fields[match.group(1)] = match.group(2).strip()
+        keys.add((
+            lines[0].split("(", 1)[-1].rstrip("):"),
+            _shacl_term(fields.get("Focus Node", "")),
+            _shacl_term(fields.get("Source Shape", "")),
+            _shacl_term(fields.get("Result Path", "")),
+            fields.get("Message", ""),
+        ))
+    return sorted(keys)
+
+
 def shacl_ontology_path() -> Path | None:
     import vcf_rdfizer
 
@@ -106,8 +162,16 @@ def validate_graph(
     graph_text: str, representation: str, *, strict_conformance: bool = False,
     include_qual: bool = True, mapping_policy: str = "strict",
     shacl_shapes: list[Path] | None = None,
+    shacl_baseline: list | None = None,
 ) -> dict:
-    """Run the whole validation decision over one graph."""
+    """Run the whole validation decision over one graph.
+
+    With ``shacl_shapes``, the shape verdict counts as a detection only when the
+    graph has a blocking result its unmutated control (``shacl_baseline``) does
+    not. A control can fail a profile on its own -- the expanded one does, see
+    docs/shacl-engines.md -- and a check that already fails on the clean graph
+    cannot tell a corrupted one from it.
+    """
     parser = fixtures.parser_summary(representation, include_qual=include_qual)
     query_dir = V.QUERY_ROOT / representation
     with tempfile.TemporaryDirectory() as td:
@@ -130,15 +194,25 @@ def validate_graph(
         if shacl_shapes:
             graph_path = Path(td) / "graph.nt"
             graph_path.write_text(graph_text, encoding="utf-8")
+            results_dir = Path(td) / "shacl"
+            results_dir.mkdir()
             shacl = V.validate_shacl(
-                graph_path, shacl_shapes, Path(td), shacl_ontology_path()
+                graph_path, shacl_shapes, results_dir, shacl_ontology_path(),
+                sparql_engine=shacl_sparql_engine(), scratch_dir=Path(td),
+                qlever_options={"port": int(os.environ.get("VCF_RDFIZER_MUTATION_QLEVER_PORT", "7019")),
+                                "memory_gb": 2, "query_timeout": 600},
             )
+            report = results_dir / "shacl-report.txt"
+            keys = shacl_violation_keys(report.read_text(encoding="utf-8")) if report.exists() else []
+            new = [key for key in keys if key not in set(map(tuple, shacl_baseline or []))]
             verdict = dict(verdict)
             verdict["shacl"] = shacl
-            # A shape violation is a detection in its own right. An execution
-            # failure is NOT: pyshacl being absent or erroring would otherwise
-            # inflate the score with detections nothing actually made.
-            if shacl.get("status") == "FAIL" and verdict["status"] == "PASS":
+            verdict["shaclViolationKeys"] = keys
+            verdict["newShaclViolations"] = new
+            # A shape violation is a detection in its own right when it is new.
+            # An execution failure is NOT: pyshacl being absent or erroring
+            # would otherwise inflate the score with detections nothing made.
+            if shacl.get("status") == "FAIL" and new and verdict["status"] == "PASS":
                 verdict["status"] = "SHACL_VIOLATION"
         return verdict
 
@@ -156,6 +230,20 @@ class MutationHarnessTests(VerboseTestCase):
         """The same holds for the condensed representation."""
         verdict = validate_graph(fixtures.build_graph("condensed"), "condensed")
         self.assertEqual(verdict["status"], "PASS", json.dumps(verdict.get("comparison"), indent=2)[:2000])
+
+    def test_shacl_keys_ignore_values_blank_labels_and_warnings(self):
+        """Detection compares checks, not the value or the parser's blank-node labels."""
+        def block(value, shape, severity="Violation"):
+            return (f"Validation Result in MinCountConstraintComponent "
+                    f"(http://www.w3.org/ns/shacl#MinCountConstraintComponent):\n"
+                    f"\tSeverity: sh:{severity}\n\tSource Shape: {shape}\n"
+                    f"\tFocus Node: <file://f#record/1>\n\tValue Node: {value}\n"
+                    f"\tResult Path: vcfc:pos\n\tMessage: m\n")
+        one = shacl_violation_keys(block('"1"', "_:N0a1b2c3d4e5f60718"))
+        two = shacl_violation_keys(block('"2"', "_:N9f8e7d6c5b4a30201")
+                                   + block('"3"', "_:Nffff", severity="Warning"))
+        self.assertEqual(one, two)
+        self.assertEqual(one[0][3], V.VCFC + "pos")
 
     def test_fixture_graph_and_oracle_describe_the_same_data(self):
         """A guard that the fixture's two halves cannot drift apart silently."""
@@ -176,6 +264,25 @@ class MutationDetectionTests(VerboseTestCase):
     def setUpClass(cls):
         cls.graphs: dict[tuple, str] = {}
         cls.results: list[dict] = []
+        cls.controls: dict[tuple, dict] = {}
+
+    @classmethod
+    def control_for(cls, representation: str, options: tuple) -> dict:
+        """The shape results of the unmutated graph a mutation starts from."""
+        key = (representation, options)
+        if key not in cls.controls:
+            verdict = validate_graph(
+                cls.graph_for(representation, options), representation,
+                include_qual=dict(options).get("include_qual", True),
+                shacl_shapes=cls.shacl_shapes,
+            )
+            cls.controls[key] = {
+                "representation": representation, "graphOptions": dict(options),
+                "queryStatus": verdict["status"],
+                "shaclStatus": verdict.get("shacl", {}).get("status"),
+                "shaclViolationKeys": verdict.get("shaclViolationKeys", []),
+            }
+        return cls.controls[key]
 
     @classmethod
     def graph_for(cls, representation: str, options: tuple) -> str:
@@ -203,6 +310,10 @@ class MutationDetectionTests(VerboseTestCase):
             # number that cannot be attributed, and the shape layer's
             # contribution stays a claim rather than a measurement.
             "shaclProfile": os.environ.get("VCF_RDFIZER_MUTATION_SHACL") or None,
+            "shaclSparqlEngine": shacl_sparql_engine() if cls.shacl_shapes else None,
+            # What each unmutated graph already reports. SHACL detection is
+            # counted against these, never against an assumed-clean control.
+            "controls": list(cls.controls.values()),
             "detectedByShacl": len(by_shacl),
             "detectedByShaclIds": sorted({r["id"] for r in by_shacl}),
             "detectedByQueriesOnly": len(detected) - len(by_shacl),
@@ -223,11 +334,14 @@ class MutationDetectionTests(VerboseTestCase):
         self.assertNotEqual(mutated, original, f"{mutation.id} did not change the graph")
         # The conformance mutation is only a failure under the strict policy.
         strict = mutation.id == "plain_dot_literal"
+        baseline = (self.control_for(representation, mutation.graph_options)["shaclViolationKeys"]
+                    if self.shacl_shapes else None)
         verdict = validate_graph(
             mutated, representation, strict_conformance=strict,
             include_qual=options.get("include_qual", True),
             mapping_policy=mutation.mapping_policy,
             shacl_shapes=self.shacl_shapes,
+            shacl_baseline=baseline,
         )
         detected = verdict["status"] != "PASS"
         detected_by_shacl = verdict["status"] == "SHACL_VIOLATION"
@@ -239,6 +353,8 @@ class MutationDetectionTests(VerboseTestCase):
             "detected": detected,
             "detectedByShacl": detected_by_shacl,
             "status": verdict["status"],
+            "shaclStatus": verdict.get("shacl", {}).get("status"),
+            "newShaclViolations": verdict.get("newShaclViolations"),
             "knownUndetected": mutation.known_undetected,
             "graphOptions": dict(mutation.graph_options),
         })
